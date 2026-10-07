@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ochreml"
+version = "0.1.0"
+description = "Classical Machine Learning Library in Rust with PyO3 Bindings (*^▽^*)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+keywords = ["machine-learning", "linear-regression", "decision-tree", "rust", "pyo3"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[tool.maturin]
+python-source = "python"
+module-name = "ochreml._ochreml"
+features = ["pyo3/extension-module"]
