@@ -130,6 +130,62 @@ impl Matrix {
     }
 }
 
+// Directly compute (X^T * X) and (X^T * y) in a single pass without allocating transpose matrices.
+// Exploits symmetry of the Gram matrix and contiguous row memory layout (*≧ω≦*)
+pub fn compute_normal_equation_mats(
+    x: &Matrix,
+    y: &[f64],
+    fit_intercept: bool,
+) -> Result<(Matrix, Vec<f64>), String> {
+    if x.rows != y.len() {
+        return Err(format!(
+            "Row count ({}) must match target length ({}) ( >_< )",
+            x.rows,
+            y.len()
+        ));
+    }
+    let p = if fit_intercept { x.cols + 1 } else { x.cols };
+    let mut xt_x = Matrix::zeros(p, p);
+    let mut xt_y = vec![0.0; p];
+
+    for r in 0..x.rows {
+        let yr = y[r];
+        let row_offset = r * x.cols;
+        let row_slice = &x.data[row_offset..row_offset + x.cols];
+
+        if fit_intercept {
+            for j in 0..x.cols {
+                let xj = row_slice[j];
+                xt_y[j] += xj * yr;
+                for k in j..x.cols {
+                    xt_x.data[j * p + k] += xj * row_slice[k];
+                }
+                xt_x.data[j * p + x.cols] += xj;
+            }
+            xt_y[x.cols] += yr;
+            xt_x.data[x.cols * p + x.cols] += 1.0;
+        } else {
+            for j in 0..x.cols {
+                let xj = row_slice[j];
+                xt_y[j] += xj * yr;
+                for k in j..x.cols {
+                    xt_x.data[j * p + k] += xj * row_slice[k];
+                }
+            }
+        }
+    }
+
+    // Mirror upper triangle to lower triangle
+    for j in 0..p {
+        for k in (j + 1)..p {
+            let val = xt_x.data[j * p + k];
+            xt_x.data[k * p + j] = val;
+        }
+    }
+
+    Ok((xt_x, xt_y))
+}
+
 // Solve linear system A * x = b using Gauss-Jordan elimination with partial pivoting
 // Equipped with Tikhonov (Ridge) regularizer fallback when near-singular (*≧ω≦*)
 pub fn solve_linear_system(a: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
@@ -275,5 +331,36 @@ mod tests {
         let sol = solve_linear_system(&a, &b).unwrap();
         assert!((sol[0] - 2.0).abs() < 1e-6);
         assert!((sol[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_compute_normal_equation_mats() {
+        let x = Matrix::from_2d(&vec![
+            vec![1.0, 2.0],
+            vec![3.0, 4.0],
+            vec![5.0, 6.0],
+        ]).unwrap();
+        let y = vec![1.0, 2.0, 3.0];
+
+        let (xt_x, xt_y) = compute_normal_equation_mats(&x, &y, true).unwrap();
+        assert_eq!(xt_x.rows, 3);
+        assert_eq!(xt_x.cols, 3);
+        assert_eq!(xt_y.len(), 3);
+
+        // Verify with manual calculation
+        // Column 0: [1, 3, 5] -> norm^2 = 1+9+25 = 35
+        assert_eq!(xt_x.get(0, 0), 35.0);
+        // Column 0 dot Col 1: 1*2 + 3*4 + 5*6 = 2 + 12 + 30 = 44
+        assert_eq!(xt_x.get(0, 1), 44.0);
+        assert_eq!(xt_x.get(1, 0), 44.0);
+        // Col 0 dot bias: 1 + 3 + 5 = 9
+        assert_eq!(xt_x.get(0, 2), 9.0);
+        assert_eq!(xt_x.get(2, 0), 9.0);
+        // Bias dot bias: 3.0
+        assert_eq!(xt_x.get(2, 2), 3.0);
+        // Col 0 dot y: 1*1 + 3*2 + 5*3 = 1 + 6 + 15 = 22
+        assert_eq!(xt_y[0], 22.0);
+        // Bias dot y: 1 + 2 + 3 = 6
+        assert_eq!(xt_y[2], 6.0);
     }
 }

@@ -1,7 +1,7 @@
 // OchreML Linear Regression Module (＾▽＾)
 // Implementation of Ordinary Least Squares (OLS) via the Normal Equation.
 
-use crate::matrix::{r2_score, solve_linear_system, Matrix};
+use crate::matrix::{compute_normal_equation_mats, r2_score, solve_linear_system, Matrix};
 
 #[derive(Debug, Clone)]
 pub struct LinearRegression {
@@ -36,24 +36,7 @@ impl LinearRegression {
 
         self.n_features_in_ = Some(x.cols);
 
-        // Construct Design Matrix, augmenting with a bias column if fit_intercept is true
-        let x_design = if self.fit_intercept {
-            let mut aug = Matrix::zeros(x.rows, x.cols + 1);
-            for r in 0..x.rows {
-                for c in 0..x.cols {
-                    aug.set(r, c, x.get(r, c));
-                }
-                aug.set(r, x.cols, 1.0);
-            }
-            aug
-        } else {
-            x.clone()
-        };
-
-        let xt = x_design.transpose();
-        let xt_x = xt.matmul(&x_design)?;
-        let xt_y = xt.matvec(y)?;
-
+        let (xt_x, xt_y) = compute_normal_equation_mats(x, y, self.fit_intercept)?;
         let theta = solve_linear_system(&xt_x, &xt_y)?;
 
         if self.fit_intercept {
@@ -85,9 +68,11 @@ impl LinearRegression {
 
         let mut predictions = Vec::with_capacity(x.rows);
         for r in 0..x.rows {
+            let offset = r * x.cols;
+            let row_slice = &x.data[offset..offset + x.cols];
             let mut val = intercept;
             for c in 0..x.cols {
-                val += x.get(r, c) * coef[c];
+                val += row_slice[c] * coef[c];
             }
             predictions.push(val);
         }

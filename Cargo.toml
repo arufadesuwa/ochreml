@@ -1,6 +1,6 @@
 [package]
 name = "ochreml"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Classical Machine Learning Library in Rust with PyO3 Bindings (*^▽^*)"
 license = "MIT OR Apache-2.0"
