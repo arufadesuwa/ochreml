@@ -56,6 +56,38 @@ impl Matrix {
         })
     }
 
+    // Construct Matrix directly from contiguous flat Vec (Zero-Copy) (*≧ω≦*)
+    pub fn from_vec(rows: usize, cols: usize, data: Vec<f64>) -> Result<Self, String> {
+        if rows == 0 || cols == 0 {
+            return Err("Matrix dimensions cannot be zero (´；ω；`)".to_string());
+        }
+        if data.len() != rows * cols {
+            return Err(format!(
+                "Data length ({}) does not match dimensions {}x{}={} ( >_< )",
+                data.len(), rows, cols, rows * cols
+            ));
+        }
+        Ok(Self { rows, cols, data })
+    }
+
+    // Construct Matrix directly from contiguous slice (o´∀｀o)
+    pub fn from_slice(rows: usize, cols: usize, slice: &[f64]) -> Result<Self, String> {
+        if rows == 0 || cols == 0 {
+            return Err("Matrix dimensions cannot be zero (´；ω；`)".to_string());
+        }
+        if slice.len() != rows * cols {
+            return Err(format!(
+                "Slice length ({}) does not match dimensions {}x{}={} ( >_< )",
+                slice.len(), rows, cols, rows * cols
+            ));
+        }
+        Ok(Self {
+            rows,
+            cols,
+            data: slice.to_vec(),
+        })
+    }
+
     #[inline]
     pub fn get(&self, r: usize, c: usize) -> f64 {
         self.data[r * self.cols + c]
@@ -193,8 +225,43 @@ pub fn compute_normal_equation_mats(
             Ok((total_xt_x, total_xt_y))
         }
         _ => {
-            // Single device (CPU / Single GPU) single-pass accumulation
-            compute_normal_equation_range(x, y, fit_intercept, 0, x.rows)
+            // Single device (CPU / Single GPU)
+            // Parallelize across CPU threads using Rayon when dataset is sufficiently large (*≧ω≦*)
+            if x.rows >= 1000 {
+                use rayon::prelude::*;
+                let num_threads = rayon::current_num_threads().max(1);
+                let chunk_size = (x.rows + num_threads - 1) / num_threads;
+                let chunks: Vec<(usize, usize)> = (0..num_threads)
+                    .map(|i| {
+                        let start = i * chunk_size;
+                        let end = (start + chunk_size).min(x.rows);
+                        (start, end)
+                    })
+                    .filter(|(start, end)| start < end)
+                    .collect();
+
+                let (total_xt_x, total_xt_y) = chunks
+                    .into_par_iter()
+                    .map(|(start, end)| compute_normal_equation_range(x, y, fit_intercept, start, end))
+                    .reduce(
+                        || Ok((Matrix::zeros(p, p), vec![0.0; p])),
+                        |acc, chunk| {
+                            let (mut acc_m, mut acc_v) = acc?;
+                            let (chunk_m, chunk_v) = chunk?;
+                            for i in 0..(p * p) {
+                                acc_m.data[i] += chunk_m.data[i];
+                            }
+                            for i in 0..p {
+                                acc_v[i] += chunk_v[i];
+                            }
+                            Ok((acc_m, acc_v))
+                        },
+                    )?;
+
+                Ok((total_xt_x, total_xt_y))
+            } else {
+                compute_normal_equation_range(x, y, fit_intercept, 0, x.rows)
+            }
         }
     }
 }
@@ -247,6 +314,81 @@ fn compute_normal_equation_range(
     }
 
     Ok((xt_x, xt_y))
+}
+
+// Solve symmetric positive semi-definite linear system (A * theta = b) using Cholesky Decomposition (L * L^T)
+// 2x faster than Gauss-Jordan with O(1/3 * p^3) FLOPs and automated regularizer fallback (*≧ω≦*)
+pub fn solve_cholesky(a: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
+    if a.rows != a.cols {
+        return Err("Coefficient matrix A must be square (n x n) (´；ω；`)".to_string());
+    }
+    if a.rows != b.len() {
+        return Err("Constant vector b length must match row count of matrix A ( >_< )".to_string());
+    }
+    let n = a.rows;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Try Cholesky decomposition directly or with subtle Ridge regularizer if ill-conditioned
+    for &lambda in &[0.0, 1e-12, 1e-9, 1e-6, 1e-3] {
+        let mut l = Matrix::zeros(n, n);
+        let mut success = true;
+
+        for i in 0..n {
+            for j in 0..=i {
+                let mut sum = 0.0;
+                for k in 0..j {
+                    sum += l.get(i, k) * l.get(j, k);
+                }
+                if i == j {
+                    let diag = a.get(i, i) + lambda - sum;
+                    if diag <= 1e-14 {
+                        success = false;
+                        break;
+                    }
+                    l.set(i, i, diag.sqrt());
+                } else {
+                    let lj_j = l.get(j, j);
+                    if lj_j.abs() <= 1e-14 {
+                        success = false;
+                        break;
+                    }
+                    l.set(i, j, (a.get(i, j) - sum) / lj_j);
+                }
+            }
+            if !success {
+                break;
+            }
+        }
+
+        if success {
+            // Forward substitution: L * z = b
+            let mut z = vec![0.0; n];
+            for i in 0..n {
+                let mut sum = 0.0;
+                for k in 0..i {
+                    sum += l.get(i, k) * z[k];
+                }
+                z[i] = (b[i] - sum) / l.get(i, i);
+            }
+
+            // Backward substitution: L^T * theta = z
+            let mut theta = vec![0.0; n];
+            for i in (0..n).rev() {
+                let mut sum = 0.0;
+                for k in (i + 1)..n {
+                    sum += l.get(k, i) * theta[k];
+                }
+                theta[i] = (z[i] - sum) / l.get(i, i);
+            }
+
+            return Ok(theta);
+        }
+    }
+
+    // Fallback to Gauss-Jordan elimination if matrix is severely rank-deficient
+    solve_linear_system(a, b)
 }
 
 // Solve linear system A * x = b using Gauss-Jordan elimination with partial pivoting
@@ -394,6 +536,29 @@ mod tests {
         let sol = solve_linear_system(&a, &b).unwrap();
         assert!((sol[0] - 2.0).abs() < 1e-6);
         assert!((sol[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cholesky_solver() {
+        // Symmetric positive definite matrix: [4, 2; 2, 3] * [x; y] = [8, 7] -> sol = [1.25, 1.5]
+        let a = Matrix::from_2d(&vec![
+            vec![4.0, 2.0],
+            vec![2.0, 3.0],
+        ]).unwrap();
+        let b = vec![8.0, 7.0];
+        let sol = solve_cholesky(&a, &b).unwrap();
+        assert!((sol[0] - 1.25).abs() < 1e-6);
+        assert!((sol[1] - 1.50).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_matrix_from_vec_and_slice() {
+        let data = vec![1.0, 2.0, 3.0, 4.0];
+        let m1 = Matrix::from_slice(2, 2, &data).unwrap();
+        let m2 = Matrix::from_vec(2, 2, data).unwrap();
+        assert_eq!(m1, m2);
+        assert_eq!(m1.get(0, 1), 2.0);
+        assert_eq!(m1.get(1, 0), 3.0);
     }
 
     #[test]

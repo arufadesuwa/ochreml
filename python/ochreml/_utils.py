@@ -1,13 +1,14 @@
 # OchreML utility module (＾▽＾)
-# Data format converters: List, NumPy ndarray, Pandas DataFrame/Series, and Polars DataFrame/Series.
+# Data format converters & Zero-Copy Buffer Protocol processors (*≧ω≦*)
+# Supports: NumPy ndarray, Polars DataFrame/Series, Pandas DataFrame/Series, and Python Lists.
 
-from typing import Any, List
+from typing import Any, List, Tuple
 
 
-def to_feature_matrix(X: Any) -> List[List[float]]:
+def process_features(X: Any) -> Tuple[bool, Any]:
     """
-    Convert feature input X to a 2D matrix list[list[float]] (*≧ω≦*)
-    Supports: Python nested lists, NumPy ndarrays, Pandas DataFrames, and Polars DataFrames.
+    Process feature matrix X for Zero-Copy Buffer Protocol or Python fallback (*≧ω≦*)
+    Returns (is_buffer, processed_data).
     """
     if X is None:
         raise ValueError("Feature matrix X cannot be None (´；ω；`)")
@@ -15,39 +16,40 @@ def to_feature_matrix(X: Any) -> List[List[float]]:
     type_name = type(X).__name__
     module_name = type(X).__module__
 
-    # 1. Convert from Polars DataFrame
-    if "polars" in module_name or (type_name == "DataFrame" and hasattr(X, "iter_rows")):
+    # 1. NumPy ndarray, Polars DataFrame, or Pandas DataFrame
+    if (
+        hasattr(X, "__array__")
+        or type_name == "ndarray"
+        or "pandas" in module_name
+        or "polars" in module_name
+        or hasattr(X, "to_numpy")
+    ):
         try:
+            import numpy as np
+
             if hasattr(X, "to_numpy"):
-                import numpy as np
-                return np.asarray(X.to_numpy(), dtype=float).tolist()
+                arr = X.to_numpy()
             else:
-                return [[float(val) for val in row] for row in X.iter_rows()]
+                arr = np.asarray(X)
+
+            arr = np.ascontiguousarray(arr, dtype=np.float64)
+            if arr.ndim == 1:
+                raise ValueError(
+                    "Feature matrix X must be a 2D array (n_samples, n_features) ( >_< )\n"
+                    "Tip: Use X.reshape(-1, 1) if data has only 1 feature."
+                )
+            if arr.ndim != 2:
+                raise ValueError(
+                    f"Feature matrix dimension ({arr.ndim}D) is not supported. Must be 2D matrix (・`ω´・)"
+                )
+            return True, arr
+        except ValueError as e:
+            if "Feature matrix" in str(e):
+                raise
         except Exception:
-            return [[float(val) for val in row] for row in X.iter_rows()]
+            pass
 
-    # 2. Convert from Pandas DataFrame
-    if "pandas" in module_name or (hasattr(X, "to_numpy") and hasattr(X, "columns")):
-        import numpy as np
-        arr = X.to_numpy()
-        return np.asarray(arr, dtype=float).tolist()
-
-    # 3. Convert from NumPy ndarray
-    if hasattr(X, "__array__") or type_name == "ndarray":
-        import numpy as np
-        arr = np.asarray(X, dtype=float)
-        if arr.ndim == 1:
-            raise ValueError(
-                "Feature matrix X must be a 2D array (n_samples, n_features) ( >_< )\n"
-                "Tip: Use X.reshape(-1, 1) if data has only 1 feature."
-            )
-        if arr.ndim != 2:
-            raise ValueError(
-                f"Feature matrix dimension ({arr.ndim}D) is not supported. Must be 2D matrix (・`ω´・)"
-            )
-        return arr.tolist()
-
-    # 4. Convert from standard Python nested lists
+    # 2. Python nested lists / tuples
     if isinstance(X, (list, tuple)):
         if len(X) == 0:
             raise ValueError("Feature matrix X cannot be empty (´-ω-`)")
@@ -56,29 +58,37 @@ def to_feature_matrix(X: Any) -> List[List[float]]:
             raise ValueError(
                 "Feature matrix X must be a nested list [[x1, x2], ...] instead of a 1D list ( >_< )"
             )
-        matrix = []
-        expected_cols = len(first)
-        for idx, row in enumerate(X):
-            if not isinstance(row, (list, tuple)):
-                raise ValueError(
-                    f"Element at row {idx} must be a list or tuple (・`ω´・)"
-                )
-            if len(row) != expected_cols:
-                raise ValueError(
-                    f"Row {idx} column count ({len(row)}) differs from first row ({expected_cols}) (´；д；`)"
-                )
-            matrix.append([float(val) for val in row])
-        return matrix
+        try:
+            import numpy as np
+
+            arr = np.ascontiguousarray(X, dtype=np.float64)
+            if arr.ndim != 2:
+                raise ValueError("Feature matrix X must be a 2D array ( >_< )")
+            return True, arr
+        except Exception:
+            matrix = []
+            expected_cols = len(first)
+            for idx, row in enumerate(X):
+                if not isinstance(row, (list, tuple)):
+                    raise ValueError(
+                        f"Element at row {idx} must be a list or tuple (・`ω´・)"
+                    )
+                if len(row) != expected_cols:
+                    raise ValueError(
+                        f"Row {idx} column count ({len(row)}) differs from first row ({expected_cols}) (´；д；`)"
+                    )
+                matrix.append([float(val) for val in row])
+            return False, matrix
 
     raise TypeError(
         f"Data format {type(X)} is not supported. Please use List, NumPy, Pandas, or Polars (T_T)"
     )
 
 
-def to_target_vector(y: Any) -> List[float]:
+def process_target(y: Any) -> Tuple[bool, Any]:
     """
-    Convert target y to a 1D vector list[float] (o´∀｀o)
-    Supports: Python lists, NumPy 1D ndarrays, Pandas Series, and Polars Series.
+    Process target vector y for Zero-Copy Buffer Protocol or Python fallback (o´∀｀o)
+    Returns (is_buffer, processed_data).
     """
     if y is None:
         raise ValueError("Target vector y cannot be None (´；ω；`)")
@@ -86,33 +96,56 @@ def to_target_vector(y: Any) -> List[float]:
     type_name = type(y).__name__
     module_name = type(y).__module__
 
-    # 1. Convert from Polars Series / 1-column DataFrame
-    if "polars" in module_name:
+    if (
+        hasattr(y, "__array__")
+        or type_name == "ndarray"
+        or "pandas" in module_name
+        or "polars" in module_name
+        or hasattr(y, "to_numpy")
+    ):
         try:
-            if hasattr(y, "to_list"):
-                return [float(v) for v in y.to_list()]
+            import numpy as np
+
             if hasattr(y, "to_numpy"):
-                import numpy as np
-                return np.asarray(y.to_numpy(), dtype=float).ravel().tolist()
+                arr = y.to_numpy()
+            else:
+                arr = np.asarray(y)
+            arr = np.ascontiguousarray(arr, dtype=np.float64).ravel()
+            return True, arr
         except Exception:
             pass
 
-    # 2. Convert from Pandas Series / DataFrame
-    if "pandas" in module_name or hasattr(y, "to_numpy"):
-        import numpy as np
-        arr = np.asarray(y.to_numpy(), dtype=float).ravel()
-        return arr.tolist()
-
-    # 3. Convert from NumPy ndarray
-    if hasattr(y, "__array__") or type_name == "ndarray":
-        import numpy as np
-        arr = np.asarray(y, dtype=float).ravel()
-        return arr.tolist()
-
-    # 4. Convert from standard Python list
     if isinstance(y, (list, tuple)):
-        return [float(v) for v in y]
+        try:
+            import numpy as np
+
+            arr = np.ascontiguousarray(y, dtype=np.float64).ravel()
+            return True, arr
+        except Exception:
+            return False, [float(v) for v in y]
 
     raise TypeError(
         f"Target format ({type(y)}) is not supported. Please use List, NumPy, Pandas, or Polars (・`ω´・)"
     )
+
+
+def to_feature_matrix(X: Any) -> List[List[float]]:
+    """
+    Convert feature input X to a 2D matrix list[list[float]] (*≧ω≦*)
+    Supports: Python nested lists, NumPy ndarrays, Pandas DataFrames, and Polars DataFrames.
+    """
+    is_buf, data = process_features(X)
+    if is_buf:
+        return data.tolist()
+    return data
+
+
+def to_target_vector(y: Any) -> List[float]:
+    """
+    Convert target y to a 1D vector list[float] (o´∀｀o)
+    Supports: Python lists, NumPy 1D ndarrays, Pandas Series, and Polars Series.
+    """
+    is_buf, data = process_target(y)
+    if is_buf:
+        return data.tolist()
+    return data

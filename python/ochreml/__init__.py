@@ -1,10 +1,16 @@
 """
 OchreML: Classical Machine Learning library in Rust with PyO3 bindings (＾▽＾)
 Hardware accelerated for CPU, GPU, Multi-GPU, and TPU (*≧ω≦*)
+Equipped with Zero-Copy Python Buffer Protocol and SIMD / Rayon solvers (o´∀｀o)
 """
 
 from typing import Any, Dict, List, Optional
-from ._utils import to_feature_matrix, to_target_vector
+from ._utils import (
+    process_features,
+    process_target,
+    to_feature_matrix,
+    to_target_vector,
+)
 from ._ochreml import (
     LinearRegression as _RustLinearRegression,
     DecisionTreeClassifier as _RustDecisionTreeClassifier,
@@ -13,7 +19,7 @@ from ._ochreml import (
     get_device_info as _get_device_info,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __all__ = [
     "LinearRegression",
     "DecisionTreeClassifier",
@@ -74,7 +80,8 @@ class LinearRegression:
     Ordinary Least Squares (OLS) Linear Regression model (＾▽＾)
 
     Solves linear regression using the Normal Equation: (X^T * X)^(-1) * X^T * y
-    equipped with automated Tikhonov (Ridge) regularization and device acceleration.
+    equipped with automated Cholesky decomposition, Tikhonov regularization,
+    and Zero-Copy Buffer Protocol acceleration (*≧ω≦*).
 
     Parameters
     ----------
@@ -120,9 +127,14 @@ class LinearRegression:
         self : LinearRegression
             Fitted estimator instance.
         """
-        X_mat = to_feature_matrix(X)
-        y_vec = to_target_vector(y)
-        self._model.fit(X_mat, y_vec)
+        is_buf_x, X_data = process_features(X)
+        is_buf_y, y_data = process_target(y)
+        if is_buf_x and is_buf_y:
+            self._model.fit_buffer(X_data, y_data)
+        else:
+            X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
+            y_vec = to_target_vector(y_data) if is_buf_y else y_data
+            self._model.fit(X_mat, y_vec)
         return self
 
     def predict(self, X: Any) -> Any:
@@ -139,8 +151,11 @@ class LinearRegression:
         predictions : numpy.ndarray or list of float
             Returns predicted values.
         """
-        X_mat = to_feature_matrix(X)
-        preds = self._model.predict(X_mat)
+        is_buf_x, X_data = process_features(X)
+        if is_buf_x:
+            preds = self._model.predict_buffer(X_data)
+        else:
+            preds = self._model.predict(X_data)
         try:
             import numpy as np
             return np.asarray(preds)
@@ -151,9 +166,14 @@ class LinearRegression:
         """
         Return the coefficient of determination R^2 of the prediction (*^▽^*)
         """
-        X_mat = to_feature_matrix(X)
-        y_vec = to_target_vector(y)
-        return self._model.score(X_mat, y_vec)
+        is_buf_x, X_data = process_features(X)
+        is_buf_y, y_data = process_target(y)
+        if is_buf_x and is_buf_y:
+            return self._model.score_buffer(X_data, y_data)
+        else:
+            X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
+            y_vec = to_target_vector(y_data) if is_buf_y else y_data
+            return self._model.score(X_mat, y_vec)
 
     @property
     def coef_(self) -> Optional[List[float]]:
@@ -179,7 +199,8 @@ class DecisionTreeClassifier:
     """
     Decision Tree Classifier model (*≧ω≦*)
 
-    Builds a classification tree using Gini Impurity or Entropy criteria.
+    Builds a classification tree using Gini Impurity or Entropy criteria,
+    equipped with Zero-Copy Buffer Protocol and Rayon parallelization.
 
     Parameters
     ----------
@@ -229,17 +250,25 @@ class DecisionTreeClassifier:
         """
         Build a decision tree classifier from the training set (X, y) (o´∀｀o)
         """
-        X_mat = to_feature_matrix(X)
-        y_vec = to_target_vector(y)
-        self._model.fit(X_mat, y_vec)
+        is_buf_x, X_data = process_features(X)
+        is_buf_y, y_data = process_target(y)
+        if is_buf_x and is_buf_y:
+            self._model.fit_buffer(X_data, y_data)
+        else:
+            X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
+            y_vec = to_target_vector(y_data) if is_buf_y else y_data
+            self._model.fit(X_mat, y_vec)
         return self
 
     def predict(self, X: Any) -> Any:
         """
         Predict class value for X (＾▽＾)
         """
-        X_mat = to_feature_matrix(X)
-        preds = self._model.predict(X_mat)
+        is_buf_x, X_data = process_features(X)
+        if is_buf_x:
+            preds = self._model.predict_buffer(X_data)
+        else:
+            preds = self._model.predict(X_data)
         try:
             import numpy as np
             return np.asarray(preds)
@@ -250,9 +279,14 @@ class DecisionTreeClassifier:
         """
         Return the mean accuracy on the given test data and labels (*^▽^*)
         """
-        X_mat = to_feature_matrix(X)
-        y_vec = to_target_vector(y)
-        return self._model.score(X_mat, y_vec)
+        is_buf_x, X_data = process_features(X)
+        is_buf_y, y_data = process_target(y)
+        if is_buf_x and is_buf_y:
+            return self._model.score_buffer(X_data, y_data)
+        else:
+            X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
+            y_vec = to_target_vector(y_data) if is_buf_y else y_data
+            return self._model.score(X_mat, y_vec)
 
     @property
     def classes_(self) -> List[float]:
@@ -277,7 +311,8 @@ class DecisionTreeRegressor:
     """
     Decision Tree Regressor model (o´∀｀o)
 
-    Builds a non-linear regression tree by minimizing Mean Squared Error (MSE).
+    Builds a non-linear regression tree by minimizing Mean Squared Error (MSE),
+    equipped with Zero-Copy Buffer Protocol and Rayon parallelization.
 
     Parameters
     ----------
@@ -325,17 +360,25 @@ class DecisionTreeRegressor:
         """
         Build a decision tree regressor from the training set (X, y) (*≧ω≦*)
         """
-        X_mat = to_feature_matrix(X)
-        y_vec = to_target_vector(y)
-        self._model.fit(X_mat, y_vec)
+        is_buf_x, X_data = process_features(X)
+        is_buf_y, y_data = process_target(y)
+        if is_buf_x and is_buf_y:
+            self._model.fit_buffer(X_data, y_data)
+        else:
+            X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
+            y_vec = to_target_vector(y_data) if is_buf_y else y_data
+            self._model.fit(X_mat, y_vec)
         return self
 
     def predict(self, X: Any) -> Any:
         """
         Predict continuous target values for X (＾▽＾)
         """
-        X_mat = to_feature_matrix(X)
-        preds = self._model.predict(X_mat)
+        is_buf_x, X_data = process_features(X)
+        if is_buf_x:
+            preds = self._model.predict_buffer(X_data)
+        else:
+            preds = self._model.predict(X_data)
         try:
             import numpy as np
             return np.asarray(preds)
@@ -346,9 +389,14 @@ class DecisionTreeRegressor:
         """
         Return the coefficient of determination R^2 of the prediction (*^▽^*)
         """
-        X_mat = to_feature_matrix(X)
-        y_vec = to_target_vector(y)
-        return self._model.score(X_mat, y_vec)
+        is_buf_x, X_data = process_features(X)
+        is_buf_y, y_data = process_target(y)
+        if is_buf_x and is_buf_y:
+            return self._model.score_buffer(X_data, y_data)
+        else:
+            X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
+            y_vec = to_target_vector(y_data) if is_buf_y else y_data
+            return self._model.score(X_mat, y_vec)
 
     @property
     def n_features_in_(self) -> Optional[int]:

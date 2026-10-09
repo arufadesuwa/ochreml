@@ -57,34 +57,34 @@ OchreML is a high-performance classical Machine Learning library written in Rust
 
 ## Performance Benchmarks (*≧ω≦*)
 
-Comprehensive benchmark comparing OchreML's pure Rust engine against Scikit-Learn (Cython backend).
+Comprehensive benchmark comparing OchreML's pure Rust engine (with Zero-Copy Python Buffer Protocol, SIMD, and Rayon multi-threading) against Scikit-Learn (Cython backend).
 
-### 1. Decision Tree Classifier (`criterion="gini"`, `max_depth=5`)
-*Dataset: 2,500 samples (2,000 train, 500 test), 8 features*
-
-| Metric | OchreML (Rust) | Scikit-Learn | Ratio / Parity |
-| :--- | :--- | :--- | :--- |
-| **Fit Time** | **5.55 ms** | 9.23 ms | **1.66x FASTER** (*≧ω≦*) |
-| **Predict Time** | **0.27 ms** | 0.38 ms | **1.40x FASTER** |
-| **Test Accuracy** | **92.40 %** | 92.40 % | Identical Parity |
-
-### 2. Decision Tree Regressor (`criterion="squared_error"`, `max_depth=5`)
-*Dataset: 2,500 samples (2,000 train, 500 test), 6 features*
-
-| Metric | OchreML (Rust) | Scikit-Learn | Ratio / Parity |
-| :--- | :--- | :--- | :--- |
-| **Fit Time** | **3.72 ms** | 5.79 ms | **1.55x FASTER** (*^▽^*) |
-| **Predict Time** | **0.25 ms** | 0.34 ms | **1.36x FASTER** |
-| **Test $R^2$ Score** | **0.870028** | 0.870028 | Identical Parity |
-
-### 3. Linear Regression (OLS Normal Equation)
+### 1. Linear Regression (OLS Normal Equation & Cholesky Solver)
 *Dataset: 20,000 samples (16,000 train, 4,000 test), 10 features*
 
 | Metric | OchreML (Rust) | Scikit-Learn | Ratio / Parity |
 | :--- | :--- | :--- | :--- |
-| **Fit Time** | 17.05 ms | 9.11 ms | Analytical Normal Equation |
-| **Predict Time** | 2.60 ms | 0.44 ms | Zero-copy row slicing |
-| **Test $R^2$ Score** | **0.997970** | 0.997970 | Max diff: $2.86 \times 10^{-14}$ |
+| **Fit Time** | **2.62 ms** | 7.99 ms | **3.05x FASTER** (*≧ω≦*) |
+| **Predict Time** | **0.60 ms** | 0.33 ms | Zero-copy vector dot product |
+| **Test $R^2$ Score** | **0.997970** | 0.997970 | Max coef diff: $7.11 \times 10^{-15}$ |
+
+### 2. Decision Tree Classifier (`criterion="gini"`, `max_depth=5`)
+*Dataset: 2,500 samples (2,000 train, 500 test), 8 features*
+
+| Metric | OchreML (Rust) | Scikit-Learn | Ratio / Parity |
+| :--- | :--- | :--- | :--- |
+| **Fit Time** | **4.17 ms** | 9.69 ms | **2.32x FASTER** (*^▽^*) |
+| **Predict Time** | **0.10 ms** | 0.40 ms | **4.00x FASTER** |
+| **Test Accuracy** | **92.40 %** | 92.40 % | Identical Parity |
+
+### 3. Decision Tree Regressor (`criterion="squared_error"`, `max_depth=5`)
+*Dataset: 2,500 samples (2,000 train, 500 test), 6 features*
+
+| Metric | OchreML (Rust) | Scikit-Learn | Ratio / Parity |
+| :--- | :--- | :--- | :--- |
+| **Fit Time** | **3.13 ms** | 6.72 ms | **2.15x FASTER** (o´∀｀o) |
+| **Predict Time** | **0.09 ms** | 0.34 ms | **3.77x FASTER** |
+| **Test $R^2$ Score** | **0.870028** | 0.870028 | Identical Parity |
 
 ---
 

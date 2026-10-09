@@ -23,6 +23,36 @@ pub fn get_device_info() -> HashMap<String, String> {
     device::get_device_info_map()
 }
 
+fn buffer_to_matrix(py: Python<'_>, x: &pyo3::buffer::PyBuffer<f64>) -> PyResult<Matrix> {
+    let shape = x.shape();
+    if shape.len() != 2 {
+        return Err(PyValueError::new_err(format!(
+            "Feature matrix X must be a 2D array (n_samples, n_features), got {}D ( >_< )",
+            shape.len()
+        )));
+    }
+    let rows = shape[0];
+    let cols = shape[1];
+    let mut data = vec![0.0; rows * cols];
+    x.copy_to_slice(py, &mut data)
+        .map_err(|e| PyValueError::new_err(format!("Failed to copy buffer data: {} (´；ω；`)", e)))?;
+    Matrix::from_vec(rows, cols, data).map_err(PyValueError::new_err)
+}
+
+fn buffer_to_target_vector(py: Python<'_>, y: &pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
+    let shape = y.shape();
+    if shape.len() > 2 || (shape.len() == 2 && shape[1] != 1) {
+        return Err(PyValueError::new_err(format!(
+            "Target vector y must be a 1D vector (n_samples,) or 2D column (n_samples, 1) (・`ω´・)"
+        )));
+    }
+    let count = y.item_count();
+    let mut data = vec![0.0; count];
+    y.copy_to_slice(py, &mut data)
+        .map_err(|e| PyValueError::new_err(format!("Failed to copy target buffer: {} (´；ω；`)", e)))?;
+    Ok(data)
+}
+
 #[pyclass(from_py_object, name = "LinearRegression")]
 #[derive(Clone)]
 pub struct PyLinearRegression {
@@ -44,14 +74,42 @@ impl PyLinearRegression {
         Ok(())
     }
 
+    pub fn fit_buffer(
+        &mut self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+        y: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<()> {
+        let mat = buffer_to_matrix(py, &x)?;
+        let target = buffer_to_target_vector(py, &y)?;
+        self.inner.fit(&mat, &target).map_err(PyValueError::new_err)?;
+        Ok(())
+    }
+
     pub fn predict(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<f64>> {
         let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
+        self.inner.predict(&mat).map_err(PyValueError::new_err)
+    }
+
+    pub fn predict_buffer(&self, py: Python<'_>, x: pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
+        let mat = buffer_to_matrix(py, &x)?;
         self.inner.predict(&mat).map_err(PyValueError::new_err)
     }
 
     pub fn score(&self, x: Vec<Vec<f64>>, y: Vec<f64>) -> PyResult<f64> {
         let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
         self.inner.score(&mat, &y).map_err(PyValueError::new_err)
+    }
+
+    pub fn score_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+        y: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<f64> {
+        let mat = buffer_to_matrix(py, &x)?;
+        let target = buffer_to_target_vector(py, &y)?;
+        self.inner.score(&mat, &target).map_err(PyValueError::new_err)
     }
 
     #[getter]
@@ -103,14 +161,42 @@ impl PyDecisionTreeClassifier {
         Ok(())
     }
 
+    pub fn fit_buffer(
+        &mut self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+        y: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<()> {
+        let mat = buffer_to_matrix(py, &x)?;
+        let target = buffer_to_target_vector(py, &y)?;
+        self.inner.fit(&mat, &target).map_err(PyValueError::new_err)?;
+        Ok(())
+    }
+
     pub fn predict(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<f64>> {
         let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
+        self.inner.predict(&mat).map_err(PyValueError::new_err)
+    }
+
+    pub fn predict_buffer(&self, py: Python<'_>, x: pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
+        let mat = buffer_to_matrix(py, &x)?;
         self.inner.predict(&mat).map_err(PyValueError::new_err)
     }
 
     pub fn score(&self, x: Vec<Vec<f64>>, y: Vec<f64>) -> PyResult<f64> {
         let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
         self.inner.score(&mat, &y).map_err(PyValueError::new_err)
+    }
+
+    pub fn score_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+        y: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<f64> {
+        let mat = buffer_to_matrix(py, &x)?;
+        let target = buffer_to_target_vector(py, &y)?;
+        self.inner.score(&mat, &target).map_err(PyValueError::new_err)
     }
 
     #[getter]
@@ -157,14 +243,42 @@ impl PyDecisionTreeRegressor {
         Ok(())
     }
 
+    pub fn fit_buffer(
+        &mut self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+        y: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<()> {
+        let mat = buffer_to_matrix(py, &x)?;
+        let target = buffer_to_target_vector(py, &y)?;
+        self.inner.fit(&mat, &target).map_err(PyValueError::new_err)?;
+        Ok(())
+    }
+
     pub fn predict(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<f64>> {
         let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
+        self.inner.predict(&mat).map_err(PyValueError::new_err)
+    }
+
+    pub fn predict_buffer(&self, py: Python<'_>, x: pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
+        let mat = buffer_to_matrix(py, &x)?;
         self.inner.predict(&mat).map_err(PyValueError::new_err)
     }
 
     pub fn score(&self, x: Vec<Vec<f64>>, y: Vec<f64>) -> PyResult<f64> {
         let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
         self.inner.score(&mat, &y).map_err(PyValueError::new_err)
+    }
+
+    pub fn score_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+        y: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<f64> {
+        let mat = buffer_to_matrix(py, &x)?;
+        let target = buffer_to_target_vector(py, &y)?;
+        self.inner.score(&mat, &target).map_err(PyValueError::new_err)
     }
 
     #[getter]

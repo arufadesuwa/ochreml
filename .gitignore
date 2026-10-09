@@ -7,3 +7,4 @@ __pycache__/
 demo.py
 generate_notebook.py
 benchmark_sklearn.py
+*.ipynb

@@ -1,5 +1,5 @@
 use crate::device::{parse_device, DeviceType};
-use crate::matrix::{compute_normal_equation_mats, r2_score, solve_linear_system, Matrix};
+use crate::matrix::{compute_normal_equation_mats, r2_score, solve_cholesky, Matrix};
 
 #[derive(Debug, Clone)]
 pub struct LinearRegression {
@@ -41,7 +41,7 @@ impl LinearRegression {
         self.device_ = Some(self.device.to_string());
 
         let (xt_x, xt_y) = compute_normal_equation_mats(x, y, self.fit_intercept, &self.device)?;
-        let theta = solve_linear_system(&xt_x, &xt_y)?;
+        let theta = solve_cholesky(&xt_x, &xt_y)?;
 
         if self.fit_intercept {
             self.coef_ = Some(theta[0..x.cols].to_vec());
