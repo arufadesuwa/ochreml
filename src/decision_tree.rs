@@ -1,6 +1,7 @@
 // OchreML Decision Tree Module (＾▽＾)
 // Implementation of CART algorithm for classification and regression trees.
 
+use crate::device::{parse_device, DeviceType};
 use crate::matrix::{r2_score, Matrix};
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,8 @@ pub struct DecisionTreeClassifier {
     pub max_depth: Option<usize>,
     pub min_samples_split: usize,
     pub min_samples_leaf: usize,
+    pub device: DeviceType,
+    pub device_: Option<String>,
     pub root: Option<TreeNode>,
     pub classes_: Vec<f64>,
     pub n_features_in_: Option<usize>,
@@ -58,16 +61,20 @@ impl DecisionTreeClassifier {
         max_depth: Option<usize>,
         min_samples_split: Option<usize>,
         min_samples_leaf: Option<usize>,
-    ) -> Self {
-        Self {
+        device: Option<String>,
+    ) -> Result<Self, String> {
+        let dev = parse_device(device.as_deref())?;
+        Ok(Self {
             criterion: criterion.unwrap_or_else(|| "gini".to_string()).to_lowercase(),
             max_depth,
             min_samples_split: min_samples_split.unwrap_or(2).max(2),
             min_samples_leaf: min_samples_leaf.unwrap_or(1).max(1),
+            device: dev,
+            device_: None,
             root: None,
             classes_: Vec::new(),
             n_features_in_: None,
-        }
+        })
     }
 
     // Compute impurity (Gini or Entropy) from class frequency counts in O(C)
@@ -239,6 +246,7 @@ impl DecisionTreeClassifier {
         }
 
         self.n_features_in_ = Some(x.cols);
+        self.device_ = Some(self.device.to_string());
 
         let mut classes = y.to_vec();
         classes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -312,6 +320,8 @@ pub struct DecisionTreeRegressor {
     pub max_depth: Option<usize>,
     pub min_samples_split: usize,
     pub min_samples_leaf: usize,
+    pub device: DeviceType,
+    pub device_: Option<String>,
     pub root: Option<TreeNode>,
     pub n_features_in_: Option<usize>,
 }
@@ -322,15 +332,19 @@ impl DecisionTreeRegressor {
         max_depth: Option<usize>,
         min_samples_split: Option<usize>,
         min_samples_leaf: Option<usize>,
-    ) -> Self {
-        Self {
+        device: Option<String>,
+    ) -> Result<Self, String> {
+        let dev = parse_device(device.as_deref())?;
+        Ok(Self {
             criterion: criterion.unwrap_or_else(|| "squared_error".to_string()).to_lowercase(),
             max_depth,
             min_samples_split: min_samples_split.unwrap_or(2).max(2),
             min_samples_leaf: min_samples_leaf.unwrap_or(1).max(1),
+            device: dev,
+            device_: None,
             root: None,
             n_features_in_: None,
-        }
+        })
     }
 
     // Recursively build regression tree with O(D * N log N) sliding split search and O(1) MSE updates
@@ -482,6 +496,7 @@ impl DecisionTreeRegressor {
         }
 
         self.n_features_in_ = Some(x.cols);
+        self.device_ = Some(self.device.to_string());
         let indices: Vec<usize> = (0..x.rows).collect();
         let root = self.build_tree(x, y, &indices, 0);
         self.root = Some(root);
@@ -537,8 +552,9 @@ mod tests {
         ]).unwrap();
         let y = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
 
-        let mut clf = DecisionTreeClassifier::new(Some("gini".to_string()), Some(3), None, None);
+        let mut clf = DecisionTreeClassifier::new(Some("gini".to_string()), Some(3), None, None, None).unwrap();
         clf.fit(&x, &y).unwrap();
+        assert!(clf.device_.is_some());
 
         let preds = clf.predict(&x).unwrap();
         assert_eq!(preds, y);
@@ -563,8 +579,9 @@ mod tests {
         ]).unwrap();
         let y = vec![10.0, 10.0, 10.0, 20.0, 20.0, 20.0];
 
-        let mut reg = DecisionTreeRegressor::new(None, Some(3), None, None);
+        let mut reg = DecisionTreeRegressor::new(None, Some(3), None, None, None).unwrap();
         reg.fit(&x, &y).unwrap();
+        assert!(reg.device_.is_some());
 
         let preds = reg.predict(&x).unwrap();
         for (p, actual) in preds.iter().zip(y.iter()) {

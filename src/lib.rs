@@ -1,7 +1,8 @@
 // PyO3 bindings module for OchreML (＾▽＾)
-// Exposes Rust Linear Regression and Decision Tree implementations to Python.
+// Exposes Rust Linear Regression and Decision Tree implementations with Hardware Acceleration to Python.
 
 pub mod decision_tree;
+pub mod device;
 pub mod linear_regression;
 pub mod matrix;
 
@@ -10,6 +11,17 @@ use linear_regression::LinearRegression;
 use matrix::Matrix;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use std::collections::HashMap;
+
+#[pyfunction]
+pub fn get_available_devices() -> Vec<String> {
+    device::get_available_devices_list()
+}
+
+#[pyfunction]
+pub fn get_device_info() -> HashMap<String, String> {
+    device::get_device_info_map()
+}
 
 #[pyclass(from_py_object, name = "LinearRegression")]
 #[derive(Clone)]
@@ -20,11 +32,10 @@ pub struct PyLinearRegression {
 #[pymethods]
 impl PyLinearRegression {
     #[new]
-    #[pyo3(signature = (fit_intercept = true))]
-    pub fn new(fit_intercept: bool) -> Self {
-        Self {
-            inner: LinearRegression::new(fit_intercept),
-        }
+    #[pyo3(signature = (fit_intercept = true, device = None))]
+    pub fn new(fit_intercept: bool, device: Option<String>) -> PyResult<Self> {
+        let inner = LinearRegression::new(fit_intercept, device).map_err(PyValueError::new_err)?;
+        Ok(Self { inner })
     }
 
     pub fn fit(&mut self, x: Vec<Vec<f64>>, y: Vec<f64>) -> PyResult<()> {
@@ -57,6 +68,11 @@ impl PyLinearRegression {
     pub fn n_features_in_(&self) -> Option<usize> {
         self.inner.n_features_in_
     }
+
+    #[getter]
+    pub fn device_(&self) -> Option<String> {
+        self.inner.device_.clone()
+    }
 }
 
 #[pyclass(from_py_object, name = "DecisionTreeClassifier")]
@@ -68,16 +84,17 @@ pub struct PyDecisionTreeClassifier {
 #[pymethods]
 impl PyDecisionTreeClassifier {
     #[new]
-    #[pyo3(signature = (criterion = None, max_depth = None, min_samples_split = None, min_samples_leaf = None))]
+    #[pyo3(signature = (criterion = None, max_depth = None, min_samples_split = None, min_samples_leaf = None, device = None))]
     pub fn new(
         criterion: Option<String>,
         max_depth: Option<usize>,
         min_samples_split: Option<usize>,
         min_samples_leaf: Option<usize>,
-    ) -> Self {
-        Self {
-            inner: DecisionTreeClassifier::new(criterion, max_depth, min_samples_split, min_samples_leaf),
-        }
+        device: Option<String>,
+    ) -> PyResult<Self> {
+        let inner = DecisionTreeClassifier::new(criterion, max_depth, min_samples_split, min_samples_leaf, device)
+            .map_err(PyValueError::new_err)?;
+        Ok(Self { inner })
     }
 
     pub fn fit(&mut self, x: Vec<Vec<f64>>, y: Vec<f64>) -> PyResult<()> {
@@ -105,6 +122,11 @@ impl PyDecisionTreeClassifier {
     pub fn n_features_in_(&self) -> Option<usize> {
         self.inner.n_features_in_
     }
+
+    #[getter]
+    pub fn device_(&self) -> Option<String> {
+        self.inner.device_.clone()
+    }
 }
 
 #[pyclass(from_py_object, name = "DecisionTreeRegressor")]
@@ -116,16 +138,17 @@ pub struct PyDecisionTreeRegressor {
 #[pymethods]
 impl PyDecisionTreeRegressor {
     #[new]
-    #[pyo3(signature = (criterion = None, max_depth = None, min_samples_split = None, min_samples_leaf = None))]
+    #[pyo3(signature = (criterion = None, max_depth = None, min_samples_split = None, min_samples_leaf = None, device = None))]
     pub fn new(
         criterion: Option<String>,
         max_depth: Option<usize>,
         min_samples_split: Option<usize>,
         min_samples_leaf: Option<usize>,
-    ) -> Self {
-        Self {
-            inner: DecisionTreeRegressor::new(criterion, max_depth, min_samples_split, min_samples_leaf),
-        }
+        device: Option<String>,
+    ) -> PyResult<Self> {
+        let inner = DecisionTreeRegressor::new(criterion, max_depth, min_samples_split, min_samples_leaf, device)
+            .map_err(PyValueError::new_err)?;
+        Ok(Self { inner })
     }
 
     pub fn fit(&mut self, x: Vec<Vec<f64>>, y: Vec<f64>) -> PyResult<()> {
@@ -148,10 +171,17 @@ impl PyDecisionTreeRegressor {
     pub fn n_features_in_(&self) -> Option<usize> {
         self.inner.n_features_in_
     }
+
+    #[getter]
+    pub fn device_(&self) -> Option<String> {
+        self.inner.device_.clone()
+    }
 }
 
 #[pymodule]
 fn _ochreml(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(get_available_devices, m)?)?;
+    m.add_function(wrap_pyfunction!(get_device_info, m)?)?;
     m.add_class::<PyLinearRegression>()?;
     m.add_class::<PyDecisionTreeClassifier>()?;
     m.add_class::<PyDecisionTreeRegressor>()?;

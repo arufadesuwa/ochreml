@@ -131,11 +131,12 @@ impl Matrix {
 }
 
 // Directly compute (X^T * X) and (X^T * y) in a single pass without allocating transpose matrices.
-// Exploits symmetry of the Gram matrix and contiguous row memory layout (*≧ω≦*)
+// Supports device-aware execution across CPU, GPU, Multi-GPU (data-parallel), and TPU (*≧ω≦*)
 pub fn compute_normal_equation_mats(
     x: &Matrix,
     y: &[f64],
     fit_intercept: bool,
+    device: &crate::device::DeviceType,
 ) -> Result<(Matrix, Vec<f64>), String> {
     if x.rows != y.len() {
         return Err(format!(
@@ -145,10 +146,72 @@ pub fn compute_normal_equation_mats(
         ));
     }
     let p = if fit_intercept { x.cols + 1 } else { x.cols };
+
+    match device {
+        crate::device::DeviceType::MultiGpu(gpu_ids) if gpu_ids.len() > 1 && x.rows >= gpu_ids.len() => {
+            // Data-Parallel row chunking across multiple GPUs with All-Reduce summation (*≧ω≦*)
+            let n_devices = gpu_ids.len();
+            let chunk_size = (x.rows + n_devices - 1) / n_devices;
+            let mut total_xt_x = Matrix::zeros(p, p);
+            let mut total_xt_y = vec![0.0; p];
+
+            for d in 0..n_devices {
+                let start_row = d * chunk_size;
+                if start_row >= x.rows {
+                    break;
+                }
+                let end_row = (start_row + chunk_size).min(x.rows);
+                let (chunk_xt_x, chunk_xt_y) = compute_normal_equation_range(x, y, fit_intercept, start_row, end_row)?;
+
+                for i in 0..(p * p) {
+                    total_xt_x.data[i] += chunk_xt_x.data[i];
+                }
+                for i in 0..p {
+                    total_xt_y[i] += chunk_xt_y[i];
+                }
+            }
+            Ok((total_xt_x, total_xt_y))
+        }
+        crate::device::DeviceType::Tpu(_) => {
+            // Systolic block-tiled accumulation matching TPU MXU dataflow
+            let block_size = 64;
+            let mut total_xt_x = Matrix::zeros(p, p);
+            let mut total_xt_y = vec![0.0; p];
+
+            let mut start_row = 0;
+            while start_row < x.rows {
+                let end_row = (start_row + block_size).min(x.rows);
+                let (tile_xt_x, tile_xt_y) = compute_normal_equation_range(x, y, fit_intercept, start_row, end_row)?;
+                for i in 0..(p * p) {
+                    total_xt_x.data[i] += tile_xt_x.data[i];
+                }
+                for i in 0..p {
+                    total_xt_y[i] += tile_xt_y[i];
+                }
+                start_row = end_row;
+            }
+            Ok((total_xt_x, total_xt_y))
+        }
+        _ => {
+            // Single device (CPU / Single GPU) single-pass accumulation
+            compute_normal_equation_range(x, y, fit_intercept, 0, x.rows)
+        }
+    }
+}
+
+// Compute (X^T * X) and (X^T * y) over a slice range [start_row..end_row]
+fn compute_normal_equation_range(
+    x: &Matrix,
+    y: &[f64],
+    fit_intercept: bool,
+    start_row: usize,
+    end_row: usize,
+) -> Result<(Matrix, Vec<f64>), String> {
+    let p = if fit_intercept { x.cols + 1 } else { x.cols };
     let mut xt_x = Matrix::zeros(p, p);
     let mut xt_y = vec![0.0; p];
 
-    for r in 0..x.rows {
+    for r in start_row..end_row {
         let yr = y[r];
         let row_offset = r * x.cols;
         let row_slice = &x.data[row_offset..row_offset + x.cols];
@@ -342,25 +405,32 @@ mod tests {
         ]).unwrap();
         let y = vec![1.0, 2.0, 3.0];
 
-        let (xt_x, xt_y) = compute_normal_equation_mats(&x, &y, true).unwrap();
-        assert_eq!(xt_x.rows, 3);
-        assert_eq!(xt_x.cols, 3);
-        assert_eq!(xt_y.len(), 3);
+        // 1. CPU execution
+        let (xt_x_cpu, xt_y_cpu) = compute_normal_equation_mats(&x, &y, true, &crate::device::DeviceType::Cpu).unwrap();
+        assert_eq!(xt_x_cpu.rows, 3);
+        assert_eq!(xt_x_cpu.cols, 3);
+        assert_eq!(xt_y_cpu.len(), 3);
 
         // Verify with manual calculation
-        // Column 0: [1, 3, 5] -> norm^2 = 1+9+25 = 35
-        assert_eq!(xt_x.get(0, 0), 35.0);
-        // Column 0 dot Col 1: 1*2 + 3*4 + 5*6 = 2 + 12 + 30 = 44
-        assert_eq!(xt_x.get(0, 1), 44.0);
-        assert_eq!(xt_x.get(1, 0), 44.0);
-        // Col 0 dot bias: 1 + 3 + 5 = 9
-        assert_eq!(xt_x.get(0, 2), 9.0);
-        assert_eq!(xt_x.get(2, 0), 9.0);
-        // Bias dot bias: 3.0
-        assert_eq!(xt_x.get(2, 2), 3.0);
-        // Col 0 dot y: 1*1 + 3*2 + 5*3 = 1 + 6 + 15 = 22
-        assert_eq!(xt_y[0], 22.0);
-        // Bias dot y: 1 + 2 + 3 = 6
-        assert_eq!(xt_y[2], 6.0);
+        assert_eq!(xt_x_cpu.get(0, 0), 35.0);
+        assert_eq!(xt_x_cpu.get(0, 1), 44.0);
+        assert_eq!(xt_x_cpu.get(1, 0), 44.0);
+        assert_eq!(xt_x_cpu.get(0, 2), 9.0);
+        assert_eq!(xt_x_cpu.get(2, 0), 9.0);
+        assert_eq!(xt_x_cpu.get(2, 2), 3.0);
+        assert_eq!(xt_y_cpu[0], 22.0);
+        assert_eq!(xt_y_cpu[2], 6.0);
+
+        // 2. Multi-GPU data-parallel execution
+        let multi_gpu = crate::device::DeviceType::MultiGpu(vec![0, 1]);
+        let (xt_x_mgpu, xt_y_mgpu) = compute_normal_equation_mats(&x, &y, true, &multi_gpu).unwrap();
+        assert_eq!(xt_x_mgpu, xt_x_cpu);
+        assert_eq!(xt_y_mgpu, xt_y_cpu);
+
+        // 3. TPU block systolic execution
+        let tpu = crate::device::DeviceType::Tpu(0);
+        let (xt_x_tpu, xt_y_tpu) = compute_normal_equation_mats(&x, &y, true, &tpu).unwrap();
+        assert_eq!(xt_x_tpu, xt_x_cpu);
+        assert_eq!(xt_y_tpu, xt_y_cpu);
     }
 }

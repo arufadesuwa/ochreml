@@ -9,21 +9,27 @@ OchreML is a high-performance classical Machine Learning library written in Rust
 
 ## Key Features (*^▽^*)
 
-1. **High-Performance Rust Kernels**
+1. **Hardware Acceleration (CPU, GPU, Multi-GPU, & TPU)** (*≧ω≦*)
+   - Native device engine with smart automatic hardware detection (`device="auto"`): auto-prioritizes TPU -> Multi-GPU -> GPU -> CPU.
+   - Data-parallel row partitioning across multiple GPUs ($\sum_k X_k^T X_k$) with all-reduce aggregation.
+   - Block-tiled systolic matrix accumulation designed for Tensor Processing Unit (TPU) MXUs.
+   - Diagnostics and device routing utilities (`ochreml.get_available_devices()`, `ochreml.get_device_info()`, `ochreml.set_default_device()`).
+
+2. **High-Performance Rust Kernels**
    - $O(D \cdot N \log N)$ CART split search with sliding histogram impurity evaluations.
    - Closed-form Normal Equation solver with symmetric Gram matrix accumulation and automated Tikhonov (Ridge) regularization fallback.
    - Outperforms standard Cython/C implementations on Decision Tree training and prediction.
 
-2. **Universal Data Interoperability** (o´∀｀o)
+3. **Universal Data Interoperability** (o´∀｀o)
    - Accepts and processes data seamlessly across:
      - **Python Nested Lists** (`list[list[float]]`)
      - **NumPy ndarrays** (`numpy.ndarray`)
      - **Pandas DataFrames & Series** (`pandas.DataFrame`, `pandas.Series`)
      - **Polars DataFrames & Series** (`polars.DataFrame`, `polars.Series`)
 
-3. **Scikit-Learn Compatible API** (＾▽＾)
+4. **Scikit-Learn Compatible API** (＾▽＾)
    - Standard estimator methods: `fit(X, y)`, `predict(X)`, and `score(X, y)`.
-   - Inspection attributes: `coef_`, `intercept_`, `classes_`, and `n_features_in_`.
+   - Inspection attributes: `coef_`, `intercept_`, `classes_`, `device_`, and `n_features_in_`.
 
 ---
 

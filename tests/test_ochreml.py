@@ -185,3 +185,62 @@ def test_dimension_mismatch_error():
     model = LinearRegression()
     with pytest.raises(Exception):
         model.fit([[1.0], [2.0]], [1.0])
+
+
+# =========================================================================
+# Hardware Acceleration & Device Tests (＾▽＾)
+# =========================================================================
+
+def test_device_discovery():
+    from ochreml import (
+        get_available_devices,
+        get_device_info,
+        get_default_device,
+        set_default_device,
+    )
+
+    devices = get_available_devices()
+    assert isinstance(devices, list)
+    assert "cpu" in devices
+
+    info = get_device_info()
+    assert isinstance(info, dict)
+    assert "cpu_cores" in info
+    assert "default_auto_device" in info
+
+    assert get_default_device() == "auto"
+    set_default_device("cpu")
+    assert get_default_device() == "cpu"
+    set_default_device("auto")
+    assert get_default_device() == "auto"
+
+
+def test_device_parameter_on_models():
+    X = [[1.0], [2.0], [3.0], [4.0]]
+    y = [2.0, 4.0, 6.0, 8.0]
+
+    # Linear Regression with auto & explicit cpu
+    lr_auto = LinearRegression(device="auto")
+    lr_auto.fit(X, y)
+    assert lr_auto.device_ is not None
+
+    lr_cpu = LinearRegression(device="cpu")
+    lr_cpu.fit(X, y)
+    assert lr_cpu.device_ == "cpu"
+
+    # Decision Tree Classifier with auto
+    y_cls = [0.0, 0.0, 1.0, 1.0]
+    clf = DecisionTreeClassifier(device="auto")
+    clf.fit(X, y_cls)
+    assert clf.device_ is not None
+
+    # Decision Tree Regressor with auto
+    reg = DecisionTreeRegressor(device="auto")
+    reg.fit(X, y)
+    assert reg.device_ is not None
+
+
+def test_invalid_device_raises_informative_error():
+    with pytest.raises(ValueError) as excinfo:
+        LinearRegression(device="non_existent_accelerator_999")
+    assert "Unrecognized device string" in str(excinfo.value)

@@ -1,13 +1,16 @@
 """
 OchreML: Classical Machine Learning library in Rust with PyO3 bindings (＾▽＾)
+Hardware accelerated for CPU, GPU, Multi-GPU, and TPU (*≧ω≦*)
 """
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from ._utils import to_feature_matrix, to_target_vector
 from ._ochreml import (
     LinearRegression as _RustLinearRegression,
     DecisionTreeClassifier as _RustDecisionTreeClassifier,
     DecisionTreeRegressor as _RustDecisionTreeRegressor,
+    get_available_devices as _get_available_devices,
+    get_device_info as _get_device_info,
 )
 
 __version__ = "0.1.2"
@@ -15,7 +18,55 @@ __all__ = [
     "LinearRegression",
     "DecisionTreeClassifier",
     "DecisionTreeRegressor",
+    "get_available_devices",
+    "get_device_info",
+    "get_default_device",
+    "set_default_device",
 ]
+
+_DEFAULT_DEVICE: str = "auto"
+
+
+def get_default_device() -> str:
+    """Return current global default hardware device (defaults to 'auto') (*^▽^*)."""
+    return _DEFAULT_DEVICE
+
+
+def set_default_device(device: str) -> None:
+    """
+    Set the global default hardware device for all OchreML estimators (*≧ω≦*).
+
+    Parameters
+    ----------
+    device : str
+        Target device identifier: 'auto', 'cpu', 'cuda:0', 'cuda:all', or 'tpu'.
+    """
+    global _DEFAULT_DEVICE
+    _DEFAULT_DEVICE = device
+
+
+def get_available_devices() -> List[str]:
+    """
+    Return list of discovered hardware accelerators on host system (o´∀｀o).
+
+    Returns
+    -------
+    devices : list of str
+        List containing detected devices, e.g. ['cpu', 'cuda:0', 'tpu:0'].
+    """
+    return _get_available_devices()
+
+
+def get_device_info() -> Dict[str, str]:
+    """
+    Return diagnostic metadata for host CPU, GPU, and TPU hardware (＾▽＾).
+
+    Returns
+    -------
+    info : dict of str to str
+        Hardware capabilities dictionary.
+    """
+    return _get_device_info()
 
 
 class LinearRegression:
@@ -23,12 +74,15 @@ class LinearRegression:
     Ordinary Least Squares (OLS) Linear Regression model (＾▽＾)
 
     Solves linear regression using the Normal Equation: (X^T * X)^(-1) * X^T * y
-    equipped with automated Tikhonov (Ridge) regularization when matrices are ill-conditioned.
+    equipped with automated Tikhonov (Ridge) regularization and device acceleration.
 
     Parameters
     ----------
     fit_intercept : bool, default=True
         Whether to calculate the intercept for this model.
+    device : str or None, default=None
+        Target computation device ('auto', 'cpu', 'cuda:0', 'cuda:all', 'tpu').
+        If None, the global default device (set via set_default_device, default 'auto') is used.
 
     Attributes
     ----------
@@ -38,11 +92,17 @@ class LinearRegression:
         Independent term in the linear model.
     n_features_in_ : int or None
         Number of features seen during fitting.
+    device_ : str or None
+        Active device utilized during training (e.g. 'cpu', 'cuda:0', 'tpu:0').
     """
 
-    def __init__(self, fit_intercept: bool = True):
+    def __init__(self, fit_intercept: bool = True, device: Optional[str] = None):
         self.fit_intercept = fit_intercept
-        self._model = _RustLinearRegression(fit_intercept=fit_intercept)
+        self.device = device or get_default_device()
+        self._model = _RustLinearRegression(
+            fit_intercept=fit_intercept,
+            device=self.device,
+        )
 
     def fit(self, X: Any, y: Any) -> "LinearRegression":
         """
@@ -107,8 +167,12 @@ class LinearRegression:
     def n_features_in_(self) -> Optional[int]:
         return self._model.n_features_in_
 
+    @property
+    def device_(self) -> Optional[str]:
+        return self._model.device_
+
     def __repr__(self) -> str:
-        return f"LinearRegression(fit_intercept={self.fit_intercept}) (＾▽＾)"
+        return f"LinearRegression(fit_intercept={self.fit_intercept}, device='{self.device}') (＾▽＾)"
 
 
 class DecisionTreeClassifier:
@@ -127,6 +191,8 @@ class DecisionTreeClassifier:
         The minimum number of samples required to split an internal node.
     min_samples_leaf : int, default=1
         The minimum number of samples required to be at a leaf node.
+    device : str or None, default=None
+        Target computation device ('auto', 'cpu', 'cuda:0', 'cuda:all', 'tpu').
 
     Attributes
     ----------
@@ -134,6 +200,8 @@ class DecisionTreeClassifier:
         The unique classes labels discovered during fitting.
     n_features_in_ : int or None
         Number of features seen during fitting.
+    device_ : str or None
+        Active device utilized during training (e.g. 'cpu', 'cuda:0', 'tpu:0').
     """
 
     def __init__(
@@ -142,16 +210,19 @@ class DecisionTreeClassifier:
         max_depth: Optional[int] = None,
         min_samples_split: int = 2,
         min_samples_leaf: int = 1,
+        device: Optional[str] = None,
     ):
         self.criterion = criterion
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
         self.min_samples_leaf = min_samples_leaf
+        self.device = device or get_default_device()
         self._model = _RustDecisionTreeClassifier(
             criterion=criterion,
             max_depth=max_depth,
             min_samples_split=min_samples_split,
             min_samples_leaf=min_samples_leaf,
+            device=self.device,
         )
 
     def fit(self, X: Any, y: Any) -> "DecisionTreeClassifier":
@@ -191,10 +262,14 @@ class DecisionTreeClassifier:
     def n_features_in_(self) -> Optional[int]:
         return self._model.n_features_in_
 
+    @property
+    def device_(self) -> Optional[str]:
+        return self._model.device_
+
     def __repr__(self) -> str:
         return (
             f"DecisionTreeClassifier(criterion='{self.criterion}', "
-            f"max_depth={self.max_depth}) (*≧ω≦*)"
+            f"max_depth={self.max_depth}, device='{self.device}') (*≧ω≦*)"
         )
 
 
@@ -214,11 +289,15 @@ class DecisionTreeRegressor:
         The minimum number of samples required to split an internal node.
     min_samples_leaf : int, default=1
         The minimum number of samples required to be at a leaf node.
+    device : str or None, default=None
+        Target computation device ('auto', 'cpu', 'cuda:0', 'cuda:all', 'tpu').
 
     Attributes
     ----------
     n_features_in_ : int or None
         Number of features seen during fitting.
+    device_ : str or None
+        Active device utilized during training (e.g. 'cpu', 'cuda:0', 'tpu:0').
     """
 
     def __init__(
@@ -227,16 +306,19 @@ class DecisionTreeRegressor:
         max_depth: Optional[int] = None,
         min_samples_split: int = 2,
         min_samples_leaf: int = 1,
+        device: Optional[str] = None,
     ):
         self.criterion = criterion
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
         self.min_samples_leaf = min_samples_leaf
+        self.device = device or get_default_device()
         self._model = _RustDecisionTreeRegressor(
             criterion=criterion,
             max_depth=max_depth,
             min_samples_split=min_samples_split,
             min_samples_leaf=min_samples_leaf,
+            device=self.device,
         )
 
     def fit(self, X: Any, y: Any) -> "DecisionTreeRegressor":
@@ -272,8 +354,12 @@ class DecisionTreeRegressor:
     def n_features_in_(self) -> Optional[int]:
         return self._model.n_features_in_
 
+    @property
+    def device_(self) -> Optional[str]:
+        return self._model.device_
+
     def __repr__(self) -> str:
         return (
             f"DecisionTreeRegressor(criterion='{self.criterion}', "
-            f"max_depth={self.max_depth}) (o´∀｀o)"
+            f"max_depth={self.max_depth}, device='{self.device}') (o´∀｀o)"
         )

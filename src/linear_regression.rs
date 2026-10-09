@@ -1,24 +1,27 @@
-// OchreML Linear Regression Module (＾▽＾)
-// Implementation of Ordinary Least Squares (OLS) via the Normal Equation.
-
+use crate::device::{parse_device, DeviceType};
 use crate::matrix::{compute_normal_equation_mats, r2_score, solve_linear_system, Matrix};
 
 #[derive(Debug, Clone)]
 pub struct LinearRegression {
     pub fit_intercept: bool,
+    pub device: DeviceType,
+    pub device_: Option<String>,
     pub coef_: Option<Vec<f64>>,
     pub intercept_: Option<f64>,
     pub n_features_in_: Option<usize>,
 }
 
 impl LinearRegression {
-    pub fn new(fit_intercept: bool) -> Self {
-        Self {
+    pub fn new(fit_intercept: bool, device: Option<String>) -> Result<Self, String> {
+        let dev = parse_device(device.as_deref())?;
+        Ok(Self {
             fit_intercept,
+            device: dev,
+            device_: None,
             coef_: None,
             intercept_: None,
             n_features_in_: None,
-        }
+        })
     }
 
     // Fit linear model using Normal Equation: (X^T * X) * theta = X^T * y
@@ -35,8 +38,9 @@ impl LinearRegression {
         }
 
         self.n_features_in_ = Some(x.cols);
+        self.device_ = Some(self.device.to_string());
 
-        let (xt_x, xt_y) = compute_normal_equation_mats(x, y, self.fit_intercept)?;
+        let (xt_x, xt_y) = compute_normal_equation_mats(x, y, self.fit_intercept, &self.device)?;
         let theta = solve_linear_system(&xt_x, &xt_y)?;
 
         if self.fit_intercept {
@@ -102,8 +106,9 @@ mod tests {
         ]).unwrap();
         let y = vec![3.0, 5.0, 7.0, 9.0, 11.0];
 
-        let mut model = LinearRegression::new(true);
+        let mut model = LinearRegression::new(true, None).unwrap();
         model.fit(&x, &y).unwrap();
+        assert!(model.device_.is_some());
 
         let coef = model.coef_.as_ref().unwrap();
         let intercept = model.intercept_.unwrap();
