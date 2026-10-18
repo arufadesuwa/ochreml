@@ -64,16 +64,16 @@ Comprehensive benchmark comparing OchreML's pure Rust engine (with Zero-Copy Pyt
 
 | Metric | OchreML (Rust) | Scikit-Learn | Ratio / Parity |
 | :--- | :--- | :--- | :--- |
-| **Fit Time** | **2.62 ms** | 7.99 ms | **3.05x FASTER** (*≧ω≦*) |
+| **Fit Time** | **2.40 ms** | 11.53 ms | **4.81x FASTER** (*≧ω≦*) |
 | **Predict Time** | **0.60 ms** | 0.33 ms | Zero-copy vector dot product |
-| **Test $R^2$ Score** | **0.997970** | 0.997970 | Max coef diff: $7.11 \times 10^{-15}$ |
+| **Test $R^2$ Score** | **0.9980** | 0.9980 | Max coef diff: $7.11 \times 10^{-15}$ |
 
 ### 2. Decision Tree Classifier (`criterion="gini"`, `max_depth=5`)
 *Dataset: 2,500 samples (2,000 train, 500 test), 8 features*
 
 | Metric | OchreML (Rust) | Scikit-Learn | Ratio / Parity |
 | :--- | :--- | :--- | :--- |
-| **Fit Time** | **4.17 ms** | 9.69 ms | **2.32x FASTER** (*^▽^*) |
+| **Fit Time** | **3.93 ms** | 15.50 ms | **3.95x FASTER** (*^▽^*) |
 | **Predict Time** | **0.10 ms** | 0.40 ms | **4.00x FASTER** |
 | **Test Accuracy** | **92.40 %** | 92.40 % | Identical Parity |
 
@@ -82,9 +82,9 @@ Comprehensive benchmark comparing OchreML's pure Rust engine (with Zero-Copy Pyt
 
 | Metric | OchreML (Rust) | Scikit-Learn | Ratio / Parity |
 | :--- | :--- | :--- | :--- |
-| **Fit Time** | **3.13 ms** | 6.72 ms | **2.15x FASTER** (o´∀｀o) |
+| **Fit Time** | **2.79 ms** | 9.71 ms | **3.48x FASTER** (o´∀｀o) |
 | **Predict Time** | **0.09 ms** | 0.34 ms | **3.77x FASTER** |
-| **Test $R^2$ Score** | **0.870028** | 0.870028 | Identical Parity |
+| **Test $R^2$ Score** | **0.8700** | 0.8700 | Identical Parity |
 
 ---
 
