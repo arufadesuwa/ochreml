@@ -110,6 +110,8 @@ class LinearRegression:
             fit_intercept=fit_intercept,
             device=self.device,
         )
+        self._coef_arr: Optional[Any] = None
+        self._intercept_val: float = 0.0
 
     def fit(self, X: Any, y: Any) -> "LinearRegression":
         """
@@ -135,6 +137,18 @@ class LinearRegression:
             X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
             y_vec = to_target_vector(y_data) if is_buf_y else y_data
             self._model.fit(X_mat, y_vec)
+
+        # Cache weights for sub-millisecond BLAS inference (*^▽^*)
+        try:
+            import numpy as np
+
+            if self._model.coef_ is not None:
+                self._coef_arr = np.asarray(self._model.coef_, dtype=np.float64)
+            self._intercept_val = float(self._model.intercept_ or 0.0)
+        except Exception:
+            self._coef_arr = None
+            self._intercept_val = float(self._model.intercept_ or 0.0)
+
         return self
 
     def predict(self, X: Any) -> Any:
@@ -153,11 +167,26 @@ class LinearRegression:
         """
         is_buf_x, X_data = process_features(X)
         if is_buf_x:
+            # Sub-millisecond direct BLAS Level 2 GEMV inference (*≧ω≦*)
+            try:
+                import numpy as np
+
+                if self._coef_arr is not None:
+                    if X_data.shape[1] != self._coef_arr.shape[0]:
+                        raise ValueError(
+                            f"Number of features in test data ({X_data.shape[1]}) does not match model ({self._coef_arr.shape[0]}) (・`ω´・)"
+                        )
+                    return np.dot(X_data, self._coef_arr) + self._intercept_val
+            except ValueError:
+                raise
+            except Exception:
+                pass
             preds = self._model.predict_buffer(X_data)
         else:
             preds = self._model.predict(X_data)
         try:
             import numpy as np
+
             return np.asarray(preds)
         except ImportError:
             return preds
@@ -166,14 +195,25 @@ class LinearRegression:
         """
         Return the coefficient of determination R^2 of the prediction (*^▽^*)
         """
-        is_buf_x, X_data = process_features(X)
-        is_buf_y, y_data = process_target(y)
-        if is_buf_x and is_buf_y:
-            return self._model.score_buffer(X_data, y_data)
-        else:
-            X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
-            y_vec = to_target_vector(y_data) if is_buf_y else y_data
-            return self._model.score(X_mat, y_vec)
+        try:
+            import numpy as np
+
+            preds = self.predict(X)
+            y_arr = np.asarray(y, dtype=np.float64).ravel()
+            u = np.sum((y_arr - preds) ** 2)
+            v = np.sum((y_arr - np.mean(y_arr)) ** 2)
+            if v <= 1e-15:
+                return 0.0
+            return float(1.0 - u / v)
+        except Exception:
+            is_buf_x, X_data = process_features(X)
+            is_buf_y, y_data = process_target(y)
+            if is_buf_x and is_buf_y:
+                return self._model.score_buffer(X_data, y_data)
+            else:
+                X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
+                y_vec = to_target_vector(y_data) if is_buf_y else y_data
+                return self._model.score(X_mat, y_vec)
 
     @property
     def coef_(self) -> Optional[List[float]]:
