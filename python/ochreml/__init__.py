@@ -19,7 +19,7 @@ from ._ochreml import (
     get_device_info as _get_device_info,
 )
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 __all__ = [
     "LinearRegression",
     "DecisionTreeClassifier",
