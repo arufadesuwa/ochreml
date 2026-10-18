@@ -123,8 +123,7 @@ impl Matrix {
             for k in 0..self.cols {
                 let a_rk = self.get(r, k);
                 for c in 0..other.cols {
-                    let old_val = res.get(r, c);
-                    res.set(r, c, old_val + a_rk * other.get(k, c));
+                    res.set(r, c, res.get(r, c) + a_rk * other.get(k, c));
                 }
             }
         }
