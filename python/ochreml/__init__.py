@@ -24,6 +24,8 @@ __all__ = [
     "LinearRegression",
     "DecisionTreeClassifier",
     "DecisionTreeRegressor",
+    "save",
+    "load",
     "get_available_devices",
     "get_device_info",
     "get_default_device",
@@ -31,6 +33,16 @@ __all__ = [
 ]
 
 _DEFAULT_DEVICE: str = "auto"
+_DIT_MAGIC = b"DIT\x01"
+
+
+def _validate_dit_path(path: str) -> str:
+    path_str = str(path)
+    if not path_str.strip().lower().endswith(".dit"):
+        raise ValueError(
+            f"Invalid file extension for '{path_str}'. Model files must use the '.dit' extension ( >_< )"
+        )
+    return path_str
 
 
 def get_default_device() -> str:
@@ -75,6 +87,52 @@ def get_device_info() -> Dict[str, str]:
     return _get_device_info()
 
 
+def save(model: Any, path: str) -> None:
+    """
+    Save any OchreML model into a compact binary '.dit' file (*≧ω≦*).
+    """
+    path_str = _validate_dit_path(path)
+    if hasattr(model, "save"):
+        model.save(path_str)
+    else:
+        raise TypeError(f"Object of type {type(model).__name__} is not a valid OchreML model ( >_< )")
+
+
+def load(path: str, device: Optional[str] = None) -> Any:
+    """
+    Load an OchreML model from a '.dit' file and automatically configure its target device (＾▽＾).
+    Supports both native '.dit' binary files and joblib/pickle '.dit' archives.
+    """
+    path_str = _validate_dit_path(path)
+    with open(path_str, "rb") as f:
+        data = f.read()
+
+    if data.startswith(_DIT_MAGIC) and len(data) >= 5:
+        tag = data[4]
+        target_dev = device or get_default_device()
+        if tag == 1:
+            return LinearRegression._from_rust(_RustLinearRegression.from_bytes(data, target_dev), target_dev)
+        if tag == 2:
+            return DecisionTreeClassifier._from_rust(_RustDecisionTreeClassifier.from_bytes(data, target_dev), target_dev)
+        if tag == 3:
+            return DecisionTreeRegressor._from_rust(_RustDecisionTreeRegressor.from_bytes(data, target_dev), target_dev)
+        raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
+
+    # Fallback if the .dit file was written via joblib.dump or pickle.dump
+    try:
+        import joblib
+
+        obj = joblib.load(path_str)
+    except Exception:
+        import pickle
+
+        obj = pickle.loads(data)
+
+    if device is not None and hasattr(obj, "to"):
+        obj.to(device)
+    return obj
+
+
 class LinearRegression:
     """
     Ordinary Least Squares (OLS) Linear Regression model (＾▽＾)
@@ -113,6 +171,30 @@ class LinearRegression:
         self._coef_arr: Optional[Any] = None
         self._intercept_val: float = 0.0
 
+    def _sync_cache(self) -> None:
+        try:
+            import numpy as np
+
+            if self._model.coef_ is not None:
+                self._coef_arr = np.asarray(self._model.coef_, dtype=np.float64)
+            else:
+                self._coef_arr = None
+            self._intercept_val = float(self._model.intercept_ or 0.0)
+        except Exception:
+            self._coef_arr = None
+            self._intercept_val = float(self._model.intercept_ or 0.0)
+
+    @classmethod
+    def _from_rust(cls, rust_model: _RustLinearRegression, device: str) -> "LinearRegression":
+        inst = cls.__new__(cls)
+        inst._model = rust_model
+        inst.fit_intercept = rust_model.fit_intercept
+        inst.device = rust_model.device_ or device
+        inst._coef_arr = None
+        inst._intercept_val = 0.0
+        inst._sync_cache()
+        return inst
+
     def fit(self, X: Any, y: Any) -> "LinearRegression":
         """
         Fit linear model (*≧ω≦*)
@@ -138,17 +220,7 @@ class LinearRegression:
             y_vec = to_target_vector(y_data) if is_buf_y else y_data
             self._model.fit(X_mat, y_vec)
 
-        # Cache weights for sub-millisecond BLAS inference (*^▽^*)
-        try:
-            import numpy as np
-
-            if self._model.coef_ is not None:
-                self._coef_arr = np.asarray(self._model.coef_, dtype=np.float64)
-            self._intercept_val = float(self._model.intercept_ or 0.0)
-        except Exception:
-            self._coef_arr = None
-            self._intercept_val = float(self._model.intercept_ or 0.0)
-
+        self._sync_cache()
         return self
 
     def predict(self, X: Any) -> Any:
@@ -214,6 +286,32 @@ class LinearRegression:
                 X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
                 y_vec = to_target_vector(y_data) if is_buf_y else y_data
                 return self._model.score(X_mat, y_vec)
+
+    def save(self, path: str) -> None:
+        self._model.save(_validate_dit_path(path))
+
+    @classmethod
+    def load(cls, path: str, device: Optional[str] = None) -> "LinearRegression":
+        target_dev = device or get_default_device()
+        rust_model = _RustLinearRegression.load(_validate_dit_path(path), target_dev)
+        return cls._from_rust(rust_model, target_dev)
+
+    def to(self, device: str) -> "LinearRegression":
+        self._model.set_device(device)
+        self.device = self._model.device_ or device
+        return self
+
+    def __getstate__(self) -> bytes:
+        return self._model.to_bytes()
+
+    def __setstate__(self, state: bytes) -> None:
+        target_dev = get_default_device()
+        self._model = _RustLinearRegression.from_bytes(state, target_dev)
+        self.fit_intercept = self._model.fit_intercept
+        self.device = self._model.device_ or target_dev
+        self._coef_arr = None
+        self._intercept_val = 0.0
+        self._sync_cache()
 
     @property
     def coef_(self) -> Optional[List[float]]:
@@ -286,6 +384,17 @@ class DecisionTreeClassifier:
             device=self.device,
         )
 
+    @classmethod
+    def _from_rust(cls, rust_model: _RustDecisionTreeClassifier, device: str) -> "DecisionTreeClassifier":
+        inst = cls.__new__(cls)
+        inst._model = rust_model
+        inst.criterion = rust_model.criterion
+        inst.max_depth = rust_model.max_depth
+        inst.min_samples_split = rust_model.min_samples_split
+        inst.min_samples_leaf = rust_model.min_samples_leaf
+        inst.device = rust_model.device_ or device
+        return inst
+
     def fit(self, X: Any, y: Any) -> "DecisionTreeClassifier":
         """
         Build a decision tree classifier from the training set (X, y) (o´∀｀o)
@@ -327,6 +436,32 @@ class DecisionTreeClassifier:
             X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
             y_vec = to_target_vector(y_data) if is_buf_y else y_data
             return self._model.score(X_mat, y_vec)
+
+    def save(self, path: str) -> None:
+        self._model.save(_validate_dit_path(path))
+
+    @classmethod
+    def load(cls, path: str, device: Optional[str] = None) -> "DecisionTreeClassifier":
+        target_dev = device or get_default_device()
+        rust_model = _RustDecisionTreeClassifier.load(_validate_dit_path(path), target_dev)
+        return cls._from_rust(rust_model, target_dev)
+
+    def to(self, device: str) -> "DecisionTreeClassifier":
+        self._model.set_device(device)
+        self.device = self._model.device_ or device
+        return self
+
+    def __getstate__(self) -> bytes:
+        return self._model.to_bytes()
+
+    def __setstate__(self, state: bytes) -> None:
+        target_dev = get_default_device()
+        self._model = _RustDecisionTreeClassifier.from_bytes(state, target_dev)
+        self.criterion = self._model.criterion
+        self.max_depth = self._model.max_depth
+        self.min_samples_split = self._model.min_samples_split
+        self.min_samples_leaf = self._model.min_samples_leaf
+        self.device = self._model.device_ or target_dev
 
     @property
     def classes_(self) -> List[float]:
@@ -396,6 +531,17 @@ class DecisionTreeRegressor:
             device=self.device,
         )
 
+    @classmethod
+    def _from_rust(cls, rust_model: _RustDecisionTreeRegressor, device: str) -> "DecisionTreeRegressor":
+        inst = cls.__new__(cls)
+        inst._model = rust_model
+        inst.criterion = rust_model.criterion
+        inst.max_depth = rust_model.max_depth
+        inst.min_samples_split = rust_model.min_samples_split
+        inst.min_samples_leaf = rust_model.min_samples_leaf
+        inst.device = rust_model.device_ or device
+        return inst
+
     def fit(self, X: Any, y: Any) -> "DecisionTreeRegressor":
         """
         Build a decision tree regressor from the training set (X, y) (*≧ω≦*)
@@ -437,6 +583,32 @@ class DecisionTreeRegressor:
             X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
             y_vec = to_target_vector(y_data) if is_buf_y else y_data
             return self._model.score(X_mat, y_vec)
+
+    def save(self, path: str) -> None:
+        self._model.save(_validate_dit_path(path))
+
+    @classmethod
+    def load(cls, path: str, device: Optional[str] = None) -> "DecisionTreeRegressor":
+        target_dev = device or get_default_device()
+        rust_model = _RustDecisionTreeRegressor.load(_validate_dit_path(path), target_dev)
+        return cls._from_rust(rust_model, target_dev)
+
+    def to(self, device: str) -> "DecisionTreeRegressor":
+        self._model.set_device(device)
+        self.device = self._model.device_ or device
+        return self
+
+    def __getstate__(self) -> bytes:
+        return self._model.to_bytes()
+
+    def __setstate__(self, state: bytes) -> None:
+        target_dev = get_default_device()
+        self._model = _RustDecisionTreeRegressor.from_bytes(state, target_dev)
+        self.criterion = self._model.criterion
+        self.max_depth = self._model.max_depth
+        self.min_samples_split = self._model.min_samples_split
+        self.min_samples_leaf = self._model.min_samples_leaf
+        self.device = self._model.device_ or target_dev
 
     @property
     def n_features_in_(self) -> Optional[int]:

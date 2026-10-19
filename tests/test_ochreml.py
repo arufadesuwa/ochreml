@@ -244,3 +244,48 @@ def test_invalid_device_raises_informative_error():
     with pytest.raises(ValueError) as excinfo:
         LinearRegression(device="non_existent_accelerator_999")
     assert "Unrecognized device string" in str(excinfo.value)
+
+
+def test_dit_save_load_and_pickle(tmp_path):
+    import pickle
+    import ochreml
+
+    X = np.array([[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0]])
+    y_reg = np.array([5.0, 4.0, 11.0, 10.0])
+    y_cls = np.array([0.0, 0.0, 1.0, 1.0])
+
+    # 1. Unified ochreml.save / ochreml.load (.dit binary format)
+    lr = LinearRegression(device="cpu").fit(X, y_reg)
+    lr_path = str(tmp_path / "lr_model.dit")
+    ochreml.save(lr, lr_path)
+
+    loaded_lr = ochreml.load(lr_path)
+    assert isinstance(loaded_lr, LinearRegression)
+    assert loaded_lr.device_ is not None
+    assert np.allclose(loaded_lr.predict(X), lr.predict(X))
+
+    # 2. DecisionTreeClassifier & DecisionTreeRegressor via ochreml.save / ochreml.load
+    clf = DecisionTreeClassifier(criterion="entropy", max_depth=3, device="cpu").fit(X, y_cls)
+    clf_path = str(tmp_path / "clf_model.dit")
+    ochreml.save(clf, clf_path)
+    loaded_clf = ochreml.load(clf_path)
+    assert isinstance(loaded_clf, DecisionTreeClassifier)
+    assert np.array_equal(loaded_clf.predict(X), clf.predict(X))
+
+    reg = DecisionTreeRegressor(max_depth=3, device="cpu").fit(X, y_reg)
+    reg_path = str(tmp_path / "reg_model.dit")
+    reg.save(reg_path)
+    loaded_reg = ochreml.load(reg_path, device="cpu")
+    assert isinstance(loaded_reg, DecisionTreeRegressor)
+    assert np.allclose(loaded_reg.predict(X), reg.predict(X))
+
+    # 3. Pickle / Joblib style compatibility
+    pickled_lr = pickle.loads(pickle.dumps(lr))
+    assert np.allclose(pickled_lr.predict(X), lr.predict(X))
+    assert pickled_lr.device_ is not None
+
+    # 4. Enforce .dit extension requirement
+    with pytest.raises(ValueError) as excinfo:
+        ochreml.save(lr, str(tmp_path / "bad_ext.pkl"))
+    assert ".dit" in str(excinfo.value)
+
