@@ -1,4 +1,5 @@
 use crate::device::{parse_device, DeviceType};
+use crate::error::{OchreError, OchreResult};
 use crate::matrix::{
     compute_normal_equation_mats, compute_normal_equation_mats_multi, r2_score, r2_score_multi,
     solve_cholesky, solve_cholesky_multi, Matrix,
@@ -19,7 +20,7 @@ pub struct LinearRegression {
 }
 
 impl LinearRegression {
-    pub fn new(fit_intercept: bool, device: Option<String>) -> Result<Self, String> {
+    pub fn new(fit_intercept: bool, device: Option<String>) -> OchreResult<Self> {
         let dev = parse_device(device.as_deref())?;
         Ok(Self {
             fit_intercept,
@@ -36,7 +37,7 @@ impl LinearRegression {
     }
 
     // Fit 1D linear model using Normal Equation: (X^T * X) * theta = X^T * y
-    pub fn fit(&mut self, x: &Matrix, y: &[f64]) -> Result<(), String> {
+    pub fn fit(&mut self, x: &Matrix, y: &[f64]) -> OchreResult<()> {
         self.fit_weighted_1d(x, y, None)
     }
 
@@ -46,16 +47,15 @@ impl LinearRegression {
         x: &Matrix,
         y: &[f64],
         sample_weight: Option<&[f64]>,
-    ) -> Result<(), String> {
+    ) -> OchreResult<()> {
         if x.rows != y.len() {
-            return Err(format!(
-                "Number of feature rows ({}) does not match target length ({}) ( >_< )",
-                x.rows,
-                y.len()
-            ));
+            return Err(OchreError::LengthMismatch {
+                features: x.rows,
+                targets: y.len(),
+            });
         }
         if x.rows == 0 || x.cols == 0 {
-            return Err("Training data cannot be empty (´；ω；`)".to_string());
+            return Err(OchreError::EmptyData);
         }
 
         if sample_weight.is_some() {
@@ -92,15 +92,15 @@ impl LinearRegression {
         y: &Matrix,
         sample_weight: Option<&[f64]>,
         is_2d_input: bool,
-    ) -> Result<(), String> {
+    ) -> OchreResult<()> {
         if x.rows != y.rows {
-            return Err(format!(
-                "Number of feature rows ({}) does not match target rows ({}) ( >_< )",
-                x.rows, y.rows
-            ));
+            return Err(OchreError::LengthMismatch {
+                features: x.rows,
+                targets: y.rows,
+            });
         }
         if x.rows == 0 || x.cols == 0 || y.cols == 0 {
-            return Err("Training data cannot be empty (´；ω；`)".to_string());
+            return Err(OchreError::EmptyData);
         }
 
         if y.cols == 1 && !is_2d_input && sample_weight.is_none() {
@@ -127,18 +127,15 @@ impl LinearRegression {
 
         for t in 0..k_targets {
             for c in 0..x.cols {
-                coef_mat.set(t, c, theta.get(c, t));
+                coef_mat[(t, c)] = theta[(c, t)];
             }
             if self.fit_intercept {
-                intercept_vec[t] = theta.get(x.cols, t);
+                intercept_vec[t] = theta[(x.cols, t)];
             }
         }
 
-        let first_coef = coef_mat.data[0..x.cols].to_vec();
-        let first_intercept = intercept_vec[0];
-
-        self.coef_ = Some(first_coef);
-        self.intercept_ = Some(first_intercept);
+        self.coef_ = Some(coef_mat.data[0..x.cols].to_vec());
+        self.intercept_ = Some(intercept_vec[0]);
         self.coef_multi_ = Some(coef_mat);
         self.intercept_multi_ = Some(intercept_vec);
 
@@ -146,19 +143,18 @@ impl LinearRegression {
     }
 
     // Predict 1D continuous target values for new feature data X
-    pub fn predict(&self, x: &Matrix) -> Result<Vec<f64>, String> {
+    pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
         let coef = match &self.coef_ {
             Some(c) => c,
-            None => return Err("Model is not fitted yet. Call fit() first (´-ω-`)".to_string()),
+            None => return Err(OchreError::NotFitted),
         };
         let intercept = self.intercept_.unwrap_or(0.0);
 
         if x.cols != coef.len() {
-            return Err(format!(
-                "Number of features in test data ({}) does not match model ({}) (・`ω´・)",
-                x.cols,
-                coef.len()
-            ));
+            return Err(OchreError::FeatureCountMismatch {
+                features: x.cols,
+                expected: coef.len(),
+            });
         }
 
         let mut predictions = Vec::with_capacity(x.rows);
@@ -176,21 +172,21 @@ impl LinearRegression {
     }
 
     // Predict multi-target continuous values of shape (n_samples, n_targets) (＾▽＾)
-    pub fn predict_multi(&self, x: &Matrix) -> Result<Matrix, String> {
+    pub fn predict_multi(&self, x: &Matrix) -> OchreResult<Matrix> {
         let coef_mat = match &self.coef_multi_ {
             Some(c) => c,
-            None => return Err("Model is not fitted yet. Call fit() first (´-ω-`)".to_string()),
+            None => return Err(OchreError::NotFitted),
         };
         let intercept_vec = match &self.intercept_multi_ {
             Some(v) => v,
-            None => return Err("Model is not fitted yet. Call fit() first (´-ω-`)".to_string()),
+            None => return Err(OchreError::NotFitted),
         };
 
         if x.cols != coef_mat.cols {
-            return Err(format!(
-                "Number of features in test data ({}) does not match model ({}) (・`ω´・)",
-                x.cols, coef_mat.cols
-            ));
+            return Err(OchreError::FeatureCountMismatch {
+                features: x.cols,
+                expected: coef_mat.cols,
+            });
         }
 
         let k_targets = coef_mat.rows;
@@ -215,7 +211,7 @@ impl LinearRegression {
     }
 
     // Compute R^2 score on 1D test data
-    pub fn score(&self, x: &Matrix, y: &[f64]) -> Result<f64, String> {
+    pub fn score(&self, x: &Matrix, y: &[f64]) -> OchreResult<f64> {
         let preds = self.predict(x)?;
         Ok(r2_score(y, &preds))
     }
@@ -226,14 +222,13 @@ impl LinearRegression {
         x: &Matrix,
         y: &Matrix,
         sample_weight: Option<&[f64]>,
-    ) -> Result<f64, String> {
+    ) -> OchreResult<f64> {
         if let Some(sw) = sample_weight {
             if sw.len() != x.rows {
-                return Err(format!(
-                    "Sample weight length ({}) must match test sample count ({}) ( >_< )",
-                    sw.len(),
-                    x.rows
-                ));
+                return Err(OchreError::WeightLengthMismatch {
+                    weights: sw.len(),
+                    samples: x.rows,
+                });
             }
         }
         let preds = self.predict_multi(x)?;
@@ -301,12 +296,12 @@ mod tests {
 
         assert_eq!(coef_mat.rows, 2);
         assert_eq!(coef_mat.cols, 2);
-        assert!((coef_mat.get(0, 0) - 2.0).abs() < 1e-6);
-        assert!((coef_mat.get(0, 1) - 3.0).abs() < 1e-6);
+        assert!((coef_mat[(0, 0)] - 2.0).abs() < 1e-6);
+        assert!((coef_mat[(0, 1)] - 3.0).abs() < 1e-6);
         assert!((intercept_vec[0] - 1.0).abs() < 1e-6);
 
-        assert!((coef_mat.get(1, 0) - 4.0).abs() < 1e-6);
-        assert!((coef_mat.get(1, 1) - (-1.0)).abs() < 1e-6);
+        assert!((coef_mat[(1, 0)] - 4.0).abs() < 1e-6);
+        assert!((coef_mat[(1, 1)] - (-1.0)).abs() < 1e-6);
         assert!((intercept_vec[1] - 5.0).abs() < 1e-6);
 
         let r2 = model.score_multi(&x, &y, Some(&weights)).unwrap();

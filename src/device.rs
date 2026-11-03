@@ -1,6 +1,7 @@
 // OchreML Device & Hardware Acceleration Module (＾▽＾)
 // Provides unified device management and hardware capability detection for CPU, GPU, Multi-GPU, and TPU.
 
+use crate::error::{OchreError, OchreResult};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -141,7 +142,7 @@ fn probe_tpus() -> (bool, Option<String>) {
 }
 
 // Parse user-specified device string or resolve 'auto' to the highest performance available device
-pub fn parse_device(device_str: Option<&str>) -> Result<DeviceType, String> {
+pub fn parse_device(device_str: Option<&str>) -> OchreResult<DeviceType> {
     let caps = SystemCapabilities::probe();
     let dev = device_str.unwrap_or("auto").trim().to_lowercase();
 
@@ -164,14 +165,18 @@ pub fn parse_device(device_str: Option<&str>) -> Result<DeviceType, String> {
             if caps.tpu_detected {
                 Ok(DeviceType::Tpu(0))
             } else {
-                Err("TPU acceleration was requested ('tpu'), but no active TPU was detected on this host. Troubleshooting: Ensure TPU_NAME or PJRT runtime is initialized, or use device='auto' for automatic hardware fallback ( >_< )".to_string())
+                Err(OchreError::DeviceError(
+                    "TPU acceleration was requested ('tpu'), but no active TPU was detected on this host. Troubleshooting: Ensure TPU_NAME or PJRT runtime is initialized, or use device='auto' for automatic hardware fallback".to_string()
+                ))
             }
         }
         "cuda" | "cuda:0" | "gpu" | "gpu:0" => {
             if caps.gpu_count > 0 {
                 Ok(DeviceType::Gpu(0))
             } else {
-                Err("GPU acceleration was requested ('cuda:0'), but no GPU device or CUDA driver was detected on this host. Troubleshooting: Ensure NVIDIA drivers or CUDA are active, or use device='auto' for automatic fallback ( >_< )".to_string())
+                Err(OchreError::DeviceError(
+                    "GPU acceleration was requested ('cuda:0'), but no GPU device or CUDA driver was detected on this host. Troubleshooting: Ensure NVIDIA drivers or CUDA are active, or use device='auto' for automatic fallback".to_string()
+                ))
             }
         }
         "cuda:all" | "multi-gpu" | "gpu:all" => {
@@ -181,7 +186,9 @@ pub fn parse_device(device_str: Option<&str>) -> Result<DeviceType, String> {
             } else if caps.gpu_count == 1 {
                 Ok(DeviceType::Gpu(0))
             } else {
-                Err("Multi-GPU acceleration was requested ('cuda:all'), but no GPUs were detected on this host ( >_< )".to_string())
+                Err(OchreError::DeviceError(
+                    "Multi-GPU acceleration was requested ('cuda:all'), but no GPUs were detected on this host".to_string()
+                ))
             }
         }
         custom => {
@@ -190,41 +197,41 @@ pub fn parse_device(device_str: Option<&str>) -> Result<DeviceType, String> {
                     let mut ids = Vec::new();
                     for part in id_str.split(',') {
                         let id = part.trim().parse::<usize>().map_err(|_| {
-                            format!("Invalid GPU index in device string '{}' (・`ω´・)", custom)
+                            OchreError::DeviceError(format!("Invalid GPU index in device string '{}'", custom))
                         })?;
                         ids.push(id);
                     }
                     if ids.is_empty() {
-                        return Err("Multi-GPU device string contains no GPU IDs ( >_< )".to_string());
+                        return Err(OchreError::DeviceError("Multi-GPU device string contains no GPU IDs".to_string()));
                     }
                     if caps.gpu_count > 0 && ids.iter().all(|&id| id < caps.gpu_count) {
                         Ok(DeviceType::MultiGpu(ids))
                     } else if caps.gpu_count == 0 {
-                        Err(format!("Device '{}' was requested, but no GPUs are available ( >_< )", custom))
+                        Err(OchreError::DeviceError(format!("Device '{}' was requested, but no GPUs are available", custom)))
                     } else {
-                        Err(format!("Requested GPU ID exceeds available GPU count ({}) ( >_< )", caps.gpu_count))
+                        Err(OchreError::DeviceError(format!("Requested GPU ID exceeds available GPU count ({})", caps.gpu_count)))
                     }
                 } else {
                     let id = id_str.parse::<usize>().map_err(|_| {
-                        format!("Invalid GPU index in device string '{}' (・`ω´・)", custom)
+                        OchreError::DeviceError(format!("Invalid GPU index in device string '{}'", custom))
                     })?;
                     if caps.gpu_count > id {
                         Ok(DeviceType::Gpu(id))
                     } else {
-                        Err(format!("GPU device 'cuda:{}' was requested, but system only has {} GPU(s) ( >_< )", id, caps.gpu_count))
+                        Err(OchreError::DeviceError(format!("GPU device 'cuda:{}' was requested, but system only has {} GPU(s)", id, caps.gpu_count)))
                     }
                 }
             } else if let Some(id_str) = custom.strip_prefix("tpu:") {
                 let id = id_str.parse::<usize>().map_err(|_| {
-                    format!("Invalid TPU index in device string '{}' (・`ω´・)", custom)
+                    OchreError::DeviceError(format!("Invalid TPU index in device string '{}'", custom))
                 })?;
                 if caps.tpu_detected {
                     Ok(DeviceType::Tpu(id))
                 } else {
-                    Err("TPU device was requested, but no TPU runtime was detected ( >_< )".to_string())
+                    Err(OchreError::DeviceError("TPU device was requested, but no TPU runtime was detected".to_string()))
                 }
             } else {
-                Err(format!("Unrecognized device string '{}'. Supported devices: 'auto', 'cpu', 'cuda', 'cuda:0', 'cuda:all', 'tpu' (´-ω-`)", custom))
+                Err(OchreError::InvalidDevice(custom.to_string()))
             }
         }
     }
@@ -307,7 +314,7 @@ mod tests {
     fn test_parse_invalid_device() {
         let res = parse_device(Some("quantum_supercomputer"));
         assert!(res.is_err());
-        assert!(res.unwrap_err().contains("Unrecognized device string"));
+        assert!(res.unwrap_err().to_string().contains("Unrecognized device string"));
     }
 
     #[test]

@@ -1,13 +1,16 @@
 // PyO3 bindings module for OchreML (＾▽＾)
 // Exposes Rust Linear Regression and Decision Tree implementations with Hardware Acceleration to Python.
 
+pub mod backend;
 pub mod decision_tree;
 pub mod device;
+pub mod error;
 pub mod linear_regression;
 pub mod matrix;
 
 use decision_tree::{DecisionTreeClassifier, DecisionTreeRegressor, TreeNode};
 use device::parse_device;
+use error::{OchreError, OchreResult};
 use linear_regression::LinearRegression;
 use matrix::Matrix;
 use pyo3::exceptions::PyValueError;
@@ -16,17 +19,21 @@ use pyo3::types::PyBytes;
 use std::collections::HashMap;
 use std::fs;
 
+// Auto-convert OchreError to PyValueError with kaomoji preserved (*≧ω≦*)
+impl From<OchreError> for pyo3::PyErr {
+    fn from(err: OchreError) -> Self {
+        pyo3::exceptions::PyValueError::new_err(err.to_string())
+    }
+}
+
 const DIT_MAGIC: &[u8; 4] = b"DIT\x01";
 const TAG_LINEAR_REGRESSION: u8 = 1;
 const TAG_DT_CLASSIFIER: u8 = 2;
 const TAG_DT_REGRESSOR: u8 = 3;
 
-fn validate_dit_path(path: &str) -> Result<(), String> {
+fn validate_dit_path(path: &str) -> OchreResult<()> {
     if !path.trim().to_lowercase().ends_with(".dit") {
-        return Err(format!(
-            "Invalid file extension for '{}'. Model files must use the '.dit' extension ( >_< )",
-            path
-        ));
+        return Err(OchreError::InvalidModelExtension(path.to_string()));
     }
     Ok(())
 }
@@ -137,55 +144,55 @@ impl<'a> ByteReader<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
     }
-    fn read_exact(&mut self, len: usize) -> Result<&'a [u8], String> {
+    fn read_exact(&mut self, len: usize) -> OchreResult<&'a [u8]> {
         if self.pos + len > self.data.len() {
-            return Err("Corrupted or truncated .dit model file (´；ω；`)".to_string());
+            return Err(OchreError::CorruptedDitFile);
         }
         let slice = &self.data[self.pos..self.pos + len];
         self.pos += len;
         Ok(slice)
     }
-    fn read_u8(&mut self) -> Result<u8, String> {
+    fn read_u8(&mut self) -> OchreResult<u8> {
         Ok(self.read_exact(1)?[0])
     }
-    fn read_bool(&mut self) -> Result<bool, String> {
+    fn read_bool(&mut self) -> OchreResult<bool> {
         Ok(self.read_u8()? != 0)
     }
-    fn read_usize(&mut self) -> Result<usize, String> {
+    fn read_usize(&mut self) -> OchreResult<usize> {
         let b = self.read_exact(8)?;
         Ok(u64::from_le_bytes(b.try_into().unwrap()) as usize)
     }
-    fn read_f64(&mut self) -> Result<f64, String> {
+    fn read_f64(&mut self) -> OchreResult<f64> {
         let b = self.read_exact(8)?;
         Ok(f64::from_le_bytes(b.try_into().unwrap()))
     }
-    fn read_str(&mut self) -> Result<String, String> {
+    fn read_str(&mut self) -> OchreResult<String> {
         let len = self.read_usize()?;
         let b = self.read_exact(len)?;
-        String::from_utf8(b.to_vec()).map_err(|_| "Invalid UTF-8 in .dit model file ( >_< )".to_string())
+        String::from_utf8(b.to_vec()).map_err(|_| OchreError::InvalidUtf8InDit)
     }
-    fn read_opt_str(&mut self) -> Result<Option<String>, String> {
+    fn read_opt_str(&mut self) -> OchreResult<Option<String>> {
         if self.read_bool()? {
             Ok(Some(self.read_str()?))
         } else {
             Ok(None)
         }
     }
-    fn read_opt_usize(&mut self) -> Result<Option<usize>, String> {
+    fn read_opt_usize(&mut self) -> OchreResult<Option<usize>> {
         if self.read_bool()? {
             Ok(Some(self.read_usize()?))
         } else {
             Ok(None)
         }
     }
-    fn read_opt_f64(&mut self) -> Result<Option<f64>, String> {
+    fn read_opt_f64(&mut self) -> OchreResult<Option<f64>> {
         if self.read_bool()? {
             Ok(Some(self.read_f64()?))
         } else {
             Ok(None)
         }
     }
-    fn read_f64_vec(&mut self) -> Result<Vec<f64>, String> {
+    fn read_f64_vec(&mut self) -> OchreResult<Vec<f64>> {
         let len = self.read_usize()?;
         let mut vec = Vec::with_capacity(len);
         for _ in 0..len {
@@ -193,14 +200,14 @@ impl<'a> ByteReader<'a> {
         }
         Ok(vec)
     }
-    fn read_opt_f64_vec(&mut self) -> Result<Option<Vec<f64>>, String> {
+    fn read_opt_f64_vec(&mut self) -> OchreResult<Option<Vec<f64>>> {
         if self.read_bool()? {
             Ok(Some(self.read_f64_vec()?))
         } else {
             Ok(None)
         }
     }
-    fn read_tree_node(&mut self) -> Result<TreeNode, String> {
+    fn read_tree_node(&mut self) -> OchreResult<TreeNode> {
         match self.read_u8()? {
             0 => {
                 let value = self.read_f64()?;
@@ -226,10 +233,10 @@ impl<'a> ByteReader<'a> {
                     right,
                 })
             }
-            _ => Err("Invalid tree node tag in .dit file ( >_< )".to_string()),
+            _ => Err(OchreError::InvalidTreeNodeTag),
         }
     }
-    fn read_opt_tree_node(&mut self) -> Result<Option<TreeNode>, String> {
+    fn read_opt_tree_node(&mut self) -> OchreResult<Option<TreeNode>> {
         if self.read_bool()? {
             Ok(Some(self.read_tree_node()?))
         } else {
@@ -238,17 +245,17 @@ impl<'a> ByteReader<'a> {
     }
 }
 
-fn check_magic_and_tag(reader: &mut ByteReader<'_>, expected_tag: u8) -> Result<(), String> {
+fn check_magic_and_tag(reader: &mut ByteReader<'_>, expected_tag: u8) -> OchreResult<()> {
     let magic = reader.read_exact(4)?;
     if magic != DIT_MAGIC {
-        return Err("Invalid .dit file format (missing DIT header) (´-ω-`)".to_string());
+        return Err(OchreError::InvalidDitHeader);
     }
     let tag = reader.read_u8()?;
     if tag != expected_tag {
-        return Err(format!(
-            "Model type mismatch in .dit file (expected tag {}, got {}) (・`ω´・)",
-            expected_tag, tag
-        ));
+        return Err(OchreError::DitTagMismatch {
+            expected: expected_tag,
+            actual: tag,
+        });
     }
     Ok(())
 }
@@ -278,7 +285,7 @@ impl LinearRegression {
         buf
     }
 
-    pub fn from_bytes(bytes: &[u8], device: Option<&str>) -> Result<Self, String> {
+    pub fn from_bytes(bytes: &[u8], device: Option<&str>) -> OchreResult<Self> {
         let mut r = ByteReader::new(bytes);
         check_magic_and_tag(&mut r, TAG_LINEAR_REGRESSION)?;
         let fit_intercept = r.read_bool()?;
@@ -329,7 +336,7 @@ impl LinearRegression {
         })
     }
 
-    pub fn set_device(&mut self, device: Option<&str>) -> Result<(), String> {
+    pub fn set_device(&mut self, device: Option<&str>) -> OchreResult<()> {
         let dev = parse_device(device)?;
         if self.device_.is_some() {
             self.device_ = Some(dev.to_string());
@@ -355,7 +362,7 @@ impl DecisionTreeClassifier {
         buf
     }
 
-    pub fn from_bytes(bytes: &[u8], device: Option<&str>) -> Result<Self, String> {
+    pub fn from_bytes(bytes: &[u8], device: Option<&str>) -> OchreResult<Self> {
         let mut r = ByteReader::new(bytes);
         check_magic_and_tag(&mut r, TAG_DT_CLASSIFIER)?;
         let criterion = r.read_str()?;
@@ -385,7 +392,7 @@ impl DecisionTreeClassifier {
         })
     }
 
-    pub fn set_device(&mut self, device: Option<&str>) -> Result<(), String> {
+    pub fn set_device(&mut self, device: Option<&str>) -> OchreResult<()> {
         let dev = parse_device(device)?;
         if self.device_.is_some() {
             self.device_ = Some(dev.to_string());
@@ -410,7 +417,7 @@ impl DecisionTreeRegressor {
         buf
     }
 
-    pub fn from_bytes(bytes: &[u8], device: Option<&str>) -> Result<Self, String> {
+    pub fn from_bytes(bytes: &[u8], device: Option<&str>) -> OchreResult<Self> {
         let mut r = ByteReader::new(bytes);
         check_magic_and_tag(&mut r, TAG_DT_REGRESSOR)?;
         let criterion = r.read_str()?;
@@ -438,7 +445,7 @@ impl DecisionTreeRegressor {
         })
     }
 
-    pub fn set_device(&mut self, device: Option<&str>) -> Result<(), String> {
+    pub fn set_device(&mut self, device: Option<&str>) -> OchreResult<()> {
         let dev = parse_device(device)?;
         if self.device_.is_some() {
             self.device_ = Some(dev.to_string());
@@ -471,7 +478,7 @@ fn buffer_to_matrix(py: Python<'_>, x: &pyo3::buffer::PyBuffer<f64>) -> PyResult
     let mut data = vec![0.0; rows * cols];
     x.copy_to_slice(py, &mut data)
         .map_err(|e| PyValueError::new_err(format!("Failed to copy buffer data: {} (´；ω；`)", e)))?;
-    Matrix::from_vec(rows, cols, data).map_err(PyValueError::new_err)
+    Ok(Matrix::from_vec(rows, cols, data)?)
 }
 
 fn buffer_to_target_vector(py: Python<'_>, y: &pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
@@ -503,7 +510,7 @@ fn buffer_to_target_matrix(py: Python<'_>, y: &pyo3::buffer::PyBuffer<f64>) -> P
     let mut data = vec![0.0; rows * cols];
     y.copy_to_slice(py, &mut data)
         .map_err(|e| PyValueError::new_err(format!("Failed to copy target buffer: {} (´；ω；`)", e)))?;
-    let mat = Matrix::from_vec(rows, cols, data).map_err(PyValueError::new_err)?;
+    let mat = Matrix::from_vec(rows, cols, data)?;
     Ok((mat, is_2d))
 }
 
@@ -533,7 +540,7 @@ impl PyLinearRegression {
     #[new]
     #[pyo3(signature = (fit_intercept = true, device = None))]
     pub fn new(fit_intercept: bool, device: Option<String>) -> PyResult<Self> {
-        let inner = LinearRegression::new(fit_intercept, device).map_err(PyValueError::new_err)?;
+        let inner = LinearRegression::new(fit_intercept, device)?;
         Ok(Self { inner })
     }
 
@@ -544,10 +551,9 @@ impl PyLinearRegression {
         y: Vec<f64>,
         sample_weight: Option<Vec<f64>>,
     ) -> PyResult<()> {
-        let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
+        let mat = Matrix::from_2d(&x)?;
         self.inner
-            .fit_weighted_1d(&mat, &y, sample_weight.as_deref())
-            .map_err(PyValueError::new_err)?;
+            .fit_weighted_1d(&mat, &y, sample_weight.as_deref())?;
         Ok(())
     }
 
@@ -558,11 +564,10 @@ impl PyLinearRegression {
         y: Vec<Vec<f64>>,
         sample_weight: Option<Vec<f64>>,
     ) -> PyResult<()> {
-        let x_mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
-        let y_mat = Matrix::from_2d(&y).map_err(PyValueError::new_err)?;
+        let x_mat = Matrix::from_2d(&x)?;
+        let y_mat = Matrix::from_2d(&y)?;
         self.inner
-            .fit_multi(&x_mat, &y_mat, sample_weight.as_deref(), true)
-            .map_err(PyValueError::new_err)?;
+            .fit_multi(&x_mat, &y_mat, sample_weight.as_deref(), true)?;
         Ok(())
     }
 
@@ -581,19 +586,18 @@ impl PyLinearRegression {
             None => None,
         };
         self.inner
-            .fit_multi(&mat, &target_mat, sw_vec.as_deref(), is_2d)
-            .map_err(PyValueError::new_err)?;
+            .fit_multi(&mat, &target_mat, sw_vec.as_deref(), is_2d)?;
         Ok(())
     }
 
     pub fn predict(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<f64>> {
-        let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
-        self.inner.predict(&mat).map_err(PyValueError::new_err)
+        let mat = Matrix::from_2d(&x)?;
+        Ok(self.inner.predict(&mat)?)
     }
 
     pub fn predict_multi(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<Vec<f64>>> {
-        let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
-        let preds = self.inner.predict_multi(&mat).map_err(PyValueError::new_err)?;
+        let mat = Matrix::from_2d(&x)?;
+        let preds = self.inner.predict_multi(&mat)?;
         let mut out = Vec::with_capacity(preds.rows);
         for r in 0..preds.rows {
             let offset = r * preds.cols;
@@ -604,7 +608,7 @@ impl PyLinearRegression {
 
     pub fn predict_buffer(&self, py: Python<'_>, x: pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
         let mat = buffer_to_matrix(py, &x)?;
-        self.inner.predict(&mat).map_err(PyValueError::new_err)
+        Ok(self.inner.predict(&mat)?)
     }
 
     #[pyo3(signature = (x, y, sample_weight = None))]
@@ -614,14 +618,13 @@ impl PyLinearRegression {
         y: Vec<f64>,
         sample_weight: Option<Vec<f64>>,
     ) -> PyResult<f64> {
-        let x_mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
+        let x_mat = Matrix::from_2d(&x)?;
         if sample_weight.is_none() && !self.inner.is_multi_target_ {
-            return self.inner.score(&x_mat, &y).map_err(PyValueError::new_err);
+            return Ok(self.inner.score(&x_mat, &y)?);
         }
-        let y_mat = Matrix::from_vec(y.len(), 1, y).map_err(PyValueError::new_err)?;
-        self.inner
-            .score_multi(&x_mat, &y_mat, sample_weight.as_deref())
-            .map_err(PyValueError::new_err)
+        let y_mat = Matrix::from_vec(y.len(), 1, y)?;
+        Ok(self.inner
+            .score_multi(&x_mat, &y_mat, sample_weight.as_deref())?)
     }
 
     #[pyo3(signature = (x, y, sample_weight = None))]
@@ -631,11 +634,10 @@ impl PyLinearRegression {
         y: Vec<Vec<f64>>,
         sample_weight: Option<Vec<f64>>,
     ) -> PyResult<f64> {
-        let x_mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
-        let y_mat = Matrix::from_2d(&y).map_err(PyValueError::new_err)?;
-        self.inner
-            .score_multi(&x_mat, &y_mat, sample_weight.as_deref())
-            .map_err(PyValueError::new_err)
+        let x_mat = Matrix::from_2d(&x)?;
+        let y_mat = Matrix::from_2d(&y)?;
+        Ok(self.inner
+            .score_multi(&x_mat, &y_mat, sample_weight.as_deref())?)
     }
 
     #[pyo3(signature = (x, y, sample_weight = None))]
@@ -652,13 +654,12 @@ impl PyLinearRegression {
             Some(ref sw_buf) => Some(buffer_to_sample_weight(py, sw_buf)?),
             None => None,
         };
-        self.inner
-            .score_multi(&x_mat, &y_mat, sw_vec.as_deref())
-            .map_err(PyValueError::new_err)
+        Ok(self.inner
+            .score_multi(&x_mat, &y_mat, sw_vec.as_deref())?)
     }
 
     pub fn save(&self, path: &str) -> PyResult<()> {
-        validate_dit_path(path).map_err(PyValueError::new_err)?;
+        validate_dit_path(path)?;
         fs::write(path, self.inner.to_bytes())
             .map_err(|e| PyValueError::new_err(format!("Failed to write .dit file: {} (´；ω；`)", e)))
     }
@@ -666,16 +667,17 @@ impl PyLinearRegression {
     #[staticmethod]
     #[pyo3(signature = (path, device = None))]
     pub fn load(path: &str, device: Option<String>) -> PyResult<Self> {
-        validate_dit_path(path).map_err(PyValueError::new_err)?;
+        validate_dit_path(path)?;
         let bytes = fs::read(path)
             .map_err(|e| PyValueError::new_err(format!("Failed to read .dit file: {} (´；ω；`)", e)))?;
-        let inner = LinearRegression::from_bytes(&bytes, device.as_deref()).map_err(PyValueError::new_err)?;
+        let inner = LinearRegression::from_bytes(&bytes, device.as_deref())?;
         Ok(Self { inner })
     }
 
     #[pyo3(signature = (device = None))]
     pub fn set_device(&mut self, device: Option<String>) -> PyResult<()> {
-        self.inner.set_device(device.as_deref()).map_err(PyValueError::new_err)
+        self.inner.set_device(device.as_deref())?;
+        Ok(())
     }
 
     pub fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
@@ -685,7 +687,7 @@ impl PyLinearRegression {
     #[staticmethod]
     #[pyo3(signature = (bytes, device = None))]
     pub fn from_bytes(bytes: &[u8], device: Option<String>) -> PyResult<Self> {
-        let inner = LinearRegression::from_bytes(bytes, device.as_deref()).map_err(PyValueError::new_err)?;
+        let inner = LinearRegression::from_bytes(bytes, device.as_deref())?;
         Ok(Self { inner })
     }
 
@@ -694,7 +696,7 @@ impl PyLinearRegression {
     }
 
     pub fn __setstate__(&mut self, state: &[u8]) -> PyResult<()> {
-        self.inner = LinearRegression::from_bytes(state, None).map_err(PyValueError::new_err)?;
+        self.inner = LinearRegression::from_bytes(state, None)?;
         Ok(())
     }
 
@@ -768,14 +770,13 @@ impl PyDecisionTreeClassifier {
         min_samples_leaf: Option<usize>,
         device: Option<String>,
     ) -> PyResult<Self> {
-        let inner = DecisionTreeClassifier::new(criterion, max_depth, min_samples_split, min_samples_leaf, device)
-            .map_err(PyValueError::new_err)?;
+        let inner = DecisionTreeClassifier::new(criterion, max_depth, min_samples_split, min_samples_leaf, device)?;
         Ok(Self { inner })
     }
 
     pub fn fit(&mut self, x: Vec<Vec<f64>>, y: Vec<f64>) -> PyResult<()> {
-        let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
-        self.inner.fit(&mat, &y).map_err(PyValueError::new_err)?;
+        let mat = Matrix::from_2d(&x)?;
+        self.inner.fit(&mat, &y)?;
         Ok(())
     }
 
@@ -787,23 +788,23 @@ impl PyDecisionTreeClassifier {
     ) -> PyResult<()> {
         let mat = buffer_to_matrix(py, &x)?;
         let target = buffer_to_target_vector(py, &y)?;
-        self.inner.fit(&mat, &target).map_err(PyValueError::new_err)?;
+        self.inner.fit(&mat, &target)?;
         Ok(())
     }
 
     pub fn predict(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<f64>> {
-        let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
-        self.inner.predict(&mat).map_err(PyValueError::new_err)
+        let mat = Matrix::from_2d(&x)?;
+        Ok(self.inner.predict(&mat)?)
     }
 
     pub fn predict_buffer(&self, py: Python<'_>, x: pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
         let mat = buffer_to_matrix(py, &x)?;
-        self.inner.predict(&mat).map_err(PyValueError::new_err)
+        Ok(self.inner.predict(&mat)?)
     }
 
     pub fn score(&self, x: Vec<Vec<f64>>, y: Vec<f64>) -> PyResult<f64> {
-        let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
-        self.inner.score(&mat, &y).map_err(PyValueError::new_err)
+        let mat = Matrix::from_2d(&x)?;
+        Ok(self.inner.score(&mat, &y)?)
     }
 
     pub fn score_buffer(
@@ -814,11 +815,11 @@ impl PyDecisionTreeClassifier {
     ) -> PyResult<f64> {
         let mat = buffer_to_matrix(py, &x)?;
         let target = buffer_to_target_vector(py, &y)?;
-        self.inner.score(&mat, &target).map_err(PyValueError::new_err)
+        Ok(self.inner.score(&mat, &target)?)
     }
 
     pub fn save(&self, path: &str) -> PyResult<()> {
-        validate_dit_path(path).map_err(PyValueError::new_err)?;
+        validate_dit_path(path)?;
         fs::write(path, self.inner.to_bytes())
             .map_err(|e| PyValueError::new_err(format!("Failed to write .dit file: {} (´；ω；`)", e)))
     }
@@ -826,16 +827,17 @@ impl PyDecisionTreeClassifier {
     #[staticmethod]
     #[pyo3(signature = (path, device = None))]
     pub fn load(path: &str, device: Option<String>) -> PyResult<Self> {
-        validate_dit_path(path).map_err(PyValueError::new_err)?;
+        validate_dit_path(path)?;
         let bytes = fs::read(path)
             .map_err(|e| PyValueError::new_err(format!("Failed to read .dit file: {} (´；ω；`)", e)))?;
-        let inner = DecisionTreeClassifier::from_bytes(&bytes, device.as_deref()).map_err(PyValueError::new_err)?;
+        let inner = DecisionTreeClassifier::from_bytes(&bytes, device.as_deref())?;
         Ok(Self { inner })
     }
 
     #[pyo3(signature = (device = None))]
     pub fn set_device(&mut self, device: Option<String>) -> PyResult<()> {
-        self.inner.set_device(device.as_deref()).map_err(PyValueError::new_err)
+        self.inner.set_device(device.as_deref())?;
+        Ok(())
     }
 
     pub fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
@@ -845,7 +847,7 @@ impl PyDecisionTreeClassifier {
     #[staticmethod]
     #[pyo3(signature = (bytes, device = None))]
     pub fn from_bytes(bytes: &[u8], device: Option<String>) -> PyResult<Self> {
-        let inner = DecisionTreeClassifier::from_bytes(bytes, device.as_deref()).map_err(PyValueError::new_err)?;
+        let inner = DecisionTreeClassifier::from_bytes(bytes, device.as_deref())?;
         Ok(Self { inner })
     }
 
@@ -854,7 +856,7 @@ impl PyDecisionTreeClassifier {
     }
 
     pub fn __setstate__(&mut self, state: &[u8]) -> PyResult<()> {
-        self.inner = DecisionTreeClassifier::from_bytes(state, None).map_err(PyValueError::new_err)?;
+        self.inner = DecisionTreeClassifier::from_bytes(state, None)?;
         Ok(())
     }
 
@@ -911,14 +913,13 @@ impl PyDecisionTreeRegressor {
         min_samples_leaf: Option<usize>,
         device: Option<String>,
     ) -> PyResult<Self> {
-        let inner = DecisionTreeRegressor::new(criterion, max_depth, min_samples_split, min_samples_leaf, device)
-            .map_err(PyValueError::new_err)?;
+        let inner = DecisionTreeRegressor::new(criterion, max_depth, min_samples_split, min_samples_leaf, device)?;
         Ok(Self { inner })
     }
 
     pub fn fit(&mut self, x: Vec<Vec<f64>>, y: Vec<f64>) -> PyResult<()> {
-        let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
-        self.inner.fit(&mat, &y).map_err(PyValueError::new_err)?;
+        let mat = Matrix::from_2d(&x)?;
+        self.inner.fit(&mat, &y)?;
         Ok(())
     }
 
@@ -930,23 +931,23 @@ impl PyDecisionTreeRegressor {
     ) -> PyResult<()> {
         let mat = buffer_to_matrix(py, &x)?;
         let target = buffer_to_target_vector(py, &y)?;
-        self.inner.fit(&mat, &target).map_err(PyValueError::new_err)?;
+        self.inner.fit(&mat, &target)?;
         Ok(())
     }
 
     pub fn predict(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<f64>> {
-        let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
-        self.inner.predict(&mat).map_err(PyValueError::new_err)
+        let mat = Matrix::from_2d(&x)?;
+        Ok(self.inner.predict(&mat)?)
     }
 
     pub fn predict_buffer(&self, py: Python<'_>, x: pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
         let mat = buffer_to_matrix(py, &x)?;
-        self.inner.predict(&mat).map_err(PyValueError::new_err)
+        Ok(self.inner.predict(&mat)?)
     }
 
     pub fn score(&self, x: Vec<Vec<f64>>, y: Vec<f64>) -> PyResult<f64> {
-        let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
-        self.inner.score(&mat, &y).map_err(PyValueError::new_err)
+        let mat = Matrix::from_2d(&x)?;
+        Ok(self.inner.score(&mat, &y)?)
     }
 
     pub fn score_buffer(
@@ -957,11 +958,11 @@ impl PyDecisionTreeRegressor {
     ) -> PyResult<f64> {
         let mat = buffer_to_matrix(py, &x)?;
         let target = buffer_to_target_vector(py, &y)?;
-        self.inner.score(&mat, &target).map_err(PyValueError::new_err)
+        Ok(self.inner.score(&mat, &target)?)
     }
 
     pub fn save(&self, path: &str) -> PyResult<()> {
-        validate_dit_path(path).map_err(PyValueError::new_err)?;
+        validate_dit_path(path)?;
         fs::write(path, self.inner.to_bytes())
             .map_err(|e| PyValueError::new_err(format!("Failed to write .dit file: {} (´；ω；`)", e)))
     }
@@ -969,16 +970,17 @@ impl PyDecisionTreeRegressor {
     #[staticmethod]
     #[pyo3(signature = (path, device = None))]
     pub fn load(path: &str, device: Option<String>) -> PyResult<Self> {
-        validate_dit_path(path).map_err(PyValueError::new_err)?;
+        validate_dit_path(path)?;
         let bytes = fs::read(path)
             .map_err(|e| PyValueError::new_err(format!("Failed to read .dit file: {} (´；ω；`)", e)))?;
-        let inner = DecisionTreeRegressor::from_bytes(&bytes, device.as_deref()).map_err(PyValueError::new_err)?;
+        let inner = DecisionTreeRegressor::from_bytes(&bytes, device.as_deref())?;
         Ok(Self { inner })
     }
 
     #[pyo3(signature = (device = None))]
     pub fn set_device(&mut self, device: Option<String>) -> PyResult<()> {
-        self.inner.set_device(device.as_deref()).map_err(PyValueError::new_err)
+        self.inner.set_device(device.as_deref())?;
+        Ok(())
     }
 
     pub fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
@@ -988,7 +990,7 @@ impl PyDecisionTreeRegressor {
     #[staticmethod]
     #[pyo3(signature = (bytes, device = None))]
     pub fn from_bytes(bytes: &[u8], device: Option<String>) -> PyResult<Self> {
-        let inner = DecisionTreeRegressor::from_bytes(bytes, device.as_deref()).map_err(PyValueError::new_err)?;
+        let inner = DecisionTreeRegressor::from_bytes(bytes, device.as_deref())?;
         Ok(Self { inner })
     }
 
@@ -997,7 +999,7 @@ impl PyDecisionTreeRegressor {
     }
 
     pub fn __setstate__(&mut self, state: &[u8]) -> PyResult<()> {
-        self.inner = DecisionTreeRegressor::from_bytes(state, None).map_err(PyValueError::new_err)?;
+        self.inner = DecisionTreeRegressor::from_bytes(state, None)?;
         Ok(())
     }
 

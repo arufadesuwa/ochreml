@@ -2,6 +2,7 @@
 // Implementation of CART algorithm for classification and regression trees.
 
 use crate::device::{parse_device, DeviceType};
+use crate::error::{OchreError, OchreResult};
 use crate::matrix::{r2_score, Matrix};
 
 #[derive(Debug, Clone)]
@@ -62,10 +63,14 @@ impl DecisionTreeClassifier {
         min_samples_split: Option<usize>,
         min_samples_leaf: Option<usize>,
         device: Option<String>,
-    ) -> Result<Self, String> {
+    ) -> OchreResult<Self> {
         let dev = parse_device(device.as_deref())?;
+        let crit = criterion.unwrap_or_else(|| "gini".to_string()).to_lowercase();
+        if crit != "gini" && crit != "entropy" {
+            return Err(OchreError::InvalidCriterion(crit));
+        }
         Ok(Self {
-            criterion: criterion.unwrap_or_else(|| "gini".to_string()).to_lowercase(),
+            criterion: crit,
             max_depth,
             min_samples_split: min_samples_split.unwrap_or(2).max(2),
             min_samples_leaf: min_samples_leaf.unwrap_or(1).max(1),
@@ -233,16 +238,15 @@ impl DecisionTreeClassifier {
     }
 
     // Fit DecisionTreeClassifier on feature matrix X and target labels y
-    pub fn fit(&mut self, x: &Matrix, y: &[f64]) -> Result<(), String> {
+    pub fn fit(&mut self, x: &Matrix, y: &[f64]) -> OchreResult<()> {
         if x.rows != y.len() {
-            return Err(format!(
-                "Number of feature rows ({}) does not match target labels length ({}) ( >_< )",
-                x.rows,
-                y.len()
-            ));
+            return Err(OchreError::LengthMismatch {
+                features: x.rows,
+                targets: y.len(),
+            });
         }
         if x.rows == 0 || x.cols == 0 {
-            return Err("Training dataset cannot be empty (´；ω；`)".to_string());
+            return Err(OchreError::EmptyData);
         }
 
         self.n_features_in_ = Some(x.cols);
@@ -271,18 +275,18 @@ impl DecisionTreeClassifier {
     }
 
     // Predict class label for new feature data X
-    pub fn predict(&self, x: &Matrix) -> Result<Vec<f64>, String> {
+    pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
         let root = match &self.root {
             Some(r) => r,
-            None => return Err("Model is not fitted yet. Call fit() first (´-ω-`)".to_string()),
+            None => return Err(OchreError::NotFitted),
         };
 
         if let Some(expected_cols) = self.n_features_in_ {
             if x.cols != expected_cols {
-                return Err(format!(
-                    "Number of features ({}) does not match training features ({}) (・`ω´・)",
-                    x.cols, expected_cols
-                ));
+                return Err(OchreError::FeatureCountMismatch {
+                    features: x.cols,
+                    expected: expected_cols,
+                });
             }
         }
 
@@ -296,7 +300,7 @@ impl DecisionTreeClassifier {
     }
 
     // Compute classification accuracy
-    pub fn score(&self, x: &Matrix, y: &[f64]) -> Result<f64, String> {
+    pub fn score(&self, x: &Matrix, y: &[f64]) -> OchreResult<f64> {
         let preds = self.predict(x)?;
         if preds.len() != y.len() || preds.is_empty() {
             return Ok(0.0);
@@ -333,10 +337,14 @@ impl DecisionTreeRegressor {
         min_samples_split: Option<usize>,
         min_samples_leaf: Option<usize>,
         device: Option<String>,
-    ) -> Result<Self, String> {
+    ) -> OchreResult<Self> {
         let dev = parse_device(device.as_deref())?;
+        let crit = criterion.unwrap_or_else(|| "squared_error".to_string()).to_lowercase();
+        if crit != "squared_error" {
+            return Err(OchreError::InvalidRegressorCriterion(crit));
+        }
         Ok(Self {
-            criterion: criterion.unwrap_or_else(|| "squared_error".to_string()).to_lowercase(),
+            criterion: crit,
             max_depth,
             min_samples_split: min_samples_split.unwrap_or(2).max(2),
             min_samples_leaf: min_samples_leaf.unwrap_or(1).max(1),
@@ -483,16 +491,15 @@ impl DecisionTreeRegressor {
     }
 
     // Fit DecisionTreeRegressor on continuous dataset (X, y)
-    pub fn fit(&mut self, x: &Matrix, y: &[f64]) -> Result<(), String> {
+    pub fn fit(&mut self, x: &Matrix, y: &[f64]) -> OchreResult<()> {
         if x.rows != y.len() {
-            return Err(format!(
-                "Number of feature rows ({}) does not match target length ({}) ( >_< )",
-                x.rows,
-                y.len()
-            ));
+            return Err(OchreError::LengthMismatch {
+                features: x.rows,
+                targets: y.len(),
+            });
         }
         if x.rows == 0 || x.cols == 0 {
-            return Err("Training dataset cannot be empty (´；ω；`)".to_string());
+            return Err(OchreError::EmptyData);
         }
 
         self.n_features_in_ = Some(x.cols);
@@ -505,18 +512,18 @@ impl DecisionTreeRegressor {
     }
 
     // Predict continuous target values for new data X
-    pub fn predict(&self, x: &Matrix) -> Result<Vec<f64>, String> {
+    pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
         let root = match &self.root {
             Some(r) => r,
-            None => return Err("Model is not fitted yet. Call fit() first (´-ω-`)".to_string()),
+            None => return Err(OchreError::NotFitted),
         };
 
         if let Some(expected_cols) = self.n_features_in_ {
             if x.cols != expected_cols {
-                return Err(format!(
-                    "Number of features ({}) does not match training features ({}) (・`ω´・)",
-                    x.cols, expected_cols
-                ));
+                return Err(OchreError::FeatureCountMismatch {
+                    features: x.cols,
+                    expected: expected_cols,
+                });
             }
         }
 
@@ -530,7 +537,7 @@ impl DecisionTreeRegressor {
     }
 
     // Compute R^2 score for regression performance
-    pub fn score(&self, x: &Matrix, y: &[f64]) -> Result<f64, String> {
+    pub fn score(&self, x: &Matrix, y: &[f64]) -> OchreResult<f64> {
         let preds = self.predict(x)?;
         Ok(r2_score(y, &preds))
     }

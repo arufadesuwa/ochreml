@@ -1,11 +1,29 @@
 // OchreML Linear Algebra Module (＾▽＾)
-// Provides fundamental matrix structures and linear equation solvers.
+// Provides fundamental matrix structures, trait-based indexing, and linear equation solvers.
+
+use crate::error::{OchreError, OchreResult};
+use std::ops::{Index, IndexMut};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Matrix {
     pub rows: usize,
     pub cols: usize,
     pub data: Vec<f64>,
+}
+
+impl Index<(usize, usize)> for Matrix {
+    type Output = f64;
+    #[inline]
+    fn index(&self, (r, c): (usize, usize)) -> &Self::Output {
+        &self.data[r * self.cols + c]
+    }
+}
+
+impl IndexMut<(usize, usize)> for Matrix {
+    #[inline]
+    fn index_mut(&mut self, (r, c): (usize, usize)) -> &mut Self::Output {
+        &mut self.data[r * self.cols + c]
+    }
 }
 
 impl Matrix {
@@ -20,31 +38,36 @@ impl Matrix {
     pub fn identity(n: usize) -> Self {
         let mut mat = Self::zeros(n, n);
         for i in 0..n {
-            mat.set(i, i, 1.0);
+            mat[(i, i)] = 1.0;
         }
         mat
     }
 
     // Convert 2D vector data into a contiguous Matrix structure
-    pub fn from_2d(data_2d: &[Vec<f64>]) -> Result<Self, String> {
+    pub fn from_2d(data_2d: &[Vec<f64>]) -> OchreResult<Self> {
         let rows = data_2d.len();
         if rows == 0 {
-            return Err("Matrix cannot be empty (´；ω；`)".to_string());
+            return Err(OchreError::EmptyData);
         }
         let cols = data_2d[0].len();
         if cols == 0 {
-            return Err("Matrix column count cannot be zero ( >_< )".to_string());
+            return Err(OchreError::DimensionMismatch {
+                expected_rows: rows,
+                expected_cols: 1,
+                actual_rows: rows,
+                actual_cols: 0,
+            });
         }
 
         let mut flat = Vec::with_capacity(rows * cols);
         for (r, row) in data_2d.iter().enumerate() {
             if row.len() != cols {
-                return Err(format!(
-                    "Row {} length ({}) does not match first column count ({}) (・`ω´・)",
-                    r,
-                    row.len(),
-                    cols
-                ));
+                return Err(OchreError::DimensionMismatch {
+                    expected_rows: r,
+                    expected_cols: cols,
+                    actual_rows: r,
+                    actual_cols: row.len(),
+                });
             }
             flat.extend_from_slice(row);
         }
@@ -57,29 +80,33 @@ impl Matrix {
     }
 
     // Construct Matrix directly from contiguous flat Vec (Zero-Copy) (*≧ω≦*)
-    pub fn from_vec(rows: usize, cols: usize, data: Vec<f64>) -> Result<Self, String> {
+    pub fn from_vec(rows: usize, cols: usize, data: Vec<f64>) -> OchreResult<Self> {
         if rows == 0 || cols == 0 {
-            return Err("Matrix dimensions cannot be zero (´；ω；`)".to_string());
+            return Err(OchreError::EmptyData);
         }
         if data.len() != rows * cols {
-            return Err(format!(
-                "Data length ({}) does not match dimensions {}x{}={} ( >_< )",
-                data.len(), rows, cols, rows * cols
-            ));
+            return Err(OchreError::DimensionMismatch {
+                expected_rows: rows,
+                expected_cols: cols,
+                actual_rows: data.len(),
+                actual_cols: 1,
+            });
         }
         Ok(Self { rows, cols, data })
     }
 
     // Construct Matrix directly from contiguous slice (o´∀｀o)
-    pub fn from_slice(rows: usize, cols: usize, slice: &[f64]) -> Result<Self, String> {
+    pub fn from_slice(rows: usize, cols: usize, slice: &[f64]) -> OchreResult<Self> {
         if rows == 0 || cols == 0 {
-            return Err("Matrix dimensions cannot be zero (´；ω；`)".to_string());
+            return Err(OchreError::EmptyData);
         }
         if slice.len() != rows * cols {
-            return Err(format!(
-                "Slice length ({}) does not match dimensions {}x{}={} ( >_< )",
-                slice.len(), rows, cols, rows * cols
-            ));
+            return Err(OchreError::DimensionMismatch {
+                expected_rows: rows,
+                expected_cols: cols,
+                actual_rows: slice.len(),
+                actual_cols: 1,
+            });
         }
         Ok(Self {
             rows,
@@ -90,12 +117,12 @@ impl Matrix {
 
     #[inline]
     pub fn get(&self, r: usize, c: usize) -> f64 {
-        self.data[r * self.cols + c]
+        self[(r, c)]
     }
 
     #[inline]
     pub fn set(&mut self, r: usize, c: usize, val: f64) {
-        self.data[r * self.cols + c] = val;
+        self[(r, c)] = val;
     }
 
     // Matrix transpose: swap rows and columns
@@ -103,27 +130,29 @@ impl Matrix {
         let mut res = Self::zeros(self.cols, self.rows);
         for r in 0..self.rows {
             for c in 0..self.cols {
-                res.set(c, r, self.get(r, c));
+                res[(c, r)] = self[(r, c)];
             }
         }
         res
     }
 
     // Matrix multiplication: A * B
-    pub fn matmul(&self, other: &Matrix) -> Result<Self, String> {
+    pub fn matmul(&self, other: &Matrix) -> OchreResult<Self> {
         if self.cols != other.rows {
-            return Err(format!(
-                "Incompatible matrix dimensions for multiplication: ({}x{}) and ({}x{}) (´-ω-`)",
-                self.rows, self.cols, other.rows, other.cols
-            ));
+            return Err(OchreError::MatmulDimensionMismatch {
+                rows_a: self.rows,
+                cols_a: self.cols,
+                rows_b: other.rows,
+                cols_b: other.cols,
+            });
         }
 
         let mut res = Self::zeros(self.rows, other.cols);
         for r in 0..self.rows {
             for k in 0..self.cols {
-                let a_rk = self.get(r, k);
+                let a_rk = self[(r, k)];
                 for c in 0..other.cols {
-                    res.set(r, c, res.get(r, c) + a_rk * other.get(k, c));
+                    res[(r, c)] += a_rk * other[(k, c)];
                 }
             }
         }
@@ -131,20 +160,19 @@ impl Matrix {
     }
 
     // Matrix-vector multiplication: A * v
-    pub fn matvec(&self, vec: &[f64]) -> Result<Vec<f64>, String> {
+    pub fn matvec(&self, vec: &[f64]) -> OchreResult<Vec<f64>> {
         if self.cols != vec.len() {
-            return Err(format!(
-                "Matrix column count ({}) must match vector length ({}) (・`ω´・)",
-                self.cols,
-                vec.len()
-            ));
+            return Err(OchreError::MatvecDimensionMismatch {
+                cols: self.cols,
+                len: vec.len(),
+            });
         }
 
         let mut res = vec![0.0; self.rows];
         for r in 0..self.rows {
             let mut sum = 0.0;
             for c in 0..self.cols {
-                sum += self.get(r, c) * vec[c];
+                sum += self[(r, c)] * vec[c];
             }
             res[r] = sum;
         }
@@ -155,317 +183,84 @@ impl Matrix {
     pub fn add_ridge_diagonal(&mut self, lambda: f64) {
         let n = self.rows.min(self.cols);
         for i in 0..n {
-            let val = self.get(i, i);
-            self.set(i, i, val + lambda);
+            self[(i, i)] += lambda;
         }
     }
 }
 
-// Directly compute (X^T * X) and (X^T * y) in a single pass without allocating transpose matrices.
-// Supports device-aware execution across CPU, GPU, Multi-GPU (data-parallel), and TPU (*≧ω≦*)
+// Compute (X^T * X) and (X^T * y) in a single pass without allocating transpose matrices.
 pub fn compute_normal_equation_mats(
     x: &Matrix,
     y: &[f64],
     fit_intercept: bool,
     device: &crate::device::DeviceType,
-) -> Result<(Matrix, Vec<f64>), String> {
+) -> OchreResult<(Matrix, Vec<f64>)> {
     if x.rows != y.len() {
-        return Err(format!(
-            "Row count ({}) must match target length ({}) ( >_< )",
-            x.rows,
-            y.len()
-        ));
+        return Err(OchreError::LengthMismatch {
+            features: x.rows,
+            targets: y.len(),
+        });
     }
+
+    let y_mat = Matrix::from_slice(y.len(), 1, y)?;
+    let (xt_x, xt_y_mat) = compute_normal_equation_mats_multi(x, &y_mat, None, fit_intercept, device)?;
+
     let p = if fit_intercept { x.cols + 1 } else { x.cols };
-
-    match device {
-        crate::device::DeviceType::MultiGpu(gpu_ids) if gpu_ids.len() > 1 && x.rows >= gpu_ids.len() => {
-            // Data-Parallel row chunking across multiple GPUs with All-Reduce summation (*≧ω≦*)
-            let n_devices = gpu_ids.len();
-            let chunk_size = (x.rows + n_devices - 1) / n_devices;
-            let mut total_xt_x = Matrix::zeros(p, p);
-            let mut total_xt_y = vec![0.0; p];
-
-            for d in 0..n_devices {
-                let start_row = d * chunk_size;
-                if start_row >= x.rows {
-                    break;
-                }
-                let end_row = (start_row + chunk_size).min(x.rows);
-                let (chunk_xt_x, chunk_xt_y) = compute_normal_equation_range(x, y, fit_intercept, start_row, end_row)?;
-
-                for i in 0..(p * p) {
-                    total_xt_x.data[i] += chunk_xt_x.data[i];
-                }
-                for i in 0..p {
-                    total_xt_y[i] += chunk_xt_y[i];
-                }
-            }
-            Ok((total_xt_x, total_xt_y))
-        }
-        crate::device::DeviceType::Tpu(_) => {
-            // Systolic block-tiled accumulation matching TPU MXU dataflow
-            let block_size = 64;
-            let mut total_xt_x = Matrix::zeros(p, p);
-            let mut total_xt_y = vec![0.0; p];
-
-            let mut start_row = 0;
-            while start_row < x.rows {
-                let end_row = (start_row + block_size).min(x.rows);
-                let (tile_xt_x, tile_xt_y) = compute_normal_equation_range(x, y, fit_intercept, start_row, end_row)?;
-                for i in 0..(p * p) {
-                    total_xt_x.data[i] += tile_xt_x.data[i];
-                }
-                for i in 0..p {
-                    total_xt_y[i] += tile_xt_y[i];
-                }
-                start_row = end_row;
-            }
-            Ok((total_xt_x, total_xt_y))
-        }
-        _ => {
-            // Single device (CPU / Single GPU)
-            // Parallelize across CPU threads using Rayon when dataset is sufficiently large (*≧ω≦*)
-            if x.rows >= 1000 {
-                use rayon::prelude::*;
-                let num_threads = rayon::current_num_threads().max(1);
-                let chunk_size = (x.rows + num_threads - 1) / num_threads;
-                let chunks: Vec<(usize, usize)> = (0..num_threads)
-                    .map(|i| {
-                        let start = i * chunk_size;
-                        let end = (start + chunk_size).min(x.rows);
-                        (start, end)
-                    })
-                    .filter(|(start, end)| start < end)
-                    .collect();
-
-                let (total_xt_x, total_xt_y) = chunks
-                    .into_par_iter()
-                    .map(|(start, end)| compute_normal_equation_range(x, y, fit_intercept, start, end))
-                    .reduce(
-                        || Ok((Matrix::zeros(p, p), vec![0.0; p])),
-                        |acc, chunk| {
-                            let (mut acc_m, mut acc_v) = acc?;
-                            let (chunk_m, chunk_v) = chunk?;
-                            for i in 0..(p * p) {
-                                acc_m.data[i] += chunk_m.data[i];
-                            }
-                            for i in 0..p {
-                                acc_v[i] += chunk_v[i];
-                            }
-                            Ok((acc_m, acc_v))
-                        },
-                    )?;
-
-                Ok((total_xt_x, total_xt_y))
-            } else {
-                compute_normal_equation_range(x, y, fit_intercept, 0, x.rows)
-            }
-        }
-    }
-}
-
-// Compute (X^T * X) and (X^T * y) over a slice range [start_row..end_row]
-fn compute_normal_equation_range(
-    x: &Matrix,
-    y: &[f64],
-    fit_intercept: bool,
-    start_row: usize,
-    end_row: usize,
-) -> Result<(Matrix, Vec<f64>), String> {
-    let p = if fit_intercept { x.cols + 1 } else { x.cols };
-    let mut xt_x = Matrix::zeros(p, p);
     let mut xt_y = vec![0.0; p];
-
-    for r in start_row..end_row {
-        let yr = y[r];
-        let row_offset = r * x.cols;
-        let row_slice = &x.data[row_offset..row_offset + x.cols];
-
-        if fit_intercept {
-            for j in 0..x.cols {
-                let xj = row_slice[j];
-                xt_y[j] += xj * yr;
-                for k in j..x.cols {
-                    xt_x.data[j * p + k] += xj * row_slice[k];
-                }
-                xt_x.data[j * p + x.cols] += xj;
-            }
-            xt_y[x.cols] += yr;
-            xt_x.data[x.cols * p + x.cols] += 1.0;
-        } else {
-            for j in 0..x.cols {
-                let xj = row_slice[j];
-                xt_y[j] += xj * yr;
-                for k in j..x.cols {
-                    xt_x.data[j * p + k] += xj * row_slice[k];
-                }
-            }
-        }
-    }
-
-    // Mirror upper triangle to lower triangle
-    for j in 0..p {
-        for k in (j + 1)..p {
-            let val = xt_x.data[j * p + k];
-            xt_x.data[k * p + j] = val;
-        }
+    for i in 0..p {
+        xt_y[i] = xt_y_mat[(i, 0)];
     }
 
     Ok((xt_x, xt_y))
 }
 
 // Compute weighted multi-target (X^T * W * X) and (X^T * W * Y) in a single streaming pass (*≧ω≦*)
+// Dispatches to trait-based ComputeBackend (CpuBackend, MultiGpuBackend, TpuBackend)
 pub fn compute_normal_equation_mats_multi(
     x: &Matrix,
     y: &Matrix,
     sample_weight: Option<&[f64]>,
     fit_intercept: bool,
     device: &crate::device::DeviceType,
-) -> Result<(Matrix, Matrix), String> {
+) -> OchreResult<(Matrix, Matrix)> {
     if x.rows != y.rows {
-        return Err(format!(
-            "Row count ({}) must match target row count ({}) ( >_< )",
-            x.rows, y.rows
-        ));
+        return Err(OchreError::LengthMismatch {
+            features: x.rows,
+            targets: y.rows,
+        });
     }
     if let Some(sw) = sample_weight {
         if sw.len() != x.rows {
-            return Err(format!(
-                "Sample weight length ({}) must match sample count ({}) ( >_< )",
-                sw.len(),
-                x.rows
-            ));
+            return Err(OchreError::WeightLengthMismatch {
+                weights: sw.len(),
+                samples: x.rows,
+            });
         }
         let mut weight_sum = 0.0;
         for &w in sw {
             if w < 0.0 || w.is_nan() {
-                return Err("Sample weights must be non-negative valid numbers (・`ω´・)".to_string());
+                return Err(OchreError::InvalidWeights);
             }
             weight_sum += w;
         }
         if weight_sum <= 0.0 {
-            return Err("Sum of sample weights must be strictly positive (´；ω；`)".to_string());
+            return Err(OchreError::NonPositiveWeightSum);
         }
     }
 
-    let p = if fit_intercept { x.cols + 1 } else { x.cols };
-    let k_targets = y.cols;
-
-    match device {
-        crate::device::DeviceType::MultiGpu(gpu_ids) if gpu_ids.len() > 1 && x.rows >= gpu_ids.len() => {
-            let n_devices = gpu_ids.len();
-            let chunk_size = (x.rows + n_devices - 1) / n_devices;
-            let mut total_xt_x = Matrix::zeros(p, p);
-            let mut total_xt_y = Matrix::zeros(p, k_targets);
-
-            for d in 0..n_devices {
-                let start_row = d * chunk_size;
-                if start_row >= x.rows {
-                    break;
-                }
-                let end_row = (start_row + chunk_size).min(x.rows);
-                let (chunk_xt_x, chunk_xt_y) = compute_normal_equation_multi_range(
-                    x,
-                    y,
-                    sample_weight,
-                    fit_intercept,
-                    start_row,
-                    end_row,
-                )?;
-
-                for i in 0..(p * p) {
-                    total_xt_x.data[i] += chunk_xt_x.data[i];
-                }
-                for i in 0..(p * k_targets) {
-                    total_xt_y.data[i] += chunk_xt_y.data[i];
-                }
-            }
-            Ok((total_xt_x, total_xt_y))
-        }
-        crate::device::DeviceType::Tpu(_) => {
-            let block_size = 64;
-            let mut total_xt_x = Matrix::zeros(p, p);
-            let mut total_xt_y = Matrix::zeros(p, k_targets);
-
-            let mut start_row = 0;
-            while start_row < x.rows {
-                let end_row = (start_row + block_size).min(x.rows);
-                let (tile_xt_x, tile_xt_y) = compute_normal_equation_multi_range(
-                    x,
-                    y,
-                    sample_weight,
-                    fit_intercept,
-                    start_row,
-                    end_row,
-                )?;
-                for i in 0..(p * p) {
-                    total_xt_x.data[i] += tile_xt_x.data[i];
-                }
-                for i in 0..(p * k_targets) {
-                    total_xt_y.data[i] += tile_xt_y.data[i];
-                }
-                start_row = end_row;
-            }
-            Ok((total_xt_x, total_xt_y))
-        }
-        _ => {
-            if x.rows >= 1000 {
-                use rayon::prelude::*;
-                let num_threads = rayon::current_num_threads().max(1);
-                let chunk_size = (x.rows + num_threads - 1) / num_threads;
-                let chunks: Vec<(usize, usize)> = (0..num_threads)
-                    .map(|i| {
-                        let start = i * chunk_size;
-                        let end = (start + chunk_size).min(x.rows);
-                        (start, end)
-                    })
-                    .filter(|(start, end)| start < end)
-                    .collect();
-
-                let (total_xt_x, total_xt_y) = chunks
-                    .into_par_iter()
-                    .map(|(start, end)| {
-                        compute_normal_equation_multi_range(
-                            x,
-                            y,
-                            sample_weight,
-                            fit_intercept,
-                            start,
-                            end,
-                        )
-                    })
-                    .reduce(
-                        || Ok((Matrix::zeros(p, p), Matrix::zeros(p, k_targets))),
-                        |acc, chunk| {
-                            let (mut acc_m, mut acc_y) = acc?;
-                            let (chunk_m, chunk_y) = chunk?;
-                            for i in 0..(p * p) {
-                                acc_m.data[i] += chunk_m.data[i];
-                            }
-                            for i in 0..(p * k_targets) {
-                                acc_y.data[i] += chunk_y.data[i];
-                            }
-                            Ok((acc_m, acc_y))
-                        },
-                    )?;
-
-                Ok((total_xt_x, total_xt_y))
-            } else {
-                compute_normal_equation_multi_range(x, y, sample_weight, fit_intercept, 0, x.rows)
-            }
-        }
-    }
+    let backend = crate::backend::get_backend(device);
+    backend.compute_normal_equation_multi(x, y, sample_weight, fit_intercept)
 }
 
-fn compute_normal_equation_multi_range(
+// Compute (X^T * W * X) and (X^T * W * Y) over row slice range [start_row..end_row]
+pub fn compute_normal_equation_multi_range(
     x: &Matrix,
     y: &Matrix,
     sample_weight: Option<&[f64]>,
     fit_intercept: bool,
     start_row: usize,
     end_row: usize,
-) -> Result<(Matrix, Matrix), String> {
+) -> OchreResult<(Matrix, Matrix)> {
     let p = if fit_intercept { x.cols + 1 } else { x.cols };
     let k_targets = y.cols;
     let mut xt_x = Matrix::zeros(p, p);
@@ -502,7 +297,7 @@ fn compute_normal_equation_multi_range(
                     for t in 0..k_targets {
                         xt_y.data[xt_y_last + t] += w * y_slice[t];
                     }
-                    xt_x.data[x.cols * p + x.cols] += w;
+                    xt_x[(x.cols, x.cols)] += w;
                 }
             }
         }
@@ -532,7 +327,7 @@ fn compute_normal_equation_multi_range(
                     for t in 0..k_targets {
                         xt_y.data[xt_y_last + t] += y_slice[t];
                     }
-                    xt_x.data[x.cols * p + x.cols] += 1.0;
+                    xt_x[(x.cols, x.cols)] += 1.0;
                 }
             }
         }
@@ -541,8 +336,8 @@ fn compute_normal_equation_multi_range(
     // Mirror upper triangle to lower triangle
     for j in 0..p {
         for k in (j + 1)..p {
-            let val = xt_x.data[j * p + k];
-            xt_x.data[k * p + j] = val;
+            let val = xt_x[(j, k)];
+            xt_x[(k, j)] = val;
         }
     }
 
@@ -550,13 +345,12 @@ fn compute_normal_equation_multi_range(
 }
 
 // Solve symmetric positive semi-definite linear system (A * theta = b) using Cholesky Decomposition (L * L^T)
-// 2x faster than Gauss-Jordan with O(1/3 * p^3) FLOPs and automated regularizer fallback (*≧ω≦*)
-pub fn solve_cholesky(a: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
+pub fn solve_cholesky(a: &Matrix, b: &[f64]) -> OchreResult<Vec<f64>> {
     if a.rows != a.cols {
-        return Err("Coefficient matrix A must be square (n x n) (´；ω；`)".to_string());
+        return Err(OchreError::NonSquareMatrix);
     }
     if a.rows != b.len() {
-        return Err("Constant vector b length must match row count of matrix A ( >_< )".to_string());
+        return Err(OchreError::VectorLengthMismatch);
     }
     let n = a.rows;
     if n == 0 {
@@ -572,22 +366,22 @@ pub fn solve_cholesky(a: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
             for j in 0..=i {
                 let mut sum = 0.0;
                 for k in 0..j {
-                    sum += l.get(i, k) * l.get(j, k);
+                    sum += l[(i, k)] * l[(j, k)];
                 }
                 if i == j {
-                    let diag = a.get(i, i) + lambda - sum;
+                    let diag = a[(i, i)] + lambda - sum;
                     if diag <= 1e-14 {
                         success = false;
                         break;
                     }
-                    l.set(i, i, diag.sqrt());
+                    l[(i, i)] = diag.sqrt();
                 } else {
-                    let lj_j = l.get(j, j);
+                    let lj_j = l[(j, j)];
                     if lj_j.abs() <= 1e-14 {
                         success = false;
                         break;
                     }
-                    l.set(i, j, (a.get(i, j) - sum) / lj_j);
+                    l[(i, j)] = (a[(i, j)] - sum) / lj_j;
                 }
             }
             if !success {
@@ -601,9 +395,9 @@ pub fn solve_cholesky(a: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
             for i in 0..n {
                 let mut sum = 0.0;
                 for k in 0..i {
-                    sum += l.get(i, k) * z[k];
+                    sum += l[(i, k)] * z[k];
                 }
-                z[i] = (b[i] - sum) / l.get(i, i);
+                z[i] = (b[i] - sum) / l[(i, i)];
             }
 
             // Backward substitution: L^T * theta = z
@@ -611,9 +405,9 @@ pub fn solve_cholesky(a: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
             for i in (0..n).rev() {
                 let mut sum = 0.0;
                 for k in (i + 1)..n {
-                    sum += l.get(k, i) * theta[k];
+                    sum += l[(k, i)] * theta[k];
                 }
-                theta[i] = (z[i] - sum) / l.get(i, i);
+                theta[i] = (z[i] - sum) / l[(i, i)];
             }
 
             return Ok(theta);
@@ -626,12 +420,12 @@ pub fn solve_cholesky(a: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
 
 // Solve multi-target symmetric positive semi-definite linear system (A * Theta = B)
 // Factorizes Cholesky L * L^T ONCE in O(1/3 * p^3) and solves K targets in O(K * p^2) (*≧ω≦*)
-pub fn solve_cholesky_multi(a: &Matrix, b: &Matrix) -> Result<Matrix, String> {
+pub fn solve_cholesky_multi(a: &Matrix, b: &Matrix) -> OchreResult<Matrix> {
     if a.rows != a.cols {
-        return Err("Coefficient matrix A must be square (n x n) (´；ω；`)".to_string());
+        return Err(OchreError::NonSquareMatrix);
     }
     if a.rows != b.rows {
-        return Err("Matrix B row count must match row count of matrix A ( >_< )".to_string());
+        return Err(OchreError::MatrixRowMismatch);
     }
     let n = a.rows;
     let k_targets = b.cols;
@@ -647,22 +441,22 @@ pub fn solve_cholesky_multi(a: &Matrix, b: &Matrix) -> Result<Matrix, String> {
             for j in 0..=i {
                 let mut sum = 0.0;
                 for k in 0..j {
-                    sum += l.get(i, k) * l.get(j, k);
+                    sum += l[(i, k)] * l[(j, k)];
                 }
                 if i == j {
-                    let diag = a.get(i, i) + lambda - sum;
+                    let diag = a[(i, i)] + lambda - sum;
                     if diag <= 1e-14 {
                         success = false;
                         break;
                     }
-                    l.set(i, i, diag.sqrt());
+                    l[(i, i)] = diag.sqrt();
                 } else {
-                    let lj_j = l.get(j, j);
+                    let lj_j = l[(j, j)];
                     if lj_j.abs() <= 1e-14 {
                         success = false;
                         break;
                     }
-                    l.set(i, j, (a.get(i, j) - sum) / lj_j);
+                    l[(i, j)] = (a[(i, j)] - sum) / lj_j;
                 }
             }
             if !success {
@@ -679,18 +473,18 @@ pub fn solve_cholesky_multi(a: &Matrix, b: &Matrix) -> Result<Matrix, String> {
                 for i in 0..n {
                     let mut sum = 0.0;
                     for k in 0..i {
-                        sum += l.get(i, k) * z[k];
+                        sum += l[(i, k)] * z[k];
                     }
-                    z[i] = (b.get(i, t) - sum) / l.get(i, i);
+                    z[i] = (b[(i, t)] - sum) / l[(i, i)];
                 }
 
                 // Backward substitution: L^T * theta[:, t] = z
                 for i in (0..n).rev() {
                     let mut sum = 0.0;
                     for k in (i + 1)..n {
-                        sum += l.get(k, i) * theta.get(k, t);
+                        sum += l[(k, i)] * theta[(k, t)];
                     }
-                    theta.set(i, t, (z[i] - sum) / l.get(i, i));
+                    theta[(i, t)] = (z[i] - sum) / l[(i, i)];
                 }
             }
 
@@ -703,24 +497,23 @@ pub fn solve_cholesky_multi(a: &Matrix, b: &Matrix) -> Result<Matrix, String> {
     let mut col_b = vec![0.0; n];
     for t in 0..k_targets {
         for i in 0..n {
-            col_b[i] = b.get(i, t);
+            col_b[i] = b[(i, t)];
         }
         let col_sol = solve_linear_system(a, &col_b)?;
         for i in 0..n {
-            theta.set(i, t, col_sol[i]);
+            theta[(i, t)] = col_sol[i];
         }
     }
     Ok(theta)
 }
 
 // Solve linear system A * x = b using Gauss-Jordan elimination with partial pivoting
-// Equipped with Tikhonov (Ridge) regularizer fallback when near-singular (*≧ω≦*)
-pub fn solve_linear_system(a: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
+pub fn solve_linear_system(a: &Matrix, b: &[f64]) -> OchreResult<Vec<f64>> {
     if a.rows != a.cols {
-        return Err("Coefficient matrix A must be square (n x n) (´；ω；`)".to_string());
+        return Err(OchreError::NonSquareMatrix);
     }
     if a.rows != b.len() {
-        return Err("Constant vector b length must match row count of matrix A ( >_< )".to_string());
+        return Err(OchreError::VectorLengthMismatch);
     }
 
     let n = a.rows;
@@ -735,18 +528,18 @@ pub fn solve_linear_system(a: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
             let mut regularized_a = a.clone();
             regularized_a.add_ridge_diagonal(1e-7);
             try_gauss_jordan(&regularized_a, b).map_err(|e| {
-                format!("Failed to solve linear system after numerical regularization: {} (T_T)", e)
+                OchreError::SolverRegularizationFailed(e.to_string())
             })
         }
     }
 }
 
-fn try_gauss_jordan(a: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
+fn try_gauss_jordan(a: &Matrix, b: &[f64]) -> OchreResult<Vec<f64>> {
     let n = a.rows;
     let mut aug = vec![0.0; n * (n + 1)];
     for r in 0..n {
         for c in 0..n {
-            aug[r * (n + 1) + c] = a.get(r, c);
+            aug[r * (n + 1) + c] = a[(r, c)];
         }
         aug[r * (n + 1) + n] = b[r];
     }
@@ -763,7 +556,7 @@ fn try_gauss_jordan(a: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
         }
 
         if max_val < 1e-12 {
-            return Err("Matrix is singular or near-singular at pivot (´-ω-`)".to_string());
+            return Err(OchreError::SingularMatrix("pivot absolute value < 1e-12".to_string()));
         }
 
         if pivot_row != col {
@@ -845,13 +638,13 @@ pub fn r2_score_multi(y_true: &Matrix, y_pred: &Matrix, sample_weight: Option<&[
                 for r in 0..rows {
                     let w = sw[r];
                     w_sum += w;
-                    wy_sum += w * y_true.get(r, t);
+                    wy_sum += w * y_true[(r, t)];
                 }
             }
             None => {
                 w_sum = rows as f64;
                 for r in 0..rows {
-                    wy_sum += y_true.get(r, t);
+                    wy_sum += y_true[(r, t)];
                 }
             }
         }
@@ -868,16 +661,16 @@ pub fn r2_score_multi(y_true: &Matrix, y_pred: &Matrix, sample_weight: Option<&[
             Some(sw) => {
                 for r in 0..rows {
                     let w = sw[r];
-                    let yt = y_true.get(r, t);
-                    let yp = y_pred.get(r, t);
+                    let yt = y_true[(r, t)];
+                    let yp = y_pred[(r, t)];
                     ss_tot += w * (yt - y_mean).powi(2);
                     ss_res += w * (yt - yp).powi(2);
                 }
             }
             None => {
                 for r in 0..rows {
-                    let yt = y_true.get(r, t);
-                    let yp = y_pred.get(r, t);
+                    let yt = y_true[(r, t)];
+                    let yp = y_pred[(r, t)];
                     ss_tot += (yt - y_mean).powi(2);
                     ss_res += (yt - yp).powi(2);
                 }
@@ -911,10 +704,10 @@ mod tests {
         ]).unwrap();
 
         let mul = m1.matmul(&m2).unwrap();
-        assert_eq!(mul.get(0, 0), 4.0);
-        assert_eq!(mul.get(0, 1), 4.0);
-        assert_eq!(mul.get(1, 0), 10.0);
-        assert_eq!(mul.get(1, 1), 8.0);
+        assert_eq!(mul[(0, 0)], 4.0);
+        assert_eq!(mul[(0, 1)], 4.0);
+        assert_eq!(mul[(1, 0)], 10.0);
+        assert_eq!(mul[(1, 1)], 8.0);
     }
 
     #[test]
@@ -948,8 +741,22 @@ mod tests {
         let m1 = Matrix::from_slice(2, 2, &data).unwrap();
         let m2 = Matrix::from_vec(2, 2, data).unwrap();
         assert_eq!(m1, m2);
-        assert_eq!(m1.get(0, 1), 2.0);
-        assert_eq!(m1.get(1, 0), 3.0);
+        assert_eq!(m1[(0, 1)], 2.0);
+        assert_eq!(m1[(1, 0)], 3.0);
+    }
+
+    #[test]
+    fn test_matrix_indexing() {
+        let mut m = Matrix::zeros(2, 2);
+        m[(0, 0)] = 5.0;
+        m[(0, 1)] = 3.0;
+        m[(1, 0)] = 2.0;
+        m[(1, 1)] = 8.0;
+
+        assert_eq!(m[(0, 0)], 5.0);
+        assert_eq!(m.get(0, 1), 3.0);
+        m[(0, 0)] += 10.0;
+        assert_eq!(m[(0, 0)], 15.0);
     }
 
     #[test]
@@ -968,12 +775,12 @@ mod tests {
         assert_eq!(xt_y_cpu.len(), 3);
 
         // Verify with manual calculation
-        assert_eq!(xt_x_cpu.get(0, 0), 35.0);
-        assert_eq!(xt_x_cpu.get(0, 1), 44.0);
-        assert_eq!(xt_x_cpu.get(1, 0), 44.0);
-        assert_eq!(xt_x_cpu.get(0, 2), 9.0);
-        assert_eq!(xt_x_cpu.get(2, 0), 9.0);
-        assert_eq!(xt_x_cpu.get(2, 2), 3.0);
+        assert_eq!(xt_x_cpu[(0, 0)], 35.0);
+        assert_eq!(xt_x_cpu[(0, 1)], 44.0);
+        assert_eq!(xt_x_cpu[(1, 0)], 44.0);
+        assert_eq!(xt_x_cpu[(0, 2)], 9.0);
+        assert_eq!(xt_x_cpu[(2, 0)], 9.0);
+        assert_eq!(xt_x_cpu[(2, 2)], 3.0);
         assert_eq!(xt_y_cpu[0], 22.0);
         assert_eq!(xt_y_cpu[2], 6.0);
 
