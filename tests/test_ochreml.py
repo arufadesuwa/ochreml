@@ -289,3 +289,100 @@ def test_dit_save_load_and_pickle(tmp_path):
         ochreml.save(lr, str(tmp_path / "bad_ext.pkl"))
     assert ".dit" in str(excinfo.value)
 
+
+def test_linear_regression_sample_weight_parity():
+    from sklearn.linear_model import LinearRegression as SklearnLR
+
+    rng = np.random.RandomState(42)
+    X = rng.randn(500, 8)
+    true_coef = rng.randn(8)
+    y = X @ true_coef + 2.5 + rng.randn(500) * 0.1
+    weights = rng.uniform(0.1, 10.0, size=500)
+
+    for fit_intercept in [True, False]:
+        ochre_lr = LinearRegression(fit_intercept=fit_intercept).fit(X, y, sample_weight=weights)
+        sk_lr = SklearnLR(fit_intercept=fit_intercept).fit(X, y, sample_weight=weights)
+
+        assert np.allclose(ochre_lr.coef_, sk_lr.coef_, atol=1e-10)
+        assert pytest.approx(float(ochre_lr.intercept_), abs=1e-10) == float(sk_lr.intercept_)
+        assert np.allclose(ochre_lr.predict(X), sk_lr.predict(X), atol=1e-10)
+        assert pytest.approx(ochre_lr.score(X, y, sample_weight=weights), abs=1e-10) == sk_lr.score(
+            X, y, sample_weight=weights
+        )
+
+
+def test_linear_regression_multi_output_parity():
+    from sklearn.linear_model import LinearRegression as SklearnLR
+
+    rng = np.random.RandomState(123)
+    X = rng.randn(400, 6)
+    true_W = rng.randn(6, 3)
+    true_b = np.array([1.5, -2.0, 0.75])
+    Y = X @ true_W + true_b + rng.randn(400, 3) * 0.05
+
+    for fit_intercept in [True, False]:
+        ochre_lr = LinearRegression(fit_intercept=fit_intercept).fit(X, Y)
+        sk_lr = SklearnLR(fit_intercept=fit_intercept).fit(X, Y)
+
+        assert ochre_lr.coef_.shape == sk_lr.coef_.shape == (3, 6)
+        assert np.allclose(ochre_lr.coef_, sk_lr.coef_, atol=1e-10)
+        if fit_intercept:
+            assert ochre_lr.intercept_.shape == sk_lr.intercept_.shape == (3,)
+            assert np.allclose(ochre_lr.intercept_, sk_lr.intercept_, atol=1e-10)
+
+        preds = ochre_lr.predict(X)
+        sk_preds = sk_lr.predict(X)
+        assert preds.shape == sk_preds.shape == (400, 3)
+        assert np.allclose(preds, sk_preds, atol=1e-10)
+        assert pytest.approx(ochre_lr.score(X, Y), abs=1e-10) == sk_lr.score(X, Y)
+
+
+def test_linear_regression_multi_output_with_weights_parity():
+    from sklearn.linear_model import LinearRegression as SklearnLR
+
+    rng = np.random.RandomState(777)
+    X = rng.randn(1200, 10)
+    Y = X @ rng.randn(10, 4) + np.array([3.0, -1.0, 0.5, 2.0]) + rng.randn(1200, 4) * 0.2
+    weights = rng.uniform(0.5, 5.0, size=1200)
+
+    ochre_lr = LinearRegression(fit_intercept=True).fit(X, Y, sample_weight=weights)
+    sk_lr = SklearnLR(fit_intercept=True).fit(X, Y, sample_weight=weights)
+
+    assert np.allclose(ochre_lr.coef_, sk_lr.coef_, atol=1e-10)
+    assert np.allclose(ochre_lr.intercept_, sk_lr.intercept_, atol=1e-10)
+    assert np.allclose(ochre_lr.predict(X), sk_lr.predict(X), atol=1e-10)
+    assert pytest.approx(ochre_lr.score(X, Y, sample_weight=weights), abs=1e-10) == sk_lr.score(
+        X, Y, sample_weight=weights
+    )
+
+
+def test_sample_weight_validation():
+    X = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    y = np.array([1.0, 2.0, 3.0])
+
+    with pytest.raises(ValueError) as excinfo:
+        LinearRegression().fit(X, y, sample_weight=np.array([1.0, -1.0, 2.0]))
+    assert "non-negative" in str(excinfo.value)
+
+    with pytest.raises(ValueError) as excinfo:
+        LinearRegression().fit(X, y, sample_weight=np.array([1.0, 2.0]))
+    assert "Sample weight length" in str(excinfo.value)
+
+
+def test_dit_save_load_multi_output(tmp_path):
+    import ochreml
+
+    X = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 3.0]])
+    Y = np.array([[3.0, 9.0], [4.0, 4.0], [6.0, 8.0], [14.0, 10.0]])
+    w = np.array([1.0, 2.0, 1.5, 3.0])
+
+    model = LinearRegression().fit(X, Y, sample_weight=w)
+    dit_path = str(tmp_path / "multi_lr.dit")
+    ochreml.save(model, dit_path)
+
+    loaded = ochreml.load(dit_path)
+    assert np.allclose(loaded.coef_, model.coef_)
+    assert np.allclose(loaded.intercept_, model.intercept_)
+    assert np.allclose(loaded.predict(X), model.predict(X))
+
+

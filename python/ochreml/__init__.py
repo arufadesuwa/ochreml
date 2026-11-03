@@ -7,7 +7,9 @@ Equipped with Zero-Copy Python Buffer Protocol and SIMD / Rayon solvers (o´∀�
 from typing import Any, Dict, List, Optional
 from ._utils import (
     process_features,
+    process_sample_weight,
     process_target,
+    process_target_multi,
     to_feature_matrix,
     to_target_vector,
 )
@@ -169,20 +171,33 @@ class LinearRegression:
             device=self.device,
         )
         self._coef_arr: Optional[Any] = None
-        self._intercept_val: float = 0.0
+        self._intercept_val: Any = 0.0
 
     def _sync_cache(self) -> None:
         try:
             import numpy as np
 
-            if self._model.coef_ is not None:
-                self._coef_arr = np.asarray(self._model.coef_, dtype=np.float64)
+            if self._model.is_multi_target_:
+                if self._model.coef_multi_ is not None:
+                    self._coef_arr = np.asarray(self._model.coef_multi_, dtype=np.float64)
+                else:
+                    self._coef_arr = None
+                if self._model.intercept_multi_ is not None:
+                    self._intercept_val = np.asarray(self._model.intercept_multi_, dtype=np.float64)
+                else:
+                    self._intercept_val = np.zeros(self._model.n_targets_, dtype=np.float64)
             else:
-                self._coef_arr = None
-            self._intercept_val = float(self._model.intercept_ or 0.0)
+                if self._model.coef_ is not None:
+                    self._coef_arr = np.asarray(self._model.coef_, dtype=np.float64)
+                else:
+                    self._coef_arr = None
+                self._intercept_val = float(self._model.intercept_ or 0.0)
         except Exception:
             self._coef_arr = None
-            self._intercept_val = float(self._model.intercept_ or 0.0)
+            if self._model.is_multi_target_:
+                self._intercept_val = self._model.intercept_multi_
+            else:
+                self._intercept_val = float(self._model.intercept_ or 0.0)
 
     @classmethod
     def _from_rust(cls, rust_model: _RustLinearRegression, device: str) -> "LinearRegression":
@@ -195,16 +210,18 @@ class LinearRegression:
         inst._sync_cache()
         return inst
 
-    def fit(self, X: Any, y: Any) -> "LinearRegression":
+    def fit(self, X: Any, y: Any, sample_weight: Optional[Any] = None) -> "LinearRegression":
         """
-        Fit linear model (*≧ω≦*)
+        Fit linear model with optional sample_weight and multi-output target support (*≧ω≦*)
 
         Parameters
         ----------
         X : array-like, nested list, pandas.DataFrame, polars.DataFrame
             Training feature matrix of shape (n_samples, n_features).
-        y : array-like, list, pandas.Series, polars.Series
-            Target values of shape (n_samples,).
+        y : array-like, list, pandas.Series, polars.Series, or 2D matrix
+            Target values of shape (n_samples,) or (n_samples, n_targets).
+        sample_weight : array-like of shape (n_samples,) or None, default=None
+            Individual weights for each sample.
 
         Returns
         -------
@@ -212,13 +229,20 @@ class LinearRegression:
             Fitted estimator instance.
         """
         is_buf_x, X_data = process_features(X)
-        is_buf_y, y_data = process_target(y)
-        if is_buf_x and is_buf_y:
-            self._model.fit_buffer(X_data, y_data)
+        is_buf_y, y_data, is_2d = process_target_multi(y)
+        is_buf_sw, sw_data = process_sample_weight(sample_weight)
+
+        if is_buf_x and is_buf_y and is_buf_sw:
+            self._model.fit_buffer(X_data, y_data, sw_data)
         else:
             X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
-            y_vec = to_target_vector(y_data) if is_buf_y else y_data
-            self._model.fit(X_mat, y_vec)
+            sw_list = sw_data.tolist() if (is_buf_sw and sw_data is not None) else sw_data
+            if is_2d:
+                y_mat = y_data.tolist() if is_buf_y else y_data
+                self._model.fit_multi(X_mat, y_mat, sw_list)
+            else:
+                y_vec = y_data.tolist() if is_buf_y else y_data
+                self._model.fit(X_mat, y_vec, sw_list)
 
         self._sync_cache()
         return self
@@ -235,27 +259,41 @@ class LinearRegression:
         Returns
         -------
         predictions : numpy.ndarray or list of float
-            Returns predicted values.
+            Returns predicted values of shape (n_samples,) or (n_samples, n_targets).
         """
         is_buf_x, X_data = process_features(X)
         if is_buf_x:
-            # Sub-millisecond direct BLAS Level 2 GEMV inference (*≧ω≦*)
+            # Sub-millisecond direct BLAS Level 2/3 GEMV/GEMM inference (*≧ω≦*)
             try:
                 import numpy as np
 
                 if self._coef_arr is not None:
-                    if X_data.shape[1] != self._coef_arr.shape[0]:
-                        raise ValueError(
-                            f"Number of features in test data ({X_data.shape[1]}) does not match model ({self._coef_arr.shape[0]}) (・`ω´・)"
-                        )
-                    return np.dot(X_data, self._coef_arr) + self._intercept_val
+                    if self._model.is_multi_target_:
+                        if X_data.shape[1] != self._coef_arr.shape[1]:
+                            raise ValueError(
+                                f"Number of features in test data ({X_data.shape[1]}) does not match model ({self._coef_arr.shape[1]}) (・`ω´・)"
+                            )
+                        return np.dot(X_data, self._coef_arr.T) + self._intercept_val
+                    else:
+                        if X_data.shape[1] != self._coef_arr.shape[0]:
+                            raise ValueError(
+                                f"Number of features in test data ({X_data.shape[1]}) does not match model ({self._coef_arr.shape[0]}) (・`ω´・)"
+                            )
+                        return np.dot(X_data, self._coef_arr) + self._intercept_val
             except ValueError:
                 raise
             except Exception:
                 pass
-            preds = self._model.predict_buffer(X_data)
+            if self._model.is_multi_target_:
+                X_mat = X_data.tolist()
+                preds = self._model.predict_multi(X_mat)
+            else:
+                preds = self._model.predict_buffer(X_data)
         else:
-            preds = self._model.predict(X_data)
+            if self._model.is_multi_target_:
+                preds = self._model.predict_multi(X_data)
+            else:
+                preds = self._model.predict(X_data)
         try:
             import numpy as np
 
@@ -263,29 +301,66 @@ class LinearRegression:
         except ImportError:
             return preds
 
-    def score(self, X: Any, y: Any) -> float:
+    def score(self, X: Any, y: Any, sample_weight: Optional[Any] = None) -> float:
         """
         Return the coefficient of determination R^2 of the prediction (*^▽^*)
+        Supports single-output, multi-output (uniform_average), and sample_weight.
         """
         try:
             import numpy as np
 
             preds = self.predict(X)
-            y_arr = np.asarray(y, dtype=np.float64).ravel()
-            u = np.sum((y_arr - preds) ** 2)
-            v = np.sum((y_arr - np.mean(y_arr)) ** 2)
-            if v <= 1e-15:
-                return 0.0
-            return float(1.0 - u / v)
+            _, y_data, _ = process_target_multi(y)
+            y_arr = np.asarray(y_data, dtype=np.float64)
+            if y_arr.ndim == 1:
+                y_arr = y_arr.reshape(-1, 1)
+            if preds.ndim == 1:
+                preds = preds.reshape(-1, 1)
+            if y_arr.shape != preds.shape:
+                raise ValueError(
+                    f"Target shape {y_arr.shape} does not match prediction shape {preds.shape} ( >_< )"
+                )
+
+            if sample_weight is not None:
+                _, sw_data = process_sample_weight(sample_weight)
+                sw = np.asarray(sw_data, dtype=np.float64).ravel()
+                if sw.shape[0] != y_arr.shape[0]:
+                    raise ValueError(
+                        f"Sample weight length ({sw.shape[0]}) must match test sample count ({y_arr.shape[0]}) ( >_< )"
+                    )
+                if np.any(sw < 0.0) or np.any(np.isnan(sw)):
+                    raise ValueError("Sample weights must be non-negative valid numbers (・`ω´・)")
+                sw_sum = np.sum(sw)
+                if sw_sum <= 0.0:
+                    raise ValueError("Sum of sample weights must be strictly positive (´；ω；`)")
+                sw_col = sw[:, None]
+                y_mean = np.sum(sw_col * y_arr, axis=0) / sw_sum
+                u = np.sum(sw_col * ((y_arr - preds) ** 2), axis=0)
+                v = np.sum(sw_col * ((y_arr - y_mean) ** 2), axis=0)
+            else:
+                y_mean = np.mean(y_arr, axis=0)
+                u = np.sum((y_arr - preds) ** 2, axis=0)
+                v = np.sum((y_arr - y_mean) ** 2, axis=0)
+
+            r2_cols = np.where(v <= 1e-12, np.where(u <= 1e-12, 1.0, 0.0), 1.0 - u / v)
+            return float(np.mean(r2_cols))
+        except ValueError:
+            raise
         except Exception:
             is_buf_x, X_data = process_features(X)
-            is_buf_y, y_data = process_target(y)
-            if is_buf_x and is_buf_y:
-                return self._model.score_buffer(X_data, y_data)
+            is_buf_y, y_data, is_2d = process_target_multi(y)
+            is_buf_sw, sw_data = process_sample_weight(sample_weight)
+            if is_buf_x and is_buf_y and is_buf_sw:
+                return self._model.score_buffer(X_data, y_data, sw_data)
             else:
                 X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
-                y_vec = to_target_vector(y_data) if is_buf_y else y_data
-                return self._model.score(X_mat, y_vec)
+                sw_list = sw_data.tolist() if (is_buf_sw and sw_data is not None) else sw_data
+                if is_2d:
+                    y_mat = y_data.tolist() if is_buf_y else y_data
+                    return self._model.score_multi(X_mat, y_mat, sw_list)
+                else:
+                    y_vec = y_data.tolist() if is_buf_y else y_data
+                    return self._model.score(X_mat, y_vec, sw_list)
 
     def save(self, path: str) -> None:
         self._model.save(_validate_dit_path(path))
@@ -314,11 +389,19 @@ class LinearRegression:
         self._sync_cache()
 
     @property
-    def coef_(self) -> Optional[List[float]]:
+    def coef_(self) -> Optional[Any]:
+        if self._coef_arr is not None:
+            return self._coef_arr
+        if self._model.is_multi_target_:
+            return self._model.coef_multi_
         return self._model.coef_
 
     @property
-    def intercept_(self) -> Optional[float]:
+    def intercept_(self) -> Optional[Any]:
+        if self._model.is_multi_target_:
+            if self._coef_arr is not None:
+                return self._intercept_val
+            return self._model.intercept_multi_
         return self._model.intercept_
 
     @property

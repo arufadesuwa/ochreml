@@ -315,6 +315,240 @@ fn compute_normal_equation_range(
     Ok((xt_x, xt_y))
 }
 
+// Compute weighted multi-target (X^T * W * X) and (X^T * W * Y) in a single streaming pass (*≧ω≦*)
+pub fn compute_normal_equation_mats_multi(
+    x: &Matrix,
+    y: &Matrix,
+    sample_weight: Option<&[f64]>,
+    fit_intercept: bool,
+    device: &crate::device::DeviceType,
+) -> Result<(Matrix, Matrix), String> {
+    if x.rows != y.rows {
+        return Err(format!(
+            "Row count ({}) must match target row count ({}) ( >_< )",
+            x.rows, y.rows
+        ));
+    }
+    if let Some(sw) = sample_weight {
+        if sw.len() != x.rows {
+            return Err(format!(
+                "Sample weight length ({}) must match sample count ({}) ( >_< )",
+                sw.len(),
+                x.rows
+            ));
+        }
+        let mut weight_sum = 0.0;
+        for &w in sw {
+            if w < 0.0 || w.is_nan() {
+                return Err("Sample weights must be non-negative valid numbers (・`ω´・)".to_string());
+            }
+            weight_sum += w;
+        }
+        if weight_sum <= 0.0 {
+            return Err("Sum of sample weights must be strictly positive (´；ω；`)".to_string());
+        }
+    }
+
+    let p = if fit_intercept { x.cols + 1 } else { x.cols };
+    let k_targets = y.cols;
+
+    match device {
+        crate::device::DeviceType::MultiGpu(gpu_ids) if gpu_ids.len() > 1 && x.rows >= gpu_ids.len() => {
+            let n_devices = gpu_ids.len();
+            let chunk_size = (x.rows + n_devices - 1) / n_devices;
+            let mut total_xt_x = Matrix::zeros(p, p);
+            let mut total_xt_y = Matrix::zeros(p, k_targets);
+
+            for d in 0..n_devices {
+                let start_row = d * chunk_size;
+                if start_row >= x.rows {
+                    break;
+                }
+                let end_row = (start_row + chunk_size).min(x.rows);
+                let (chunk_xt_x, chunk_xt_y) = compute_normal_equation_multi_range(
+                    x,
+                    y,
+                    sample_weight,
+                    fit_intercept,
+                    start_row,
+                    end_row,
+                )?;
+
+                for i in 0..(p * p) {
+                    total_xt_x.data[i] += chunk_xt_x.data[i];
+                }
+                for i in 0..(p * k_targets) {
+                    total_xt_y.data[i] += chunk_xt_y.data[i];
+                }
+            }
+            Ok((total_xt_x, total_xt_y))
+        }
+        crate::device::DeviceType::Tpu(_) => {
+            let block_size = 64;
+            let mut total_xt_x = Matrix::zeros(p, p);
+            let mut total_xt_y = Matrix::zeros(p, k_targets);
+
+            let mut start_row = 0;
+            while start_row < x.rows {
+                let end_row = (start_row + block_size).min(x.rows);
+                let (tile_xt_x, tile_xt_y) = compute_normal_equation_multi_range(
+                    x,
+                    y,
+                    sample_weight,
+                    fit_intercept,
+                    start_row,
+                    end_row,
+                )?;
+                for i in 0..(p * p) {
+                    total_xt_x.data[i] += tile_xt_x.data[i];
+                }
+                for i in 0..(p * k_targets) {
+                    total_xt_y.data[i] += tile_xt_y.data[i];
+                }
+                start_row = end_row;
+            }
+            Ok((total_xt_x, total_xt_y))
+        }
+        _ => {
+            if x.rows >= 1000 {
+                use rayon::prelude::*;
+                let num_threads = rayon::current_num_threads().max(1);
+                let chunk_size = (x.rows + num_threads - 1) / num_threads;
+                let chunks: Vec<(usize, usize)> = (0..num_threads)
+                    .map(|i| {
+                        let start = i * chunk_size;
+                        let end = (start + chunk_size).min(x.rows);
+                        (start, end)
+                    })
+                    .filter(|(start, end)| start < end)
+                    .collect();
+
+                let (total_xt_x, total_xt_y) = chunks
+                    .into_par_iter()
+                    .map(|(start, end)| {
+                        compute_normal_equation_multi_range(
+                            x,
+                            y,
+                            sample_weight,
+                            fit_intercept,
+                            start,
+                            end,
+                        )
+                    })
+                    .reduce(
+                        || Ok((Matrix::zeros(p, p), Matrix::zeros(p, k_targets))),
+                        |acc, chunk| {
+                            let (mut acc_m, mut acc_y) = acc?;
+                            let (chunk_m, chunk_y) = chunk?;
+                            for i in 0..(p * p) {
+                                acc_m.data[i] += chunk_m.data[i];
+                            }
+                            for i in 0..(p * k_targets) {
+                                acc_y.data[i] += chunk_y.data[i];
+                            }
+                            Ok((acc_m, acc_y))
+                        },
+                    )?;
+
+                Ok((total_xt_x, total_xt_y))
+            } else {
+                compute_normal_equation_multi_range(x, y, sample_weight, fit_intercept, 0, x.rows)
+            }
+        }
+    }
+}
+
+fn compute_normal_equation_multi_range(
+    x: &Matrix,
+    y: &Matrix,
+    sample_weight: Option<&[f64]>,
+    fit_intercept: bool,
+    start_row: usize,
+    end_row: usize,
+) -> Result<(Matrix, Matrix), String> {
+    let p = if fit_intercept { x.cols + 1 } else { x.cols };
+    let k_targets = y.cols;
+    let mut xt_x = Matrix::zeros(p, p);
+    let mut xt_y = Matrix::zeros(p, k_targets);
+
+    match sample_weight {
+        Some(sw) => {
+            for r in start_row..end_row {
+                let w = sw[r];
+                if w == 0.0 {
+                    continue;
+                }
+                let row_offset = r * x.cols;
+                let row_slice = &x.data[row_offset..row_offset + x.cols];
+                let y_offset = r * k_targets;
+                let y_slice = &y.data[y_offset..y_offset + k_targets];
+
+                for j in 0..x.cols {
+                    let w_xj = w * row_slice[j];
+                    let xt_y_row = j * k_targets;
+                    for t in 0..k_targets {
+                        xt_y.data[xt_y_row + t] += w_xj * y_slice[t];
+                    }
+                    let xt_x_row = j * p;
+                    for k in j..x.cols {
+                        xt_x.data[xt_x_row + k] += w_xj * row_slice[k];
+                    }
+                    if fit_intercept {
+                        xt_x.data[xt_x_row + x.cols] += w_xj;
+                    }
+                }
+                if fit_intercept {
+                    let xt_y_last = x.cols * k_targets;
+                    for t in 0..k_targets {
+                        xt_y.data[xt_y_last + t] += w * y_slice[t];
+                    }
+                    xt_x.data[x.cols * p + x.cols] += w;
+                }
+            }
+        }
+        None => {
+            for r in start_row..end_row {
+                let row_offset = r * x.cols;
+                let row_slice = &x.data[row_offset..row_offset + x.cols];
+                let y_offset = r * k_targets;
+                let y_slice = &y.data[y_offset..y_offset + k_targets];
+
+                for j in 0..x.cols {
+                    let xj = row_slice[j];
+                    let xt_y_row = j * k_targets;
+                    for t in 0..k_targets {
+                        xt_y.data[xt_y_row + t] += xj * y_slice[t];
+                    }
+                    let xt_x_row = j * p;
+                    for k in j..x.cols {
+                        xt_x.data[xt_x_row + k] += xj * row_slice[k];
+                    }
+                    if fit_intercept {
+                        xt_x.data[xt_x_row + x.cols] += xj;
+                    }
+                }
+                if fit_intercept {
+                    let xt_y_last = x.cols * k_targets;
+                    for t in 0..k_targets {
+                        xt_y.data[xt_y_last + t] += y_slice[t];
+                    }
+                    xt_x.data[x.cols * p + x.cols] += 1.0;
+                }
+            }
+        }
+    }
+
+    // Mirror upper triangle to lower triangle
+    for j in 0..p {
+        for k in (j + 1)..p {
+            let val = xt_x.data[j * p + k];
+            xt_x.data[k * p + j] = val;
+        }
+    }
+
+    Ok((xt_x, xt_y))
+}
+
 // Solve symmetric positive semi-definite linear system (A * theta = b) using Cholesky Decomposition (L * L^T)
 // 2x faster than Gauss-Jordan with O(1/3 * p^3) FLOPs and automated regularizer fallback (*≧ω≦*)
 pub fn solve_cholesky(a: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
@@ -388,6 +622,95 @@ pub fn solve_cholesky(a: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
 
     // Fallback to Gauss-Jordan elimination if matrix is severely rank-deficient
     solve_linear_system(a, b)
+}
+
+// Solve multi-target symmetric positive semi-definite linear system (A * Theta = B)
+// Factorizes Cholesky L * L^T ONCE in O(1/3 * p^3) and solves K targets in O(K * p^2) (*≧ω≦*)
+pub fn solve_cholesky_multi(a: &Matrix, b: &Matrix) -> Result<Matrix, String> {
+    if a.rows != a.cols {
+        return Err("Coefficient matrix A must be square (n x n) (´；ω；`)".to_string());
+    }
+    if a.rows != b.rows {
+        return Err("Matrix B row count must match row count of matrix A ( >_< )".to_string());
+    }
+    let n = a.rows;
+    let k_targets = b.cols;
+    if n == 0 || k_targets == 0 {
+        return Ok(Matrix::zeros(n, k_targets));
+    }
+
+    for &lambda in &[0.0, 1e-12, 1e-9, 1e-6, 1e-3] {
+        let mut l = Matrix::zeros(n, n);
+        let mut success = true;
+
+        for i in 0..n {
+            for j in 0..=i {
+                let mut sum = 0.0;
+                for k in 0..j {
+                    sum += l.get(i, k) * l.get(j, k);
+                }
+                if i == j {
+                    let diag = a.get(i, i) + lambda - sum;
+                    if diag <= 1e-14 {
+                        success = false;
+                        break;
+                    }
+                    l.set(i, i, diag.sqrt());
+                } else {
+                    let lj_j = l.get(j, j);
+                    if lj_j.abs() <= 1e-14 {
+                        success = false;
+                        break;
+                    }
+                    l.set(i, j, (a.get(i, j) - sum) / lj_j);
+                }
+            }
+            if !success {
+                break;
+            }
+        }
+
+        if success {
+            let mut theta = Matrix::zeros(n, k_targets);
+            let mut z = vec![0.0; n];
+
+            for t in 0..k_targets {
+                // Forward substitution: L * z = B[:, t]
+                for i in 0..n {
+                    let mut sum = 0.0;
+                    for k in 0..i {
+                        sum += l.get(i, k) * z[k];
+                    }
+                    z[i] = (b.get(i, t) - sum) / l.get(i, i);
+                }
+
+                // Backward substitution: L^T * theta[:, t] = z
+                for i in (0..n).rev() {
+                    let mut sum = 0.0;
+                    for k in (i + 1)..n {
+                        sum += l.get(k, i) * theta.get(k, t);
+                    }
+                    theta.set(i, t, (z[i] - sum) / l.get(i, i));
+                }
+            }
+
+            return Ok(theta);
+        }
+    }
+
+    // Fallback: solve each column via Gauss-Jordan elimination
+    let mut theta = Matrix::zeros(n, k_targets);
+    let mut col_b = vec![0.0; n];
+    for t in 0..k_targets {
+        for i in 0..n {
+            col_b[i] = b.get(i, t);
+        }
+        let col_sol = solve_linear_system(a, &col_b)?;
+        for i in 0..n {
+            theta.set(i, t, col_sol[i]);
+        }
+    }
+    Ok(theta)
 }
 
 // Solve linear system A * x = b using Gauss-Jordan elimination with partial pivoting
@@ -501,6 +824,75 @@ pub fn r2_score(y_true: &[f64], y_pred: &[f64]) -> f64 {
         return 1.0;
     }
     1.0 - (ss_res / ss_tot)
+}
+
+// Calculate multi-output weighted R^2 score (uniform_average matching Scikit-Learn) (＾▽＾)
+pub fn r2_score_multi(y_true: &Matrix, y_pred: &Matrix, sample_weight: Option<&[f64]>) -> f64 {
+    if y_true.rows != y_pred.rows || y_true.cols != y_pred.cols || y_true.rows == 0 || y_true.cols == 0 {
+        return 0.0;
+    }
+    let rows = y_true.rows;
+    let cols = y_true.cols;
+
+    let mut total_r2 = 0.0;
+
+    for t in 0..cols {
+        let mut w_sum = 0.0;
+        let mut wy_sum = 0.0;
+
+        match sample_weight {
+            Some(sw) => {
+                for r in 0..rows {
+                    let w = sw[r];
+                    w_sum += w;
+                    wy_sum += w * y_true.get(r, t);
+                }
+            }
+            None => {
+                w_sum = rows as f64;
+                for r in 0..rows {
+                    wy_sum += y_true.get(r, t);
+                }
+            }
+        }
+
+        if w_sum <= 0.0 {
+            continue;
+        }
+        let y_mean = wy_sum / w_sum;
+
+        let mut ss_tot = 0.0;
+        let mut ss_res = 0.0;
+
+        match sample_weight {
+            Some(sw) => {
+                for r in 0..rows {
+                    let w = sw[r];
+                    let yt = y_true.get(r, t);
+                    let yp = y_pred.get(r, t);
+                    ss_tot += w * (yt - y_mean).powi(2);
+                    ss_res += w * (yt - yp).powi(2);
+                }
+            }
+            None => {
+                for r in 0..rows {
+                    let yt = y_true.get(r, t);
+                    let yp = y_pred.get(r, t);
+                    ss_tot += (yt - y_mean).powi(2);
+                    ss_res += (yt - yp).powi(2);
+                }
+            }
+        }
+
+        let r2_t = if ss_tot.abs() < 1e-12 {
+            if ss_res.abs() < 1e-12 { 1.0 } else { 0.0 }
+        } else {
+            1.0 - (ss_res / ss_tot)
+        };
+        total_r2 += r2_t;
+    }
+
+    total_r2 / (cols as f64)
 }
 
 #[cfg(test)]

@@ -263,6 +263,18 @@ impl LinearRegression {
         write_opt_f64_vec(&mut buf, &self.coef_);
         write_opt_f64(&mut buf, self.intercept_);
         write_opt_usize(&mut buf, self.n_features_in_);
+        write_bool(&mut buf, self.is_multi_target_);
+        write_usize(&mut buf, self.n_targets_);
+        match &self.coef_multi_ {
+            Some(m) => {
+                write_u8(&mut buf, 1);
+                write_usize(&mut buf, m.rows);
+                write_usize(&mut buf, m.cols);
+                write_f64_vec(&mut buf, &m.data);
+            }
+            None => write_u8(&mut buf, 0),
+        }
+        write_opt_f64_vec(&mut buf, &self.intercept_multi_);
         buf
     }
 
@@ -280,12 +292,39 @@ impl LinearRegression {
         } else {
             None
         };
+
+        let (is_multi_target_, n_targets_, coef_multi_, intercept_multi_) = if r.pos < r.data.len() {
+            let is_multi = r.read_bool()?;
+            let n_targets = r.read_usize()?;
+            let coef_multi = if r.read_bool()? {
+                let rows = r.read_usize()?;
+                let cols = r.read_usize()?;
+                let data = r.read_f64_vec()?;
+                Some(Matrix::from_vec(rows, cols, data)?)
+            } else {
+                None
+            };
+            let intercept_multi = r.read_opt_f64_vec()?;
+            (is_multi, n_targets, coef_multi, intercept_multi)
+        } else {
+            let coef_multi = match &coef_ {
+                Some(c) => Some(Matrix::from_vec(1, c.len(), c.clone())?),
+                None => None,
+            };
+            let intercept_multi = intercept_.map(|v| vec![v]);
+            (false, 1, coef_multi, intercept_multi)
+        };
+
         Ok(Self {
             fit_intercept,
             device: dev,
             device_,
             coef_,
             intercept_,
+            coef_multi_,
+            intercept_multi_,
+            is_multi_target_,
+            n_targets_,
             n_features_in_,
         })
     }
@@ -449,6 +488,40 @@ fn buffer_to_target_vector(py: Python<'_>, y: &pyo3::buffer::PyBuffer<f64>) -> P
     Ok(data)
 }
 
+fn buffer_to_target_matrix(py: Python<'_>, y: &pyo3::buffer::PyBuffer<f64>) -> PyResult<(Matrix, bool)> {
+    let shape = y.shape();
+    let (rows, cols, is_2d) = if shape.len() == 1 {
+        (shape[0], 1, false)
+    } else if shape.len() == 2 {
+        (shape[0], shape[1], true)
+    } else {
+        return Err(PyValueError::new_err(format!(
+            "Target y must be a 1D vector or 2D matrix (n_samples, n_targets), got {}D (・`ω´・)",
+            shape.len()
+        )));
+    };
+    let mut data = vec![0.0; rows * cols];
+    y.copy_to_slice(py, &mut data)
+        .map_err(|e| PyValueError::new_err(format!("Failed to copy target buffer: {} (´；ω；`)", e)))?;
+    let mat = Matrix::from_vec(rows, cols, data).map_err(PyValueError::new_err)?;
+    Ok((mat, is_2d))
+}
+
+fn buffer_to_sample_weight(py: Python<'_>, sw: &pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
+    let shape = sw.shape();
+    if shape.len() != 1 {
+        return Err(PyValueError::new_err(format!(
+            "sample_weight must be a 1D vector (n_samples,), got {}D ( >_< )",
+            shape.len()
+        )));
+    }
+    let count = sw.item_count();
+    let mut data = vec![0.0; count];
+    sw.copy_to_slice(py, &mut data)
+        .map_err(|e| PyValueError::new_err(format!("Failed to copy sample_weight buffer: {} (´；ω；`)", e)))?;
+    Ok(data)
+}
+
 #[pyclass(from_py_object, name = "LinearRegression")]
 #[derive(Clone)]
 pub struct PyLinearRegression {
@@ -464,21 +537,52 @@ impl PyLinearRegression {
         Ok(Self { inner })
     }
 
-    pub fn fit(&mut self, x: Vec<Vec<f64>>, y: Vec<f64>) -> PyResult<()> {
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn fit(
+        &mut self,
+        x: Vec<Vec<f64>>,
+        y: Vec<f64>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<()> {
         let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
-        self.inner.fit(&mat, &y).map_err(PyValueError::new_err)?;
+        self.inner
+            .fit_weighted_1d(&mat, &y, sample_weight.as_deref())
+            .map_err(PyValueError::new_err)?;
         Ok(())
     }
 
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn fit_multi(
+        &mut self,
+        x: Vec<Vec<f64>>,
+        y: Vec<Vec<f64>>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<()> {
+        let x_mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
+        let y_mat = Matrix::from_2d(&y).map_err(PyValueError::new_err)?;
+        self.inner
+            .fit_multi(&x_mat, &y_mat, sample_weight.as_deref(), true)
+            .map_err(PyValueError::new_err)?;
+        Ok(())
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
     pub fn fit_buffer(
         &mut self,
         py: Python<'_>,
         x: pyo3::buffer::PyBuffer<f64>,
         y: pyo3::buffer::PyBuffer<f64>,
+        sample_weight: Option<pyo3::buffer::PyBuffer<f64>>,
     ) -> PyResult<()> {
         let mat = buffer_to_matrix(py, &x)?;
-        let target = buffer_to_target_vector(py, &y)?;
-        self.inner.fit(&mat, &target).map_err(PyValueError::new_err)?;
+        let (target_mat, is_2d) = buffer_to_target_matrix(py, &y)?;
+        let sw_vec = match sample_weight {
+            Some(ref sw_buf) => Some(buffer_to_sample_weight(py, sw_buf)?),
+            None => None,
+        };
+        self.inner
+            .fit_multi(&mat, &target_mat, sw_vec.as_deref(), is_2d)
+            .map_err(PyValueError::new_err)?;
         Ok(())
     }
 
@@ -487,25 +591,70 @@ impl PyLinearRegression {
         self.inner.predict(&mat).map_err(PyValueError::new_err)
     }
 
+    pub fn predict_multi(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<Vec<f64>>> {
+        let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
+        let preds = self.inner.predict_multi(&mat).map_err(PyValueError::new_err)?;
+        let mut out = Vec::with_capacity(preds.rows);
+        for r in 0..preds.rows {
+            let offset = r * preds.cols;
+            out.push(preds.data[offset..offset + preds.cols].to_vec());
+        }
+        Ok(out)
+    }
+
     pub fn predict_buffer(&self, py: Python<'_>, x: pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
         let mat = buffer_to_matrix(py, &x)?;
         self.inner.predict(&mat).map_err(PyValueError::new_err)
     }
 
-    pub fn score(&self, x: Vec<Vec<f64>>, y: Vec<f64>) -> PyResult<f64> {
-        let mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
-        self.inner.score(&mat, &y).map_err(PyValueError::new_err)
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn score(
+        &self,
+        x: Vec<Vec<f64>>,
+        y: Vec<f64>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<f64> {
+        let x_mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
+        if sample_weight.is_none() && !self.inner.is_multi_target_ {
+            return self.inner.score(&x_mat, &y).map_err(PyValueError::new_err);
+        }
+        let y_mat = Matrix::from_vec(y.len(), 1, y).map_err(PyValueError::new_err)?;
+        self.inner
+            .score_multi(&x_mat, &y_mat, sample_weight.as_deref())
+            .map_err(PyValueError::new_err)
     }
 
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn score_multi(
+        &self,
+        x: Vec<Vec<f64>>,
+        y: Vec<Vec<f64>>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<f64> {
+        let x_mat = Matrix::from_2d(&x).map_err(PyValueError::new_err)?;
+        let y_mat = Matrix::from_2d(&y).map_err(PyValueError::new_err)?;
+        self.inner
+            .score_multi(&x_mat, &y_mat, sample_weight.as_deref())
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
     pub fn score_buffer(
         &self,
         py: Python<'_>,
         x: pyo3::buffer::PyBuffer<f64>,
         y: pyo3::buffer::PyBuffer<f64>,
+        sample_weight: Option<pyo3::buffer::PyBuffer<f64>>,
     ) -> PyResult<f64> {
-        let mat = buffer_to_matrix(py, &x)?;
-        let target = buffer_to_target_vector(py, &y)?;
-        self.inner.score(&mat, &target).map_err(PyValueError::new_err)
+        let x_mat = buffer_to_matrix(py, &x)?;
+        let (y_mat, _) = buffer_to_target_matrix(py, &y)?;
+        let sw_vec = match sample_weight {
+            Some(ref sw_buf) => Some(buffer_to_sample_weight(py, sw_buf)?),
+            None => None,
+        };
+        self.inner
+            .score_multi(&x_mat, &y_mat, sw_vec.as_deref())
+            .map_err(PyValueError::new_err)
     }
 
     pub fn save(&self, path: &str) -> PyResult<()> {
@@ -560,8 +709,35 @@ impl PyLinearRegression {
     }
 
     #[getter]
+    pub fn coef_multi_(&self) -> Option<Vec<Vec<f64>>> {
+        self.inner.coef_multi_.as_ref().map(|m| {
+            let mut out = Vec::with_capacity(m.rows);
+            for r in 0..m.rows {
+                let offset = r * m.cols;
+                out.push(m.data[offset..offset + m.cols].to_vec());
+            }
+            out
+        })
+    }
+
+    #[getter]
     pub fn intercept_(&self) -> Option<f64> {
         self.inner.intercept_
+    }
+
+    #[getter]
+    pub fn intercept_multi_(&self) -> Option<Vec<f64>> {
+        self.inner.intercept_multi_.clone()
+    }
+
+    #[getter]
+    pub fn is_multi_target_(&self) -> bool {
+        self.inner.is_multi_target_
+    }
+
+    #[getter]
+    pub fn n_targets_(&self) -> usize {
+        self.inner.n_targets_
     }
 
     #[getter]

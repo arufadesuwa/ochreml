@@ -27,9 +27,11 @@ OchreML is a high-performance classical Machine Learning library written in Rust
      - **Pandas DataFrames & Series** (`pandas.DataFrame`, `pandas.Series`)
      - **Polars DataFrames & Series** (`polars.DataFrame`, `polars.Series`)
 
-4. **Scikit-Learn Compatible API** (＾▽＾)
-   - Standard estimator methods: `fit(X, y)`, `predict(X)`, and `score(X, y)`.
-   - Inspection attributes: `coef_`, `intercept_`, `classes_`, `device_`, and `n_features_in_`.
+4. **Scikit-Learn Compatible API & Multi-Output Support** (＾▽＾)
+   - Standard estimator methods: `fit(X, y, sample_weight=None)`, `predict(X)`, and `score(X, y, sample_weight=None)`.
+   - Native support for **Multi-Output Regression** ($Y \in \mathbb{R}^{N \times K}$) with one-time Cholesky factorization.
+   - Individual sample weighting (`sample_weight`) with zero-copy streaming accumulation.
+   - Standard inspection attributes: `coef_`, `intercept_`, `classes_`, `device_`, and `n_features_in_`.
 
 ---
 
@@ -39,7 +41,7 @@ OchreML is a high-performance classical Machine Learning library written in Rust
 
 | Model | Module | Primary Algorithm & Characteristics |
 | :--- | :--- | :--- |
-| **`LinearRegression`** | `ochreml.LinearRegression` | Analytical Ordinary Least Squares (OLS) via Normal Equation $(X^T X)^{-1} X^T y$ with automated Tikhonov Ridge fallback. |
+| **`LinearRegression`** | `ochreml.LinearRegression` | Analytical Ordinary & Weighted Least Squares (OLS/WLS) via $(X^T W X)^{-1} X^T W Y$ with single-pass Cholesky factorization, Multi-Output ($N \times K$) support, and automated Tikhonov Ridge fallback. |
 | **`DecisionTreeClassifier`** | `ochreml.DecisionTreeClassifier` | Optimized CART classification tree supporting both **Gini Impurity** and **Entropy** splitting criteria with sliding histograms. |
 | **`DecisionTreeRegressor`** | `ochreml.DecisionTreeRegressor` | Fast non-linear regression tree minimizing **Mean Squared Error (MSE / Variance Reduction)** with $O(1)$ running sum variance updates. |
 
@@ -64,11 +66,20 @@ Comprehensive benchmark comparing OchreML's pure Rust engine (with Zero-Copy Pyt
 
 | Metric | OchreML (Rust) | Scikit-Learn | Ratio / Parity |
 | :--- | :--- | :--- | :--- |
-| **Fit Time** | **2.40 ms** | 11.53 ms | **4.81x FASTER** (*≧ω≦*) |
-| **Predict Time** | **0.12 ms** | 0.40 ms | **3.33x FASTER** (o´∀｀o) |
+| **Fit Time** | **2.42 ms** | 8.34 ms | **3.45x FASTER** (*≧ω≦*) |
+| **Predict Time** | **0.10 ms** | 0.32 ms | **3.20x FASTER** (o´∀｀o) |
 | **Test $R^2$ Score** | **0.9980** | 0.9980 | Max coef diff: $7.11 \times 10^{-15}$ |
 
-### 2. Decision Tree Classifier (`criterion="gini"`, `max_depth=5`)
+### 2. Multi-Output & Sample Weight Regression (OLS)
+*Dataset: 20,000 samples (16,000 train, 4,000 test), 10 features, 4 targets with sample_weight*
+
+| Metric | OchreML (Rust) | Scikit-Learn | Ratio / Parity |
+| :--- | :--- | :--- | :--- |
+| **Fit Time** | **3.46 ms** | 8.20 ms | **2.37x FASTER** (*^▽^*) |
+| **Predict Time** | **0.20 ms** | 0.38 ms | **1.90x FASTER** (o´∀｀o) |
+| **Weighted Test $R^2$** | **0.9988** | 0.9988 | Max coef diff: $8.88 \times 10^{-15}$ |
+
+### 3. Decision Tree Classifier (`criterion="gini"`, `max_depth=5`)
 *Dataset: 2,500 samples (2,000 train, 500 test), 8 features*
 
 | Metric | OchreML (Rust) | Scikit-Learn | Ratio / Parity |
@@ -77,7 +88,7 @@ Comprehensive benchmark comparing OchreML's pure Rust engine (with Zero-Copy Pyt
 | **Predict Time** | **0.10 ms** | 0.40 ms | **4.00x FASTER** |
 | **Test Accuracy** | **92.40 %** | 92.40 % | Identical Parity |
 
-### 3. Decision Tree Regressor (`criterion="squared_error"`, `max_depth=5`)
+### 4. Decision Tree Regressor (`criterion="squared_error"`, `max_depth=5`)
 *Dataset: 2,500 samples (2,000 train, 500 test), 6 features*
 
 | Metric | OchreML (Rust) | Scikit-Learn | Ratio / Parity |
