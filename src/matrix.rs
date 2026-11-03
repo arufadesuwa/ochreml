@@ -13,14 +13,14 @@ pub struct Matrix {
 
 impl Index<(usize, usize)> for Matrix {
     type Output = f64;
-    #[inline]
+    #[inline(always)]
     fn index(&self, (r, c): (usize, usize)) -> &Self::Output {
         &self.data[r * self.cols + c]
     }
 }
 
 impl IndexMut<(usize, usize)> for Matrix {
-    #[inline]
+    #[inline(always)]
     fn index_mut(&mut self, (r, c): (usize, usize)) -> &mut Self::Output {
         &mut self.data[r * self.cols + c]
     }
@@ -202,13 +202,58 @@ pub fn compute_normal_equation_mats(
         });
     }
 
-    let y_mat = Matrix::from_slice(y.len(), 1, y)?;
-    let (xt_x, xt_y_mat) = compute_normal_equation_mats_multi(x, &y_mat, None, fit_intercept, device)?;
+    let backend = crate::backend::get_backend(device);
+    backend.compute_normal_equation(x, y, fit_intercept)
+}
 
+// Compute (X^T * X) and (X^T * y) over a slice range [start_row..end_row] for 1D target (Zero-allocation scalar loop)
+#[inline]
+pub fn compute_normal_equation_range(
+    x: &Matrix,
+    y: &[f64],
+    fit_intercept: bool,
+    start_row: usize,
+    end_row: usize,
+) -> OchreResult<(Matrix, Vec<f64>)> {
     let p = if fit_intercept { x.cols + 1 } else { x.cols };
+    let mut xt_x = Matrix::zeros(p, p);
     let mut xt_y = vec![0.0; p];
-    for i in 0..p {
-        xt_y[i] = xt_y_mat[(i, 0)];
+
+    for r in start_row..end_row {
+        let yr = y[r];
+        let row_offset = r * x.cols;
+        let row_slice = &x.data[row_offset..row_offset + x.cols];
+
+        if fit_intercept {
+            for j in 0..x.cols {
+                let xj = row_slice[j];
+                xt_y[j] += xj * yr;
+                let xt_x_row = j * p;
+                for k in j..x.cols {
+                    xt_x.data[xt_x_row + k] += xj * row_slice[k];
+                }
+                xt_x.data[xt_x_row + x.cols] += xj;
+            }
+            xt_y[x.cols] += yr;
+            xt_x.data[x.cols * p + x.cols] += 1.0;
+        } else {
+            for j in 0..x.cols {
+                let xj = row_slice[j];
+                xt_y[j] += xj * yr;
+                let xt_x_row = j * p;
+                for k in j..x.cols {
+                    xt_x.data[xt_x_row + k] += xj * row_slice[k];
+                }
+            }
+        }
+    }
+
+    // Mirror upper triangle to lower triangle
+    for j in 0..p {
+        for k in (j + 1)..p {
+            let val = xt_x.data[j * p + k];
+            xt_x.data[k * p + j] = val;
+        }
     }
 
     Ok((xt_x, xt_y))
