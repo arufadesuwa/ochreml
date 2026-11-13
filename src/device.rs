@@ -327,6 +327,23 @@ pub fn get_device_info_map() -> HashMap<String, String> {
         map.insert("wgpu_adapter".to_string(), "None".to_string());
     }
 
+    #[cfg(feature = "tpu-pjrt")]
+    {
+        map.insert(
+            "tpu_native_ready".to_string(),
+            crate::backends::tpu::is_available().to_string(),
+        );
+        map.insert(
+            "tpu_runtime".to_string(),
+            crate::backends::tpu::tpu_info_string().unwrap_or_else(|| "None".to_string()),
+        );
+    }
+    #[cfg(not(feature = "tpu-pjrt"))]
+    {
+        map.insert("tpu_native_ready".to_string(), "false".to_string());
+        map.insert("tpu_runtime".to_string(), "None".to_string());
+    }
+
     map
 }
 

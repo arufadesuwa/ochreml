@@ -64,6 +64,13 @@ impl<'a> Backend<'a> {
             }
         }
 
+        #[cfg(feature = "tpu-pjrt")]
+        if let Backend::Tpu(id) = self {
+            if let Some(res) = crate::backends::tpu::tpu_matmul(*id, a, b) {
+                return res;
+            }
+        }
+
         a.matmul(b)
     }
 
@@ -99,6 +106,13 @@ impl<'a> Backend<'a> {
             }
         }
 
+        #[cfg(feature = "tpu-pjrt")]
+        if let Backend::Tpu(id) = self {
+            if let Some(res) = crate::backends::tpu::tpu_matmul_at_b(*id, a, b) {
+                return res;
+            }
+        }
+
         cpu_matmul_at_b(a, b)
     }
 
@@ -130,6 +144,13 @@ impl<'a> Backend<'a> {
         #[cfg(feature = "wgpu-backend")]
         if matches!(self, Backend::Wgpu) {
             if let Some(res) = crate::backends::wgpu_gpu::wgpu_matvec(a, v) {
+                return res;
+            }
+        }
+
+        #[cfg(feature = "tpu-pjrt")]
+        if let Backend::Tpu(id) = self {
+            if let Some(res) = crate::backends::tpu::tpu_matvec(*id, a, v) {
                 return res;
             }
         }
@@ -202,7 +223,14 @@ impl<'a> Backend<'a> {
                 }
                 Ok((total_xt_x, total_xt_y))
             }
-            Backend::Tpu(_) => {
+            Backend::Tpu(_id) => {
+                #[cfg(feature = "tpu-pjrt")]
+                if let Some(res) =
+                    crate::backends::tpu::tpu_compute_normal_equation(*_id, x, y, fit_intercept)
+                {
+                    return res;
+                }
+
                 let block_size = 64;
                 let mut total_xt_x = Matrix::zeros(p, p);
                 let mut total_xt_y = vec![0.0; p];
@@ -310,7 +338,18 @@ impl<'a> Backend<'a> {
                 }
                 Ok((total_xt_x, total_xt_y))
             }
-            Backend::Tpu(_) => {
+            Backend::Tpu(_id) => {
+                #[cfg(feature = "tpu-pjrt")]
+                if let Some(res) = crate::backends::tpu::tpu_compute_normal_equation_multi(
+                    *_id,
+                    x,
+                    y,
+                    sample_weight,
+                    fit_intercept,
+                ) {
+                    return res;
+                }
+
                 let block_size = 64;
                 let mut total_xt_x = Matrix::zeros(p, p);
                 let mut total_xt_y = Matrix::zeros(p, k_targets);

@@ -7,3 +7,6 @@ pub mod cuda;
 #[cfg(feature = "wgpu-backend")]
 pub mod wgpu_gpu;
 
+#[cfg(feature = "tpu-pjrt")]
+pub mod tpu;
+
