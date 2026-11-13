@@ -4,3 +4,6 @@
 #[cfg(feature = "cuda-dynamic")]
 pub mod cuda;
 
+#[cfg(feature = "wgpu-backend")]
+pub mod wgpu_gpu;
+

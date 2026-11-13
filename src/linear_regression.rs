@@ -69,7 +69,15 @@ impl LinearRegression {
         self.n_targets_ = 1;
 
         let (xt_x, xt_y) = compute_normal_equation_mats(x, y, self.fit_intercept, &self.device)?;
-        let theta = solve_cholesky(&xt_x, &xt_y)?;
+        let theta = match solve_cholesky(&xt_x, &xt_y) {
+            Ok(t) => t,
+            Err(_) if self.device == DeviceType::Wgpu => {
+                let (cpu_xtx, cpu_xty) =
+                    compute_normal_equation_mats(x, y, self.fit_intercept, &DeviceType::Cpu)?;
+                solve_cholesky(&cpu_xtx, &cpu_xty)?
+            }
+            Err(e) => return Err(e),
+        };
 
         let (coef_vec, intercept_val) = if self.fit_intercept {
             (theta[0..x.cols].to_vec(), theta[x.cols])
@@ -119,7 +127,20 @@ impl LinearRegression {
             self.fit_intercept,
             &self.device,
         )?;
-        let theta = solve_cholesky_multi(&xt_x, &xt_y)?;
+        let theta = match solve_cholesky_multi(&xt_x, &xt_y) {
+            Ok(t) => t,
+            Err(_) if self.device == DeviceType::Wgpu => {
+                let (cpu_xtx, cpu_xty) = compute_normal_equation_mats_multi(
+                    x,
+                    y,
+                    sample_weight,
+                    self.fit_intercept,
+                    &DeviceType::Cpu,
+                )?;
+                solve_cholesky_multi(&cpu_xtx, &cpu_xty)?
+            }
+            Err(e) => return Err(e),
+        };
 
         let k_targets = y.cols;
         let mut coef_mat = Matrix::zeros(k_targets, x.cols);

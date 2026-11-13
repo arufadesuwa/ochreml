@@ -13,6 +13,7 @@ pub enum Backend<'a> {
     Cpu,
     CudaSingle(usize),
     CudaMulti(&'a [usize]),
+    Wgpu,
     Tpu(usize),
 }
 
@@ -22,6 +23,7 @@ pub fn get_backend(device: &DeviceType) -> Backend<'_> {
         DeviceType::Gpu(id) => Backend::CudaSingle(*id),
         DeviceType::MultiGpu(gpu_ids) if gpu_ids.len() > 1 => Backend::CudaMulti(gpu_ids),
         DeviceType::MultiGpu(gpu_ids) if gpu_ids.len() == 1 => Backend::CudaSingle(gpu_ids[0]),
+        DeviceType::Wgpu => Backend::Wgpu,
         DeviceType::Tpu(id) => Backend::Tpu(*id),
         _ => Backend::Cpu,
     }
@@ -55,6 +57,13 @@ impl<'a> Backend<'a> {
             _ => {}
         }
 
+        #[cfg(feature = "wgpu-backend")]
+        if matches!(self, Backend::Wgpu) {
+            if let Some(res) = crate::backends::wgpu_gpu::wgpu_matmul(a, b) {
+                return res;
+            }
+        }
+
         a.matmul(b)
     }
 
@@ -83,6 +92,13 @@ impl<'a> Backend<'a> {
             _ => {}
         }
 
+        #[cfg(feature = "wgpu-backend")]
+        if matches!(self, Backend::Wgpu) {
+            if let Some(res) = crate::backends::wgpu_gpu::wgpu_matmul_at_b(a, b) {
+                return res;
+            }
+        }
+
         cpu_matmul_at_b(a, b)
     }
 
@@ -109,6 +125,13 @@ impl<'a> Backend<'a> {
                 }
             }
             _ => {}
+        }
+
+        #[cfg(feature = "wgpu-backend")]
+        if matches!(self, Backend::Wgpu) {
+            if let Some(res) = crate::backends::wgpu_gpu::wgpu_matvec(a, v) {
+                return res;
+            }
         }
 
         a.matvec(v)
@@ -141,9 +164,20 @@ impl<'a> Backend<'a> {
             _ => {}
         }
 
+        #[cfg(feature = "wgpu-backend")]
+        if matches!(self, Backend::Wgpu) {
+            if let Some(res) =
+                crate::backends::wgpu_gpu::wgpu_compute_normal_equation(x, y, fit_intercept)
+            {
+                return res;
+            }
+        }
+
         let p = if fit_intercept { x.cols + 1 } else { x.cols };
         match self {
-            Backend::Cpu | Backend::CudaSingle(_) => cpu_normal_equation_1d(x, y, fit_intercept, p),
+            Backend::Cpu | Backend::CudaSingle(_) | Backend::Wgpu => {
+                cpu_normal_equation_1d(x, y, fit_intercept, p)
+            }
             Backend::CudaMulti(gpu_ids) => {
                 let n_devices = gpu_ids.len().max(1);
                 let chunk_size = (x.rows + n_devices - 1) / n_devices;
@@ -227,11 +261,23 @@ impl<'a> Backend<'a> {
             _ => {}
         }
 
+        #[cfg(feature = "wgpu-backend")]
+        if matches!(self, Backend::Wgpu) {
+            if let Some(res) = crate::backends::wgpu_gpu::wgpu_compute_normal_equation_multi(
+                x,
+                y,
+                sample_weight,
+                fit_intercept,
+            ) {
+                return res;
+            }
+        }
+
         let p = if fit_intercept { x.cols + 1 } else { x.cols };
         let k_targets = y.cols;
 
         match self {
-            Backend::Cpu | Backend::CudaSingle(_) => {
+            Backend::Cpu | Backend::CudaSingle(_) | Backend::Wgpu => {
                 cpu_normal_equation_multi(x, y, sample_weight, fit_intercept, p, k_targets)
             }
             Backend::CudaMulti(gpu_ids) => {
@@ -419,6 +465,7 @@ mod tests {
             get_backend(&DeviceType::MultiGpu(ids.clone())),
             Backend::CudaMulti(&ids)
         );
+        assert_eq!(get_backend(&DeviceType::Wgpu), Backend::Wgpu);
         assert_eq!(get_backend(&DeviceType::Tpu(0)), Backend::Tpu(0));
     }
 

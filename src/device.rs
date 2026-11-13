@@ -12,6 +12,7 @@ pub enum DeviceType {
     Cpu,
     Gpu(usize),
     MultiGpu(Vec<usize>),
+    Wgpu,
     Tpu(usize),
 }
 
@@ -24,6 +25,7 @@ impl std::fmt::Display for DeviceType {
                 let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
                 write!(f, "cuda:{}", id_strs.join(","))
             }
+            DeviceType::Wgpu => write!(f, "wgpu"),
             DeviceType::Tpu(id) => write!(f, "tpu:{}", id),
         }
     }
@@ -174,10 +176,23 @@ pub fn parse_device(device_str: Option<&str>) -> OchreResult<DeviceType> {
             if caps.gpu_count > 0 {
                 Ok(DeviceType::Gpu(0))
             } else {
+                #[cfg(feature = "wgpu-backend")]
+                if dev.starts_with("gpu") && crate::backends::wgpu_gpu::is_available() {
+                    return Ok(DeviceType::Wgpu);
+                }
                 Err(OchreError::DeviceError(
                     "GPU acceleration was requested ('cuda:0'), but no GPU device or CUDA driver was detected on this host. Troubleshooting: Ensure NVIDIA drivers or CUDA are active, or use device='auto' for automatic fallback".to_string()
                 ))
             }
+        }
+        "wgpu" | "vulkan" | "metal" | "dx12" => {
+            #[cfg(feature = "wgpu-backend")]
+            if crate::backends::wgpu_gpu::is_available() {
+                return Ok(DeviceType::Wgpu);
+            }
+            Err(OchreError::DeviceError(
+                "Cross-platform GPU ('wgpu') was requested, but no hardware GPU adapter (Vulkan/Metal/DX12) was detected on this host ( >_< )".to_string()
+            ))
         }
         "cuda:all" | "multi-gpu" | "gpu:all" => {
             if caps.gpu_count >= 2 {
@@ -255,6 +270,11 @@ pub fn get_available_devices_list() -> Vec<String> {
         list.push("tpu:0".to_string());
     }
 
+    #[cfg(feature = "wgpu-backend")]
+    if crate::backends::wgpu_gpu::is_available() {
+        list.push("wgpu".to_string());
+    }
+
     list
 }
 
@@ -290,6 +310,23 @@ pub fn get_device_info_map() -> HashMap<String, String> {
     #[cfg(not(feature = "cuda-dynamic"))]
     map.insert("cuda_native_ready".to_string(), "false".to_string());
 
+    #[cfg(feature = "wgpu-backend")]
+    {
+        map.insert(
+            "wgpu_native_ready".to_string(),
+            crate::backends::wgpu_gpu::is_available().to_string(),
+        );
+        map.insert(
+            "wgpu_adapter".to_string(),
+            crate::backends::wgpu_gpu::adapter_info_string().unwrap_or_else(|| "None".to_string()),
+        );
+    }
+    #[cfg(not(feature = "wgpu-backend"))]
+    {
+        map.insert("wgpu_native_ready".to_string(), "false".to_string());
+        map.insert("wgpu_adapter".to_string(), "None".to_string());
+    }
+
     map
 }
 
@@ -302,6 +339,7 @@ mod tests {
         assert_eq!(DeviceType::Cpu.to_string(), "cpu");
         assert_eq!(DeviceType::Gpu(0).to_string(), "cuda:0");
         assert_eq!(DeviceType::MultiGpu(vec![0, 1]).to_string(), "cuda:0,1");
+        assert_eq!(DeviceType::Wgpu.to_string(), "wgpu");
         assert_eq!(DeviceType::Tpu(0).to_string(), "tpu:0");
     }
 
