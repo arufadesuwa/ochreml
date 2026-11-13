@@ -282,6 +282,14 @@ pub fn get_device_info_map() -> HashMap<String, String> {
     let auto_dev = parse_device(Some("auto")).unwrap_or(DeviceType::Cpu);
     map.insert("default_auto_device".to_string(), auto_dev.to_string());
 
+    #[cfg(feature = "cuda-dynamic")]
+    map.insert(
+        "cuda_native_ready".to_string(),
+        crate::backends::cuda::is_available().to_string(),
+    );
+    #[cfg(not(feature = "cuda-dynamic"))]
+    map.insert("cuda_native_ready".to_string(), "false".to_string());
+
     map
 }
 

@@ -1,9 +1,9 @@
 // OchreML Hardware Compute Backend Module (*≧ω≦*)
-// Decouples hardware acceleration targets (CPU Rayon, Multi-GPU Data-Parallel, TPU Systolic)
+// Decouples hardware acceleration targets (CPU Rayon, Native CUDA/cuBLAS, TPU)
 // from core mathematical solvers using zero-cost enum dispatch.
 
 use crate::device::DeviceType;
-use crate::error::OchreResult;
+use crate::error::{OchreError, OchreResult};
 use crate::matrix::{
     compute_normal_equation_multi_range, compute_normal_equation_range, Matrix,
 };
@@ -11,21 +11,110 @@ use crate::matrix::{
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Backend<'a> {
     Cpu,
-    MultiGpu(&'a [usize]),
+    CudaSingle(usize),
+    CudaMulti(&'a [usize]),
     Tpu(usize),
 }
 
 #[inline(always)]
 pub fn get_backend(device: &DeviceType) -> Backend<'_> {
     match device {
-        DeviceType::MultiGpu(gpu_ids) if gpu_ids.len() > 1 => Backend::MultiGpu(gpu_ids),
+        DeviceType::Gpu(id) => Backend::CudaSingle(*id),
+        DeviceType::MultiGpu(gpu_ids) if gpu_ids.len() > 1 => Backend::CudaMulti(gpu_ids),
+        DeviceType::MultiGpu(gpu_ids) if gpu_ids.len() == 1 => Backend::CudaSingle(gpu_ids[0]),
         DeviceType::Tpu(id) => Backend::Tpu(*id),
         _ => Backend::Cpu,
     }
 }
 
 impl<'a> Backend<'a> {
-    // 1D single-output normal equation: zero intermediate allocations (*≧ω≦*)
+    // Reusable Primitive 1: General Matrix Multiplication (C = A * B)
+    #[inline]
+    pub fn matmul(&self, a: &Matrix, b: &Matrix) -> OchreResult<Matrix> {
+        if a.cols != b.rows {
+            return Err(OchreError::MatmulDimensionMismatch {
+                rows_a: a.rows,
+                cols_a: a.cols,
+                rows_b: b.rows,
+                cols_b: b.cols,
+            });
+        }
+
+        #[cfg(feature = "cuda-dynamic")]
+        match self {
+            Backend::CudaSingle(id) => {
+                if let Some(res) = crate::backends::cuda::cuda_matmul(*id, a, b) {
+                    return res;
+                }
+            }
+            Backend::CudaMulti(ids) if !ids.is_empty() => {
+                if let Some(res) = crate::backends::cuda::cuda_matmul(ids[0], a, b) {
+                    return res;
+                }
+            }
+            _ => {}
+        }
+
+        a.matmul(b)
+    }
+
+    // Reusable Primitive 2: Transposed Matrix Multiplication (C = A^T * B)
+    #[inline]
+    pub fn matmul_at_b(&self, a: &Matrix, b: &Matrix) -> OchreResult<Matrix> {
+        if a.rows != b.rows {
+            return Err(OchreError::LengthMismatch {
+                features: a.rows,
+                targets: b.rows,
+            });
+        }
+
+        #[cfg(feature = "cuda-dynamic")]
+        match self {
+            Backend::CudaSingle(id) => {
+                if let Some(res) = crate::backends::cuda::cuda_matmul_at_b(*id, a, b) {
+                    return res;
+                }
+            }
+            Backend::CudaMulti(ids) if !ids.is_empty() => {
+                if let Some(res) = crate::backends::cuda::cuda_matmul_at_b(ids[0], a, b) {
+                    return res;
+                }
+            }
+            _ => {}
+        }
+
+        cpu_matmul_at_b(a, b)
+    }
+
+    // Reusable Primitive 3: Matrix-Vector Multiplication (y = A * v)
+    #[inline]
+    pub fn matvec(&self, a: &Matrix, v: &[f64]) -> OchreResult<Vec<f64>> {
+        if a.cols != v.len() {
+            return Err(OchreError::MatvecDimensionMismatch {
+                cols: a.cols,
+                len: v.len(),
+            });
+        }
+
+        #[cfg(feature = "cuda-dynamic")]
+        match self {
+            Backend::CudaSingle(id) => {
+                if let Some(res) = crate::backends::cuda::cuda_matvec(*id, a, v) {
+                    return res;
+                }
+            }
+            Backend::CudaMulti(ids) if !ids.is_empty() => {
+                if let Some(res) = crate::backends::cuda::cuda_matvec(ids[0], a, v) {
+                    return res;
+                }
+            }
+            _ => {}
+        }
+
+        a.matvec(v)
+    }
+
+    // Fused Normal Equation (1D single-output): zero intermediate allocations (*≧ω≦*)
     #[inline]
     pub fn compute_normal_equation(
         &self,
@@ -33,46 +122,29 @@ impl<'a> Backend<'a> {
         y: &[f64],
         fit_intercept: bool,
     ) -> OchreResult<(Matrix, Vec<f64>)> {
-        let p = if fit_intercept { x.cols + 1 } else { x.cols };
-
+        #[cfg(feature = "cuda-dynamic")]
         match self {
-            Backend::Cpu => {
-                if x.rows >= 1000 {
-                    use rayon::prelude::*;
-                    let num_threads = rayon::current_num_threads().max(1);
-                    let chunk_size = (x.rows + num_threads - 1) / num_threads;
-                    let chunks: Vec<(usize, usize)> = (0..num_threads)
-                        .map(|i| {
-                            let start = i * chunk_size;
-                            let end = (start + chunk_size).min(x.rows);
-                            (start, end)
-                        })
-                        .filter(|(start, end)| start < end)
-                        .collect();
-
-                    let (total_xt_x, total_xt_y) = chunks
-                        .into_par_iter()
-                        .map(|(start, end)| compute_normal_equation_range(x, y, fit_intercept, start, end))
-                        .reduce(
-                            || Ok((Matrix::zeros(p, p), vec![0.0; p])),
-                            |acc, chunk| {
-                                let (mut acc_m, mut acc_y) = acc?;
-                                let (chunk_m, chunk_y) = chunk?;
-                                for i in 0..(p * p) {
-                                    acc_m.data[i] += chunk_m.data[i];
-                                }
-                                for i in 0..p {
-                                    acc_y[i] += chunk_y[i];
-                                }
-                                Ok((acc_m, acc_y))
-                            },
-                        )?;
-                    Ok((total_xt_x, total_xt_y))
-                } else {
-                    compute_normal_equation_range(x, y, fit_intercept, 0, x.rows)
+            Backend::CudaSingle(id) => {
+                if let Some(res) =
+                    crate::backends::cuda::cuda_compute_normal_equation(&[*id], x, y, fit_intercept)
+                {
+                    return res;
                 }
             }
-            Backend::MultiGpu(gpu_ids) => {
+            Backend::CudaMulti(ids) => {
+                if let Some(res) =
+                    crate::backends::cuda::cuda_compute_normal_equation(ids, x, y, fit_intercept)
+                {
+                    return res;
+                }
+            }
+            _ => {}
+        }
+
+        let p = if fit_intercept { x.cols + 1 } else { x.cols };
+        match self {
+            Backend::Cpu | Backend::CudaSingle(_) => cpu_normal_equation_1d(x, y, fit_intercept, p),
+            Backend::CudaMulti(gpu_ids) => {
                 let n_devices = gpu_ids.len().max(1);
                 let chunk_size = (x.rows + n_devices - 1) / n_devices;
                 let mut total_xt_x = Matrix::zeros(p, p);
@@ -119,7 +191,7 @@ impl<'a> Backend<'a> {
         }
     }
 
-    // Multi-target normal equation
+    // Fused Multi-target & weighted Normal Equation
     #[inline]
     pub fn compute_normal_equation_multi(
         &self,
@@ -128,57 +200,41 @@ impl<'a> Backend<'a> {
         sample_weight: Option<&[f64]>,
         fit_intercept: bool,
     ) -> OchreResult<(Matrix, Matrix)> {
+        #[cfg(feature = "cuda-dynamic")]
+        match self {
+            Backend::CudaSingle(id) => {
+                if let Some(res) = crate::backends::cuda::cuda_compute_normal_equation_multi(
+                    &[*id],
+                    x,
+                    y,
+                    sample_weight,
+                    fit_intercept,
+                ) {
+                    return res;
+                }
+            }
+            Backend::CudaMulti(ids) => {
+                if let Some(res) = crate::backends::cuda::cuda_compute_normal_equation_multi(
+                    ids,
+                    x,
+                    y,
+                    sample_weight,
+                    fit_intercept,
+                ) {
+                    return res;
+                }
+            }
+            _ => {}
+        }
+
         let p = if fit_intercept { x.cols + 1 } else { x.cols };
         let k_targets = y.cols;
 
         match self {
-            Backend::Cpu => {
-                if x.rows >= 1000 {
-                    use rayon::prelude::*;
-                    let num_threads = rayon::current_num_threads().max(1);
-                    let chunk_size = (x.rows + num_threads - 1) / num_threads;
-                    let chunks: Vec<(usize, usize)> = (0..num_threads)
-                        .map(|i| {
-                            let start = i * chunk_size;
-                            let end = (start + chunk_size).min(x.rows);
-                            (start, end)
-                        })
-                        .filter(|(start, end)| start < end)
-                        .collect();
-
-                    let (total_xt_x, total_xt_y) = chunks
-                        .into_par_iter()
-                        .map(|(start, end)| {
-                            compute_normal_equation_multi_range(
-                                x,
-                                y,
-                                sample_weight,
-                                fit_intercept,
-                                start,
-                                end,
-                            )
-                        })
-                        .reduce(
-                            || Ok((Matrix::zeros(p, p), Matrix::zeros(p, k_targets))),
-                            |acc, chunk| {
-                                let (mut acc_m, mut acc_y) = acc?;
-                                let (chunk_m, chunk_y) = chunk?;
-                                for i in 0..(p * p) {
-                                    acc_m.data[i] += chunk_m.data[i];
-                                }
-                                for i in 0..(p * k_targets) {
-                                    acc_y.data[i] += chunk_y.data[i];
-                                }
-                                Ok((acc_m, acc_y))
-                            },
-                        )?;
-
-                    Ok((total_xt_x, total_xt_y))
-                } else {
-                    compute_normal_equation_multi_range(x, y, sample_weight, fit_intercept, 0, x.rows)
-                }
+            Backend::Cpu | Backend::CudaSingle(_) => {
+                cpu_normal_equation_multi(x, y, sample_weight, fit_intercept, p, k_targets)
             }
-            Backend::MultiGpu(gpu_ids) => {
+            Backend::CudaMulti(gpu_ids) => {
                 let n_devices = gpu_ids.len().max(1);
                 let chunk_size = (x.rows + n_devices - 1) / n_devices;
                 let mut total_xt_x = Matrix::zeros(p, p);
@@ -235,5 +291,157 @@ impl<'a> Backend<'a> {
                 Ok((total_xt_x, total_xt_y))
             }
         }
+    }
+}
+
+fn cpu_normal_equation_1d(
+    x: &Matrix,
+    y: &[f64],
+    fit_intercept: bool,
+    p: usize,
+) -> OchreResult<(Matrix, Vec<f64>)> {
+    if x.rows >= 1000 {
+        use rayon::prelude::*;
+        let num_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (x.rows + num_threads - 1) / num_threads;
+        let chunks: Vec<(usize, usize)> = (0..num_threads)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = (start + chunk_size).min(x.rows);
+                (start, end)
+            })
+            .filter(|(start, end)| start < end)
+            .collect();
+
+        chunks
+            .into_par_iter()
+            .map(|(start, end)| compute_normal_equation_range(x, y, fit_intercept, start, end))
+            .reduce(
+                || Ok((Matrix::zeros(p, p), vec![0.0; p])),
+                |acc, chunk| {
+                    let (mut acc_m, mut acc_y) = acc?;
+                    let (chunk_m, chunk_y) = chunk?;
+                    for i in 0..(p * p) {
+                        acc_m.data[i] += chunk_m.data[i];
+                    }
+                    for i in 0..p {
+                        acc_y[i] += chunk_y[i];
+                    }
+                    Ok((acc_m, acc_y))
+                },
+            )
+    } else {
+        compute_normal_equation_range(x, y, fit_intercept, 0, x.rows)
+    }
+}
+
+fn cpu_normal_equation_multi(
+    x: &Matrix,
+    y: &Matrix,
+    sample_weight: Option<&[f64]>,
+    fit_intercept: bool,
+    p: usize,
+    k_targets: usize,
+) -> OchreResult<(Matrix, Matrix)> {
+    if x.rows >= 1000 {
+        use rayon::prelude::*;
+        let num_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (x.rows + num_threads - 1) / num_threads;
+        let chunks: Vec<(usize, usize)> = (0..num_threads)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = (start + chunk_size).min(x.rows);
+                (start, end)
+            })
+            .filter(|(start, end)| start < end)
+            .collect();
+
+        chunks
+            .into_par_iter()
+            .map(|(start, end)| {
+                compute_normal_equation_multi_range(
+                    x,
+                    y,
+                    sample_weight,
+                    fit_intercept,
+                    start,
+                    end,
+                )
+            })
+            .reduce(
+                || Ok((Matrix::zeros(p, p), Matrix::zeros(p, k_targets))),
+                |acc, chunk| {
+                    let (mut acc_m, mut acc_y) = acc?;
+                    let (chunk_m, chunk_y) = chunk?;
+                    for i in 0..(p * p) {
+                        acc_m.data[i] += chunk_m.data[i];
+                    }
+                    for i in 0..(p * k_targets) {
+                        acc_y.data[i] += chunk_y.data[i];
+                    }
+                    Ok((acc_m, acc_y))
+                },
+            )
+    } else {
+        compute_normal_equation_multi_range(x, y, sample_weight, fit_intercept, 0, x.rows)
+    }
+}
+
+// Cache-friendly A^T * B on CPU without allocating explicit A^T
+fn cpu_matmul_at_b(a: &Matrix, b: &Matrix) -> OchreResult<Matrix> {
+    let p = a.cols;
+    let k = b.cols;
+    let mut out = Matrix::zeros(p, k);
+    for r in 0..a.rows {
+        let a_row = &a.data[(r * p)..(r * p + p)];
+        let b_row = &b.data[(r * k)..(r * k + k)];
+        for i in 0..p {
+            let ai = a_row[i];
+            let out_row = &mut out.data[(i * k)..(i * k + k)];
+            for j in 0..k {
+                out_row[j] += ai * b_row[j];
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backend_dispatch_single_and_multi_gpu() {
+        assert_eq!(get_backend(&DeviceType::Cpu), Backend::Cpu);
+        assert_eq!(get_backend(&DeviceType::Gpu(0)), Backend::CudaSingle(0));
+        let ids = vec![0, 1];
+        assert_eq!(
+            get_backend(&DeviceType::MultiGpu(ids.clone())),
+            Backend::CudaMulti(&ids)
+        );
+        assert_eq!(get_backend(&DeviceType::Tpu(0)), Backend::Tpu(0));
+    }
+
+    #[test]
+    fn test_backend_matrix_primitives() {
+        let backend = Backend::Cpu;
+        let a = Matrix::from_2d(&[vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]).unwrap();
+        let b = Matrix::from_2d(&[vec![7.0, 8.0], vec![9.0, 10.0], vec![11.0, 12.0]]).unwrap();
+
+        // A^T * B: (2x3) * (3x2) = (2x2)
+        // [1*7 + 3*9 + 5*11 = 89,  1*8 + 3*10 + 5*12 = 98]
+        // [2*7 + 4*9 + 6*11 = 116, 2*8 + 4*10 + 6*12 = 128]
+        let atb = backend.matmul_at_b(&a, &b).unwrap();
+        assert_eq!(atb.rows, 2);
+        assert_eq!(atb.cols, 2);
+        assert_eq!(atb.data, vec![89.0, 98.0, 116.0, 128.0]);
+
+        let v = vec![2.0, 3.0];
+        let mv = backend.matvec(&a, &v).unwrap();
+        assert_eq!(mv, vec![8.0, 18.0, 28.0]);
+
+        let c = Matrix::from_2d(&[vec![1.0, 0.0], vec![0.0, 2.0]]).unwrap();
+        let mm = backend.matmul(&a, &c).unwrap();
+        assert_eq!(mm.data, vec![1.0, 4.0, 3.0, 8.0, 5.0, 12.0]);
     }
 }

@@ -8,3 +8,5 @@ demo.py
 generate_notebook.py
 benchmark_sklearn.py
 *.ipynb
+dist/
+*.dit

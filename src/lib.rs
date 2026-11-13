@@ -2,6 +2,7 @@
 // Exposes Rust Linear Regression and Decision Tree implementations with Hardware Acceleration to Python.
 
 pub mod backend;
+pub mod backends;
 pub mod decision_tree;
 pub mod device;
 pub mod error;

@@ -1,6 +1,6 @@
 [package]
 name = "ochreml"
-version = "0.2.6"
+version = "0.3.0-beta.1"
 edition = "2024"
 description = "Classical Machine Learning Library in Rust with PyO3 Bindings (*^▽^*)"
 license = "MIT OR Apache-2.0"
@@ -14,6 +14,11 @@ crate-type = ["cdylib", "rlib"]
 pyo3 = { version = "0.29.3", features = ["extension-module"] }
 rayon = "1.10"
 thiserror = "2.0"
+libloading = "0.8"
+
+[features]
+default = ["cuda-dynamic"]
+cuda-dynamic = []
 
 [profile.release]
 lto = true
