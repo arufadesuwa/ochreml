@@ -188,8 +188,15 @@ pub struct PjrtExecuteOptions {
     pub num_non_donatable_input_indices: usize,
     pub context: *mut c_void,
     pub call_location: *const c_char,
-    pub incarnation_ids: *const i32,
-    pub num_incarnation_ids: usize,
+    pub num_tasks: usize,
+    pub task_ids: *mut c_int,
+    pub incarnation_ids: *mut i64,
+    pub multi_slice_config: *mut c_void,
+    pub use_major_to_minor_data_layout_for_callbacks: bool,
+    pub hlo_output_callbacks: *mut c_void,
+    pub num_hlo_output_callbacks: usize,
+    pub custom_options: *const c_void,
+    pub num_custom_options: usize,
 }
 
 #[repr(C)]
@@ -304,9 +311,15 @@ pub struct PjrtApiPrefix {
     pub loaded_executable_is_deleted: *const c_void,
     pub loaded_executable_execute:
         Option<unsafe extern "C" fn(*mut PjrtLoadedExecutableExecuteArgs) -> *mut PjrtError>,
+    pub executable_deserialize_and_load: *const c_void,
+    pub loaded_executable_fingerprint: *const c_void,
 
     pub buffer_destroy: Option<unsafe extern "C" fn(*mut PjrtBufferDestroyArgs) -> *mut PjrtError>,
-    pub buffer_get_memory_for_device: *const c_void,
+    pub buffer_element_type: *const c_void,
+    pub buffer_dimensions: *const c_void,
+    pub buffer_unpadded_dimensions: *const c_void,
+    pub buffer_dynamic_dimension_indices: *const c_void,
+    pub buffer_get_memory_layout: *const c_void,
     pub buffer_on_device_size_in_bytes: *const c_void,
     pub buffer_device: *const c_void,
     pub buffer_memory: *const c_void,
@@ -823,8 +836,15 @@ fn execute_tpu_dot(
         num_non_donatable_input_indices: 0,
         context: ptr::null_mut(),
         call_location: ptr::null(),
-        incarnation_ids: ptr::null(),
-        num_incarnation_ids: 0,
+        num_tasks: 0,
+        task_ids: ptr::null_mut(),
+        incarnation_ids: ptr::null_mut(),
+        multi_slice_config: ptr::null_mut(),
+        use_major_to_minor_data_layout_for_callbacks: false,
+        hlo_output_callbacks: ptr::null_mut(),
+        num_hlo_output_callbacks: 0,
+        custom_options: ptr::null(),
+        num_custom_options: 0,
     };
 
     let mut exec_args = PjrtLoadedExecutableExecuteArgs {
