@@ -631,7 +631,7 @@ pub fn emit_stablehlo_dot_general_mlir(
     format!(
         "module @ochreml_tpu {{\n\
          \x20 func.func @main(%arg0: tensor<{a_rows}x{a_cols}xf32>, %arg1: tensor<{k_pad}x{n_pad}xf32>) -> tensor<{m_pad}x{n_pad}xf32> {{\n\
-         \x20   %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [{lhs_contract}] x [0] : (tensor<{a_rows}x{a_cols}xf32>, tensor<{k_pad}x{n_pad}xf32>) -> tensor<{m_pad}x{n_pad}xf32>\n\
+         \x20   %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [{lhs_contract}] x [0], precision = [HIGHEST, HIGHEST] : (tensor<{a_rows}x{a_cols}xf32>, tensor<{k_pad}x{n_pad}xf32>) -> tensor<{m_pad}x{n_pad}xf32>\n\
          \x20   return %0 : tensor<{m_pad}x{n_pad}xf32>\n\
          \x20 }}\n\
          }}\n"
