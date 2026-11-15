@@ -5,6 +5,7 @@
 use crate::error::{OchreError, OchreResult};
 use crate::matrix::Matrix;
 use libloading::Library;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -22,6 +23,11 @@ const CUBLAS_OP_N: i32 = 0;
 const CUBLAS_OP_T: i32 = 1;
 const CUBLAS_FILL_MODE_UPPER: i32 = 1;
 const CUBLAS_SIDE_RIGHT: i32 = 1;
+
+// Persistent 64 MB (8M f64) per-GPU workspace to avoid repeated OS/MMU cuMemAlloc/cuMemFree calls
+const DEFAULT_WORKSPACE_F64: usize = 8 * 1024 * 1024;
+// Minimum matrix elements (128 MB) before sharding across multiple GPUs
+const MULTI_GPU_MIN_ELEMENTS: usize = 16_000_000;
 
 type FnCuInit = unsafe extern "C" fn(u32) -> CuResult;
 type FnCuDeviceGet = unsafe extern "C" fn(*mut CuDevice, i32) -> CuResult;
@@ -77,15 +83,6 @@ type FnCublasDgemv = unsafe extern "C" fn(
     CuDevicePtr,
     i32,
 ) -> CublasStatus;
-type FnCublasDdot = unsafe extern "C" fn(
-    CublasHandle,
-    i32,
-    CuDevicePtr,
-    i32,
-    CuDevicePtr,
-    i32,
-    *mut f64,
-) -> CublasStatus;
 type FnCublasDdgmm = unsafe extern "C" fn(
     CublasHandle,
     i32,
@@ -102,11 +99,75 @@ type FnCublasDdgmm = unsafe extern "C" fn(
 struct CudaDeviceCtx {
     ctx: CuContext,
     handle: CublasHandle,
+    workspace_ptr: CuDevicePtr,
+    workspace_len: usize,
+    cu_ctx_set_current: FnCuCtxSetCurrent,
+    cu_mem_free: FnCuMemFree,
 }
 
-// Safety: Protected by Mutex and bound to calling thread via cuCtxSetCurrent before every call.
+// SAFETY: Protected by Mutex and bound to calling thread via cuCtxSetCurrent before every call.
 unsafe impl Send for CudaDeviceCtx {}
+// SAFETY: All mutable access to CudaDeviceCtx goes through Arc<Mutex<CudaDeviceCtx>>.
 unsafe impl Sync for CudaDeviceCtx {}
+
+impl Drop for CudaDeviceCtx {
+    fn drop(&mut self) {
+        if self.workspace_ptr != 0 {
+            // SAFETY: Bind context and release persistent VRAM workspace on teardown.
+            unsafe {
+                let _ = (self.cu_ctx_set_current)(self.ctx);
+                let _ = (self.cu_mem_free)(self.workspace_ptr);
+            }
+            self.workspace_ptr = 0;
+            self.workspace_len = 0;
+        }
+    }
+}
+
+#[inline]
+fn align32(len_f64: usize) -> usize {
+    (len_f64 + 31) & !31
+}
+
+#[inline]
+fn offset_ptr(base: CuDevicePtr, offset_f64: usize) -> CuDevicePtr {
+    base + (offset_f64 * std::mem::size_of::<f64>()) as u64
+}
+
+impl CudaDeviceCtx {
+    fn ensure_workspace(
+        &mut self,
+        driver: &CudaDriver,
+        required_f64: usize,
+    ) -> OchreResult<CuDevicePtr> {
+        let needed = align32(required_f64.max(1));
+        if self.workspace_ptr != 0 && self.workspace_len >= needed {
+            return Ok(self.workspace_ptr);
+        }
+
+        let new_len = needed.max(DEFAULT_WORKSPACE_F64);
+        let bytes = new_len * std::mem::size_of::<f64>();
+        let mut new_ptr: CuDevicePtr = 0;
+        // SAFETY: Current thread has bound `self.ctx`; `new_ptr` receives a valid device allocation.
+        let rc = unsafe { (driver.cu_mem_alloc)(&mut new_ptr, bytes) };
+        if rc != CUDA_SUCCESS || new_ptr == 0 {
+            return Err(OchreError::DeviceError(format!(
+                "CUDA cuMemAlloc failed with code {} (´；ω；`)",
+                rc
+            )));
+        }
+
+        if self.workspace_ptr != 0 {
+            // SAFETY: Old workspace is no longer referenced by any active stream on this context.
+            unsafe {
+                let _ = (driver.cu_mem_free)(self.workspace_ptr);
+            }
+        }
+        self.workspace_ptr = new_ptr;
+        self.workspace_len = new_len;
+        Ok(self.workspace_ptr)
+    }
+}
 
 struct CudaDriver {
     _cuda_lib: Library,
@@ -123,18 +184,20 @@ struct CudaDriver {
     cublas_dgemm: FnCublasDgemm,
     cublas_dsyrk: FnCublasDsyrk,
     cublas_dgemv: FnCublasDgemv,
-    cublas_ddot: FnCublasDdot,
     cublas_ddgmm: Option<FnCublasDdgmm>,
     contexts: Mutex<HashMap<usize, Arc<Mutex<CudaDeviceCtx>>>>,
 }
 
+// SAFETY: Function pointers and dynamic library handles are thread-safe after initialization.
 unsafe impl Send for CudaDriver {}
+// SAFETY: Mutable context map is protected by a Mutex.
 unsafe impl Sync for CudaDriver {}
 
 static CUDA_DRIVER: OnceLock<Option<CudaDriver>> = OnceLock::new();
 
 fn load_first_library(candidates: &[&str]) -> Option<Library> {
     for name in candidates {
+        // SAFETY: Loading shared system library (`libcuda` / `libcublas`) by standard SONAME.
         if let Ok(lib) = unsafe { Library::new(name) } {
             return Some(lib);
         }
@@ -156,6 +219,7 @@ fn init_cuda_driver() -> Option<CudaDriver> {
     let cuda_lib = load_first_library(&cuda_candidates)?;
     let cublas_lib = load_first_library(&cublas_candidates)?;
 
+    // SAFETY: Resolve standard CUDA Driver API and cuBLAS C ABI symbols from loaded libraries.
     unsafe {
         let cu_init: FnCuInit = *cuda_lib.get::<FnCuInit>(b"cuInit\0").ok()?;
         if cu_init(0) != CUDA_SUCCESS {
@@ -182,7 +246,6 @@ fn init_cuda_driver() -> Option<CudaDriver> {
         let cublas_dgemm = *cublas_lib.get::<FnCublasDgemm>(b"cublasDgemm_v2\0").ok()?;
         let cublas_dsyrk = *cublas_lib.get::<FnCublasDsyrk>(b"cublasDsyrk_v2\0").ok()?;
         let cublas_dgemv = *cublas_lib.get::<FnCublasDgemv>(b"cublasDgemv_v2\0").ok()?;
-        let cublas_ddot = *cublas_lib.get::<FnCublasDdot>(b"cublasDdot_v2\0").ok()?;
         let cublas_ddgmm = cublas_lib
             .get::<FnCublasDdgmm>(b"cublasDdgmm\0")
             .ok()
@@ -203,7 +266,6 @@ fn init_cuda_driver() -> Option<CudaDriver> {
             cublas_dgemm,
             cublas_dsyrk,
             cublas_dgemv,
-            cublas_ddot,
             cublas_ddgmm,
             contexts: Mutex::new(HashMap::new()),
         })
@@ -214,71 +276,52 @@ fn get_driver() -> Option<&'static CudaDriver> {
     CUDA_DRIVER.get_or_init(init_cuda_driver).as_ref()
 }
 
+/// Pre-warm CUDA primary context, cuBLAS handle, and persistent 64 MB VRAM workspace on `gpu_id`.
+pub fn warmup_device(gpu_id: usize) {
+    if let Some(driver) = get_driver() {
+        let _ = driver.get_device_ctx(gpu_id);
+    }
+}
+
 pub fn is_available() -> bool {
-    get_driver().is_some()
+    if let Some(driver) = get_driver() {
+        let _ = driver.get_device_ctx(0);
+        true
+    } else {
+        false
+    }
 }
 
-// RAII GPU buffer so VRAM is always freed even on early error returns
-struct DeviceBuffer<'a> {
-    driver: &'a CudaDriver,
-    ptr: CuDevicePtr,
-}
-
-impl<'a> DeviceBuffer<'a> {
-    fn alloc(driver: &'a CudaDriver, len_f64: usize) -> OchreResult<Self> {
-        let mut ptr: CuDevicePtr = 0;
-        let bytes = len_f64.max(1) * std::mem::size_of::<f64>();
-        let rc = unsafe { (driver.cu_mem_alloc)(&mut ptr, bytes) };
+#[inline]
+fn copy_htod_raw(driver: &CudaDriver, dst: CuDevicePtr, src: &[f64]) -> OchreResult<()> {
+    let bytes = std::mem::size_of_val(src);
+    if bytes > 0 {
+        // SAFETY: `dst` points to a valid device allocation with at least `bytes` capacity.
+        let rc = unsafe { (driver.cu_memcpy_htod)(dst, src.as_ptr() as *const c_void, bytes) };
         if rc != CUDA_SUCCESS {
             return Err(OchreError::DeviceError(format!(
-                "CUDA cuMemAlloc failed with code {} (´；ω；`)",
+                "CUDA cuMemcpyHtoD failed with code {} (´；ω；`)",
                 rc
             )));
         }
-        Ok(Self { driver, ptr })
     }
-
-    fn from_slice(driver: &'a CudaDriver, data: &[f64]) -> OchreResult<Self> {
-        let buf = Self::alloc(driver, data.len())?;
-        let bytes = data.len() * std::mem::size_of::<f64>();
-        if bytes > 0 {
-            let rc =
-                unsafe { (driver.cu_memcpy_htod)(buf.ptr, data.as_ptr() as *const c_void, bytes) };
-            if rc != CUDA_SUCCESS {
-                return Err(OchreError::DeviceError(format!(
-                    "CUDA cuMemcpyHtoD failed with code {} (´；ω；`)",
-                    rc
-                )));
-            }
-        }
-        Ok(buf)
-    }
-
-    fn copy_to_host(&self, out: &mut [f64]) -> OchreResult<()> {
-        let bytes = out.len() * std::mem::size_of::<f64>();
-        if bytes > 0 {
-            let rc = unsafe {
-                (self.driver.cu_memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, self.ptr, bytes)
-            };
-            if rc != CUDA_SUCCESS {
-                return Err(OchreError::DeviceError(format!(
-                    "CUDA cuMemcpyDtoH failed with code {} (´；ω；`)",
-                    rc
-                )));
-            }
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
-impl<'a> Drop for DeviceBuffer<'a> {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            unsafe {
-                (self.driver.cu_mem_free)(self.ptr);
-            }
+#[inline]
+fn copy_dtoh_raw(driver: &CudaDriver, dst: &mut [f64], src: CuDevicePtr) -> OchreResult<()> {
+    let bytes = std::mem::size_of_val(dst);
+    if bytes > 0 {
+        // SAFETY: `src` points to a valid device allocation and `dst` has `bytes` capacity.
+        let rc = unsafe { (driver.cu_memcpy_dtoh)(dst.as_mut_ptr() as *mut c_void, src, bytes) };
+        if rc != CUDA_SUCCESS {
+            return Err(OchreError::DeviceError(format!(
+                "CUDA cuMemcpyDtoH failed with code {} (´；ω；`)",
+                rc
+            )));
         }
     }
+    Ok(())
 }
 
 impl CudaDriver {
@@ -291,6 +334,7 @@ impl CudaDriver {
         }
 
         let mut dev: CuDevice = 0;
+        // SAFETY: Queries device handle for `gpu_id`.
         let rc = unsafe { (self.cu_device_get)(&mut dev, gpu_id as i32) };
         if rc != CUDA_SUCCESS {
             return Err(OchreError::DeviceError(format!(
@@ -300,6 +344,7 @@ impl CudaDriver {
         }
 
         let mut ctx: CuContext = std::ptr::null_mut();
+        // SAFETY: Retains primary context (shared with PyTorch/CUDA runtime) or creates a new context.
         let ctx_rc = if let Some(retain) = self.cu_primary_ctx_retain {
             unsafe { retain(&mut ctx, dev) }
         } else {
@@ -312,6 +357,7 @@ impl CudaDriver {
             )));
         }
 
+        // SAFETY: Binds `ctx` to the current host thread.
         let set_rc = unsafe { (self.cu_ctx_set_current)(ctx) };
         if set_rc != CUDA_SUCCESS {
             return Err(OchreError::DeviceError(format!(
@@ -321,6 +367,7 @@ impl CudaDriver {
         }
 
         let mut handle: CublasHandle = std::ptr::null_mut();
+        // SAFETY: Initializes cuBLAS handle on the currently bound context.
         let blas_rc = unsafe { (self.cublas_create)(&mut handle) };
         if blas_rc != CUBLAS_STATUS_SUCCESS || handle.is_null() {
             return Err(OchreError::DeviceError(format!(
@@ -329,12 +376,61 @@ impl CudaDriver {
             )));
         }
 
-        let arc = Arc::new(Mutex::new(CudaDeviceCtx { ctx, handle }));
+        let mut dev_ctx = CudaDeviceCtx {
+            ctx,
+            handle,
+            workspace_ptr: 0,
+            workspace_len: 0,
+            cu_ctx_set_current: self.cu_ctx_set_current,
+            cu_mem_free: self.cu_mem_free,
+        };
+
+        // Pre-allocate default 64 MB persistent workspace and warm up cuBLAS FP64 kernels
+        if let Ok(ws_ptr) = dev_ctx.ensure_workspace(self, DEFAULT_WORKSPACE_F64) {
+            let zeros = [0.0_f64; 4];
+            let _ = copy_htod_raw(self, ws_ptr, &zeros);
+            let alpha = 1.0_f64;
+            let beta = 0.0_f64;
+            let d_out = offset_ptr(ws_ptr, 32);
+            // SAFETY: Warm-up 1x1 dsyrk and dgemv within pre-allocated workspace.
+            unsafe {
+                let _ = (self.cublas_dsyrk)(
+                    handle,
+                    CUBLAS_FILL_MODE_UPPER,
+                    CUBLAS_OP_N,
+                    1,
+                    1,
+                    &alpha,
+                    ws_ptr,
+                    1,
+                    &beta,
+                    d_out,
+                    1,
+                );
+                let _ = (self.cublas_dgemv)(
+                    handle,
+                    CUBLAS_OP_N,
+                    1,
+                    1,
+                    &alpha,
+                    ws_ptr,
+                    1,
+                    ws_ptr,
+                    1,
+                    &beta,
+                    d_out,
+                    1,
+                );
+            }
+        }
+
+        let arc = Arc::new(Mutex::new(dev_ctx));
         map.insert(gpu_id, Arc::clone(&arc));
         Ok(arc)
     }
 
     fn bind_ctx(&self, guard: &CudaDeviceCtx) -> OchreResult<()> {
+        // SAFETY: Binds `guard.ctx` to the calling thread while holding the device mutex.
         let rc = unsafe { (self.cu_ctx_set_current)(guard.ctx) };
         if rc != CUDA_SUCCESS {
             return Err(OchreError::DeviceError(format!(
@@ -368,12 +464,165 @@ fn mirror_cublas_upper_to_full(mat: &mut Matrix) {
     }
 }
 
+// Compute column sums of X (n_chunk x p_x) and sum of y (n_chunk) on CPU in parallel
+// while the GPU executes dsyrk/dgemv asynchronously.
+fn host_sum_x_and_y_1d(
+    x_slice: &[f64],
+    y_slice: &[f64],
+    n_chunk: usize,
+    p_x: usize,
+) -> (Vec<f64>, f64) {
+    if n_chunk < 8192 {
+        let mut sum_x = vec![0.0_f64; p_x];
+        let mut sum_y = 0.0_f64;
+        for (i, &yi) in y_slice.iter().enumerate() {
+            sum_y += yi;
+            let row = &x_slice[(i * p_x)..((i + 1) * p_x)];
+            for j in 0..p_x {
+                sum_x[j] += row[j];
+            }
+        }
+        return (sum_x, sum_y);
+    }
+
+    let n_threads = rayon::current_num_threads().max(1);
+    let block_rows = (n_chunk / (n_threads * 4).max(1)).max(2048);
+    let mut ranges = Vec::new();
+    let mut r = 0;
+    while r < n_chunk {
+        let end = (r + block_rows).min(n_chunk);
+        ranges.push((r, end));
+        r = end;
+    }
+
+    let partials: Vec<(Vec<f64>, f64)> = ranges
+        .into_par_iter()
+        .map(|(start, end)| {
+            let mut sx = vec![0.0_f64; p_x];
+            let mut sy = 0.0_f64;
+            for i in start..end {
+                sy += y_slice[i];
+                let row = &x_slice[(i * p_x)..((i + 1) * p_x)];
+                for j in 0..p_x {
+                    sx[j] += row[j];
+                }
+            }
+            (sx, sy)
+        })
+        .collect();
+
+    let mut total_x = vec![0.0_f64; p_x];
+    let mut total_y = 0.0_f64;
+    for (sx, sy) in partials {
+        total_y += sy;
+        for j in 0..p_x {
+            total_x[j] += sx[j];
+        }
+    }
+    (total_x, total_y)
+}
+
+// Compute (optionally weighted) column sums of X (n_chunk x p_x) and Y (n_chunk x k_targets)
+// on CPU in parallel while the GPU executes dsyrk/dgemm asynchronously.
+fn host_sum_x_and_y_multi(
+    x_slice: &[f64],
+    y_slice: &[f64],
+    sw_slice: Option<&[f64]>,
+    n_chunk: usize,
+    p_x: usize,
+    k_targets: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    if n_chunk < 8192 {
+        let mut sum_x = vec![0.0_f64; p_x];
+        let mut sum_y = vec![0.0_f64; k_targets];
+        if let Some(sw) = sw_slice {
+            for (i, &w) in sw.iter().enumerate() {
+                let x_row = &x_slice[(i * p_x)..((i + 1) * p_x)];
+                let y_row = &y_slice[(i * k_targets)..((i + 1) * k_targets)];
+                for j in 0..p_x {
+                    sum_x[j] += w * x_row[j];
+                }
+                for t in 0..k_targets {
+                    sum_y[t] += w * y_row[t];
+                }
+            }
+        } else {
+            for i in 0..n_chunk {
+                let x_row = &x_slice[(i * p_x)..((i + 1) * p_x)];
+                let y_row = &y_slice[(i * k_targets)..((i + 1) * k_targets)];
+                for j in 0..p_x {
+                    sum_x[j] += x_row[j];
+                }
+                for t in 0..k_targets {
+                    sum_y[t] += y_row[t];
+                }
+            }
+        }
+        return (sum_x, sum_y);
+    }
+
+    let n_threads = rayon::current_num_threads().max(1);
+    let block_rows = (n_chunk / (n_threads * 4).max(1)).max(2048);
+    let mut ranges = Vec::new();
+    let mut r = 0;
+    while r < n_chunk {
+        let end = (r + block_rows).min(n_chunk);
+        ranges.push((r, end));
+        r = end;
+    }
+
+    let partials: Vec<(Vec<f64>, Vec<f64>)> = ranges
+        .into_par_iter()
+        .map(|(start, end)| {
+            let mut sx = vec![0.0_f64; p_x];
+            let mut sy = vec![0.0_f64; k_targets];
+            if let Some(sw) = sw_slice {
+                for i in start..end {
+                    let w = sw[i];
+                    let x_row = &x_slice[(i * p_x)..((i + 1) * p_x)];
+                    let y_row = &y_slice[(i * k_targets)..((i + 1) * k_targets)];
+                    for j in 0..p_x {
+                        sx[j] += w * x_row[j];
+                    }
+                    for t in 0..k_targets {
+                        sy[t] += w * y_row[t];
+                    }
+                }
+            } else {
+                for i in start..end {
+                    let x_row = &x_slice[(i * p_x)..((i + 1) * p_x)];
+                    let y_row = &y_slice[(i * k_targets)..((i + 1) * k_targets)];
+                    for j in 0..p_x {
+                        sx[j] += x_row[j];
+                    }
+                    for t in 0..k_targets {
+                        sy[t] += y_row[t];
+                    }
+                }
+            }
+            (sx, sy)
+        })
+        .collect();
+
+    let mut total_x = vec![0.0_f64; p_x];
+    let mut total_y = vec![0.0_f64; k_targets];
+    for (sx, sy) in partials {
+        for j in 0..p_x {
+            total_x[j] += sx[j];
+        }
+        for t in 0..k_targets {
+            total_y[t] += sy[t];
+        }
+    }
+    (total_x, total_y)
+}
+
 // General Matrix Multiplication: C = A * B (Zero-transpose via C^T = B^T * A^T in column-major)
 pub fn cuda_matmul(gpu_id: usize, a: &Matrix, b: &Matrix) -> Option<OchreResult<Matrix>> {
     let driver = get_driver()?;
     let res = (|| {
         let ctx_arc = driver.get_device_ctx(gpu_id)?;
-        let guard = ctx_arc.lock().map_err(|_| {
+        let mut guard = ctx_arc.lock().map_err(|_| {
             OchreError::DeviceError("CUDA device mutex poisoned ( >_< )".to_string())
         })?;
         driver.bind_ctx(&guard)?;
@@ -382,12 +631,22 @@ pub fn cuda_matmul(gpu_id: usize, a: &Matrix, b: &Matrix) -> Option<OchreResult<
         let k = a.cols as i32;
         let n = b.cols as i32;
 
-        let d_a = DeviceBuffer::from_slice(driver, &a.data)?;
-        let d_b = DeviceBuffer::from_slice(driver, &b.data)?;
-        let d_c = DeviceBuffer::alloc(driver, a.rows * b.cols)?;
+        let off_a = 0;
+        let off_b = off_a + align32(a.data.len());
+        let off_c = off_b + align32(b.data.len());
+        let total_f64 = off_c + align32(a.rows * b.cols);
+        let ws_ptr = guard.ensure_workspace(driver, total_f64)?;
+
+        let d_a = offset_ptr(ws_ptr, off_a);
+        let d_b = offset_ptr(ws_ptr, off_b);
+        let d_c = offset_ptr(ws_ptr, off_c);
+
+        copy_htod_raw(driver, d_a, &a.data)?;
+        copy_htod_raw(driver, d_b, &b.data)?;
 
         let alpha = 1.0_f64;
         let beta = 0.0_f64;
+        // SAFETY: All device pointers lie within the bound context's persistent workspace.
         let status = unsafe {
             (driver.cublas_dgemm)(
                 guard.handle,
@@ -397,19 +656,19 @@ pub fn cuda_matmul(gpu_id: usize, a: &Matrix, b: &Matrix) -> Option<OchreResult<
                 m,
                 k,
                 &alpha,
-                d_b.ptr,
+                d_b,
                 n,
-                d_a.ptr,
+                d_a,
                 k,
                 &beta,
-                d_c.ptr,
+                d_c,
                 n,
             )
         };
         check_cublas(status, "cublasDgemm_v2")?;
 
         let mut out = Matrix::zeros(a.rows, b.cols);
-        d_c.copy_to_host(&mut out.data)?;
+        copy_dtoh_raw(driver, &mut out.data, d_c)?;
         Ok(out)
     })();
     Some(res)
@@ -420,7 +679,7 @@ pub fn cuda_matmul_at_b(gpu_id: usize, a: &Matrix, b: &Matrix) -> Option<OchreRe
     let driver = get_driver()?;
     let res = (|| {
         let ctx_arc = driver.get_device_ctx(gpu_id)?;
-        let guard = ctx_arc.lock().map_err(|_| {
+        let mut guard = ctx_arc.lock().map_err(|_| {
             OchreError::DeviceError("CUDA device mutex poisoned ( >_< )".to_string())
         })?;
         driver.bind_ctx(&guard)?;
@@ -429,12 +688,22 @@ pub fn cuda_matmul_at_b(gpu_id: usize, a: &Matrix, b: &Matrix) -> Option<OchreRe
         let p = a.cols as i32;
         let k = b.cols as i32;
 
-        let d_a = DeviceBuffer::from_slice(driver, &a.data)?;
-        let d_b = DeviceBuffer::from_slice(driver, &b.data)?;
-        let d_c = DeviceBuffer::alloc(driver, a.cols * b.cols)?;
+        let off_a = 0;
+        let off_b = off_a + align32(a.data.len());
+        let off_c = off_b + align32(b.data.len());
+        let total_f64 = off_c + align32(a.cols * b.cols);
+        let ws_ptr = guard.ensure_workspace(driver, total_f64)?;
+
+        let d_a = offset_ptr(ws_ptr, off_a);
+        let d_b = offset_ptr(ws_ptr, off_b);
+        let d_c = offset_ptr(ws_ptr, off_c);
+
+        copy_htod_raw(driver, d_a, &a.data)?;
+        copy_htod_raw(driver, d_b, &b.data)?;
 
         let alpha = 1.0_f64;
         let beta = 0.0_f64;
+        // SAFETY: All device pointers lie within the bound context's persistent workspace.
         let status = unsafe {
             (driver.cublas_dgemm)(
                 guard.handle,
@@ -444,19 +713,19 @@ pub fn cuda_matmul_at_b(gpu_id: usize, a: &Matrix, b: &Matrix) -> Option<OchreRe
                 p,
                 n_rows,
                 &alpha,
-                d_b.ptr,
+                d_b,
                 k,
-                d_a.ptr,
+                d_a,
                 p,
                 &beta,
-                d_c.ptr,
+                d_c,
                 k,
             )
         };
         check_cublas(status, "cublasDgemm_v2(AtB)")?;
 
         let mut out = Matrix::zeros(a.cols, b.cols);
-        d_c.copy_to_host(&mut out.data)?;
+        copy_dtoh_raw(driver, &mut out.data, d_c)?;
         Ok(out)
     })();
     Some(res)
@@ -467,7 +736,7 @@ pub fn cuda_matvec(gpu_id: usize, a: &Matrix, v: &[f64]) -> Option<OchreResult<V
     let driver = get_driver()?;
     let res = (|| {
         let ctx_arc = driver.get_device_ctx(gpu_id)?;
-        let guard = ctx_arc.lock().map_err(|_| {
+        let mut guard = ctx_arc.lock().map_err(|_| {
             OchreError::DeviceError("CUDA device mutex poisoned ( >_< )".to_string())
         })?;
         driver.bind_ctx(&guard)?;
@@ -475,12 +744,22 @@ pub fn cuda_matvec(gpu_id: usize, a: &Matrix, v: &[f64]) -> Option<OchreResult<V
         let m = a.rows as i32;
         let n = a.cols as i32;
 
-        let d_a = DeviceBuffer::from_slice(driver, &a.data)?;
-        let d_v = DeviceBuffer::from_slice(driver, v)?;
-        let d_y = DeviceBuffer::alloc(driver, a.rows)?;
+        let off_a = 0;
+        let off_v = off_a + align32(a.data.len());
+        let off_y = off_v + align32(v.len());
+        let total_f64 = off_y + align32(a.rows);
+        let ws_ptr = guard.ensure_workspace(driver, total_f64)?;
+
+        let d_a = offset_ptr(ws_ptr, off_a);
+        let d_v = offset_ptr(ws_ptr, off_v);
+        let d_y = offset_ptr(ws_ptr, off_y);
+
+        copy_htod_raw(driver, d_a, &a.data)?;
+        copy_htod_raw(driver, d_v, v)?;
 
         let alpha = 1.0_f64;
         let beta = 0.0_f64;
+        // SAFETY: All device pointers lie within the bound context's persistent workspace.
         let status = unsafe {
             (driver.cublas_dgemv)(
                 guard.handle,
@@ -488,25 +767,26 @@ pub fn cuda_matvec(gpu_id: usize, a: &Matrix, v: &[f64]) -> Option<OchreResult<V
                 n,
                 m,
                 &alpha,
-                d_a.ptr,
+                d_a,
                 n,
-                d_v.ptr,
+                d_v,
                 1,
                 &beta,
-                d_y.ptr,
+                d_y,
                 1,
             )
         };
         check_cublas(status, "cublasDgemv_v2")?;
 
         let mut out = vec![0.0; a.rows];
-        d_y.copy_to_host(&mut out)?;
+        copy_dtoh_raw(driver, &mut out, d_y)?;
         Ok(out)
     })();
     Some(res)
 }
 
-// Single-GPU 1D Normal Equation chunk over [start_row..end_row] without copying X into N x (p+1)
+// Single-GPU 1D Normal Equation chunk over [start_row..end_row] using persistent workspace
+// and host-overlapped intercept summation.
 fn cuda_normal_eq_1d_chunk(
     driver: &CudaDriver,
     gpu_id: usize,
@@ -521,7 +801,7 @@ fn cuda_normal_eq_1d_chunk(
     let p_total = if fit_intercept { p_x + 1 } else { p_x };
 
     let ctx_arc = driver.get_device_ctx(gpu_id)?;
-    let guard = ctx_arc
+    let mut guard = ctx_arc
         .lock()
         .map_err(|_| OchreError::DeviceError("CUDA device mutex poisoned ( >_< )".to_string()))?;
     driver.bind_ctx(&guard)?;
@@ -529,15 +809,26 @@ fn cuda_normal_eq_1d_chunk(
     let x_slice = &x.data[(start_row * p_x)..(end_row * p_x)];
     let y_slice = &y[start_row..end_row];
 
-    let d_x = DeviceBuffer::from_slice(driver, x_slice)?;
-    let d_y = DeviceBuffer::from_slice(driver, y_slice)?;
-    let d_xtx = DeviceBuffer::alloc(driver, p_x * p_x)?;
-    let d_xty = DeviceBuffer::alloc(driver, p_x)?;
+    let off_x = 0;
+    let off_y = off_x + align32(x_slice.len());
+    let off_xtx = off_y + align32(y_slice.len());
+    let off_xty = off_xtx + align32(p_x * p_x);
+    let total_f64 = off_xty + align32(p_x);
+    let ws_ptr = guard.ensure_workspace(driver, total_f64)?;
+
+    let d_x = offset_ptr(ws_ptr, off_x);
+    let d_y = offset_ptr(ws_ptr, off_y);
+    let d_xtx = offset_ptr(ws_ptr, off_xtx);
+    let d_xty = offset_ptr(ws_ptr, off_xty);
+
+    copy_htod_raw(driver, d_x, x_slice)?;
+    copy_htod_raw(driver, d_y, y_slice)?;
 
     let alpha = 1.0_f64;
     let beta = 0.0_f64;
 
-    // 1. X^T * X via cublasDsyrk_v2 (row-major X(N x p) == col-major X^T(p x N))
+    // 1. X^T * X via cublasDsyrk_v2 (asynchronous on CUDA stream)
+    // SAFETY: `d_x` and `d_xtx` are valid workspace sub-allocations on the bound context.
     let syrk_rc = unsafe {
         (driver.cublas_dsyrk)(
             guard.handle,
@@ -546,16 +837,17 @@ fn cuda_normal_eq_1d_chunk(
             p_x as i32,
             n_chunk as i32,
             &alpha,
-            d_x.ptr,
+            d_x,
             p_x as i32,
             &beta,
-            d_xtx.ptr,
+            d_xtx,
             p_x as i32,
         )
     };
     check_cublas(syrk_rc, "cublasDsyrk_v2")?;
 
-    // 2. X^T * y via cublasDgemv_v2
+    // 2. X^T * y via cublasDgemv_v2 (asynchronous on CUDA stream)
+    // SAFETY: `d_x`, `d_y`, and `d_xty` are valid workspace sub-allocations on the bound context.
     let gemv_rc = unsafe {
         (driver.cublas_dgemv)(
             guard.handle,
@@ -563,75 +855,43 @@ fn cuda_normal_eq_1d_chunk(
             p_x as i32,
             n_chunk as i32,
             &alpha,
-            d_x.ptr,
+            d_x,
             p_x as i32,
-            d_y.ptr,
+            d_y,
             1,
             &beta,
-            d_xty.ptr,
+            d_xty,
             1,
         )
     };
     check_cublas(gemv_rc, "cublasDgemv_v2(Xty)")?;
 
+    // 3. While the GPU executes dsyrk + dgemv asynchronously, compute intercept sums on host CPU!
+    let intercept_sums = if fit_intercept {
+        Some(host_sum_x_and_y_1d(x_slice, y_slice, n_chunk, p_x))
+    } else {
+        None
+    };
+
     let mut xtx_sub = Matrix::zeros(p_x, p_x);
-    d_xtx.copy_to_host(&mut xtx_sub.data)?;
+    copy_dtoh_raw(driver, &mut xtx_sub.data, d_xtx)?;
     mirror_cublas_upper_to_full(&mut xtx_sub);
 
     let mut xty_sub = vec![0.0; p_x];
-    d_xty.copy_to_host(&mut xty_sub)?;
+    copy_dtoh_raw(driver, &mut xty_sub, d_xty)?;
 
-    if !fit_intercept {
-        return Ok((xtx_sub, xty_sub));
-    }
-
-    // 3. Intercept sums via ones vector on GPU (avoids copying X into N x (p+1))
-    let ones = vec![1.0_f64; n_chunk];
-    let d_ones = DeviceBuffer::from_slice(driver, &ones)?;
-    let d_sum_x = DeviceBuffer::alloc(driver, p_x)?;
-
-    let sum_x_rc = unsafe {
-        (driver.cublas_dgemv)(
-            guard.handle,
-            CUBLAS_OP_N,
-            p_x as i32,
-            n_chunk as i32,
-            &alpha,
-            d_x.ptr,
-            p_x as i32,
-            d_ones.ptr,
-            1,
-            &beta,
-            d_sum_x.ptr,
-            1,
-        )
+    let (sum_x, sum_y) = match intercept_sums {
+        Some(sums) => sums,
+        None => return Ok((xtx_sub, xty_sub)),
     };
-    check_cublas(sum_x_rc, "cublasDgemv_v2(sum_x)")?;
-
-    let mut sum_y = 0.0_f64;
-    let sum_y_rc = unsafe {
-        (driver.cublas_ddot)(
-            guard.handle,
-            n_chunk as i32,
-            d_y.ptr,
-            1,
-            d_ones.ptr,
-            1,
-            &mut sum_y,
-        )
-    };
-    check_cublas(sum_y_rc, "cublasDdot_v2(sum_y)")?;
-
-    let mut sum_x = vec![0.0; p_x];
-    d_sum_x.copy_to_host(&mut sum_x)?;
 
     let mut full_xtx = Matrix::zeros(p_total, p_total);
-    for r in 0..p_x {
+    for (r, &sx) in sum_x.iter().enumerate().take(p_x) {
         let dst_off = r * p_total;
         let src_off = r * p_x;
         full_xtx.data[dst_off..(dst_off + p_x)]
             .copy_from_slice(&xtx_sub.data[src_off..(src_off + p_x)]);
-        full_xtx.data[dst_off + p_x] = sum_x[r];
+        full_xtx.data[dst_off + p_x] = sx;
     }
     let last_off = p_x * p_total;
     full_xtx.data[last_off..(last_off + p_x)].copy_from_slice(&sum_x);
@@ -655,7 +915,8 @@ pub fn cuda_compute_normal_equation(
         return None;
     }
 
-    if gpu_ids.len() == 1 || x.rows < gpu_ids.len() {
+    let total_elems = x.rows.saturating_mul(x.cols);
+    if gpu_ids.len() == 1 || x.rows < gpu_ids.len() || total_elems < MULTI_GPU_MIN_ELEMENTS {
         return Some(cuda_normal_eq_1d_chunk(
             driver,
             gpu_ids[0],
@@ -669,7 +930,7 @@ pub fn cuda_compute_normal_equation(
 
     let p = if fit_intercept { x.cols + 1 } else { x.cols };
     let n_dev = gpu_ids.len();
-    let chunk_size = (x.rows + n_dev - 1) / n_dev;
+    let chunk_size = x.rows.div_ceil(n_dev);
 
     let chunk_results: Vec<OchreResult<(Matrix, Vec<f64>)>> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(n_dev);
@@ -713,7 +974,9 @@ pub fn cuda_compute_normal_equation(
     Some(Ok((total_xtx, total_xty)))
 }
 
-// Multi-target & optional sample_weight Normal Equation chunk on GPU
+// Multi-target & optional sample_weight Normal Equation chunk on GPU using persistent workspace
+// and host-overlapped intercept summation.
+#[allow(clippy::too_many_arguments)]
 fn cuda_normal_eq_multi_chunk(
     driver: &CudaDriver,
     gpu_id: usize,
@@ -730,73 +993,92 @@ fn cuda_normal_eq_multi_chunk(
     let p_total = if fit_intercept { p_x + 1 } else { p_x };
 
     let ctx_arc = driver.get_device_ctx(gpu_id)?;
-    let guard = ctx_arc
+    let mut guard = ctx_arc
         .lock()
         .map_err(|_| OchreError::DeviceError("CUDA device mutex poisoned ( >_< )".to_string()))?;
     driver.bind_ctx(&guard)?;
 
     let x_slice = &x.data[(start_row * p_x)..(end_row * p_x)];
     let y_slice = &y.data[(start_row * k_targets)..(end_row * k_targets)];
+    let sw_slice = sample_weight.map(|sw| &sw[start_row..end_row]);
 
-    let d_x = DeviceBuffer::from_slice(driver, x_slice)?;
-    let d_y = DeviceBuffer::from_slice(driver, y_slice)?;
+    let off_x = 0;
+    let off_y = off_x + align32(x_slice.len());
+    let off_xtx = off_y + align32(y_slice.len());
+    let off_xty = off_xtx + align32(p_x * p_x);
+    let off_sqrt = off_xty + align32(p_x * k_targets);
+    let total_f64 = if sw_slice.is_some() {
+        off_sqrt + align32(n_chunk)
+    } else {
+        off_sqrt
+    };
+    let ws_ptr = guard.ensure_workspace(driver, total_f64)?;
 
-    let (d_weight_vec, weight_sum) = if let Some(sw) = sample_weight {
-        let sw_slice = &sw[start_row..end_row];
+    let d_x = offset_ptr(ws_ptr, off_x);
+    let d_y = offset_ptr(ws_ptr, off_y);
+    let d_xtx = offset_ptr(ws_ptr, off_xtx);
+    let d_xty = offset_ptr(ws_ptr, off_xty);
+
+    copy_htod_raw(driver, d_x, x_slice)?;
+    copy_htod_raw(driver, d_y, y_slice)?;
+
+    let weight_sum = if let Some(sw) = sw_slice {
         let mut sqrt_sw = Vec::with_capacity(n_chunk);
         let mut w_sum = 0.0;
-        for &w in sw_slice {
+        for &w in sw {
             w_sum += w;
             sqrt_sw.push(w.sqrt());
         }
-        let d_sqrt = DeviceBuffer::from_slice(driver, &sqrt_sw)?;
+        let d_sqrt = offset_ptr(ws_ptr, off_sqrt);
+        copy_htod_raw(driver, d_sqrt, &sqrt_sw)?;
+
         let ddgmm = driver.cublas_ddgmm.ok_or_else(|| {
             OchreError::DeviceError(
                 "cublasDdgmm not available in loaded cuBLAS library ( >_< )".to_string(),
             )
         })?;
+        // SAFETY: `d_x` and `d_sqrt` are valid workspace sub-allocations on the bound context.
         let rc_x = unsafe {
             ddgmm(
                 guard.handle,
                 CUBLAS_SIDE_RIGHT,
                 p_x as i32,
                 n_chunk as i32,
-                d_x.ptr,
+                d_x,
                 p_x as i32,
-                d_sqrt.ptr,
+                d_sqrt,
                 1,
-                d_x.ptr,
+                d_x,
                 p_x as i32,
             )
         };
         check_cublas(rc_x, "cublasDdgmm(X)")?;
 
+        // SAFETY: `d_y` and `d_sqrt` are valid workspace sub-allocations on the bound context.
         let rc_y = unsafe {
             ddgmm(
                 guard.handle,
                 CUBLAS_SIDE_RIGHT,
                 k_targets as i32,
                 n_chunk as i32,
-                d_y.ptr,
+                d_y,
                 k_targets as i32,
-                d_sqrt.ptr,
+                d_sqrt,
                 1,
-                d_y.ptr,
+                d_y,
                 k_targets as i32,
             )
         };
         check_cublas(rc_y, "cublasDdgmm(Y)")?;
-        (Some(d_sqrt), w_sum)
+        w_sum
     } else {
-        (None, n_chunk as f64)
+        n_chunk as f64
     };
-
-    let d_xtx = DeviceBuffer::alloc(driver, p_x * p_x)?;
-    let d_xty = DeviceBuffer::alloc(driver, p_x * k_targets)?;
 
     let alpha = 1.0_f64;
     let beta = 0.0_f64;
 
+    // SAFETY: `d_x` and `d_xtx` are valid workspace sub-allocations on the bound context.
     let syrk_rc = unsafe {
         (driver.cublas_dsyrk)(
             guard.handle,
@@ -805,16 +1087,17 @@ fn cuda_normal_eq_multi_chunk(
             p_x as i32,
             n_chunk as i32,
             &alpha,
-            d_x.ptr,
+            d_x,
             p_x as i32,
             &beta,
-            d_xtx.ptr,
+            d_xtx,
             p_x as i32,
         )
     };
     check_cublas(syrk_rc, "cublasDsyrk_v2(multi)")?;
 
     // X^T * Y: col-major C^T(K x p_x) = B^T(K x N) * A(N x p_x)
+    // SAFETY: `d_x`, `d_y`, and `d_xty` are valid workspace sub-allocations on the bound context.
     let gemm_rc = unsafe {
         (driver.cublas_dgemm)(
             guard.handle,
@@ -824,90 +1107,45 @@ fn cuda_normal_eq_multi_chunk(
             p_x as i32,
             n_chunk as i32,
             &alpha,
-            d_y.ptr,
+            d_y,
             k_targets as i32,
-            d_x.ptr,
+            d_x,
             p_x as i32,
             &beta,
-            d_xty.ptr,
+            d_xty,
             k_targets as i32,
         )
     };
     check_cublas(gemm_rc, "cublasDgemm_v2(XtY)")?;
 
+    // Compute intercept sums on host CPU while GPU executes dsyrk + dgemm asynchronously
+    let intercept_sums = if fit_intercept {
+        Some(host_sum_x_and_y_multi(
+            x_slice, y_slice, sw_slice, n_chunk, p_x, k_targets,
+        ))
+    } else {
+        None
+    };
+
     let mut xtx_sub = Matrix::zeros(p_x, p_x);
-    d_xtx.copy_to_host(&mut xtx_sub.data)?;
+    copy_dtoh_raw(driver, &mut xtx_sub.data, d_xtx)?;
     mirror_cublas_upper_to_full(&mut xtx_sub);
 
     let mut xty_sub = Matrix::zeros(p_x, k_targets);
-    d_xty.copy_to_host(&mut xty_sub.data)?;
+    copy_dtoh_raw(driver, &mut xty_sub.data, d_xty)?;
 
-    if !fit_intercept {
-        return Ok((xtx_sub, xty_sub));
-    }
-
-    // Intercept sums: if weighted, d_x and d_y are already scaled by sqrt(w),
-    // so multiplying by sqrt(w) gives sum(w * x_j) and sum(w * y_t).
-    let d_ones_owned;
-    let d_vec_ptr = match d_weight_vec {
-        Some(ref buf) => buf.ptr,
-        None => {
-            let ones = vec![1.0_f64; n_chunk];
-            d_ones_owned = DeviceBuffer::from_slice(driver, &ones)?;
-            d_ones_owned.ptr
-        }
+    let (sum_x, sum_y) = match intercept_sums {
+        Some(sums) => sums,
+        None => return Ok((xtx_sub, xty_sub)),
     };
-
-    let d_sum_x = DeviceBuffer::alloc(driver, p_x)?;
-    let sum_x_rc = unsafe {
-        (driver.cublas_dgemv)(
-            guard.handle,
-            CUBLAS_OP_N,
-            p_x as i32,
-            n_chunk as i32,
-            &alpha,
-            d_x.ptr,
-            p_x as i32,
-            d_vec_ptr,
-            1,
-            &beta,
-            d_sum_x.ptr,
-            1,
-        )
-    };
-    check_cublas(sum_x_rc, "cublasDgemv_v2(sum_x multi)")?;
-
-    let d_sum_y = DeviceBuffer::alloc(driver, k_targets)?;
-    let sum_y_rc = unsafe {
-        (driver.cublas_dgemv)(
-            guard.handle,
-            CUBLAS_OP_N,
-            k_targets as i32,
-            n_chunk as i32,
-            &alpha,
-            d_y.ptr,
-            k_targets as i32,
-            d_vec_ptr,
-            1,
-            &beta,
-            d_sum_y.ptr,
-            1,
-        )
-    };
-    check_cublas(sum_y_rc, "cublasDgemv_v2(sum_y multi)")?;
-
-    let mut sum_x = vec![0.0; p_x];
-    d_sum_x.copy_to_host(&mut sum_x)?;
-    let mut sum_y = vec![0.0; k_targets];
-    d_sum_y.copy_to_host(&mut sum_y)?;
 
     let mut full_xtx = Matrix::zeros(p_total, p_total);
-    for r in 0..p_x {
+    for (r, &sx) in sum_x.iter().enumerate().take(p_x) {
         let dst_off = r * p_total;
         let src_off = r * p_x;
         full_xtx.data[dst_off..(dst_off + p_x)]
             .copy_from_slice(&xtx_sub.data[src_off..(src_off + p_x)]);
-        full_xtx.data[dst_off + p_x] = sum_x[r];
+        full_xtx.data[dst_off + p_x] = sx;
     }
     let last_off = p_x * p_total;
     full_xtx.data[last_off..(last_off + p_x)].copy_from_slice(&sum_x);
@@ -936,7 +1174,8 @@ pub fn cuda_compute_normal_equation_multi(
         return None;
     }
 
-    if gpu_ids.len() == 1 || x.rows < gpu_ids.len() {
+    let total_elems = x.rows.saturating_mul(x.cols);
+    if gpu_ids.len() == 1 || x.rows < gpu_ids.len() || total_elems < MULTI_GPU_MIN_ELEMENTS {
         return Some(cuda_normal_eq_multi_chunk(
             driver,
             gpu_ids[0],
@@ -952,7 +1191,7 @@ pub fn cuda_compute_normal_equation_multi(
     let p = if fit_intercept { x.cols + 1 } else { x.cols };
     let k_targets = y.cols;
     let n_dev = gpu_ids.len();
-    let chunk_size = (x.rows + n_dev - 1) / n_dev;
+    let chunk_size = x.rows.div_ceil(n_dev);
 
     let chunk_results: Vec<OchreResult<(Matrix, Matrix)>> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(n_dev);

@@ -109,6 +109,24 @@ pub(crate) fn compute_and_solve_normal_multi(
     }
 }
 
+#[inline(always)]
+pub(crate) fn dot_unrolled(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    let mut acc = [0.0f64; 4];
+    let chunks = n / 4;
+    for i in 0..chunks {
+        let base = i * 4;
+        for lane in 0..4 {
+            acc[lane] += a[base + lane] * b[base + lane];
+        }
+    }
+    let mut tail = 0.0;
+    for i in (chunks * 4)..n {
+        tail += a[i] * b[i];
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3]) + tail
+}
+
 pub(crate) fn predict_linear_1d(x: &Matrix, coef: &[f64], intercept: f64) -> OchreResult<Vec<f64>> {
     if x.cols != coef.len() {
         return Err(OchreError::FeatureCountMismatch {
@@ -117,15 +135,28 @@ pub(crate) fn predict_linear_1d(x: &Matrix, coef: &[f64], intercept: f64) -> Och
         });
     }
 
+    let d = x.cols;
+    if x.rows >= 2048 {
+        use rayon::prelude::*;
+        let mut predictions = vec![0.0; x.rows];
+        predictions
+            .par_chunks_mut(512)
+            .enumerate()
+            .for_each(|(chunk_idx, out_chunk)| {
+                let start_r = chunk_idx * 512;
+                for (i, out_val) in out_chunk.iter_mut().enumerate() {
+                    let r = start_r + i;
+                    let row_slice = &x.data[(r * d)..(r * d + d)];
+                    *out_val = intercept + dot_unrolled(row_slice, coef);
+                }
+            });
+        return Ok(predictions);
+    }
+
     let mut predictions = Vec::with_capacity(x.rows);
     for r in 0..x.rows {
-        let offset = r * x.cols;
-        let row_slice = &x.data[offset..offset + x.cols];
-        let mut val = intercept;
-        for c in 0..x.cols {
-            val += row_slice[c] * coef[c];
-        }
-        predictions.push(val);
+        let row_slice = &x.data[(r * d)..(r * d + d)];
+        predictions.push(intercept + dot_unrolled(row_slice, coef));
     }
 
     Ok(predictions)
@@ -146,21 +177,39 @@ pub(crate) fn predict_linear_multi(
         return Err(OchreError::VectorLengthMismatch);
     }
 
+    let d = x.cols;
     let k_targets = coef_mat.rows;
     let mut preds = Matrix::zeros(x.rows, k_targets);
 
+    if x.rows >= 2048 {
+        use rayon::prelude::*;
+        let row_block = 512;
+        preds
+            .data
+            .par_chunks_mut(row_block * k_targets)
+            .enumerate()
+            .for_each(|(chunk_idx, out_chunk)| {
+                let start_r = chunk_idx * row_block;
+                let n_rows_chunk = out_chunk.len() / k_targets;
+                for i in 0..n_rows_chunk {
+                    let r = start_r + i;
+                    let x_row = &x.data[(r * d)..(r * d + d)];
+                    let pred_off = i * k_targets;
+                    for (t, &intercept_t) in intercept_vec.iter().enumerate() {
+                        let c_row = &coef_mat.data[(t * d)..(t * d + d)];
+                        out_chunk[pred_off + t] = intercept_t + dot_unrolled(x_row, c_row);
+                    }
+                }
+            });
+        return Ok(preds);
+    }
+
     for r in 0..x.rows {
-        let x_offset = r * x.cols;
-        let x_row = &x.data[x_offset..x_offset + x.cols];
+        let x_row = &x.data[(r * d)..(r * d + d)];
         let pred_offset = r * k_targets;
         for (t, &intercept_t) in intercept_vec.iter().enumerate() {
-            let c_offset = t * x.cols;
-            let c_row = &coef_mat.data[c_offset..c_offset + x.cols];
-            let mut val = intercept_t;
-            for (&xr, &cr) in x_row.iter().zip(c_row.iter()) {
-                val += xr * cr;
-            }
-            preds.data[pred_offset + t] = val;
+            let c_row = &coef_mat.data[(t * d)..(t * d + d)];
+            preds.data[pred_offset + t] = intercept_t + dot_unrolled(x_row, c_row);
         }
     }
 

@@ -377,6 +377,20 @@ impl<'a> Backend<'a> {
     }
 }
 
+fn aligned_row_chunks(n_rows: usize) -> Vec<(usize, usize)> {
+    let num_tasks = (rayon::current_num_threads().max(1) * 4).max(4);
+    let raw_chunk = (n_rows + num_tasks - 1) / num_tasks;
+    let chunk_size = ((raw_chunk + 63) / 64 * 64).max(64);
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < n_rows {
+        let end = (start + chunk_size).min(n_rows);
+        chunks.push((start, end));
+        start = end;
+    }
+    chunks
+}
+
 fn cpu_normal_equation_1d(
     x: &Matrix,
     y: &[f64],
@@ -385,16 +399,7 @@ fn cpu_normal_equation_1d(
 ) -> OchreResult<(Matrix, Vec<f64>)> {
     if x.rows >= 1000 {
         use rayon::prelude::*;
-        let num_threads = rayon::current_num_threads().max(1);
-        let chunk_size = (x.rows + num_threads - 1) / num_threads;
-        let chunks: Vec<(usize, usize)> = (0..num_threads)
-            .map(|i| {
-                let start = i * chunk_size;
-                let end = (start + chunk_size).min(x.rows);
-                (start, end)
-            })
-            .filter(|(start, end)| start < end)
-            .collect();
+        let chunks = aligned_row_chunks(x.rows);
 
         chunks
             .into_par_iter()
@@ -428,16 +433,7 @@ fn cpu_normal_equation_multi(
 ) -> OchreResult<(Matrix, Matrix)> {
     if x.rows >= 1000 {
         use rayon::prelude::*;
-        let num_threads = rayon::current_num_threads().max(1);
-        let chunk_size = (x.rows + num_threads - 1) / num_threads;
-        let chunks: Vec<(usize, usize)> = (0..num_threads)
-            .map(|i| {
-                let start = i * chunk_size;
-                let end = (start + chunk_size).min(x.rows);
-                (start, end)
-            })
-            .filter(|(start, end)| start < end)
-            .collect();
+        let chunks = aligned_row_chunks(x.rows);
 
         chunks
             .into_par_iter()

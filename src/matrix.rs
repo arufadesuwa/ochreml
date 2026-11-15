@@ -215,7 +215,106 @@ pub fn compute_normal_equation_mats(
     backend.compute_normal_equation(x, y, fit_intercept)
 }
 
-// Compute (X^T * X) and (X^T * y) over a slice range [start_row..end_row] for 1D target (Zero-allocation scalar loop)
+const NORMAL_EQ_TILE: usize = 64;
+
+#[inline(always)]
+fn dot64(a: &[f64; NORMAL_EQ_TILE], b: &[f64; NORMAL_EQ_TILE]) -> f64 {
+    let mut acc = [0.0f64; 4];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        for lane in 0..4 {
+            acc[lane] += a[base + lane] * b[base + lane];
+        }
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
+}
+
+#[inline(always)]
+fn sum64(a: &[f64; NORMAL_EQ_TILE]) -> f64 {
+    let mut acc = [0.0f64; 4];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        for lane in 0..4 {
+            acc[lane] += a[base + lane];
+        }
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
+}
+
+#[inline(always)]
+fn dot64_1x4(
+    a: &[f64; NORMAL_EQ_TILE],
+    b0: &[f64; NORMAL_EQ_TILE],
+    b1: &[f64; NORMAL_EQ_TILE],
+    b2: &[f64; NORMAL_EQ_TILE],
+    b3: &[f64; NORMAL_EQ_TILE],
+) -> (f64, f64, f64, f64) {
+    let mut acc0 = [0.0f64; 4];
+    let mut acc1 = [0.0f64; 4];
+    let mut acc2 = [0.0f64; 4];
+    let mut acc3 = [0.0f64; 4];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        for lane in 0..4 {
+            let ai = a[base + lane];
+            acc0[lane] += ai * b0[base + lane];
+            acc1[lane] += ai * b1[base + lane];
+            acc2[lane] += ai * b2[base + lane];
+            acc3[lane] += ai * b3[base + lane];
+        }
+    }
+    (
+        (acc0[0] + acc0[1]) + (acc0[2] + acc0[3]),
+        (acc1[0] + acc1[1]) + (acc1[2] + acc1[3]),
+        (acc2[0] + acc2[1]) + (acc2[2] + acc2[3]),
+        (acc3[0] + acc3[1]) + (acc3[2] + acc3[3]),
+    )
+}
+
+// Accumulate upper triangle of left_t * right_t^T into xt_x (stride p) using 1x4 SIMD micro-kernel.
+#[inline]
+fn accumulate_gram_upper_tile(
+    left_t: &[[f64; NORMAL_EQ_TILE]],
+    right_t: &[[f64; NORMAL_EQ_TILE]],
+    xt_x: &mut Matrix,
+    p: usize,
+) {
+    let d = left_t.len();
+    for j in 0..d {
+        let lj = &left_t[j];
+        let row_off = j * p;
+        let mut k = j;
+        while k + 4 <= d {
+            let (s0, s1, s2, s3) = dot64_1x4(
+                lj,
+                &right_t[k],
+                &right_t[k + 1],
+                &right_t[k + 2],
+                &right_t[k + 3],
+            );
+            xt_x.data[row_off + k] += s0;
+            xt_x.data[row_off + k + 1] += s1;
+            xt_x.data[row_off + k + 2] += s2;
+            xt_x.data[row_off + k + 3] += s3;
+            k += 4;
+        }
+        while k < d {
+            xt_x.data[row_off + k] += dot64(lj, &right_t[k]);
+            k += 1;
+        }
+    }
+}
+
+fn mirror_upper_to_lower(xt_x: &mut Matrix, p: usize) {
+    for j in 0..p {
+        for k in (j + 1)..p {
+            let val = xt_x.data[j * p + k];
+            xt_x.data[k * p + j] = val;
+        }
+    }
+}
+
+// Compute (X^T * X) and (X^T * y) over a slice range [start_row..end_row] using L1-blocked 64-row tiles.
 #[inline]
 pub fn compute_normal_equation_range(
     x: &Matrix,
@@ -224,47 +323,49 @@ pub fn compute_normal_equation_range(
     start_row: usize,
     end_row: usize,
 ) -> OchreResult<(Matrix, Vec<f64>)> {
-    let p = if fit_intercept { x.cols + 1 } else { x.cols };
+    let d = x.cols;
+    let p = if fit_intercept { d + 1 } else { d };
     let mut xt_x = Matrix::zeros(p, p);
     let mut xt_y = vec![0.0; p];
+    let mut x_t = vec![[0.0f64; NORMAL_EQ_TILE]; d];
+    let mut y_t = [0.0f64; NORMAL_EQ_TILE];
 
-    for r in start_row..end_row {
-        let yr = y[r];
-        let row_offset = r * x.cols;
-        let row_slice = &x.data[row_offset..row_offset + x.cols];
+    let mut r_block = start_row;
+    while r_block < end_row {
+        let block_end = (r_block + NORMAL_EQ_TILE).min(end_row);
+        let b_len = block_end - r_block;
+        if b_len < NORMAL_EQ_TILE {
+            for col in &mut x_t {
+                col[b_len..NORMAL_EQ_TILE].fill(0.0);
+            }
+            y_t[b_len..NORMAL_EQ_TILE].fill(0.0);
+        }
 
+        for (b, r) in (r_block..block_end).enumerate() {
+            y_t[b] = y[r];
+            let row = &x.data[(r * d)..(r * d + d)];
+            for (j, &val) in row.iter().enumerate() {
+                x_t[j][b] = val;
+            }
+        }
+
+        accumulate_gram_upper_tile(&x_t, &x_t, &mut xt_x, p);
+        for j in 0..d {
+            xt_y[j] += dot64(&x_t[j], &y_t);
+            if fit_intercept {
+                xt_x.data[j * p + d] += sum64(&x_t[j]);
+            }
+        }
         if fit_intercept {
-            for j in 0..x.cols {
-                let xj = row_slice[j];
-                xt_y[j] += xj * yr;
-                let xt_x_row = j * p;
-                for k in j..x.cols {
-                    xt_x.data[xt_x_row + k] += xj * row_slice[k];
-                }
-                xt_x.data[xt_x_row + x.cols] += xj;
-            }
-            xt_y[x.cols] += yr;
-            xt_x.data[x.cols * p + x.cols] += 1.0;
-        } else {
-            for j in 0..x.cols {
-                let xj = row_slice[j];
-                xt_y[j] += xj * yr;
-                let xt_x_row = j * p;
-                for k in j..x.cols {
-                    xt_x.data[xt_x_row + k] += xj * row_slice[k];
-                }
-            }
+            xt_y[d] += sum64(&y_t);
         }
+        r_block = block_end;
     }
 
-    // Mirror upper triangle to lower triangle
-    for j in 0..p {
-        for k in (j + 1)..p {
-            let val = xt_x.data[j * p + k];
-            xt_x.data[k * p + j] = val;
-        }
+    if fit_intercept {
+        xt_x.data[d * p + d] = (end_row.saturating_sub(start_row)) as f64;
     }
-
+    mirror_upper_to_lower(&mut xt_x, p);
     Ok((xt_x, xt_y))
 }
 
@@ -306,7 +407,7 @@ pub fn compute_normal_equation_mats_multi(
     backend.compute_normal_equation_multi(x, y, sample_weight, fit_intercept)
 }
 
-// Compute (X^T * W * X) and (X^T * W * Y) over row slice range [start_row..end_row]
+// Compute (X^T * W * X) and (X^T * W * Y) over row slice range [start_row..end_row] using L1-blocked 64-row tiles
 pub fn compute_normal_equation_multi_range(
     x: &Matrix,
     y: &Matrix,
@@ -315,86 +416,117 @@ pub fn compute_normal_equation_multi_range(
     start_row: usize,
     end_row: usize,
 ) -> OchreResult<(Matrix, Matrix)> {
-    let p = if fit_intercept { x.cols + 1 } else { x.cols };
+    let d = x.cols;
+    let p = if fit_intercept { d + 1 } else { d };
     let k_targets = y.cols;
     let mut xt_x = Matrix::zeros(p, p);
     let mut xt_y = Matrix::zeros(p, k_targets);
+    let mut x_t = vec![[0.0f64; NORMAL_EQ_TILE]; d];
+    let mut y_t = vec![[0.0f64; NORMAL_EQ_TILE]; k_targets];
 
     match sample_weight {
-        Some(sw) => {
-            for r in start_row..end_row {
-                let w = sw[r];
-                if w == 0.0 {
-                    continue;
-                }
-                let row_offset = r * x.cols;
-                let row_slice = &x.data[row_offset..row_offset + x.cols];
-                let y_offset = r * k_targets;
-                let y_slice = &y.data[y_offset..y_offset + k_targets];
-
-                for j in 0..x.cols {
-                    let w_xj = w * row_slice[j];
-                    let xt_y_row = j * k_targets;
-                    for t in 0..k_targets {
-                        xt_y.data[xt_y_row + t] += w_xj * y_slice[t];
-                    }
-                    let xt_x_row = j * p;
-                    for k in j..x.cols {
-                        xt_x.data[xt_x_row + k] += w_xj * row_slice[k];
-                    }
-                    if fit_intercept {
-                        xt_x.data[xt_x_row + x.cols] += w_xj;
-                    }
-                }
-                if fit_intercept {
-                    let xt_y_last = x.cols * k_targets;
-                    for t in 0..k_targets {
-                        xt_y.data[xt_y_last + t] += w * y_slice[t];
-                    }
-                    xt_x[(x.cols, x.cols)] += w;
-                }
-            }
-        }
         None => {
-            for r in start_row..end_row {
-                let row_offset = r * x.cols;
-                let row_slice = &x.data[row_offset..row_offset + x.cols];
-                let y_offset = r * k_targets;
-                let y_slice = &y.data[y_offset..y_offset + k_targets];
-
-                for j in 0..x.cols {
-                    let xj = row_slice[j];
-                    let xt_y_row = j * k_targets;
-                    for t in 0..k_targets {
-                        xt_y.data[xt_y_row + t] += xj * y_slice[t];
+            let mut r_block = start_row;
+            while r_block < end_row {
+                let block_end = (r_block + NORMAL_EQ_TILE).min(end_row);
+                let b_len = block_end - r_block;
+                if b_len < NORMAL_EQ_TILE {
+                    for col in &mut x_t {
+                        col[b_len..NORMAL_EQ_TILE].fill(0.0);
                     }
-                    let xt_x_row = j * p;
-                    for k in j..x.cols {
-                        xt_x.data[xt_x_row + k] += xj * row_slice[k];
+                    for col in &mut y_t {
+                        col[b_len..NORMAL_EQ_TILE].fill(0.0);
+                    }
+                }
+                for (b, r) in (r_block..block_end).enumerate() {
+                    let x_row = &x.data[(r * d)..(r * d + d)];
+                    for (j, &val) in x_row.iter().enumerate() {
+                        x_t[j][b] = val;
+                    }
+                    let y_row = &y.data[(r * k_targets)..(r * k_targets + k_targets)];
+                    for (t, &val) in y_row.iter().enumerate() {
+                        y_t[t][b] = val;
+                    }
+                }
+                accumulate_gram_upper_tile(&x_t, &x_t, &mut xt_x, p);
+                for j in 0..d {
+                    let xj = &x_t[j];
+                    let xty_off = j * k_targets;
+                    for (t, yt) in y_t.iter().enumerate() {
+                        xt_y.data[xty_off + t] += dot64(xj, yt);
                     }
                     if fit_intercept {
-                        xt_x.data[xt_x_row + x.cols] += xj;
+                        xt_x.data[j * p + d] += sum64(xj);
                     }
                 }
                 if fit_intercept {
-                    let xt_y_last = x.cols * k_targets;
-                    for t in 0..k_targets {
-                        xt_y.data[xt_y_last + t] += y_slice[t];
+                    let xty_last = d * k_targets;
+                    for (t, yt) in y_t.iter().enumerate() {
+                        xt_y.data[xty_last + t] += sum64(yt);
                     }
-                    xt_x[(x.cols, x.cols)] += 1.0;
                 }
+                r_block = block_end;
+            }
+            if fit_intercept {
+                xt_x.data[d * p + d] = (end_row.saturating_sub(start_row)) as f64;
+            }
+        }
+        Some(sw) => {
+            let mut wx_t = vec![[0.0f64; NORMAL_EQ_TILE]; d];
+            let mut w_t = [0.0f64; NORMAL_EQ_TILE];
+            let mut r_block = start_row;
+            while r_block < end_row {
+                let block_end = (r_block + NORMAL_EQ_TILE).min(end_row);
+                let b_len = block_end - r_block;
+                if b_len < NORMAL_EQ_TILE {
+                    for col in &mut x_t {
+                        col[b_len..NORMAL_EQ_TILE].fill(0.0);
+                    }
+                    for col in &mut wx_t {
+                        col[b_len..NORMAL_EQ_TILE].fill(0.0);
+                    }
+                    for col in &mut y_t {
+                        col[b_len..NORMAL_EQ_TILE].fill(0.0);
+                    }
+                    w_t[b_len..NORMAL_EQ_TILE].fill(0.0);
+                }
+                for (b, r) in (r_block..block_end).enumerate() {
+                    let w = sw[r];
+                    w_t[b] = w;
+                    let x_row = &x.data[(r * d)..(r * d + d)];
+                    for (j, &val) in x_row.iter().enumerate() {
+                        x_t[j][b] = val;
+                        wx_t[j][b] = w * val;
+                    }
+                    let y_row = &y.data[(r * k_targets)..(r * k_targets + k_targets)];
+                    for (t, &val) in y_row.iter().enumerate() {
+                        y_t[t][b] = val;
+                    }
+                }
+                accumulate_gram_upper_tile(&wx_t, &x_t, &mut xt_x, p);
+                for j in 0..d {
+                    let wxj = &wx_t[j];
+                    let xty_off = j * k_targets;
+                    for (t, yt) in y_t.iter().enumerate() {
+                        xt_y.data[xty_off + t] += dot64(wxj, yt);
+                    }
+                    if fit_intercept {
+                        xt_x.data[j * p + d] += sum64(wxj);
+                    }
+                }
+                if fit_intercept {
+                    let xty_last = d * k_targets;
+                    for (t, yt) in y_t.iter().enumerate() {
+                        xt_y.data[xty_last + t] += dot64(&w_t, yt);
+                    }
+                    xt_x.data[d * p + d] += sum64(&w_t);
+                }
+                r_block = block_end;
             }
         }
     }
 
-    // Mirror upper triangle to lower triangle
-    for j in 0..p {
-        for k in (j + 1)..p {
-            let val = xt_x[(j, k)];
-            xt_x[(k, j)] = val;
-        }
-    }
-
+    mirror_upper_to_lower(&mut xt_x, p);
     Ok((xt_x, xt_y))
 }
 

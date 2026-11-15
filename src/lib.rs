@@ -689,8 +689,7 @@ fn buffer_to_matrix(py: Python<'_>, x: &pyo3::buffer::PyBuffer<f64>) -> PyResult
     }
     let rows = shape[0];
     let cols = shape[1];
-    let mut data = vec![0.0; rows * cols];
-    x.copy_to_slice(py, &mut data).map_err(|e| {
+    let data = x.to_vec(py).map_err(|e| {
         PyValueError::new_err(format!("Failed to copy buffer data: {} (´；ω；`)", e))
     })?;
     Ok(Matrix::from_vec(rows, cols, data)?)
@@ -703,12 +702,9 @@ fn buffer_to_target_vector(py: Python<'_>, y: &pyo3::buffer::PyBuffer<f64>) -> P
             "Target vector y must be a 1D vector (n_samples,) or 2D column (n_samples, 1) (・`ω´・)"
         )));
     }
-    let count = y.item_count();
-    let mut data = vec![0.0; count];
-    y.copy_to_slice(py, &mut data).map_err(|e| {
+    y.to_vec(py).map_err(|e| {
         PyValueError::new_err(format!("Failed to copy target buffer: {} (´；ω；`)", e))
-    })?;
-    Ok(data)
+    })
 }
 
 fn buffer_to_target_matrix(
@@ -726,8 +722,7 @@ fn buffer_to_target_matrix(
             shape.len()
         )));
     };
-    let mut data = vec![0.0; rows * cols];
-    y.copy_to_slice(py, &mut data).map_err(|e| {
+    let data = y.to_vec(py).map_err(|e| {
         PyValueError::new_err(format!("Failed to copy target buffer: {} (´；ω；`)", e))
     })?;
     let mat = Matrix::from_vec(rows, cols, data)?;
@@ -742,15 +737,12 @@ fn buffer_to_sample_weight(py: Python<'_>, sw: &pyo3::buffer::PyBuffer<f64>) -> 
             shape.len()
         )));
     }
-    let count = sw.item_count();
-    let mut data = vec![0.0; count];
-    sw.copy_to_slice(py, &mut data).map_err(|e| {
+    sw.to_vec(py).map_err(|e| {
         PyValueError::new_err(format!(
             "Failed to copy sample_weight buffer: {} (´；ω；`)",
             e
         ))
-    })?;
-    Ok(data)
+    })
 }
 
 #[pyclass(from_py_object, name = "LinearRegression")]

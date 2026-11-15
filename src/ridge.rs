@@ -4,12 +4,12 @@
 use crate::device::{DeviceType, parse_device};
 use crate::error::{OchreError, OchreResult};
 use crate::linear_regression::{
-    compute_and_solve_normal_1d, compute_and_solve_normal_multi, predict_linear_1d,
+    compute_and_solve_normal_1d, compute_and_solve_normal_multi, dot_unrolled, predict_linear_1d,
     predict_linear_multi, solve_from_normal_mats_multi,
 };
 use crate::matrix::{
-    Matrix, compute_normal_equation_mats_multi, compute_normal_equation_multi_range,
-    invert_spd_cholesky, r2_score, r2_score_multi,
+    Matrix, compute_normal_equation_mats, compute_normal_equation_mats_multi,
+    compute_normal_equation_multi_range, r2_score, r2_score_multi,
 };
 
 fn validate_alpha(alpha: f64) -> OchreResult<()> {
@@ -344,25 +344,48 @@ impl RidgeClassifier {
     ) -> OchreResult<()> {
         self.is_multiclass_ = true;
         let n_classes = self.classes_.len();
-        let mut y_ovr = Matrix {
-            rows: x.rows,
-            cols: n_classes,
-            data: vec![-1.0; x.rows * n_classes],
-        };
-        for (r, &label) in y.iter().enumerate() {
-            if let Some(cls_idx) = self.classes_.iter().position(|&c| (c - label).abs() < 1e-9) {
-                y_ovr[(r, cls_idx)] = 1.0;
-            }
-        }
+        let d = x.cols;
+        let p = if self.fit_intercept { d + 1 } else { d };
 
-        let (coef_mat, intercept_vec) = compute_and_solve_normal_multi(
-            x,
-            &y_ovr,
-            sample_weight,
-            self.fit_intercept,
-            self.alpha,
-            &self.device,
-        )?;
+        let (coef_mat, intercept_vec) = if sample_weight.is_none() {
+            let (xt_x, _) = compute_normal_equation_mats(x, y, self.fit_intercept, &self.device)?;
+            let xt_y = build_ovr_xt_y_unweighted(x, y, &self.classes_, self.fit_intercept, p)?;
+            match solve_from_normal_mats_multi(&xt_x, &xt_y, d, self.fit_intercept, self.alpha) {
+                Ok(res) => res,
+                Err(_) if self.device == DeviceType::Wgpu => {
+                    let (cpu_xtx, _) =
+                        compute_normal_equation_mats(x, y, self.fit_intercept, &DeviceType::Cpu)?;
+                    solve_from_normal_mats_multi(
+                        &cpu_xtx,
+                        &xt_y,
+                        d,
+                        self.fit_intercept,
+                        self.alpha,
+                    )?
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            let mut y_ovr = Matrix {
+                rows: x.rows,
+                cols: n_classes,
+                data: vec![-1.0; x.rows * n_classes],
+            };
+            for (r, &label) in y.iter().enumerate() {
+                if let Some(cls_idx) = self.classes_.iter().position(|&c| (c - label).abs() < 1e-9)
+                {
+                    y_ovr[(r, cls_idx)] = 1.0;
+                }
+            }
+            compute_and_solve_normal_multi(
+                x,
+                &y_ovr,
+                sample_weight,
+                self.fit_intercept,
+                self.alpha,
+                &self.device,
+            )?
+        };
 
         self.coef_ = Some(coef_mat.data[0..x.cols].to_vec());
         self.intercept_ = Some(intercept_vec[0]);
@@ -480,30 +503,192 @@ pub struct RidgeCV {
     pub n_features_in_: Option<usize>,
 }
 
-#[inline]
-fn quad_form_row(a_inv: &Matrix, x_row: &[f64], fit_intercept: bool) -> f64 {
-    let d = x_row.len();
-    let p = a_inv.cols;
-    let mut sum = 0.0;
-    for (i, &xi) in x_row.iter().enumerate() {
-        let row_off = i * p;
-        sum += xi * xi * a_inv.data[row_off + i];
-        let mut off_sum = 0.0;
-        for (&xj, &aij) in x_row[(i + 1)..d]
-            .iter()
-            .zip(&a_inv.data[(row_off + i + 1)..(row_off + d)])
-        {
-            off_sum += xj * aij;
+fn build_ovr_xt_y_unweighted(
+    x: &Matrix,
+    y: &[f64],
+    classes: &[f64],
+    fit_intercept: bool,
+    p: usize,
+) -> OchreResult<Matrix> {
+    let d = x.cols;
+    let k = classes.len();
+    let (class_x_sum, class_count) = if x.rows >= 2048 {
+        use rayon::prelude::*;
+        x.data
+            .par_chunks(512 * d)
+            .enumerate()
+            .map(|(chunk_idx, x_chunk)| {
+                let start_r = chunk_idx * 512;
+                let n_r = x_chunk.len() / d;
+                let mut local_sum = vec![0.0; k * d];
+                let mut local_cnt = vec![0.0; k];
+                for i in 0..n_r {
+                    let label = y[start_r + i];
+                    if let Some(c) = classes.iter().position(|&cl| (cl - label).abs() < 1e-9) {
+                        local_cnt[c] += 1.0;
+                        let dst = &mut local_sum[(c * d)..(c * d + d)];
+                        let src = &x_chunk[(i * d)..(i * d + d)];
+                        for (dv, &sv) in dst.iter_mut().zip(src.iter()) {
+                            *dv += sv;
+                        }
+                    }
+                }
+                (local_sum, local_cnt)
+            })
+            .reduce(
+                || (vec![0.0; k * d], vec![0.0; k]),
+                |(mut s_a, mut c_a), (s_b, c_b)| {
+                    for (a, b) in s_a.iter_mut().zip(s_b.iter()) {
+                        *a += *b;
+                    }
+                    for (a, b) in c_a.iter_mut().zip(c_b.iter()) {
+                        *a += *b;
+                    }
+                    (s_a, c_a)
+                },
+            )
+    } else {
+        let mut local_sum = vec![0.0; k * d];
+        let mut local_cnt = vec![0.0; k];
+        for (r, &label) in y.iter().enumerate() {
+            if let Some(c) = classes.iter().position(|&cl| (cl - label).abs() < 1e-9) {
+                local_cnt[c] += 1.0;
+                let dst = &mut local_sum[(c * d)..(c * d + d)];
+                let src = &x.data[(r * d)..(r * d + d)];
+                for (dv, &sv) in dst.iter_mut().zip(src.iter()) {
+                    *dv += sv;
+                }
+            }
         }
-        sum += 2.0 * xi * off_sum;
-        if fit_intercept {
-            sum += 2.0 * xi * a_inv.data[row_off + d];
+        (local_sum, local_cnt)
+    };
+
+    let mut total_col_sum = vec![0.0; d];
+    for c in 0..k {
+        let c_slice = &class_x_sum[(c * d)..(c * d + d)];
+        for (j, &v) in c_slice.iter().enumerate() {
+            total_col_sum[j] += v;
+        }
+    }
+
+    let mut xt_y = Matrix::zeros(p, k);
+    for j in 0..d {
+        let col_tot = total_col_sum[j];
+        for c in 0..k {
+            xt_y[(j, c)] = 2.0 * class_x_sum[c * d + j] - col_tot;
         }
     }
     if fit_intercept {
-        sum += a_inv.data[d * p + d];
+        let n_f = x.rows as f64;
+        for c in 0..k {
+            xt_y[(d, c)] = 2.0 * class_count[c] - n_f;
+        }
     }
-    sum
+    Ok(xt_y)
+}
+
+// Cyclic Jacobi eigendecomposition of symmetric d x d matrix G_c = Q * diag(eig) * Q^T.
+// Returns (eigenvalues, Q^T) where each row of Q^T is an orthonormal eigenvector.
+fn sym_eigen_jacobi_transpose(g: &Matrix) -> (Vec<f64>, Matrix) {
+    let d = g.rows;
+    let mut a = g.data.clone();
+    let mut q_t = vec![0.0; d * d];
+    for i in 0..d {
+        q_t[i * d + i] = 1.0;
+    }
+
+    for _sweep in 0..50 {
+        let mut max_off = 0.0f64;
+        for p in 0..d {
+            for q in (p + 1)..d {
+                let apq = a[p * d + q];
+                max_off = max_off.max(apq.abs());
+                let app = a[p * d + p];
+                let aqq = a[q * d + q];
+                if apq.abs() <= 1e-15 * (app.abs() + aqq.abs()) {
+                    continue;
+                }
+                let tau = (aqq - app) / (2.0 * apq);
+                let t = if tau >= 0.0 {
+                    1.0 / (tau + (1.0 + tau * tau).sqrt())
+                } else {
+                    -1.0 / (-tau + (1.0 + tau * tau).sqrt())
+                };
+                let c = 1.0 / (1.0 + t * t).sqrt();
+                let s = t * c;
+
+                a[p * d + p] = app - t * apq;
+                a[q * d + q] = aqq + t * apq;
+                a[p * d + q] = 0.0;
+                a[q * d + p] = 0.0;
+
+                for k in 0..d {
+                    if k != p && k != q {
+                        let akp = a[k * d + p];
+                        let akq = a[k * d + q];
+                        let new_kp = c * akp - s * akq;
+                        let new_kq = s * akp + c * akq;
+                        a[k * d + p] = new_kp;
+                        a[p * d + k] = new_kp;
+                        a[k * d + q] = new_kq;
+                        a[q * d + k] = new_kq;
+                    }
+                }
+                for k in 0..d {
+                    let qp = q_t[p * d + k];
+                    let qq = q_t[q * d + k];
+                    q_t[p * d + k] = c * qp - s * qq;
+                    q_t[q * d + k] = s * qp + c * qq;
+                }
+            }
+        }
+        if max_off < 1e-13 {
+            break;
+        }
+    }
+
+    let eig: Vec<f64> = (0..d).map(|i| a[i * d + i].max(0.0)).collect();
+    (
+        eig,
+        Matrix {
+            rows: d,
+            cols: d,
+            data: q_t,
+        },
+    )
+}
+
+#[inline]
+fn project_z_sq_row(q_t: &[f64], q_mu: &[f64], x_row: &[f64], z_sq: &mut [f64]) {
+    let d = x_row.len();
+    let mut i = 0;
+    while i + 4 <= d {
+        let q0 = &q_t[(i * d)..(i * d + d)];
+        let q1 = &q_t[((i + 1) * d)..((i + 1) * d + d)];
+        let q2 = &q_t[((i + 2) * d)..((i + 2) * d + d)];
+        let q3 = &q_t[((i + 3) * d)..((i + 3) * d + d)];
+        let mut s0 = -q_mu[i];
+        let mut s1 = -q_mu[i + 1];
+        let mut s2 = -q_mu[i + 2];
+        let mut s3 = -q_mu[i + 3];
+        for j in 0..d {
+            let xj = x_row[j];
+            s0 += xj * q0[j];
+            s1 += xj * q1[j];
+            s2 += xj * q2[j];
+            s3 += xj * q3[j];
+        }
+        z_sq[i] = s0 * s0;
+        z_sq[i + 1] = s1 * s1;
+        z_sq[i + 2] = s2 * s2;
+        z_sq[i + 3] = s3 * s3;
+        i += 4;
+    }
+    while i < d {
+        let zi = dot_unrolled(&q_t[(i * d)..(i * d + d)], x_row) - q_mu[i];
+        z_sq[i] = zi * zi;
+        i += 1;
+    }
 }
 
 fn slice_matrix_rows(m: &Matrix, start_row: usize, end_row: usize) -> Matrix {
@@ -527,47 +712,122 @@ fn subtract_matrix(a: &Matrix, b: &Matrix) -> Matrix {
     }
 }
 
-fn compute_loo_score(
+fn evaluate_loo_batched_eigen(
     x: &Matrix,
     y: &Matrix,
     sample_weight: Option<&[f64]>,
     fit_intercept: bool,
-    xt_x: &Matrix,
-    xt_y: &Matrix,
-    alpha: f64,
-) -> OchreResult<(f64, Matrix, Vec<f64>)> {
-    let mut reg_xtx = xt_x.clone();
-    reg_xtx.add_ridge_feature_diagonal(alpha, x.cols);
+    total_xt_x: &Matrix,
+    total_xt_y: &Matrix,
+    alphas: &[f64],
+) -> OchreResult<(f64, f64, Matrix, Vec<f64>)> {
+    let d = x.cols;
+    let m_count = alphas.len();
+    let k_targets = y.cols;
 
-    let (coef_mat, intercept_vec) =
-        solve_from_normal_mats_multi(&reg_xtx, xt_y, x.cols, fit_intercept, 0.0)?;
-    let a_inv = invert_spd_cholesky(&reg_xtx)?;
-    let preds = predict_linear_multi(x, &coef_mat, &intercept_vec)?;
-
-    let mut sum_sq_looe = 0.0;
-    for r in 0..x.rows {
-        let w = sample_weight.map_or(1.0, |sw| sw[r]);
-        if w == 0.0 {
-            continue;
-        }
-        let x_off = r * x.cols;
-        let x_row = &x.data[x_off..x_off + x.cols];
-        let leverage = w * quad_form_row(&a_inv, x_row, fit_intercept);
-        let raw_denom = 1.0 - leverage;
-        let denom = if raw_denom.abs() < 1e-12 {
-            if raw_denom < 0.0 { -1e-12 } else { 1e-12 }
-        } else {
-            raw_denom
-        };
-        let sqrt_w = w.sqrt();
-        for t in 0..y.cols {
-            let err = sqrt_w * (y[(r, t)] - preds[(r, t)]) / denom;
-            sum_sq_looe += err * err;
-        }
+    let mut models = Vec::with_capacity(m_count);
+    for &alpha in alphas {
+        let mut reg_xtx = total_xt_x.clone();
+        reg_xtx.add_ridge_feature_diagonal(alpha, d);
+        let (coef_mat, intercept_vec) =
+            solve_from_normal_mats_multi(&reg_xtx, total_xt_y, d, fit_intercept, 0.0)?;
+        models.push((alpha, coef_mat, intercept_vec));
     }
 
-    let score = -sum_sq_looe / ((x.rows * y.cols) as f64);
-    Ok((score, coef_mat, intercept_vec))
+    let (mu, g_c, c0) = if fit_intercept {
+        let w_sum = total_xt_x[(d, d)];
+        if w_sum <= 1e-12 {
+            return Err(OchreError::NonPositiveWeightSum);
+        }
+        let mu_vec: Vec<f64> = (0..d).map(|j| total_xt_x[(j, d)] / w_sum).collect();
+        let mut g_mat = Matrix::zeros(d, d);
+        for i in 0..d {
+            for j in 0..d {
+                g_mat[(i, j)] = total_xt_x[(i, j)] - w_sum * mu_vec[i] * mu_vec[j];
+            }
+        }
+        (mu_vec, g_mat, 1.0 / w_sum)
+    } else {
+        let mut g_mat = Matrix::zeros(d, d);
+        for i in 0..d {
+            for j in 0..d {
+                g_mat[(i, j)] = total_xt_x[(i, j)];
+            }
+        }
+        (vec![0.0; d], g_mat, 0.0)
+    };
+
+    let (eig, q_t) = sym_eigen_jacobi_transpose(&g_c);
+    let q_mu: Vec<f64> = (0..d)
+        .map(|i| dot_unrolled(&q_t.data[(i * d)..(i * d + d)], &mu))
+        .collect();
+    let inv_eigs: Vec<Vec<f64>> = alphas
+        .iter()
+        .map(|&a| (0..d).map(|i| 1.0 / (eig[i] + a)).collect())
+        .collect();
+
+    let eval_chunk = |start_r: usize, x_chunk: &[f64]| -> Vec<f64> {
+        let n_r = x_chunk.len() / d;
+        let mut local_err = vec![0.0; m_count];
+        let mut z_sq = vec![0.0; d];
+        for idx in 0..n_r {
+            let r = start_r + idx;
+            let w = sample_weight.map_or(1.0, |sw| sw[r]);
+            if w == 0.0 {
+                continue;
+            }
+            let x_row = &x_chunk[(idx * d)..(idx * d + d)];
+            project_z_sq_row(&q_t.data, &q_mu, x_row, &mut z_sq);
+            let sqrt_w = w.sqrt();
+            for m in 0..m_count {
+                let lev = w * (c0 + dot_unrolled(&z_sq, &inv_eigs[m]));
+                let raw_denom = 1.0 - lev;
+                let denom = if raw_denom.abs() < 1e-12 {
+                    if raw_denom < 0.0 { -1e-12 } else { 1e-12 }
+                } else {
+                    raw_denom
+                };
+                let (_, ref coef_mat, ref intercept_vec) = models[m];
+                for t in 0..k_targets {
+                    let c_row = &coef_mat.data[(t * d)..(t * d + d)];
+                    let pred = intercept_vec[t] + dot_unrolled(x_row, c_row);
+                    let err = sqrt_w * (y[(r, t)] - pred) / denom;
+                    local_err[m] += err * err;
+                }
+            }
+        }
+        local_err
+    };
+
+    let sum_sq_looe = if x.rows >= 1024 {
+        use rayon::prelude::*;
+        let block = 512;
+        x.data
+            .par_chunks(block * d)
+            .enumerate()
+            .map(|(c_idx, x_chunk)| eval_chunk(c_idx * block, x_chunk))
+            .reduce(
+                || vec![0.0; m_count],
+                |mut a, b| {
+                    for (va, vb) in a.iter_mut().zip(b.iter()) {
+                        *va += *vb;
+                    }
+                    a
+                },
+            )
+    } else {
+        eval_chunk(0, &x.data)
+    };
+
+    let denom_scale = (x.rows * k_targets) as f64;
+    let mut best: Option<(f64, f64, Matrix, Vec<f64>)> = None;
+    for (m, (alpha, coef_mat, intercept_vec)) in models.into_iter().enumerate() {
+        let score = -sum_sq_looe[m] / denom_scale;
+        if best.as_ref().is_none_or(|cur| score > cur.1) {
+            best = Some((alpha, score, coef_mat, intercept_vec));
+        }
+    }
+    best.ok_or(OchreError::InvalidRidgeCVAlphas)
 }
 
 impl RidgeCV {
@@ -703,26 +963,15 @@ impl RidgeCV {
         total_xt_x: &Matrix,
         total_xt_y: &Matrix,
     ) -> OchreResult<(f64, f64, Matrix, Vec<f64>)> {
-        let mut best: Option<(f64, f64, Matrix, Vec<f64>)> = None;
-        for &alpha in &self.alphas {
-            let (score, coef_mat, intercept_vec) = compute_loo_score(
-                x,
-                y,
-                sample_weight,
-                self.fit_intercept,
-                total_xt_x,
-                total_xt_y,
-                alpha,
-            )?;
-            let is_better = match &best {
-                None => true,
-                Some(cur) => score > cur.1,
-            };
-            if is_better {
-                best = Some((alpha, score, coef_mat, intercept_vec));
-            }
-        }
-        best.ok_or(OchreError::InvalidRidgeCVAlphas)
+        evaluate_loo_batched_eigen(
+            x,
+            y,
+            sample_weight,
+            self.fit_intercept,
+            total_xt_x,
+            total_xt_y,
+            &self.alphas,
+        )
     }
 
     fn evaluate_kfold_candidates(
