@@ -684,13 +684,16 @@ fn get_or_compile_executable(
         format_size: format_cstr.as_bytes().len(),
     };
 
+    // Serialized xla::CompileOptionsProto { executable_build_options: { num_replicas: 1, num_partitions: 1 } }
+    const COMPILE_OPTIONS_PROTO: [u8; 6] = [0x1A, 0x04, 0x20, 0x01, 0x28, 0x01];
+
     let mut compile_args = PjrtClientCompileArgs {
         struct_size: std::mem::size_of::<PjrtClientCompileArgs>(),
         extension_start: ptr::null_mut(),
         client: ctx.client.0,
         program: &program,
-        compile_options: ptr::null(),
-        compile_options_size: 0,
+        compile_options: COMPILE_OPTIONS_PROTO.as_ptr() as *const c_char,
+        compile_options_size: COMPILE_OPTIONS_PROTO.len(),
         executable: ptr::null_mut(),
     };
 
