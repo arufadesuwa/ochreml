@@ -223,6 +223,43 @@ pub struct PjrtBufferDestroyArgs {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
+pub struct PjrtBufferMemoryLayoutTiled {
+    pub struct_size: usize,
+    pub extension_start: *mut PjrtExtensionBase,
+    pub minor_to_major: *const i64,
+    pub minor_to_major_size: usize,
+    pub tile_dims: *const i64,
+    pub tile_dim_sizes: *const usize,
+    pub num_tiles: usize,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct PjrtBufferMemoryLayoutStrides {
+    pub struct_size: usize,
+    pub extension_start: *mut PjrtExtensionBase,
+    pub byte_strides: *const i64,
+    pub num_byte_strides: usize,
+}
+
+#[repr(C)]
+pub union PjrtBufferMemoryLayoutUnion {
+    pub tiled: PjrtBufferMemoryLayoutTiled,
+    pub strides: PjrtBufferMemoryLayoutStrides,
+}
+
+#[repr(C)]
+pub struct PjrtBufferMemoryLayout {
+    pub struct_size: usize,
+    pub extension_start: *mut PjrtExtensionBase,
+    pub layout: PjrtBufferMemoryLayoutUnion,
+    pub layout_type: c_int,
+}
+
+const PJRT_BUFFER_MEMORY_LAYOUT_TYPE_TILED: c_int = 0;
+
+#[repr(C)]
 pub struct PjrtBufferToHostBufferArgs {
     pub struct_size: usize,
     pub extension_start: *mut PjrtExtensionBase,
@@ -883,12 +920,29 @@ fn execute_tpu_dot(
     }
 
     let mut out_host = vec![0.0f32; m_pad * n_pad];
+    let row_major_order: [i64; 2] = [1, 0];
+    let mut host_layout = PjrtBufferMemoryLayout {
+        struct_size: std::mem::size_of::<PjrtBufferMemoryLayout>(),
+        extension_start: ptr::null_mut(),
+        layout: PjrtBufferMemoryLayoutUnion {
+            tiled: PjrtBufferMemoryLayoutTiled {
+                struct_size: std::mem::size_of::<PjrtBufferMemoryLayoutTiled>(),
+                extension_start: ptr::null_mut(),
+                minor_to_major: row_major_order.as_ptr(),
+                minor_to_major_size: row_major_order.len(),
+                tile_dims: ptr::null(),
+                tile_dim_sizes: ptr::null(),
+                num_tiles: 0,
+            },
+        },
+        layout_type: PJRT_BUFFER_MEMORY_LAYOUT_TYPE_TILED,
+    };
     let to_host_fn = api.buffer_to_host_buffer?;
     let mut to_host_args = PjrtBufferToHostBufferArgs {
         struct_size: std::mem::size_of::<PjrtBufferToHostBufferArgs>(),
         extension_start: ptr::null_mut(),
         src: out_ptrs[0],
-        host_layout: ptr::null_mut(),
+        host_layout: (&mut host_layout as *mut PjrtBufferMemoryLayout) as *mut c_void,
         dst: out_host.as_mut_ptr() as *mut c_void,
         dst_size: out_host.len() * std::mem::size_of::<f32>(),
         event: ptr::null_mut(),
