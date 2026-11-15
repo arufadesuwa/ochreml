@@ -110,6 +110,8 @@ pub struct PjrtClientCreateArgs {
     pub kv_put_callback: *const c_void,
     pub kv_put_user_arg: *mut c_void,
     pub client: *mut PjrtClient,
+    pub kv_try_get_callback: *const c_void,
+    pub kv_try_get_user_arg: *mut c_void,
 }
 
 #[repr(C)]
@@ -535,6 +537,8 @@ fn try_init_tpu_context() -> Option<TpuContext> {
             kv_put_callback: ptr::null(),
             kv_put_user_arg: ptr::null_mut(),
             client: ptr::null_mut(),
+            kv_try_get_callback: ptr::null(),
+            kv_try_get_user_arg: ptr::null_mut(),
         };
         let err = unsafe { create_fn(&mut create_args) };
         if !check_pjrt_error(api, err) || create_args.client.is_null() {
