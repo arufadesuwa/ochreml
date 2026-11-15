@@ -4,6 +4,11 @@
 
 from typing import Any, List, Tuple
 
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
+
 
 def process_features(X: Any) -> Tuple[bool, Any]:
     """
@@ -12,6 +17,20 @@ def process_features(X: Any) -> Tuple[bool, Any]:
     """
     if X is None:
         raise ValueError("Feature matrix X cannot be None (´；ω；`)")
+
+    if _np is not None and type(X) is _np.ndarray:
+        if X.ndim == 2 and X.dtype == _np.float64 and X.flags.c_contiguous:
+            return True, X
+        if X.ndim == 1:
+            raise ValueError(
+                "Feature matrix X must be a 2D array (n_samples, n_features) ( >_< )\n"
+                "Tip: Use X.reshape(-1, 1) if data has only 1 feature."
+            )
+        if X.ndim != 2:
+            raise ValueError(
+                f"Feature matrix dimension ({X.ndim}D) is not supported. Must be 2D matrix (・`ω´・)"
+            )
+        return True, _np.ascontiguousarray(X, dtype=_np.float64)
 
     type_name = type(X).__name__
     module_name = type(X).__module__
@@ -93,6 +112,11 @@ def process_target(y: Any) -> Tuple[bool, Any]:
     if y is None:
         raise ValueError("Target vector y cannot be None (´；ω；`)")
 
+    if _np is not None and type(y) is _np.ndarray:
+        if y.ndim == 1 and y.dtype == _np.float64 and y.flags.c_contiguous:
+            return True, y
+        return True, _np.ascontiguousarray(y, dtype=_np.float64).ravel()
+
     type_name = type(y).__name__
     module_name = type(y).__module__
 
@@ -158,6 +182,21 @@ def process_target_multi(y: Any) -> Tuple[bool, Any, bool]:
     """
     if y is None:
         raise ValueError("Target y cannot be None (´；ω；`)")
+
+    if _np is not None and type(y) is _np.ndarray:
+        if y.dtype == _np.float64 and y.flags.c_contiguous:
+            if y.ndim == 1:
+                return True, y, False
+            if y.ndim == 2:
+                return True, y, True
+        arr = _np.ascontiguousarray(y, dtype=_np.float64)
+        if arr.ndim == 1:
+            return True, arr, False
+        if arr.ndim == 2:
+            return True, arr, True
+        raise ValueError(
+            f"Target dimension ({arr.ndim}D) is not supported. Must be 1D or 2D (・`ω´・)"
+        )
 
     type_name = type(y).__name__
     module_name = type(y).__module__

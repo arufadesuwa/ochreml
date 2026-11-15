@@ -679,7 +679,56 @@ pub fn get_device_info() -> HashMap<String, String> {
     device::get_device_info_map()
 }
 
-fn buffer_to_matrix(py: Python<'_>, x: &pyo3::buffer::PyBuffer<f64>) -> PyResult<Matrix> {
+thread_local! {
+    static MATRIX_BUF_POOL: std::cell::RefCell<Vec<Vec<f64>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn pop_pooled_vec(min_cap: usize) -> Vec<f64> {
+    MATRIX_BUF_POOL
+        .with(|pool| {
+            let mut slots = pool.borrow_mut();
+            if let Some(pos) = slots.iter().position(|v| v.capacity() >= min_cap) {
+                Some(slots.swap_remove(pos))
+            } else {
+                slots.pop()
+            }
+        })
+        .unwrap_or_default()
+}
+
+struct PooledMatrix {
+    mat: Matrix,
+}
+
+impl std::ops::Deref for PooledMatrix {
+    type Target = Matrix;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.mat
+    }
+}
+
+impl Drop for PooledMatrix {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.mat.data);
+        if buf.capacity() <= 16 * 1024 * 1024 {
+            MATRIX_BUF_POOL.with(|pool| {
+                if let Ok(mut slots) = pool.try_borrow_mut() {
+                    if slots.len() < 2 {
+                        slots.push(buf);
+                    } else if let Some(min_slot) = slots.iter_mut().min_by_key(|v| v.capacity())
+                        && buf.capacity() > min_slot.capacity()
+                    {
+                        *min_slot = buf;
+                    }
+                }
+            });
+        }
+    }
+}
+
+fn buffer_to_matrix(py: Python<'_>, x: &pyo3::buffer::PyBuffer<f64>) -> PyResult<PooledMatrix> {
     let shape = x.shape();
     if shape.len() != 2 {
         return Err(PyValueError::new_err(format!(
@@ -689,10 +738,27 @@ fn buffer_to_matrix(py: Python<'_>, x: &pyo3::buffer::PyBuffer<f64>) -> PyResult
     }
     let rows = shape[0];
     let cols = shape[1];
+    let len = rows
+        .checked_mul(cols)
+        .ok_or_else(|| PyValueError::new_err("Matrix dimensions overflow ( >_< )"))?;
+
+    if x.is_c_contiguous() {
+        let mut data = pop_pooled_vec(len);
+        data.resize(len, 0.0);
+        x.copy_to_slice(py, &mut data[..len]).map_err(|e| {
+            PyValueError::new_err(format!("Failed to copy buffer data: {} (´；ω；`)", e))
+        })?;
+        return Ok(PooledMatrix {
+            mat: Matrix::from_vec(rows, cols, data)?,
+        });
+    }
+
     let data = x.to_vec(py).map_err(|e| {
         PyValueError::new_err(format!("Failed to copy buffer data: {} (´；ω；`)", e))
     })?;
-    Ok(Matrix::from_vec(rows, cols, data)?)
+    Ok(PooledMatrix {
+        mat: Matrix::from_vec(rows, cols, data)?,
+    })
 }
 
 fn buffer_to_target_vector(py: Python<'_>, y: &pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
@@ -710,7 +776,7 @@ fn buffer_to_target_vector(py: Python<'_>, y: &pyo3::buffer::PyBuffer<f64>) -> P
 fn buffer_to_target_matrix(
     py: Python<'_>,
     y: &pyo3::buffer::PyBuffer<f64>,
-) -> PyResult<(Matrix, bool)> {
+) -> PyResult<(PooledMatrix, bool)> {
     let shape = y.shape();
     let (rows, cols, is_2d) = if shape.len() == 1 {
         (shape[0], 1, false)
@@ -722,11 +788,27 @@ fn buffer_to_target_matrix(
             shape.len()
         )));
     };
+    let len = rows
+        .checked_mul(cols)
+        .ok_or_else(|| PyValueError::new_err("Target dimensions overflow ( >_< )"))?;
+    if y.is_c_contiguous() {
+        let mut data = pop_pooled_vec(len);
+        data.resize(len, 0.0);
+        y.copy_to_slice(py, &mut data[..len]).map_err(|e| {
+            PyValueError::new_err(format!("Failed to copy target buffer: {} (´；ω；`)", e))
+        })?;
+        return Ok((
+            PooledMatrix {
+                mat: Matrix::from_vec(rows, cols, data)?,
+            },
+            is_2d,
+        ));
+    }
     let data = y.to_vec(py).map_err(|e| {
         PyValueError::new_err(format!("Failed to copy target buffer: {} (´；ω；`)", e))
     })?;
     let mat = Matrix::from_vec(rows, cols, data)?;
-    Ok((mat, is_2d))
+    Ok((PooledMatrix { mat }, is_2d))
 }
 
 fn buffer_to_sample_weight(py: Python<'_>, sw: &pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {

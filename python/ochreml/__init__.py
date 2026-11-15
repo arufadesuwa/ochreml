@@ -24,7 +24,7 @@ from ._ochreml import (
     get_device_info as _get_device_info,
 )
 
-__version__ = "0.3.1b2"
+__version__ = "0.3.1b3"
 __all__ = [
     "LinearRegression",
     "Ridge",
@@ -147,6 +147,44 @@ def load(path: str, device: Optional[str] = None) -> Any:
     return obj
 
 
+def _fast_linear_predict_1d(X_data: Any, w: Any, b: float) -> Any:
+    """L1/L2-tiled GEMV + in-place bias addition without OpenBLAS/Rayon thread-pool collision (＾▽＾)."""
+    import numpy as np
+
+    n = X_data.shape[0]
+    step = 4096
+    if n <= step:
+        out = np.dot(X_data, w)
+        if b != 0.0:
+            out += b
+        return out
+    out = np.empty(n, dtype=np.float64)
+    for i in range(0, n, step):
+        sl = out[i : i + step]
+        np.dot(X_data[i : i + step], w, out=sl)
+        if b != 0.0:
+            sl += b
+    return out
+
+
+def _fast_linear_predict_2d(X_data: Any, w_t: Any, b: Any) -> Any:
+    """L1/L2-tiled GEMM + in-place bias addition without OpenBLAS/Rayon thread-pool collision (＾▽＾)."""
+    import numpy as np
+
+    n = X_data.shape[0]
+    step = 2048
+    if n <= step:
+        out = np.dot(X_data, w_t)
+        out += b
+        return out
+    out = np.empty((n, w_t.shape[1]), dtype=np.float64)
+    for i in range(0, n, step):
+        sl = out[i : i + step]
+        np.dot(X_data[i : i + step], w_t, out=sl)
+        sl += b
+    return out
+
+
 class _BaseLinearEstimator:
     """Shared Python wrapper infrastructure for linear regression estimators (＾▽＾)."""
 
@@ -159,8 +197,10 @@ class _BaseLinearEstimator:
             if self._model.is_multi_target_:
                 if self._model.coef_multi_ is not None:
                     self._coef_arr = np.asarray(self._model.coef_multi_, dtype=np.float64)
+                    self._coef_arr_t = np.ascontiguousarray(self._coef_arr.T)
                 else:
                     self._coef_arr = None
+                    self._coef_arr_t = None
                 if self._model.intercept_multi_ is not None:
                     self._intercept_val = np.asarray(self._model.intercept_multi_, dtype=np.float64)
                 else:
@@ -170,9 +210,11 @@ class _BaseLinearEstimator:
                     self._coef_arr = np.asarray(self._model.coef_, dtype=np.float64)
                 else:
                     self._coef_arr = None
+                self._coef_arr_t = None
                 self._intercept_val = float(self._model.intercept_ or 0.0)
         except Exception:
             self._coef_arr = None
+            self._coef_arr_t = None
             if self._model.is_multi_target_:
                 self._intercept_val = self._model.intercept_multi_
             else:
@@ -241,13 +283,16 @@ class _BaseLinearEstimator:
                             raise ValueError(
                                 f"Number of features in test data ({X_data.shape[1]}) does not match model ({self._coef_arr.shape[1]}) (・`ω´・)"
                             )
-                        return np.dot(X_data, self._coef_arr.T) + self._intercept_val
+                        w_t = getattr(self, "_coef_arr_t", None)
+                        if w_t is None:
+                            w_t = np.ascontiguousarray(self._coef_arr.T)
+                        return _fast_linear_predict_2d(X_data, w_t, self._intercept_val)
                     else:
                         if X_data.shape[1] != self._coef_arr.shape[0]:
                             raise ValueError(
                                 f"Number of features in test data ({X_data.shape[1]}) does not match model ({self._coef_arr.shape[0]}) (・`ω´・)"
                             )
-                        return np.dot(X_data, self._coef_arr) + self._intercept_val
+                        return _fast_linear_predict_1d(X_data, self._coef_arr, self._intercept_val)
             except ValueError:
                 raise
             except Exception:
@@ -430,6 +475,7 @@ class LinearRegression(_BaseLinearEstimator):
         self.device = self._model.device_ or target_dev
         self._coef_arr = None
         self._intercept_val = 0.0
+        self._classes_arr = None
         self._sync_cache()
 
     def __repr__(self) -> str:
@@ -505,6 +551,7 @@ class Ridge(_BaseLinearEstimator):
         self.device = self._model.device_ or target_dev
         self._coef_arr = None
         self._intercept_val = 0.0
+        self._classes_arr = None
         self._sync_cache()
 
     def __repr__(self) -> str:
@@ -560,17 +607,26 @@ class RidgeClassifier:
             device=self.device,
         )
         self._coef_arr: Optional[Any] = None
+        self._coef_arr_t: Optional[Any] = None
         self._intercept_val: Any = 0.0
+        self._classes_arr: Optional[Any] = None
 
     def _sync_cache(self) -> None:
         try:
             import numpy as np
 
+            self._classes_arr = (
+                np.asarray(self._model.classes_, dtype=np.float64)
+                if self._model.classes_
+                else None
+            )
             if self._model.is_multiclass_:
                 if self._model.coef_multi_ is not None:
                     self._coef_arr = np.asarray(self._model.coef_multi_, dtype=np.float64)
+                    self._coef_arr_t = np.ascontiguousarray(self._coef_arr.T)
                 else:
                     self._coef_arr = None
+                    self._coef_arr_t = None
                 if self._model.intercept_multi_ is not None:
                     self._intercept_val = np.asarray(self._model.intercept_multi_, dtype=np.float64)
                 else:
@@ -580,9 +636,12 @@ class RidgeClassifier:
                     self._coef_arr = np.asarray(self._model.coef_, dtype=np.float64)
                 else:
                     self._coef_arr = None
+                self._coef_arr_t = None
                 self._intercept_val = float(self._model.intercept_ or 0.0)
         except Exception:
             self._coef_arr = None
+            self._coef_arr_t = None
+            self._classes_arr = None
             if self._model.is_multiclass_:
                 self._intercept_val = self._model.intercept_multi_
             else:
@@ -596,7 +655,9 @@ class RidgeClassifier:
         inst.fit_intercept = rust_model.fit_intercept
         inst.device = rust_model.device_ or device
         inst._coef_arr = None
+        inst._coef_arr_t = None
         inst._intercept_val = 0.0
+        inst._classes_arr = None
         inst._sync_cache()
         return inst
 
@@ -659,13 +720,16 @@ class RidgeClassifier:
                             raise ValueError(
                                 f"Number of features in test data ({X_data.shape[1]}) does not match model ({self._coef_arr.shape[1]}) (・`ω´・)"
                             )
-                        return np.dot(X_data, self._coef_arr.T) + self._intercept_val
+                        w_t = getattr(self, "_coef_arr_t", None)
+                        if w_t is None:
+                            w_t = np.ascontiguousarray(self._coef_arr.T)
+                        return _fast_linear_predict_2d(X_data, w_t, self._intercept_val)
                     else:
                         if X_data.shape[1] != self._coef_arr.shape[0]:
                             raise ValueError(
                                 f"Number of features in test data ({X_data.shape[1]}) does not match model ({self._coef_arr.shape[0]}) (・`ω´・)"
                             )
-                        return np.dot(X_data, self._coef_arr) + self._intercept_val
+                        return _fast_linear_predict_1d(X_data, self._coef_arr, self._intercept_val)
             except ValueError:
                 raise
             except Exception:
@@ -692,6 +756,53 @@ class RidgeClassifier:
         """
         is_buf_x, X_data = process_features(X)
         if is_buf_x:
+            try:
+                import numpy as np
+
+                if self._classes_arr is not None:
+                    if len(self._classes_arr) == 1:
+                        if X_data.shape[1] != self._model.n_features_in_:
+                            raise ValueError(
+                                f"Number of features in test data ({X_data.shape[1]}) does not match model ({self._model.n_features_in_}) (・`ω´・)"
+                            )
+                        return np.full(X_data.shape[0], self._classes_arr[0], dtype=np.float64)
+                    if self._coef_arr is not None:
+                        if self._model.is_multiclass_:
+                            if X_data.shape[1] != self._coef_arr.shape[1]:
+                                raise ValueError(
+                                    f"Number of features in test data ({X_data.shape[1]}) does not match model ({self._coef_arr.shape[1]}) (・`ω´・)"
+                                )
+                            w_t = getattr(self, "_coef_arr_t", None)
+                            if w_t is None:
+                                w_t = np.ascontiguousarray(self._coef_arr.T)
+                            n = X_data.shape[0]
+                            step = 2048
+                            if n <= step:
+                                scores = np.dot(X_data, w_t)
+                                scores += self._intercept_val
+                                return self._classes_arr[np.argmax(scores, axis=1)]
+                            out = np.empty(n, dtype=self._classes_arr.dtype)
+                            buf = np.empty((step, w_t.shape[1]), dtype=np.float64)
+                            for i in range(0, n, step):
+                                end = min(i + step, n)
+                                sl = buf[: end - i]
+                                np.dot(X_data[i:end], w_t, out=sl)
+                                sl += self._intercept_val
+                                out[i:end] = self._classes_arr[np.argmax(sl, axis=1)]
+                            return out
+                        else:
+                            if X_data.shape[1] != self._coef_arr.shape[0]:
+                                raise ValueError(
+                                    f"Number of features in test data ({X_data.shape[1]}) does not match model ({self._coef_arr.shape[0]}) (・`ω´・)"
+                                )
+                            scores = _fast_linear_predict_1d(
+                                X_data, self._coef_arr, self._intercept_val
+                            )
+                            return np.where(scores > 0.0, self._classes_arr[1], self._classes_arr[0])
+            except ValueError:
+                raise
+            except Exception:
+                pass
             preds = self._model.predict_buffer(X_data)
         else:
             preds = self._model.predict(X_data)
@@ -741,6 +852,7 @@ class RidgeClassifier:
         self.device = self._model.device_ or target_dev
         self._coef_arr = None
         self._intercept_val = 0.0
+        self._classes_arr = None
         self._sync_cache()
 
     @property
@@ -869,6 +981,7 @@ class RidgeCV(_BaseLinearEstimator):
         self.device = self._model.device_ or target_dev
         self._coef_arr = None
         self._intercept_val = 0.0
+        self._classes_arr = None
         self._sync_cache()
 
     @property

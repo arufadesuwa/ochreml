@@ -260,6 +260,12 @@ impl<'a> Backend<'a> {
         sample_weight: Option<&[f64]>,
         fit_intercept: bool,
     ) -> OchreResult<(Matrix, Matrix)> {
+        if y.cols == 1 && sample_weight.is_none() {
+            let (xt_x, xt_y_vec) = self.compute_normal_equation(x, &y.data, fit_intercept)?;
+            let p = xt_y_vec.len();
+            return Ok((xt_x, Matrix::from_vec(p, 1, xt_y_vec)?));
+        }
+
         #[cfg(feature = "cuda-dynamic")]
         match self {
             Backend::CudaSingle(id) => {
@@ -377,32 +383,36 @@ impl<'a> Backend<'a> {
     }
 }
 
-fn aligned_row_chunks(n_rows: usize) -> Vec<(usize, usize)> {
-    let num_tasks = (rayon::current_num_threads().max(1) * 4).max(4);
-    let raw_chunk = (n_rows + num_tasks - 1) / num_tasks;
-    let chunk_size = ((raw_chunk + 63) / 64 * 64).max(64);
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < n_rows {
-        let end = (start + chunk_size).min(n_rows);
+fn aligned_row_chunks_range(start_row: usize, end_row: usize) -> Vec<(usize, usize)> {
+    let n_rows = end_row.saturating_sub(start_row);
+    let num_tasks = (rayon::current_num_threads().max(1) * 8).max(8);
+    let raw_chunk = n_rows.div_ceil(num_tasks);
+    let chunk_size = (raw_chunk.div_ceil(64) * 64).max(64);
+    let mut chunks = Vec::with_capacity(num_tasks);
+    let mut start = start_row;
+    while start < end_row {
+        let end = (start + chunk_size).min(end_row);
         chunks.push((start, end));
         start = end;
     }
     chunks
 }
 
-fn cpu_normal_equation_1d(
+pub(crate) fn cpu_normal_equation_1d_slice(
     x: &Matrix,
     y: &[f64],
     fit_intercept: bool,
-    p: usize,
+    start_row: usize,
+    end_row: usize,
 ) -> OchreResult<(Matrix, Vec<f64>)> {
-    if x.rows >= 1000 {
+    let p = if fit_intercept { x.cols + 1 } else { x.cols };
+    if end_row.saturating_sub(start_row) >= 1000 {
         use rayon::prelude::*;
-        let chunks = aligned_row_chunks(x.rows);
+        let chunks = aligned_row_chunks_range(start_row, end_row);
 
         chunks
             .into_par_iter()
+            .with_max_len(1)
             .map(|(start, end)| compute_normal_equation_range(x, y, fit_intercept, start, end))
             .reduce(
                 || Ok((Matrix::zeros(p, p), vec![0.0; p])),
@@ -419,24 +429,36 @@ fn cpu_normal_equation_1d(
                 },
             )
     } else {
-        compute_normal_equation_range(x, y, fit_intercept, 0, x.rows)
+        compute_normal_equation_range(x, y, fit_intercept, start_row, end_row)
     }
 }
 
-fn cpu_normal_equation_multi(
+fn cpu_normal_equation_1d(
+    x: &Matrix,
+    y: &[f64],
+    fit_intercept: bool,
+    _p: usize,
+) -> OchreResult<(Matrix, Vec<f64>)> {
+    cpu_normal_equation_1d_slice(x, y, fit_intercept, 0, x.rows)
+}
+
+pub(crate) fn cpu_normal_equation_multi_slice(
     x: &Matrix,
     y: &Matrix,
     sample_weight: Option<&[f64]>,
     fit_intercept: bool,
-    p: usize,
-    k_targets: usize,
+    start_row: usize,
+    end_row: usize,
 ) -> OchreResult<(Matrix, Matrix)> {
-    if x.rows >= 1000 {
+    let p = if fit_intercept { x.cols + 1 } else { x.cols };
+    let k_targets = y.cols;
+    if end_row.saturating_sub(start_row) >= 1000 {
         use rayon::prelude::*;
-        let chunks = aligned_row_chunks(x.rows);
+        let chunks = aligned_row_chunks_range(start_row, end_row);
 
         chunks
             .into_par_iter()
+            .with_max_len(1)
             .map(|(start, end)| {
                 compute_normal_equation_multi_range(x, y, sample_weight, fit_intercept, start, end)
             })
@@ -455,8 +477,19 @@ fn cpu_normal_equation_multi(
                 },
             )
     } else {
-        compute_normal_equation_multi_range(x, y, sample_weight, fit_intercept, 0, x.rows)
+        compute_normal_equation_multi_range(x, y, sample_weight, fit_intercept, start_row, end_row)
     }
+}
+
+fn cpu_normal_equation_multi(
+    x: &Matrix,
+    y: &Matrix,
+    sample_weight: Option<&[f64]>,
+    fit_intercept: bool,
+    _p: usize,
+    _k_targets: usize,
+) -> OchreResult<(Matrix, Matrix)> {
+    cpu_normal_equation_multi_slice(x, y, sample_weight, fit_intercept, 0, x.rows)
 }
 
 // Cache-friendly A^T * B on CPU without allocating explicit A^T

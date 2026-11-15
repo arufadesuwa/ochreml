@@ -452,37 +452,28 @@ fn check_cublas(status: CublasStatus, op: &str) -> OchreResult<()> {
     Ok(())
 }
 
-// Mirror lower triangle (row-major) produced by column-major CUBLAS_FILL_MODE_UPPER cublasDsyrk_v2
-#[inline]
-fn mirror_cublas_upper_to_full(mat: &mut Matrix) {
-    let p = mat.rows;
-    for r in 0..p {
-        for c in (r + 1)..p {
-            let val = mat.data[c * p + r];
-            mat.data[r * p + c] = val;
-        }
-    }
-}
-
-// Compute column sums of X (n_chunk x p_x) and sum of y (n_chunk) on CPU in parallel
-// while the GPU executes dsyrk/dgemv asynchronously.
-fn host_sum_x_and_y_1d(
+// Compute X^T * y (p_x), column sums of X (p_x), and sum of y in a single register-fused host pass
+// while the GPU executes Split-K cublasDgemm_v2 asynchronously.
+fn host_sum_and_xty_1d(
     x_slice: &[f64],
     y_slice: &[f64],
     n_chunk: usize,
     p_x: usize,
-) -> (Vec<f64>, f64) {
+) -> (Vec<f64>, Vec<f64>, f64) {
     if n_chunk < 8192 {
+        let mut xty = vec![0.0_f64; p_x];
         let mut sum_x = vec![0.0_f64; p_x];
         let mut sum_y = 0.0_f64;
         for (i, &yi) in y_slice.iter().enumerate() {
             sum_y += yi;
             let row = &x_slice[(i * p_x)..((i + 1) * p_x)];
             for j in 0..p_x {
-                sum_x[j] += row[j];
+                let xij = row[j];
+                sum_x[j] += xij;
+                xty[j] += xij * yi;
             }
         }
-        return (sum_x, sum_y);
+        return (xty, sum_x, sum_y);
     }
 
     let n_threads = rayon::current_num_threads().max(1);
@@ -495,31 +486,37 @@ fn host_sum_x_and_y_1d(
         r = end;
     }
 
-    let partials: Vec<(Vec<f64>, f64)> = ranges
+    let partials: Vec<(Vec<f64>, Vec<f64>, f64)> = ranges
         .into_par_iter()
         .map(|(start, end)| {
+            let mut xty = vec![0.0_f64; p_x];
             let mut sx = vec![0.0_f64; p_x];
             let mut sy = 0.0_f64;
             for i in start..end {
-                sy += y_slice[i];
+                let yi = y_slice[i];
+                sy += yi;
                 let row = &x_slice[(i * p_x)..((i + 1) * p_x)];
                 for j in 0..p_x {
-                    sx[j] += row[j];
+                    let xij = row[j];
+                    sx[j] += xij;
+                    xty[j] += xij * yi;
                 }
             }
-            (sx, sy)
+            (xty, sx, sy)
         })
         .collect();
 
+    let mut total_xty = vec![0.0_f64; p_x];
     let mut total_x = vec![0.0_f64; p_x];
     let mut total_y = 0.0_f64;
-    for (sx, sy) in partials {
+    for (xty, sx, sy) in partials {
         total_y += sy;
         for j in 0..p_x {
             total_x[j] += sx[j];
+            total_xty[j] += xty[j];
         }
     }
-    (total_x, total_y)
+    (total_xty, total_x, total_y)
 }
 
 // Compute (optionally weighted) column sums of X (n_chunk x p_x) and Y (n_chunk x k_targets)
@@ -785,8 +782,9 @@ pub fn cuda_matvec(gpu_id: usize, a: &Matrix, v: &[f64]) -> Option<OchreResult<V
     Some(res)
 }
 
-// Single-GPU 1D Normal Equation chunk over [start_row..end_row] using persistent workspace
-// and host-overlapped intercept summation.
+// Single-GPU 1D Normal Equation chunk over [start_row..end_row] using persistent workspace,
+// Split-K cublasDgemm_v2, register-fused host X^T y + intercept sums, and heterogeneous
+// GPU + CPU co-execution for tall-skinny matrices (p <= 64).
 fn cuda_normal_eq_1d_chunk(
     driver: &CudaDriver,
     gpu_id: usize,
@@ -806,37 +804,45 @@ fn cuda_normal_eq_1d_chunk(
         .map_err(|_| OchreError::DeviceError("CUDA device mutex poisoned ( >_< )".to_string()))?;
     driver.bind_ctx(&guard)?;
 
-    let x_slice = &x.data[(start_row * p_x)..(end_row * p_x)];
-    let y_slice = &y[start_row..end_row];
+    // For tall-skinny matrices (p_x <= 64), PCIe transfer + 1/32-rate FP64 on T4/GeForce GPUs
+    // is memory/FP64-bound on large N; co-executing 4096 rows on GPU and the remainder on
+    // host AVX2/AVX-512 cores overlaps both processors for maximum throughput.
+    let n_gpu = if p_x <= 64 && n_chunk > 4096 {
+        4096
+    } else {
+        n_chunk
+    };
+    let gpu_end = start_row + n_gpu;
+
+    let x_gpu_slice = &x.data[(start_row * p_x)..(gpu_end * p_x)];
+    let y_gpu_slice = &y[start_row..gpu_end];
 
     let off_x = 0;
-    let off_y = off_x + align32(x_slice.len());
-    let off_xtx = off_y + align32(y_slice.len());
-    let off_xty = off_xtx + align32(p_x * p_x);
-    let total_f64 = off_xty + align32(p_x);
+    let off_xtx = off_x + align32(x_gpu_slice.len());
+    let total_f64 = off_xtx + align32(p_x * p_x);
     let ws_ptr = guard.ensure_workspace(driver, total_f64)?;
 
     let d_x = offset_ptr(ws_ptr, off_x);
-    let d_y = offset_ptr(ws_ptr, off_y);
     let d_xtx = offset_ptr(ws_ptr, off_xtx);
-    let d_xty = offset_ptr(ws_ptr, off_xty);
 
-    copy_htod_raw(driver, d_x, x_slice)?;
-    copy_htod_raw(driver, d_y, y_slice)?;
+    copy_htod_raw(driver, d_x, x_gpu_slice)?;
 
     let alpha = 1.0_f64;
     let beta = 0.0_f64;
 
-    // 1. X^T * X via cublasDsyrk_v2 (asynchronous on CUDA stream)
+    // 1. X_gpu^T * X_gpu via Split-K cublasDgemm_v2 (asynchronous across all GPU SMs)
     // SAFETY: `d_x` and `d_xtx` are valid workspace sub-allocations on the bound context.
-    let syrk_rc = unsafe {
-        (driver.cublas_dsyrk)(
+    let gemm_rc = unsafe {
+        (driver.cublas_dgemm)(
             guard.handle,
-            CUBLAS_FILL_MODE_UPPER,
             CUBLAS_OP_N,
+            CUBLAS_OP_T,
             p_x as i32,
-            n_chunk as i32,
+            p_x as i32,
+            n_gpu as i32,
             &alpha,
+            d_x,
+            p_x as i32,
             d_x,
             p_x as i32,
             &beta,
@@ -844,62 +850,55 @@ fn cuda_normal_eq_1d_chunk(
             p_x as i32,
         )
     };
-    check_cublas(syrk_rc, "cublasDsyrk_v2")?;
+    check_cublas(gemm_rc, "cublasDgemm_v2(XtX)")?;
 
-    // 2. X^T * y via cublasDgemv_v2 (asynchronous on CUDA stream)
-    // SAFETY: `d_x`, `d_y`, and `d_xty` are valid workspace sub-allocations on the bound context.
-    let gemv_rc = unsafe {
-        (driver.cublas_dgemv)(
-            guard.handle,
-            CUBLAS_OP_N,
-            p_x as i32,
-            n_chunk as i32,
-            &alpha,
-            d_x,
-            p_x as i32,
-            d_y,
-            1,
-            &beta,
-            d_xty,
-            1,
-        )
-    };
-    check_cublas(gemv_rc, "cublasDgemv_v2(Xty)")?;
-
-    // 3. While the GPU executes dsyrk + dgemv asynchronously, compute intercept sums on host CPU!
-    let intercept_sums = if fit_intercept {
-        Some(host_sum_x_and_y_1d(x_slice, y_slice, n_chunk, p_x))
+    // 2. While GPU executes dgemm asynchronously, compute X_gpu^T * y_gpu + intercept sums
+    //    AND co-execute any remaining rows [gpu_end..end_row] on host SIMD cores!
+    let (xty_sub, sum_x, sum_y) = host_sum_and_xty_1d(x_gpu_slice, y_gpu_slice, n_gpu, p_x);
+    let cpu_tail = if gpu_end < end_row {
+        Some(crate::backend::cpu_normal_equation_1d_slice(
+            x,
+            y,
+            fit_intercept,
+            gpu_end,
+            end_row,
+        )?)
     } else {
         None
     };
 
     let mut xtx_sub = Matrix::zeros(p_x, p_x);
     copy_dtoh_raw(driver, &mut xtx_sub.data, d_xtx)?;
-    mirror_cublas_upper_to_full(&mut xtx_sub);
 
-    let mut xty_sub = vec![0.0; p_x];
-    copy_dtoh_raw(driver, &mut xty_sub, d_xty)?;
+    let (mut full_xtx, mut full_xty) = if !fit_intercept {
+        (xtx_sub, xty_sub)
+    } else {
+        let mut fxtx = Matrix::zeros(p_total, p_total);
+        for (r, &sx) in sum_x.iter().enumerate().take(p_x) {
+            let dst_off = r * p_total;
+            let src_off = r * p_x;
+            fxtx.data[dst_off..(dst_off + p_x)]
+                .copy_from_slice(&xtx_sub.data[src_off..(src_off + p_x)]);
+            fxtx.data[dst_off + p_x] = sx;
+        }
+        let last_off = p_x * p_total;
+        fxtx.data[last_off..(last_off + p_x)].copy_from_slice(&sum_x);
+        fxtx.data[last_off + p_x] = n_gpu as f64;
 
-    let (sum_x, sum_y) = match intercept_sums {
-        Some(sums) => sums,
-        None => return Ok((xtx_sub, xty_sub)),
+        let mut fxty = Vec::with_capacity(p_total);
+        fxty.extend_from_slice(&xty_sub);
+        fxty.push(sum_y);
+        (fxtx, fxty)
     };
 
-    let mut full_xtx = Matrix::zeros(p_total, p_total);
-    for (r, &sx) in sum_x.iter().enumerate().take(p_x) {
-        let dst_off = r * p_total;
-        let src_off = r * p_x;
-        full_xtx.data[dst_off..(dst_off + p_x)]
-            .copy_from_slice(&xtx_sub.data[src_off..(src_off + p_x)]);
-        full_xtx.data[dst_off + p_x] = sx;
+    if let Some((tail_xtx, tail_xty)) = cpu_tail {
+        for i in 0..(p_total * p_total) {
+            full_xtx.data[i] += tail_xtx.data[i];
+        }
+        for i in 0..p_total {
+            full_xty[i] += tail_xty[i];
+        }
     }
-    let last_off = p_x * p_total;
-    full_xtx.data[last_off..(last_off + p_x)].copy_from_slice(&sum_x);
-    full_xtx.data[last_off + p_x] = n_chunk as f64;
-
-    let mut full_xty = Vec::with_capacity(p_total);
-    full_xty.extend_from_slice(&xty_sub);
-    full_xty.push(sum_y);
 
     Ok((full_xtx, full_xty))
 }
@@ -974,8 +973,8 @@ pub fn cuda_compute_normal_equation(
     Some(Ok((total_xtx, total_xty)))
 }
 
-// Multi-target & optional sample_weight Normal Equation chunk on GPU using persistent workspace
-// and host-overlapped intercept summation.
+// Multi-target & optional sample_weight Normal Equation chunk on GPU using persistent workspace,
+// Split-K cublasDgemm_v2, and heterogeneous GPU + CPU co-execution for tall-skinny matrices.
 #[allow(clippy::too_many_arguments)]
 fn cuda_normal_eq_multi_chunk(
     driver: &CudaDriver,
@@ -998,9 +997,16 @@ fn cuda_normal_eq_multi_chunk(
         .map_err(|_| OchreError::DeviceError("CUDA device mutex poisoned ( >_< )".to_string()))?;
     driver.bind_ctx(&guard)?;
 
-    let x_slice = &x.data[(start_row * p_x)..(end_row * p_x)];
-    let y_slice = &y.data[(start_row * k_targets)..(end_row * k_targets)];
-    let sw_slice = sample_weight.map(|sw| &sw[start_row..end_row]);
+    let n_gpu = if p_x <= 64 && n_chunk > 4096 {
+        4096
+    } else {
+        n_chunk
+    };
+    let gpu_end = start_row + n_gpu;
+
+    let x_slice = &x.data[(start_row * p_x)..(gpu_end * p_x)];
+    let y_slice = &y.data[(start_row * k_targets)..(gpu_end * k_targets)];
+    let sw_slice = sample_weight.map(|sw| &sw[start_row..gpu_end]);
 
     let off_x = 0;
     let off_y = off_x + align32(x_slice.len());
@@ -1008,7 +1014,7 @@ fn cuda_normal_eq_multi_chunk(
     let off_xty = off_xtx + align32(p_x * p_x);
     let off_sqrt = off_xty + align32(p_x * k_targets);
     let total_f64 = if sw_slice.is_some() {
-        off_sqrt + align32(n_chunk)
+        off_sqrt + align32(n_gpu)
     } else {
         off_sqrt
     };
@@ -1023,7 +1029,7 @@ fn cuda_normal_eq_multi_chunk(
     copy_htod_raw(driver, d_y, y_slice)?;
 
     let weight_sum = if let Some(sw) = sw_slice {
-        let mut sqrt_sw = Vec::with_capacity(n_chunk);
+        let mut sqrt_sw = Vec::with_capacity(n_gpu);
         let mut w_sum = 0.0;
         for &w in sw {
             w_sum += w;
@@ -1043,7 +1049,7 @@ fn cuda_normal_eq_multi_chunk(
                 guard.handle,
                 CUBLAS_SIDE_RIGHT,
                 p_x as i32,
-                n_chunk as i32,
+                n_gpu as i32,
                 d_x,
                 p_x as i32,
                 d_sqrt,
@@ -1060,7 +1066,7 @@ fn cuda_normal_eq_multi_chunk(
                 guard.handle,
                 CUBLAS_SIDE_RIGHT,
                 k_targets as i32,
-                n_chunk as i32,
+                n_gpu as i32,
                 d_y,
                 k_targets as i32,
                 d_sqrt,
@@ -1072,21 +1078,24 @@ fn cuda_normal_eq_multi_chunk(
         check_cublas(rc_y, "cublasDdgmm(Y)")?;
         w_sum
     } else {
-        n_chunk as f64
+        n_gpu as f64
     };
 
     let alpha = 1.0_f64;
     let beta = 0.0_f64;
 
     // SAFETY: `d_x` and `d_xtx` are valid workspace sub-allocations on the bound context.
-    let syrk_rc = unsafe {
-        (driver.cublas_dsyrk)(
+    let xtx_rc = unsafe {
+        (driver.cublas_dgemm)(
             guard.handle,
-            CUBLAS_FILL_MODE_UPPER,
             CUBLAS_OP_N,
+            CUBLAS_OP_T,
             p_x as i32,
-            n_chunk as i32,
+            p_x as i32,
+            n_gpu as i32,
             &alpha,
+            d_x,
+            p_x as i32,
             d_x,
             p_x as i32,
             &beta,
@@ -1094,7 +1103,7 @@ fn cuda_normal_eq_multi_chunk(
             p_x as i32,
         )
     };
-    check_cublas(syrk_rc, "cublasDsyrk_v2(multi)")?;
+    check_cublas(xtx_rc, "cublasDgemm_v2(XtX_multi)")?;
 
     // X^T * Y: col-major C^T(K x p_x) = B^T(K x N) * A(N x p_x)
     // SAFETY: `d_x`, `d_y`, and `d_xty` are valid workspace sub-allocations on the bound context.
@@ -1105,7 +1114,7 @@ fn cuda_normal_eq_multi_chunk(
             CUBLAS_OP_T,
             k_targets as i32,
             p_x as i32,
-            n_chunk as i32,
+            n_gpu as i32,
             &alpha,
             d_y,
             k_targets as i32,
@@ -1118,42 +1127,63 @@ fn cuda_normal_eq_multi_chunk(
     };
     check_cublas(gemm_rc, "cublasDgemm_v2(XtY)")?;
 
-    // Compute intercept sums on host CPU while GPU executes dsyrk + dgemm asynchronously
+    // Compute intercept sums and co-execute remaining rows [gpu_end..end_row] on host CPU
     let intercept_sums = if fit_intercept {
         Some(host_sum_x_and_y_multi(
-            x_slice, y_slice, sw_slice, n_chunk, p_x, k_targets,
+            x_slice, y_slice, sw_slice, n_gpu, p_x, k_targets,
         ))
+    } else {
+        None
+    };
+    let cpu_tail = if gpu_end < end_row {
+        Some(crate::backend::cpu_normal_equation_multi_slice(
+            x,
+            y,
+            sample_weight,
+            fit_intercept,
+            gpu_end,
+            end_row,
+        )?)
     } else {
         None
     };
 
     let mut xtx_sub = Matrix::zeros(p_x, p_x);
     copy_dtoh_raw(driver, &mut xtx_sub.data, d_xtx)?;
-    mirror_cublas_upper_to_full(&mut xtx_sub);
 
     let mut xty_sub = Matrix::zeros(p_x, k_targets);
     copy_dtoh_raw(driver, &mut xty_sub.data, d_xty)?;
 
-    let (sum_x, sum_y) = match intercept_sums {
-        Some(sums) => sums,
-        None => return Ok((xtx_sub, xty_sub)),
+    let (mut full_xtx, mut full_xty) = match intercept_sums {
+        Some((sum_x, sum_y)) => {
+            let mut fxtx = Matrix::zeros(p_total, p_total);
+            for (r, &sx) in sum_x.iter().enumerate().take(p_x) {
+                let dst_off = r * p_total;
+                let src_off = r * p_x;
+                fxtx.data[dst_off..(dst_off + p_x)]
+                    .copy_from_slice(&xtx_sub.data[src_off..(src_off + p_x)]);
+                fxtx.data[dst_off + p_x] = sx;
+            }
+            let last_off = p_x * p_total;
+            fxtx.data[last_off..(last_off + p_x)].copy_from_slice(&sum_x);
+            fxtx.data[last_off + p_x] = weight_sum;
+
+            let mut fxty = Matrix::zeros(p_total, k_targets);
+            fxty.data[0..(p_x * k_targets)].copy_from_slice(&xty_sub.data);
+            fxty.data[(p_x * k_targets)..(p_total * k_targets)].copy_from_slice(&sum_y);
+            (fxtx, fxty)
+        }
+        None => (xtx_sub, xty_sub),
     };
 
-    let mut full_xtx = Matrix::zeros(p_total, p_total);
-    for (r, &sx) in sum_x.iter().enumerate().take(p_x) {
-        let dst_off = r * p_total;
-        let src_off = r * p_x;
-        full_xtx.data[dst_off..(dst_off + p_x)]
-            .copy_from_slice(&xtx_sub.data[src_off..(src_off + p_x)]);
-        full_xtx.data[dst_off + p_x] = sx;
+    if let Some((tail_xtx, tail_xty)) = cpu_tail {
+        for i in 0..(p_total * p_total) {
+            full_xtx.data[i] += tail_xtx.data[i];
+        }
+        for i in 0..(p_total * k_targets) {
+            full_xty.data[i] += tail_xty.data[i];
+        }
     }
-    let last_off = p_x * p_total;
-    full_xtx.data[last_off..(last_off + p_x)].copy_from_slice(&sum_x);
-    full_xtx.data[last_off + p_x] = weight_sum;
-
-    let mut full_xty = Matrix::zeros(p_total, k_targets);
-    full_xty.data[0..(p_x * k_targets)].copy_from_slice(&xty_sub.data);
-    full_xty.data[(p_x * k_targets)..(p_total * k_targets)].copy_from_slice(&sum_y);
 
     Ok((full_xtx, full_xty))
 }

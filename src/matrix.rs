@@ -271,7 +271,59 @@ fn dot64_1x4(
     )
 }
 
-// Accumulate upper triangle of left_t * right_t^T into xt_x (stride p) using 1x4 SIMD micro-kernel.
+#[inline(always)]
+fn dot64_2x4(
+    a0: &[f64; NORMAL_EQ_TILE],
+    a1: &[f64; NORMAL_EQ_TILE],
+    b0: &[f64; NORMAL_EQ_TILE],
+    b1: &[f64; NORMAL_EQ_TILE],
+    b2: &[f64; NORMAL_EQ_TILE],
+    b3: &[f64; NORMAL_EQ_TILE],
+) -> ((f64, f64, f64, f64), (f64, f64, f64, f64)) {
+    let mut acc00 = [0.0f64; 4];
+    let mut acc01 = [0.0f64; 4];
+    let mut acc02 = [0.0f64; 4];
+    let mut acc03 = [0.0f64; 4];
+    let mut acc10 = [0.0f64; 4];
+    let mut acc11 = [0.0f64; 4];
+    let mut acc12 = [0.0f64; 4];
+    let mut acc13 = [0.0f64; 4];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        for lane in 0..4 {
+            let v_a0 = a0[base + lane];
+            let v_a1 = a1[base + lane];
+            let v_b0 = b0[base + lane];
+            let v_b1 = b1[base + lane];
+            let v_b2 = b2[base + lane];
+            let v_b3 = b3[base + lane];
+            acc00[lane] += v_a0 * v_b0;
+            acc01[lane] += v_a0 * v_b1;
+            acc02[lane] += v_a0 * v_b2;
+            acc03[lane] += v_a0 * v_b3;
+            acc10[lane] += v_a1 * v_b0;
+            acc11[lane] += v_a1 * v_b1;
+            acc12[lane] += v_a1 * v_b2;
+            acc13[lane] += v_a1 * v_b3;
+        }
+    }
+    (
+        (
+            (acc00[0] + acc00[1]) + (acc00[2] + acc00[3]),
+            (acc01[0] + acc01[1]) + (acc01[2] + acc01[3]),
+            (acc02[0] + acc02[1]) + (acc02[2] + acc02[3]),
+            (acc03[0] + acc03[1]) + (acc03[2] + acc03[3]),
+        ),
+        (
+            (acc10[0] + acc10[1]) + (acc10[2] + acc10[3]),
+            (acc11[0] + acc11[1]) + (acc11[2] + acc11[3]),
+            (acc12[0] + acc12[1]) + (acc12[2] + acc12[3]),
+            (acc13[0] + acc13[1]) + (acc13[2] + acc13[3]),
+        ),
+    )
+}
+
+// Accumulate upper triangle of left_t * right_t^T into xt_x (stride p) using 2x4 SIMD micro-kernel.
 #[inline]
 fn accumulate_gram_upper_tile(
     left_t: &[[f64; NORMAL_EQ_TILE]],
@@ -280,7 +332,44 @@ fn accumulate_gram_upper_tile(
     p: usize,
 ) {
     let d = left_t.len();
-    for j in 0..d {
+    let mut j = 0;
+    while j + 2 <= d {
+        let lj0 = &left_t[j];
+        let lj1 = &left_t[j + 1];
+        let off0 = j * p;
+        let off1 = (j + 1) * p;
+        xt_x.data[off0 + j] += dot64(lj0, &right_t[j]);
+        xt_x.data[off0 + j + 1] += dot64(lj0, &right_t[j + 1]);
+        xt_x.data[off1 + j + 1] += dot64(lj1, &right_t[j + 1]);
+
+        let mut k = j + 2;
+        while k + 4 <= d {
+            let ((r00, r01, r02, r03), (r10, r11, r12, r13)) = dot64_2x4(
+                lj0,
+                lj1,
+                &right_t[k],
+                &right_t[k + 1],
+                &right_t[k + 2],
+                &right_t[k + 3],
+            );
+            xt_x.data[off0 + k] += r00;
+            xt_x.data[off0 + k + 1] += r01;
+            xt_x.data[off0 + k + 2] += r02;
+            xt_x.data[off0 + k + 3] += r03;
+            xt_x.data[off1 + k] += r10;
+            xt_x.data[off1 + k + 1] += r11;
+            xt_x.data[off1 + k + 2] += r12;
+            xt_x.data[off1 + k + 3] += r13;
+            k += 4;
+        }
+        while k < d {
+            xt_x.data[off0 + k] += dot64(lj0, &right_t[k]);
+            xt_x.data[off1 + k] += dot64(lj1, &right_t[k]);
+            k += 1;
+        }
+        j += 2;
+    }
+    while j < d {
         let lj = &left_t[j];
         let row_off = j * p;
         let mut k = j;
@@ -302,6 +391,7 @@ fn accumulate_gram_upper_tile(
             xt_x.data[row_off + k] += dot64(lj, &right_t[k]);
             k += 1;
         }
+        j += 1;
     }
 }
 
@@ -341,19 +431,35 @@ pub fn compute_normal_equation_range(
             y_t[b_len..NORMAL_EQ_TILE].fill(0.0);
         }
 
-        for (b, r) in (r_block..block_end).enumerate() {
-            y_t[b] = y[r];
-            let row = &x.data[(r * d)..(r * d + d)];
+        y_t[0..b_len].copy_from_slice(&y[r_block..block_end]);
+        let mut b = 0;
+        while b + 4 <= b_len {
+            let r0 = (r_block + b) * d;
+            let row0 = &x.data[r0..(r0 + d)];
+            let row1 = &x.data[(r0 + d)..(r0 + 2 * d)];
+            let row2 = &x.data[(r0 + 2 * d)..(r0 + 3 * d)];
+            let row3 = &x.data[(r0 + 3 * d)..(r0 + 4 * d)];
+            for (j, col) in x_t.iter_mut().enumerate().take(d) {
+                col[b] = row0[j];
+                col[b + 1] = row1[j];
+                col[b + 2] = row2[j];
+                col[b + 3] = row3[j];
+            }
+            b += 4;
+        }
+        while b < b_len {
+            let row = &x.data[((r_block + b) * d)..((r_block + b) * d + d)];
             for (j, &val) in row.iter().enumerate() {
                 x_t[j][b] = val;
             }
+            b += 1;
         }
 
         accumulate_gram_upper_tile(&x_t, &x_t, &mut xt_x, p);
-        for j in 0..d {
-            xt_y[j] += dot64(&x_t[j], &y_t);
+        for (j, col) in x_t.iter().enumerate().take(d) {
+            xt_y[j] += dot64(col, &y_t);
             if fit_intercept {
-                xt_x.data[j * p + d] += sum64(&x_t[j]);
+                xt_x.data[j * p + d] += sum64(col);
             }
         }
         if fit_intercept {
