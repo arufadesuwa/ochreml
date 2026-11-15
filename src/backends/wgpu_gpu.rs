@@ -376,8 +376,12 @@ fn run_binary_shader(
     });
     ctx.device.poll(wgpu::Maintain::Wait);
     rx.recv()
-        .map_err(|_| OchreError::DeviceError("wgpu map_async channel closed (´；ω；`)".to_string()))?
-        .map_err(|e| OchreError::DeviceError(format!("wgpu buffer map failed: {:?} (´；ω；`)", e)))?;
+        .map_err(|_| {
+            OchreError::DeviceError("wgpu map_async channel closed (´；ω；`)".to_string())
+        })?
+        .map_err(|e| {
+            OchreError::DeviceError(format!("wgpu buffer map failed: {:?} (´；ω；`)", e))
+        })?;
 
     let view = slice.get_mapped_range();
     let result: Vec<f32> = bytemuck::cast_slice(&view)[..out_len].to_vec();
@@ -531,7 +535,15 @@ pub fn wgpu_compute_normal_equation_multi(
                     (xs, ys, sx, sy, ws)
                 })
                 .reduce(
-                    || (vec![0.0; p_x], vec![0.0; k_targets], vec![0.0; p_x], vec![0.0; k_targets], 0.0),
+                    || {
+                        (
+                            vec![0.0; p_x],
+                            vec![0.0; k_targets],
+                            vec![0.0; p_x],
+                            vec![0.0; k_targets],
+                            0.0,
+                        )
+                    },
                     |mut a, b| {
                         for j in 0..p_x {
                             if b.0[j] > a.0[j] {
@@ -640,16 +652,20 @@ pub fn wgpu_compute_normal_equation_multi(
         let xtx_bytes = (xtx_elems.max(1) * std::mem::size_of::<f32>()) as u64;
         let xty_bytes = (xty_elems.max(1) * std::mem::size_of::<f32>()) as u64;
 
-        let x_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("x_f32"),
-            contents: bytemuck::cast_slice(&x_f32),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let y_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("y_f32"),
-            contents: bytemuck::cast_slice(&y_f32),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let x_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("x_f32"),
+                contents: bytemuck::cast_slice(&x_f32),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let y_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("y_f32"),
+                contents: bytemuck::cast_slice(&y_f32),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
 
         let dims_xtx = MatDims {
             m: p_x as u32,
@@ -664,16 +680,20 @@ pub fn wgpu_compute_normal_equation_multi(
             split_k,
         };
 
-        let dims_xtx_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("dims_xtx"),
-            contents: bytemuck::bytes_of(&dims_xtx),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let dims_xty_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("dims_xty"),
-            contents: bytemuck::bytes_of(&dims_xty),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let dims_xtx_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dims_xtx"),
+                contents: bytemuck::bytes_of(&dims_xtx),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let dims_xty_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dims_xty"),
+                contents: bytemuck::bytes_of(&dims_xty),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
         let out_xtx_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("out_xtx"),
@@ -705,26 +725,52 @@ pub fn wgpu_compute_normal_equation_multi(
             label: Some("bg_xtx"),
             layout: &bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: dims_xtx_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: x_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: out_xtx_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: dims_xtx_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out_xtx_buf.as_entire_binding(),
+                },
             ],
         });
         let bg_xty = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bg_xty"),
             layout: &bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: dims_xty_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: y_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: out_xty_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: dims_xty_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out_xty_buf.as_entire_binding(),
+                },
             ],
         });
 
-        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("norm_eq_enc"),
-        });
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("norm_eq_enc"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("norm_eq_pass"),
@@ -734,7 +780,11 @@ pub fn wgpu_compute_normal_equation_multi(
             pass.set_bind_group(0, &bg_xtx, &[]);
             pass.dispatch_workgroups((p_x as u32 + 15) / 16, (p_x as u32 + 15) / 16, split_k);
             pass.set_bind_group(0, &bg_xty, &[]);
-            pass.dispatch_workgroups((k_targets as u32 + 15) / 16, (p_x as u32 + 15) / 16, split_k);
+            pass.dispatch_workgroups(
+                (k_targets as u32 + 15) / 16,
+                (p_x as u32 + 15) / 16,
+                split_k,
+            );
         }
         encoder.copy_buffer_to_buffer(&out_xtx_buf, 0, &stg_xtx_buf, 0, xtx_bytes);
         encoder.copy_buffer_to_buffer(&out_xty_buf, 0, &stg_xty_buf, 0, xty_bytes);
@@ -744,15 +794,27 @@ pub fn wgpu_compute_normal_equation_multi(
         let s_xty = stg_xty_buf.slice(..);
         let (tx1, rx1) = mpsc::channel();
         let (tx2, rx2) = mpsc::channel();
-        s_xtx.map_async(wgpu::MapMode::Read, move |r| { let _ = tx1.send(r); });
-        s_xty.map_async(wgpu::MapMode::Read, move |r| { let _ = tx2.send(r); });
+        s_xtx.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx1.send(r);
+        });
+        s_xty.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx2.send(r);
+        });
         ctx.device.poll(wgpu::Maintain::Wait);
         rx1.recv()
-            .map_err(|_| OchreError::DeviceError("wgpu xtx map channel closed (´；ω；`)".to_string()))?
-            .map_err(|e| OchreError::DeviceError(format!("wgpu xtx map failed: {:?} (´；ω；`)", e)))?;
+            .map_err(|_| {
+                OchreError::DeviceError("wgpu xtx map channel closed (´；ω；`)".to_string())
+            })?
+            .map_err(|e| {
+                OchreError::DeviceError(format!("wgpu xtx map failed: {:?} (´；ω；`)", e))
+            })?;
         rx2.recv()
-            .map_err(|_| OchreError::DeviceError("wgpu xty map channel closed (´；ω；`)".to_string()))?
-            .map_err(|e| OchreError::DeviceError(format!("wgpu xty map failed: {:?} (´；ω；`)", e)))?;
+            .map_err(|_| {
+                OchreError::DeviceError("wgpu xty map channel closed (´；ω；`)".to_string())
+            })?
+            .map_err(|e| {
+                OchreError::DeviceError(format!("wgpu xty map failed: {:?} (´；ω；`)", e))
+            })?;
 
         let v_xtx = s_xtx.get_mapped_range();
         let v_xty = s_xty.get_mapped_range();
@@ -820,4 +882,3 @@ pub fn wgpu_compute_normal_equation(
     let res = wgpu_compute_normal_equation_multi(x, &y_mat, None, fit_intercept)?;
     Some(res.map(|(xtx, xty_mat)| (xtx, xty_mat.data)))
 }
-

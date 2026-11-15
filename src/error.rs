@@ -5,7 +5,9 @@ use thiserror::Error;
 
 #[derive(Error, Debug, Clone, PartialEq)]
 pub enum OchreError {
-    #[error("Incompatible matrix dimensions for multiplication: ({rows_a}x{cols_a}) and ({rows_b}x{cols_b}) (´-ω-`)")]
+    #[error(
+        "Incompatible matrix dimensions for multiplication: ({rows_a}x{cols_a}) and ({rows_b}x{cols_b}) (´-ω-`)"
+    )]
     MatmulDimensionMismatch {
         rows_a: usize,
         cols_a: usize,
@@ -16,7 +18,9 @@ pub enum OchreError {
     #[error("Matrix column count ({cols}) must match vector length ({len}) (・`ω´・)")]
     MatvecDimensionMismatch { cols: usize, len: usize },
 
-    #[error("Shape mismatch: expected {expected_rows}x{expected_cols}, got {actual_rows}x{actual_cols} ( >_< )")]
+    #[error(
+        "Shape mismatch: expected {expected_rows}x{expected_cols}, got {actual_rows}x{actual_cols} ( >_< )"
+    )]
     DimensionMismatch {
         expected_rows: usize,
         expected_cols: usize,
@@ -57,10 +61,14 @@ pub enum OchreError {
     #[error("Model is not fitted yet. Call fit() first (´-ω-`)")]
     NotFitted,
 
-    #[error("Number of features in test data ({features}) does not match model ({expected}) (・`ω´・)")]
+    #[error(
+        "Number of features in test data ({features}) does not match model ({expected}) (・`ω´・)"
+    )]
     FeatureCountMismatch { features: usize, expected: usize },
 
-    #[error("Unrecognized device string '{0}'. Available devices: 'auto', 'cpu', 'cuda:0', 'cuda:all', 'tpu' ( >_< )")]
+    #[error(
+        "Unrecognized device string '{0}'. Available devices: 'auto', 'cpu', 'cuda:0', 'cuda:all', 'tpu' ( >_< )"
+    )]
     InvalidDevice(String),
 
     #[error("{0}")]
@@ -89,6 +97,17 @@ pub enum OchreError {
 
     #[error("Invalid regressor criterion '{0}'. Supported criterion is 'squared_error' (・`ω´・)")]
     InvalidRegressorCriterion(String),
+
+    #[error("Regularization strength alpha ({0}) must be a non-negative finite number (・`ω´・)")]
+    InvalidAlpha(f64),
+
+    #[error(
+        "RidgeCV alphas must be non-empty and strictly positive for LOO-CV (or non-negative for K-Fold CV) (・`ω´・)"
+    )]
+    InvalidRidgeCVAlphas,
+
+    #[error("Number of cross-validation folds ({0}) must be between 2 and n_samples ( >_< )")]
+    InvalidCvFolds(usize),
 
     #[error("{0}")]
     General(String),

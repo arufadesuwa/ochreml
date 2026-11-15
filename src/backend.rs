@@ -4,9 +4,7 @@
 
 use crate::device::DeviceType;
 use crate::error::{OchreError, OchreResult};
-use crate::matrix::{
-    compute_normal_equation_multi_range, compute_normal_equation_range, Matrix,
-};
+use crate::matrix::{Matrix, compute_normal_equation_multi_range, compute_normal_equation_range};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Backend<'a> {
@@ -444,14 +442,7 @@ fn cpu_normal_equation_multi(
         chunks
             .into_par_iter()
             .map(|(start, end)| {
-                compute_normal_equation_multi_range(
-                    x,
-                    y,
-                    sample_weight,
-                    fit_intercept,
-                    start,
-                    end,
-                )
+                compute_normal_equation_multi_range(x, y, sample_weight, fit_intercept, start, end)
             })
             .reduce(
                 || Ok((Matrix::zeros(p, p), Matrix::zeros(p, k_targets))),

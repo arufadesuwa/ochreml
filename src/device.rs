@@ -212,38 +212,60 @@ pub fn parse_device(device_str: Option<&str>) -> OchreResult<DeviceType> {
                     let mut ids = Vec::new();
                     for part in id_str.split(',') {
                         let id = part.trim().parse::<usize>().map_err(|_| {
-                            OchreError::DeviceError(format!("Invalid GPU index in device string '{}'", custom))
+                            OchreError::DeviceError(format!(
+                                "Invalid GPU index in device string '{}'",
+                                custom
+                            ))
                         })?;
                         ids.push(id);
                     }
                     if ids.is_empty() {
-                        return Err(OchreError::DeviceError("Multi-GPU device string contains no GPU IDs".to_string()));
+                        return Err(OchreError::DeviceError(
+                            "Multi-GPU device string contains no GPU IDs".to_string(),
+                        ));
                     }
                     if caps.gpu_count > 0 && ids.iter().all(|&id| id < caps.gpu_count) {
                         Ok(DeviceType::MultiGpu(ids))
                     } else if caps.gpu_count == 0 {
-                        Err(OchreError::DeviceError(format!("Device '{}' was requested, but no GPUs are available", custom)))
+                        Err(OchreError::DeviceError(format!(
+                            "Device '{}' was requested, but no GPUs are available",
+                            custom
+                        )))
                     } else {
-                        Err(OchreError::DeviceError(format!("Requested GPU ID exceeds available GPU count ({})", caps.gpu_count)))
+                        Err(OchreError::DeviceError(format!(
+                            "Requested GPU ID exceeds available GPU count ({})",
+                            caps.gpu_count
+                        )))
                     }
                 } else {
                     let id = id_str.parse::<usize>().map_err(|_| {
-                        OchreError::DeviceError(format!("Invalid GPU index in device string '{}'", custom))
+                        OchreError::DeviceError(format!(
+                            "Invalid GPU index in device string '{}'",
+                            custom
+                        ))
                     })?;
                     if caps.gpu_count > id {
                         Ok(DeviceType::Gpu(id))
                     } else {
-                        Err(OchreError::DeviceError(format!("GPU device 'cuda:{}' was requested, but system only has {} GPU(s)", id, caps.gpu_count)))
+                        Err(OchreError::DeviceError(format!(
+                            "GPU device 'cuda:{}' was requested, but system only has {} GPU(s)",
+                            id, caps.gpu_count
+                        )))
                     }
                 }
             } else if let Some(id_str) = custom.strip_prefix("tpu:") {
                 let id = id_str.parse::<usize>().map_err(|_| {
-                    OchreError::DeviceError(format!("Invalid TPU index in device string '{}'", custom))
+                    OchreError::DeviceError(format!(
+                        "Invalid TPU index in device string '{}'",
+                        custom
+                    ))
                 })?;
                 if caps.tpu_detected {
                     Ok(DeviceType::Tpu(id))
                 } else {
-                    Err(OchreError::DeviceError("TPU device was requested, but no TPU runtime was detected".to_string()))
+                    Err(OchreError::DeviceError(
+                        "TPU device was requested, but no TPU runtime was detected".to_string(),
+                    ))
                 }
             } else {
                 Err(OchreError::InvalidDevice(custom.to_string()))
@@ -370,14 +392,21 @@ mod tests {
     fn test_parse_device_auto() {
         let dev = parse_device(Some("auto")).unwrap();
         // On machines without GPU/TPU, auto defaults cleanly to CPU
-        assert!(matches!(dev, DeviceType::Cpu | DeviceType::Gpu(_) | DeviceType::MultiGpu(_) | DeviceType::Tpu(_)));
+        assert!(matches!(
+            dev,
+            DeviceType::Cpu | DeviceType::Gpu(_) | DeviceType::MultiGpu(_) | DeviceType::Tpu(_)
+        ));
     }
 
     #[test]
     fn test_parse_invalid_device() {
         let res = parse_device(Some("quantum_supercomputer"));
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("Unrecognized device string"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("Unrecognized device string")
+        );
     }
 
     #[test]

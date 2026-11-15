@@ -168,13 +168,17 @@ fn init_cuda_driver() -> Option<CudaDriver> {
             .ok()
             .map(|s| *s);
         let cu_ctx_create = *cuda_lib.get::<FnCuCtxCreate>(b"cuCtxCreate_v2\0").ok()?;
-        let cu_ctx_set_current = *cuda_lib.get::<FnCuCtxSetCurrent>(b"cuCtxSetCurrent\0").ok()?;
+        let cu_ctx_set_current = *cuda_lib
+            .get::<FnCuCtxSetCurrent>(b"cuCtxSetCurrent\0")
+            .ok()?;
         let cu_mem_alloc = *cuda_lib.get::<FnCuMemAlloc>(b"cuMemAlloc_v2\0").ok()?;
         let cu_mem_free = *cuda_lib.get::<FnCuMemFree>(b"cuMemFree_v2\0").ok()?;
         let cu_memcpy_htod = *cuda_lib.get::<FnCuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0").ok()?;
         let cu_memcpy_dtoh = *cuda_lib.get::<FnCuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0").ok()?;
 
-        let cublas_create = *cublas_lib.get::<FnCublasCreate>(b"cublasCreate_v2\0").ok()?;
+        let cublas_create = *cublas_lib
+            .get::<FnCublasCreate>(b"cublasCreate_v2\0")
+            .ok()?;
         let cublas_dgemm = *cublas_lib.get::<FnCublasDgemm>(b"cublasDgemm_v2\0").ok()?;
         let cublas_dsyrk = *cublas_lib.get::<FnCublasDsyrk>(b"cublasDsyrk_v2\0").ok()?;
         let cublas_dgemv = *cublas_lib.get::<FnCublasDgemv>(b"cublasDgemv_v2\0").ok()?;
@@ -238,9 +242,8 @@ impl<'a> DeviceBuffer<'a> {
         let buf = Self::alloc(driver, data.len())?;
         let bytes = data.len() * std::mem::size_of::<f64>();
         if bytes > 0 {
-            let rc = unsafe {
-                (driver.cu_memcpy_htod)(buf.ptr, data.as_ptr() as *const c_void, bytes)
-            };
+            let rc =
+                unsafe { (driver.cu_memcpy_htod)(buf.ptr, data.as_ptr() as *const c_void, bytes) };
             if rc != CUDA_SUCCESS {
                 return Err(OchreError::DeviceError(format!(
                     "CUDA cuMemcpyHtoD failed with code {} (´；ω；`)",
@@ -518,9 +521,9 @@ fn cuda_normal_eq_1d_chunk(
     let p_total = if fit_intercept { p_x + 1 } else { p_x };
 
     let ctx_arc = driver.get_device_ctx(gpu_id)?;
-    let guard = ctx_arc.lock().map_err(|_| {
-        OchreError::DeviceError("CUDA device mutex poisoned ( >_< )".to_string())
-    })?;
+    let guard = ctx_arc
+        .lock()
+        .map_err(|_| OchreError::DeviceError("CUDA device mutex poisoned ( >_< )".to_string()))?;
     driver.bind_ctx(&guard)?;
 
     let x_slice = &x.data[(start_row * p_x)..(end_row * p_x)];
@@ -626,7 +629,8 @@ fn cuda_normal_eq_1d_chunk(
     for r in 0..p_x {
         let dst_off = r * p_total;
         let src_off = r * p_x;
-        full_xtx.data[dst_off..(dst_off + p_x)].copy_from_slice(&xtx_sub.data[src_off..(src_off + p_x)]);
+        full_xtx.data[dst_off..(dst_off + p_x)]
+            .copy_from_slice(&xtx_sub.data[src_off..(src_off + p_x)]);
         full_xtx.data[dst_off + p_x] = sum_x[r];
     }
     let last_off = p_x * p_total;
@@ -683,7 +687,9 @@ pub fn cuda_compute_normal_equation(
             .into_iter()
             .map(|h| {
                 h.join().unwrap_or_else(|_| {
-                    Err(OchreError::DeviceError("Multi-GPU worker thread panicked (´；ω；`)".to_string()))
+                    Err(OchreError::DeviceError(
+                        "Multi-GPU worker thread panicked (´；ω；`)".to_string(),
+                    ))
                 })
             })
             .collect()
@@ -724,9 +730,9 @@ fn cuda_normal_eq_multi_chunk(
     let p_total = if fit_intercept { p_x + 1 } else { p_x };
 
     let ctx_arc = driver.get_device_ctx(gpu_id)?;
-    let guard = ctx_arc.lock().map_err(|_| {
-        OchreError::DeviceError("CUDA device mutex poisoned ( >_< )".to_string())
-    })?;
+    let guard = ctx_arc
+        .lock()
+        .map_err(|_| OchreError::DeviceError("CUDA device mutex poisoned ( >_< )".to_string()))?;
     driver.bind_ctx(&guard)?;
 
     let x_slice = &x.data[(start_row * p_x)..(end_row * p_x)];
@@ -745,7 +751,9 @@ fn cuda_normal_eq_multi_chunk(
         }
         let d_sqrt = DeviceBuffer::from_slice(driver, &sqrt_sw)?;
         let ddgmm = driver.cublas_ddgmm.ok_or_else(|| {
-            OchreError::DeviceError("cublasDdgmm not available in loaded cuBLAS library ( >_< )".to_string())
+            OchreError::DeviceError(
+                "cublasDdgmm not available in loaded cuBLAS library ( >_< )".to_string(),
+            )
         })?;
         let rc_x = unsafe {
             ddgmm(
@@ -897,7 +905,8 @@ fn cuda_normal_eq_multi_chunk(
     for r in 0..p_x {
         let dst_off = r * p_total;
         let src_off = r * p_x;
-        full_xtx.data[dst_off..(dst_off + p_x)].copy_from_slice(&xtx_sub.data[src_off..(src_off + p_x)]);
+        full_xtx.data[dst_off..(dst_off + p_x)]
+            .copy_from_slice(&xtx_sub.data[src_off..(src_off + p_x)]);
         full_xtx.data[dst_off + p_x] = sum_x[r];
     }
     let last_off = p_x * p_total;
@@ -970,7 +979,9 @@ pub fn cuda_compute_normal_equation_multi(
             .into_iter()
             .map(|h| {
                 h.join().unwrap_or_else(|_| {
-                    Err(OchreError::DeviceError("Multi-GPU worker thread panicked (´；ω；`)".to_string()))
+                    Err(OchreError::DeviceError(
+                        "Multi-GPU worker thread panicked (´；ω；`)".to_string(),
+                    ))
                 })
             })
             .collect()
@@ -993,4 +1004,3 @@ pub fn cuda_compute_normal_equation_multi(
     }
     Some(Ok((total_xtx, total_xty)))
 }
-

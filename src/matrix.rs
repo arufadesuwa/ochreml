@@ -186,6 +186,15 @@ impl Matrix {
             self[(i, i)] += lambda;
         }
     }
+
+    /// Add L2 regularization penalty `alpha` only to the first `n_features` diagonal entries,
+    /// leaving the intercept row/column (`index == n_features`) unpenalized.
+    pub fn add_ridge_feature_diagonal(&mut self, alpha: f64, n_features: usize) {
+        let limit = n_features.min(self.rows).min(self.cols);
+        for i in 0..limit {
+            self[(i, i)] += alpha;
+        }
+    }
 }
 
 // Compute (X^T * X) and (X^T * y) in a single pass without allocating transpose matrices.
@@ -552,6 +561,15 @@ pub fn solve_cholesky_multi(a: &Matrix, b: &Matrix) -> OchreResult<Matrix> {
     Ok(theta)
 }
 
+/// Invert a symmetric positive semi-definite matrix A (P x P) using multi-target Cholesky solver.
+pub fn invert_spd_cholesky(a: &Matrix) -> OchreResult<Matrix> {
+    if a.rows != a.cols {
+        return Err(OchreError::NonSquareMatrix);
+    }
+    let id = Matrix::identity(a.rows);
+    solve_cholesky_multi(a, &id)
+}
+
 // Solve linear system A * x = b using Gauss-Jordan elimination with partial pivoting
 pub fn solve_linear_system(a: &Matrix, b: &[f64]) -> OchreResult<Vec<f64>> {
     if a.rows != a.cols {
@@ -572,9 +590,8 @@ pub fn solve_linear_system(a: &Matrix, b: &[f64]) -> OchreResult<Vec<f64>> {
             // Apply Tikhonov ridge regularization if determinant is close to zero
             let mut regularized_a = a.clone();
             regularized_a.add_ridge_diagonal(1e-7);
-            try_gauss_jordan(&regularized_a, b).map_err(|e| {
-                OchreError::SolverRegularizationFailed(e.to_string())
-            })
+            try_gauss_jordan(&regularized_a, b)
+                .map_err(|e| OchreError::SolverRegularizationFailed(e.to_string()))
         }
     }
 }
@@ -601,7 +618,9 @@ fn try_gauss_jordan(a: &Matrix, b: &[f64]) -> OchreResult<Vec<f64>> {
         }
 
         if max_val < 1e-12 {
-            return Err(OchreError::SingularMatrix("pivot absolute value < 1e-12".to_string()));
+            return Err(OchreError::SingularMatrix(
+                "pivot absolute value < 1e-12".to_string(),
+            ));
         }
 
         if pivot_row != col {
@@ -666,7 +685,11 @@ pub fn r2_score(y_true: &[f64], y_pred: &[f64]) -> f64 {
 
 // Calculate multi-output weighted R^2 score (uniform_average matching Scikit-Learn) (＾▽＾)
 pub fn r2_score_multi(y_true: &Matrix, y_pred: &Matrix, sample_weight: Option<&[f64]>) -> f64 {
-    if y_true.rows != y_pred.rows || y_true.cols != y_pred.cols || y_true.rows == 0 || y_true.cols == 0 {
+    if y_true.rows != y_pred.rows
+        || y_true.cols != y_pred.cols
+        || y_true.rows == 0
+        || y_true.cols == 0
+    {
         return 0.0;
     }
     let rows = y_true.rows;
@@ -739,14 +762,8 @@ mod tests {
 
     #[test]
     fn test_matrix_operations() {
-        let m1 = Matrix::from_2d(&vec![
-            vec![1.0, 2.0],
-            vec![3.0, 4.0],
-        ]).unwrap();
-        let m2 = Matrix::from_2d(&vec![
-            vec![2.0, 0.0],
-            vec![1.0, 2.0],
-        ]).unwrap();
+        let m1 = Matrix::from_2d(&vec![vec![1.0, 2.0], vec![3.0, 4.0]]).unwrap();
+        let m2 = Matrix::from_2d(&vec![vec![2.0, 0.0], vec![1.0, 2.0]]).unwrap();
 
         let mul = m1.matmul(&m2).unwrap();
         assert_eq!(mul[(0, 0)], 4.0);
@@ -757,10 +774,7 @@ mod tests {
 
     #[test]
     fn test_linear_solver() {
-        let a = Matrix::from_2d(&vec![
-            vec![2.0, 1.0],
-            vec![1.0, 3.0],
-        ]).unwrap();
+        let a = Matrix::from_2d(&vec![vec![2.0, 1.0], vec![1.0, 3.0]]).unwrap();
         let b = vec![5.0, 5.0];
         let sol = solve_linear_system(&a, &b).unwrap();
         assert!((sol[0] - 2.0).abs() < 1e-6);
@@ -770,10 +784,7 @@ mod tests {
     #[test]
     fn test_cholesky_solver() {
         // Symmetric positive definite matrix: [4, 2; 2, 3] * [x; y] = [8, 7] -> sol = [1.25, 1.5]
-        let a = Matrix::from_2d(&vec![
-            vec![4.0, 2.0],
-            vec![2.0, 3.0],
-        ]).unwrap();
+        let a = Matrix::from_2d(&vec![vec![4.0, 2.0], vec![2.0, 3.0]]).unwrap();
         let b = vec![8.0, 7.0];
         let sol = solve_cholesky(&a, &b).unwrap();
         assert!((sol[0] - 1.25).abs() < 1e-6);
@@ -806,15 +817,12 @@ mod tests {
 
     #[test]
     fn test_compute_normal_equation_mats() {
-        let x = Matrix::from_2d(&vec![
-            vec![1.0, 2.0],
-            vec![3.0, 4.0],
-            vec![5.0, 6.0],
-        ]).unwrap();
+        let x = Matrix::from_2d(&vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]).unwrap();
         let y = vec![1.0, 2.0, 3.0];
 
         // 1. CPU execution
-        let (xt_x_cpu, xt_y_cpu) = compute_normal_equation_mats(&x, &y, true, &crate::device::DeviceType::Cpu).unwrap();
+        let (xt_x_cpu, xt_y_cpu) =
+            compute_normal_equation_mats(&x, &y, true, &crate::device::DeviceType::Cpu).unwrap();
         assert_eq!(xt_x_cpu.rows, 3);
         assert_eq!(xt_x_cpu.cols, 3);
         assert_eq!(xt_y_cpu.len(), 3);
@@ -831,7 +839,8 @@ mod tests {
 
         // 2. Multi-GPU data-parallel execution
         let multi_gpu = crate::device::DeviceType::MultiGpu(vec![0, 1]);
-        let (xt_x_mgpu, xt_y_mgpu) = compute_normal_equation_mats(&x, &y, true, &multi_gpu).unwrap();
+        let (xt_x_mgpu, xt_y_mgpu) =
+            compute_normal_equation_mats(&x, &y, true, &multi_gpu).unwrap();
         assert_eq!(xt_x_mgpu, xt_x_cpu);
         assert_eq!(xt_y_mgpu, xt_y_cpu);
 

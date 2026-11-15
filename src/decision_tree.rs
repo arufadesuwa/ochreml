@@ -1,9 +1,9 @@
 // OchreML Decision Tree Module (＾▽＾)
 // Implementation of CART algorithm for classification and regression trees.
 
-use crate::device::{parse_device, DeviceType};
+use crate::device::{DeviceType, parse_device};
 use crate::error::{OchreError, OchreResult};
-use crate::matrix::{r2_score, Matrix};
+use crate::matrix::{Matrix, r2_score};
 
 #[derive(Debug, Clone)]
 pub enum TreeNode {
@@ -65,7 +65,9 @@ impl DecisionTreeClassifier {
         device: Option<String>,
     ) -> OchreResult<Self> {
         let dev = parse_device(device.as_deref())?;
-        let crit = criterion.unwrap_or_else(|| "gini".to_string()).to_lowercase();
+        let crit = criterion
+            .unwrap_or_else(|| "gini".to_string())
+            .to_lowercase();
         if crit != "gini" && crit != "entropy" {
             return Err(OchreError::InvalidCriterion(crit));
         }
@@ -169,7 +171,9 @@ impl DecisionTreeClassifier {
             for &i in indices {
                 pairs.push((x.get(i, f), class_indices[i]));
             }
-            pairs.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            pairs.sort_unstable_by(|a, b| {
+                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
 
             if (pairs[n_samples - 1].0 - pairs[0].0).abs() < 1e-9 {
                 continue;
@@ -339,7 +343,9 @@ impl DecisionTreeRegressor {
         device: Option<String>,
     ) -> OchreResult<Self> {
         let dev = parse_device(device.as_deref())?;
-        let crit = criterion.unwrap_or_else(|| "squared_error".to_string()).to_lowercase();
+        let crit = criterion
+            .unwrap_or_else(|| "squared_error".to_string())
+            .to_lowercase();
         if crit != "squared_error" {
             return Err(OchreError::InvalidRegressorCriterion(crit));
         }
@@ -356,13 +362,7 @@ impl DecisionTreeRegressor {
     }
 
     // Recursively build regression tree with O(D * N log N) sliding split search and O(1) MSE updates
-    fn build_tree(
-        &self,
-        x: &Matrix,
-        y: &[f64],
-        indices: &[usize],
-        depth: usize,
-    ) -> TreeNode {
+    fn build_tree(&self, x: &Matrix, y: &[f64], indices: &[usize], depth: usize) -> TreeNode {
         let n_samples = indices.len();
         let mut total_sum = 0.0;
         let mut total_sum_sq = 0.0;
@@ -407,7 +407,9 @@ impl DecisionTreeRegressor {
             for &i in indices {
                 pairs.push((x.get(i, f), y[i]));
             }
-            pairs.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            pairs.sort_unstable_by(|a, b| {
+                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
 
             if (pairs[n_samples - 1].0 - pairs[0].0).abs() < 1e-9 {
                 continue;
@@ -556,10 +558,13 @@ mod tests {
             vec![2.5],
             vec![3.0],
             vec![3.5],
-        ]).unwrap();
+        ])
+        .unwrap();
         let y = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
 
-        let mut clf = DecisionTreeClassifier::new(Some("gini".to_string()), Some(3), None, None, None).unwrap();
+        let mut clf =
+            DecisionTreeClassifier::new(Some("gini".to_string()), Some(3), None, None, None)
+                .unwrap();
         clf.fit(&x, &y).unwrap();
         assert!(clf.device_.is_some());
 
@@ -583,7 +588,8 @@ mod tests {
             vec![6.0],
             vec![7.0],
             vec![8.0],
-        ]).unwrap();
+        ])
+        .unwrap();
         let y = vec![10.0, 10.0, 10.0, 20.0, 20.0, 20.0];
 
         let mut reg = DecisionTreeRegressor::new(None, Some(3), None, None, None).unwrap();

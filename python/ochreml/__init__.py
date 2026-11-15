@@ -15,15 +15,21 @@ from ._utils import (
 )
 from ._ochreml import (
     LinearRegression as _RustLinearRegression,
+    Ridge as _RustRidge,
+    RidgeClassifier as _RustRidgeClassifier,
+    RidgeCV as _RustRidgeCV,
     DecisionTreeClassifier as _RustDecisionTreeClassifier,
     DecisionTreeRegressor as _RustDecisionTreeRegressor,
     get_available_devices as _get_available_devices,
     get_device_info as _get_device_info,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1b1"
 __all__ = [
     "LinearRegression",
+    "Ridge",
+    "RidgeClassifier",
+    "RidgeCV",
     "DecisionTreeClassifier",
     "DecisionTreeRegressor",
     "save",
@@ -118,6 +124,12 @@ def load(path: str, device: Optional[str] = None) -> Any:
             return DecisionTreeClassifier._from_rust(_RustDecisionTreeClassifier.from_bytes(data, target_dev), target_dev)
         if tag == 3:
             return DecisionTreeRegressor._from_rust(_RustDecisionTreeRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 4:
+            return Ridge._from_rust(_RustRidge.from_bytes(data, target_dev), target_dev)
+        if tag == 5:
+            return RidgeClassifier._from_rust(_RustRidgeClassifier.from_bytes(data, target_dev), target_dev)
+        if tag == 6:
+            return RidgeCV._from_rust(_RustRidgeCV.from_bytes(data, target_dev), target_dev)
         raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
     # Fallback if the .dit file was written via joblib.dump or pickle.dump
@@ -135,43 +147,10 @@ def load(path: str, device: Optional[str] = None) -> Any:
     return obj
 
 
-class LinearRegression:
-    """
-    Ordinary Least Squares (OLS) Linear Regression model (＾▽＾)
+class _BaseLinearEstimator:
+    """Shared Python wrapper infrastructure for linear regression estimators (＾▽＾)."""
 
-    Solves linear regression using the Normal Equation: (X^T * X)^(-1) * X^T * y
-    equipped with automated Cholesky decomposition, Tikhonov regularization,
-    and Zero-Copy Buffer Protocol acceleration (*≧ω≦*).
-
-    Parameters
-    ----------
-    fit_intercept : bool, default=True
-        Whether to calculate the intercept for this model.
-    device : str or None, default=None
-        Target computation device ('auto', 'cpu', 'cuda:0', 'cuda:all', 'tpu').
-        If None, the global default device (set via set_default_device, default 'auto') is used.
-
-    Attributes
-    ----------
-    coef_ : list of float or None
-        Estimated coefficients for the linear regression problem.
-    intercept_ : float or None
-        Independent term in the linear model.
-    n_features_in_ : int or None
-        Number of features seen during fitting.
-    device_ : str or None
-        Active device utilized during training (e.g. 'cpu', 'cuda:0', 'tpu:0').
-    """
-
-    def __init__(self, fit_intercept: bool = True, device: Optional[str] = None):
-        self.fit_intercept = fit_intercept
-        self.device = device or get_default_device()
-        self._model = _RustLinearRegression(
-            fit_intercept=fit_intercept,
-            device=self.device,
-        )
-        self._coef_arr: Optional[Any] = None
-        self._intercept_val: Any = 0.0
+    _rust_cls: Any = None
 
     def _sync_cache(self) -> None:
         try:
@@ -199,18 +178,7 @@ class LinearRegression:
             else:
                 self._intercept_val = float(self._model.intercept_ or 0.0)
 
-    @classmethod
-    def _from_rust(cls, rust_model: _RustLinearRegression, device: str) -> "LinearRegression":
-        inst = cls.__new__(cls)
-        inst._model = rust_model
-        inst.fit_intercept = rust_model.fit_intercept
-        inst.device = rust_model.device_ or device
-        inst._coef_arr = None
-        inst._intercept_val = 0.0
-        inst._sync_cache()
-        return inst
-
-    def fit(self, X: Any, y: Any, sample_weight: Optional[Any] = None) -> "LinearRegression":
+    def fit(self, X: Any, y: Any, sample_weight: Optional[Any] = None) -> Any:
         """
         Fit linear model with optional sample_weight and multi-output target support (*≧ω≦*)
 
@@ -225,7 +193,7 @@ class LinearRegression:
 
         Returns
         -------
-        self : LinearRegression
+        self : object
             Fitted estimator instance.
         """
         is_buf_x, X_data = process_features(X)
@@ -366,27 +334,18 @@ class LinearRegression:
         self._model.save(_validate_dit_path(path))
 
     @classmethod
-    def load(cls, path: str, device: Optional[str] = None) -> "LinearRegression":
+    def load(cls, path: str, device: Optional[str] = None) -> Any:
         target_dev = device or get_default_device()
-        rust_model = _RustLinearRegression.load(_validate_dit_path(path), target_dev)
+        rust_model = cls._rust_cls.load(_validate_dit_path(path), target_dev)
         return cls._from_rust(rust_model, target_dev)
 
-    def to(self, device: str) -> "LinearRegression":
+    def to(self, device: str) -> Any:
         self._model.set_device(device)
         self.device = self._model.device_ or device
         return self
 
     def __getstate__(self) -> bytes:
         return self._model.to_bytes()
-
-    def __setstate__(self, state: bytes) -> None:
-        target_dev = get_default_device()
-        self._model = _RustLinearRegression.from_bytes(state, target_dev)
-        self.fit_intercept = self._model.fit_intercept
-        self.device = self._model.device_ or target_dev
-        self._coef_arr = None
-        self._intercept_val = 0.0
-        self._sync_cache()
 
     @property
     def coef_(self) -> Optional[Any]:
@@ -412,8 +371,519 @@ class LinearRegression:
     def device_(self) -> Optional[str]:
         return self._model.device_
 
+
+class LinearRegression(_BaseLinearEstimator):
+    """
+    Ordinary Least Squares (OLS) Linear Regression model (＾▽＾)
+
+    Solves linear regression using the Normal Equation: (X^T * X)^(-1) * X^T * y
+    equipped with automated Cholesky decomposition, Tikhonov regularization,
+    and Zero-Copy Buffer Protocol acceleration (*≧ω≦*).
+
+    Parameters
+    ----------
+    fit_intercept : bool, default=True
+        Whether to calculate the intercept for this model.
+    device : str or None, default=None
+        Target computation device ('auto', 'cpu', 'cuda:0', 'cuda:all', 'tpu').
+        If None, the global default device (set via set_default_device, default 'auto') is used.
+
+    Attributes
+    ----------
+    coef_ : numpy.ndarray or list of float or None
+        Estimated coefficients for the linear regression problem.
+    intercept_ : float, numpy.ndarray, or None
+        Independent term in the linear model.
+    n_features_in_ : int or None
+        Number of features seen during fitting.
+    device_ : str or None
+        Active device utilized during training (e.g. 'cpu', 'cuda:0', 'tpu:0').
+    """
+
+    _rust_cls = _RustLinearRegression
+
+    def __init__(self, fit_intercept: bool = True, device: Optional[str] = None):
+        self.fit_intercept = fit_intercept
+        self.device = device or get_default_device()
+        self._model = _RustLinearRegression(
+            fit_intercept=fit_intercept,
+            device=self.device,
+        )
+        self._coef_arr: Optional[Any] = None
+        self._intercept_val: Any = 0.0
+
+    @classmethod
+    def _from_rust(cls, rust_model: _RustLinearRegression, device: str) -> "LinearRegression":
+        inst = cls.__new__(cls)
+        inst._model = rust_model
+        inst.fit_intercept = rust_model.fit_intercept
+        inst.device = rust_model.device_ or device
+        inst._coef_arr = None
+        inst._intercept_val = 0.0
+        inst._sync_cache()
+        return inst
+
+    def __setstate__(self, state: bytes) -> None:
+        target_dev = get_default_device()
+        self._model = _RustLinearRegression.from_bytes(state, target_dev)
+        self.fit_intercept = self._model.fit_intercept
+        self.device = self._model.device_ or target_dev
+        self._coef_arr = None
+        self._intercept_val = 0.0
+        self._sync_cache()
+
     def __repr__(self) -> str:
         return f"LinearRegression(fit_intercept={self.fit_intercept}, device='{self.device}') (＾▽＾)"
+
+
+class Ridge(_BaseLinearEstimator):
+    """
+    Linear least squares with L2 (Tikhonov) regularization (*≧ω≦*)
+
+    Minimizes the objective function: ||y - Xw||^2_2 + alpha * ||w||^2_2
+    using normal equations computed on CPU, CUDA, wgpu, or TPU backends without
+    penalizing the intercept term.
+
+    Parameters
+    ----------
+    alpha : float, default=1.0
+        Constant that multiplies the L2 term, controlling regularization strength.
+        Must be a non-negative finite float.
+    fit_intercept : bool, default=True
+        Whether to calculate the intercept for this model.
+    device : str or None, default=None
+        Target computation device ('auto', 'cpu', 'cuda:0', 'cuda:all', 'wgpu', 'tpu').
+
+    Attributes
+    ----------
+    coef_ : numpy.ndarray or list of float or None
+        Weight vector(s) of shape (n_features,) or (n_targets, n_features).
+    intercept_ : float, numpy.ndarray, or None
+        Independent term in decision function. Set to 0.0 if fit_intercept=False.
+    n_features_in_ : int or None
+        Number of features seen during fitting.
+    device_ : str or None
+        Active device utilized during training.
+    """
+
+    _rust_cls = _RustRidge
+
+    def __init__(
+        self,
+        alpha: float = 1.0,
+        fit_intercept: bool = True,
+        device: Optional[str] = None,
+    ):
+        self.alpha = float(alpha)
+        self.fit_intercept = fit_intercept
+        self.device = device or get_default_device()
+        self._model = _RustRidge(
+            alpha=self.alpha,
+            fit_intercept=fit_intercept,
+            device=self.device,
+        )
+        self._coef_arr: Optional[Any] = None
+        self._intercept_val: Any = 0.0
+
+    @classmethod
+    def _from_rust(cls, rust_model: _RustRidge, device: str) -> "Ridge":
+        inst = cls.__new__(cls)
+        inst._model = rust_model
+        inst.alpha = rust_model.alpha
+        inst.fit_intercept = rust_model.fit_intercept
+        inst.device = rust_model.device_ or device
+        inst._coef_arr = None
+        inst._intercept_val = 0.0
+        inst._sync_cache()
+        return inst
+
+    def __setstate__(self, state: bytes) -> None:
+        target_dev = get_default_device()
+        self._model = _RustRidge.from_bytes(state, target_dev)
+        self.alpha = self._model.alpha
+        self.fit_intercept = self._model.fit_intercept
+        self.device = self._model.device_ or target_dev
+        self._coef_arr = None
+        self._intercept_val = 0.0
+        self._sync_cache()
+
+    def __repr__(self) -> str:
+        return (
+            f"Ridge(alpha={self.alpha}, fit_intercept={self.fit_intercept}, "
+            f"device='{self.device}') (*≧ω≦*)"
+        )
+
+
+class RidgeClassifier:
+    """
+    Classifier using Ridge regression (o´∀｀o)
+
+    Converts binary targets into {-1.0, +1.0} or multiclass targets into a
+    one-vs-rest {-1.0, +1.0} matrix and solves L2-regularized normal equations
+    across CPU, CUDA, wgpu, and TPU backends.
+
+    Parameters
+    ----------
+    alpha : float, default=1.0
+        Regularization strength; must be a non-negative finite float.
+    fit_intercept : bool, default=True
+        Whether to calculate the intercept for this model.
+    device : str or None, default=None
+        Target computation device ('auto', 'cpu', 'cuda:0', 'cuda:all', 'wgpu', 'tpu').
+
+    Attributes
+    ----------
+    coef_ : numpy.ndarray or list of float or None
+        Coefficient of the features in the decision function.
+    intercept_ : float, numpy.ndarray, or None
+        Independent term in decision function.
+    classes_ : numpy.ndarray or list of float
+        Unique class labels discovered during fitting.
+    n_features_in_ : int or None
+        Number of features seen during fitting.
+    device_ : str or None
+        Active device utilized during training.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 1.0,
+        fit_intercept: bool = True,
+        device: Optional[str] = None,
+    ):
+        self.alpha = float(alpha)
+        self.fit_intercept = fit_intercept
+        self.device = device or get_default_device()
+        self._model = _RustRidgeClassifier(
+            alpha=self.alpha,
+            fit_intercept=fit_intercept,
+            device=self.device,
+        )
+        self._coef_arr: Optional[Any] = None
+        self._intercept_val: Any = 0.0
+
+    def _sync_cache(self) -> None:
+        try:
+            import numpy as np
+
+            if self._model.is_multiclass_:
+                if self._model.coef_multi_ is not None:
+                    self._coef_arr = np.asarray(self._model.coef_multi_, dtype=np.float64)
+                else:
+                    self._coef_arr = None
+                if self._model.intercept_multi_ is not None:
+                    self._intercept_val = np.asarray(self._model.intercept_multi_, dtype=np.float64)
+                else:
+                    self._intercept_val = np.zeros(len(self._model.classes_), dtype=np.float64)
+            else:
+                if self._model.coef_ is not None:
+                    self._coef_arr = np.asarray(self._model.coef_, dtype=np.float64)
+                else:
+                    self._coef_arr = None
+                self._intercept_val = float(self._model.intercept_ or 0.0)
+        except Exception:
+            self._coef_arr = None
+            if self._model.is_multiclass_:
+                self._intercept_val = self._model.intercept_multi_
+            else:
+                self._intercept_val = float(self._model.intercept_ or 0.0)
+
+    @classmethod
+    def _from_rust(cls, rust_model: _RustRidgeClassifier, device: str) -> "RidgeClassifier":
+        inst = cls.__new__(cls)
+        inst._model = rust_model
+        inst.alpha = rust_model.alpha
+        inst.fit_intercept = rust_model.fit_intercept
+        inst.device = rust_model.device_ or device
+        inst._coef_arr = None
+        inst._intercept_val = 0.0
+        inst._sync_cache()
+        return inst
+
+    def fit(self, X: Any, y: Any, sample_weight: Optional[Any] = None) -> "RidgeClassifier":
+        """
+        Fit Ridge classifier model (＾▽＾)
+
+        Parameters
+        ----------
+        X : array-like, nested list, pandas.DataFrame, polars.DataFrame
+            Training data of shape (n_samples, n_features).
+        y : array-like of shape (n_samples,)
+            Target class labels.
+        sample_weight : array-like of shape (n_samples,) or None, default=None
+            Individual weights for each sample.
+
+        Returns
+        -------
+        self : RidgeClassifier
+            Fitted estimator instance.
+        """
+        is_buf_x, X_data = process_features(X)
+        is_buf_y, y_data = process_target(y)
+        is_buf_sw, sw_data = process_sample_weight(sample_weight)
+
+        if is_buf_x and is_buf_y and is_buf_sw:
+            self._model.fit_buffer(X_data, y_data, sw_data)
+        else:
+            X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
+            y_vec = to_target_vector(y_data) if is_buf_y else y_data
+            sw_list = sw_data.tolist() if (is_buf_sw and sw_data is not None) else sw_data
+            self._model.fit(X_mat, y_vec, sw_list)
+
+        self._sync_cache()
+        return self
+
+    def decision_function(self, X: Any) -> Any:
+        """
+        Predict confidence scores for samples (o´∀｀o)
+
+        Parameters
+        ----------
+        X : array-like, nested list, pandas.DataFrame, polars.DataFrame
+            The data matrix for which we want to compute confidence scores.
+
+        Returns
+        -------
+        scores : numpy.ndarray or list
+            Confidence scores of shape (n_samples,) for binary classification or
+            (n_samples, n_classes) for multiclass classification.
+        """
+        is_buf_x, X_data = process_features(X)
+        if is_buf_x:
+            try:
+                import numpy as np
+
+                if self._coef_arr is not None:
+                    if self._model.is_multiclass_:
+                        if X_data.shape[1] != self._coef_arr.shape[1]:
+                            raise ValueError(
+                                f"Number of features in test data ({X_data.shape[1]}) does not match model ({self._coef_arr.shape[1]}) (・`ω´・)"
+                            )
+                        return np.dot(X_data, self._coef_arr.T) + self._intercept_val
+                    else:
+                        if X_data.shape[1] != self._coef_arr.shape[0]:
+                            raise ValueError(
+                                f"Number of features in test data ({X_data.shape[1]}) does not match model ({self._coef_arr.shape[0]}) (・`ω´・)"
+                            )
+                        return np.dot(X_data, self._coef_arr) + self._intercept_val
+            except ValueError:
+                raise
+            except Exception:
+                pass
+            if self._model.is_multiclass_:
+                scores = self._model.decision_function_multi_buffer(X_data)
+            else:
+                scores = self._model.decision_function_buffer(X_data)
+        else:
+            if self._model.is_multiclass_:
+                scores = self._model.decision_function_multi(X_data)
+            else:
+                scores = self._model.decision_function(X_data)
+        try:
+            import numpy as np
+
+            return np.asarray(scores)
+        except ImportError:
+            return scores
+
+    def predict(self, X: Any) -> Any:
+        """
+        Predict class labels for samples in X (＾▽＾)
+        """
+        is_buf_x, X_data = process_features(X)
+        if is_buf_x:
+            preds = self._model.predict_buffer(X_data)
+        else:
+            preds = self._model.predict(X_data)
+        try:
+            import numpy as np
+
+            return np.asarray(preds)
+        except ImportError:
+            return preds
+
+    def score(self, X: Any, y: Any, sample_weight: Optional[Any] = None) -> float:
+        """
+        Return the mean accuracy on the given test data and labels (*^▽^*)
+        """
+        is_buf_x, X_data = process_features(X)
+        is_buf_y, y_data = process_target(y)
+        is_buf_sw, sw_data = process_sample_weight(sample_weight)
+        if is_buf_x and is_buf_y and is_buf_sw:
+            return self._model.score_buffer(X_data, y_data, sw_data)
+        X_mat = to_feature_matrix(X_data) if is_buf_x else X_data
+        y_vec = to_target_vector(y_data) if is_buf_y else y_data
+        sw_list = sw_data.tolist() if (is_buf_sw and sw_data is not None) else sw_data
+        return self._model.score(X_mat, y_vec, sw_list)
+
+    def save(self, path: str) -> None:
+        self._model.save(_validate_dit_path(path))
+
+    @classmethod
+    def load(cls, path: str, device: Optional[str] = None) -> "RidgeClassifier":
+        target_dev = device or get_default_device()
+        rust_model = _RustRidgeClassifier.load(_validate_dit_path(path), target_dev)
+        return cls._from_rust(rust_model, target_dev)
+
+    def to(self, device: str) -> "RidgeClassifier":
+        self._model.set_device(device)
+        self.device = self._model.device_ or device
+        return self
+
+    def __getstate__(self) -> bytes:
+        return self._model.to_bytes()
+
+    def __setstate__(self, state: bytes) -> None:
+        target_dev = get_default_device()
+        self._model = _RustRidgeClassifier.from_bytes(state, target_dev)
+        self.alpha = self._model.alpha
+        self.fit_intercept = self._model.fit_intercept
+        self.device = self._model.device_ or target_dev
+        self._coef_arr = None
+        self._intercept_val = 0.0
+        self._sync_cache()
+
+    @property
+    def classes_(self) -> Any:
+        try:
+            import numpy as np
+
+            return np.asarray(self._model.classes_, dtype=np.float64)
+        except ImportError:
+            return self._model.classes_
+
+    @property
+    def coef_(self) -> Optional[Any]:
+        if self._coef_arr is not None:
+            return self._coef_arr
+        if self._model.is_multiclass_:
+            return self._model.coef_multi_
+        return self._model.coef_
+
+    @property
+    def intercept_(self) -> Optional[Any]:
+        if self._model.is_multiclass_:
+            if self._coef_arr is not None:
+                return self._intercept_val
+            return self._model.intercept_multi_
+        return self._model.intercept_
+
+    @property
+    def n_features_in_(self) -> Optional[int]:
+        return self._model.n_features_in_
+
+    @property
+    def device_(self) -> Optional[str]:
+        return self._model.device_
+
+    def __repr__(self) -> str:
+        return (
+            f"RidgeClassifier(alpha={self.alpha}, fit_intercept={self.fit_intercept}, "
+            f"device='{self.device}') (o´∀｀o)"
+        )
+
+
+class RidgeCV(_BaseLinearEstimator):
+    """
+    Ridge regression with built-in cross-validation (*^▽^*)
+
+    Computes (X^T W X, X^T W Y) once on the configured hardware backend (CPU,
+    CUDA, wgpu, or TPU), then evaluates each candidate alpha via closed-form
+    Leave-One-Out CV (when cv=None) or K-Fold CV (when cv is an integer >= 2).
+
+    Parameters
+    ----------
+    alphas : array-like of shape (n_alphas,), default=(0.1, 1.0, 10.0)
+        Array of alpha values to try. Must be strictly positive when cv=None,
+        or non-negative when cv is an integer.
+    fit_intercept : bool, default=True
+        Whether to calculate the intercept for this model.
+    cv : int or None, default=None
+        Cross-validation splitting strategy. None performs efficient closed-form
+        Leave-One-Out CV; an integer k >= 2 performs k-fold CV.
+    device : str or None, default=None
+        Target computation device ('auto', 'cpu', 'cuda:0', 'cuda:all', 'wgpu', 'tpu').
+
+    Attributes
+    ----------
+    alpha_ : float or None
+        Estimated regularization parameter maximizing cross-validation score.
+    best_score_ : float or None
+        Highest cross-validation score achieved (negative LOO MSE when cv=None,
+        mean R^2 when cv is an integer).
+    coef_ : numpy.ndarray or list of float or None
+        Weight vector(s) for the selected alpha.
+    intercept_ : float, numpy.ndarray, or None
+        Independent term in decision function.
+    n_features_in_ : int or None
+        Number of features seen during fitting.
+    device_ : str or None
+        Active device utilized during training.
+    """
+
+    _rust_cls = _RustRidgeCV
+
+    def __init__(
+        self,
+        alphas: Any = (0.1, 1.0, 10.0),
+        fit_intercept: bool = True,
+        cv: Optional[int] = None,
+        device: Optional[str] = None,
+    ):
+        try:
+            alpha_list = [float(a) for a in alphas]
+        except TypeError:
+            alpha_list = [float(alphas)]
+        self.alphas = tuple(alpha_list)
+        self.fit_intercept = fit_intercept
+        self.cv = cv
+        self.device = device or get_default_device()
+        self._model = _RustRidgeCV(
+            alphas=alpha_list,
+            fit_intercept=fit_intercept,
+            cv=cv,
+            device=self.device,
+        )
+        self._coef_arr: Optional[Any] = None
+        self._intercept_val: Any = 0.0
+
+    @classmethod
+    def _from_rust(cls, rust_model: _RustRidgeCV, device: str) -> "RidgeCV":
+        inst = cls.__new__(cls)
+        inst._model = rust_model
+        inst.alphas = tuple(rust_model.alphas)
+        inst.fit_intercept = rust_model.fit_intercept
+        inst.cv = rust_model.cv
+        inst.device = rust_model.device_ or device
+        inst._coef_arr = None
+        inst._intercept_val = 0.0
+        inst._sync_cache()
+        return inst
+
+    def __setstate__(self, state: bytes) -> None:
+        target_dev = get_default_device()
+        self._model = _RustRidgeCV.from_bytes(state, target_dev)
+        self.alphas = tuple(self._model.alphas)
+        self.fit_intercept = self._model.fit_intercept
+        self.cv = self._model.cv
+        self.device = self._model.device_ or target_dev
+        self._coef_arr = None
+        self._intercept_val = 0.0
+        self._sync_cache()
+
+    @property
+    def alpha_(self) -> Optional[float]:
+        return self._model.alpha_
+
+    @property
+    def best_score_(self) -> Optional[float]:
+        return self._model.best_score_
+
+    def __repr__(self) -> str:
+        return (
+            f"RidgeCV(alphas={self.alphas}, fit_intercept={self.fit_intercept}, "
+            f"cv={self.cv}, device='{self.device}') (*^▽^*)"
+        )
 
 
 class DecisionTreeClassifier:

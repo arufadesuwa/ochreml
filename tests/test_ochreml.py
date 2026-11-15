@@ -6,7 +6,14 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-from ochreml import LinearRegression, DecisionTreeClassifier, DecisionTreeRegressor
+from ochreml import (
+    LinearRegression,
+    Ridge,
+    RidgeClassifier,
+    RidgeCV,
+    DecisionTreeClassifier,
+    DecisionTreeRegressor,
+)
 
 
 # =========================================================================
@@ -384,5 +391,225 @@ def test_dit_save_load_multi_output(tmp_path):
     assert np.allclose(loaded.coef_, model.coef_)
     assert np.allclose(loaded.intercept_, model.intercept_)
     assert np.allclose(loaded.predict(X), model.predict(X))
+
+
+# =========================================================================
+# Ridge, RidgeClassifier, and RidgeCV Tests (＾▽＾)
+# =========================================================================
+
+def test_ridge_unpenalized_intercept():
+    X = np.array([[-2.0], [-1.0], [0.0], [1.0], [2.0]])
+    y = 3.0 * X[:, 0] + 42.0
+
+    model = Ridge(alpha=1e4, fit_intercept=True, device="cpu").fit(X, y)
+    assert pytest.approx(float(model.intercept_), abs=1e-10) == 42.0
+    assert abs(float(model.coef_[0])) < 0.01
+
+
+def test_ridge_parity_with_sklearn():
+    from sklearn.linear_model import Ridge as SklearnRidge
+
+    rng = np.random.RandomState(2026)
+    X = rng.randn(300, 6)
+    y_1d = X @ rng.randn(6) + 2.5 + rng.randn(300) * 0.2
+    Y_2d = X @ rng.randn(6, 3) + np.array([1.0, -2.0, 0.5]) + rng.randn(300, 3) * 0.2
+    weights = rng.uniform(0.2, 5.0, size=300)
+
+    for alpha in [0.01, 1.0, 100.0]:
+        for fit_intercept in [True, False]:
+            for sw in [None, weights]:
+                ochre_1d = Ridge(alpha=alpha, fit_intercept=fit_intercept, device="cpu").fit(
+                    X, y_1d, sample_weight=sw
+                )
+                sk_1d = SklearnRidge(alpha=alpha, fit_intercept=fit_intercept).fit(
+                    X, y_1d, sample_weight=sw
+                )
+                assert np.allclose(ochre_1d.coef_, sk_1d.coef_, atol=1e-8)
+                assert pytest.approx(float(ochre_1d.intercept_), abs=1e-8) == float(sk_1d.intercept_)
+                assert np.allclose(ochre_1d.predict(X), sk_1d.predict(X), atol=1e-8)
+                assert pytest.approx(ochre_1d.score(X, y_1d, sample_weight=sw), abs=1e-8) == sk_1d.score(
+                    X, y_1d, sample_weight=sw
+                )
+
+                ochre_2d = Ridge(alpha=alpha, fit_intercept=fit_intercept, device="cpu").fit(
+                    X, Y_2d, sample_weight=sw
+                )
+                sk_2d = SklearnRidge(alpha=alpha, fit_intercept=fit_intercept).fit(
+                    X, Y_2d, sample_weight=sw
+                )
+                assert ochre_2d.coef_.shape == sk_2d.coef_.shape == (3, 6)
+                assert np.allclose(ochre_2d.coef_, sk_2d.coef_, atol=1e-8)
+                if fit_intercept:
+                    assert np.allclose(ochre_2d.intercept_, sk_2d.intercept_, atol=1e-8)
+                else:
+                    assert np.allclose(ochre_2d.intercept_, np.zeros(3), atol=1e-10)
+                assert np.allclose(ochre_2d.predict(X), sk_2d.predict(X), atol=1e-8)
+                assert pytest.approx(ochre_2d.score(X, Y_2d, sample_weight=sw), abs=1e-8) == sk_2d.score(
+                    X, Y_2d, sample_weight=sw
+                )
+
+
+def test_ridge_input_formats():
+    df = pd.DataFrame({"a": [1.0, 2.0, 3.0, 4.0], "b": [2.0, 1.0, 4.0, 3.0]})
+    s_y = pd.Series([5.0, 5.0, 11.0, 11.0])
+
+    r1 = Ridge(alpha=0.5).fit(df, s_y)
+    assert r1.score(df, s_y) > 0.98
+
+    pl_df = pl.DataFrame({"a": [1.0, 2.0, 3.0, 4.0], "b": [2.0, 1.0, 4.0, 3.0]})
+    pl_y = pl.Series("y", [5.0, 5.0, 11.0, 11.0])
+    r2 = Ridge(alpha=0.5).fit(pl_df, pl_y)
+    assert np.allclose(r1.coef_, r2.coef_)
+
+    r3 = Ridge(alpha=0.5).fit([[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0]], [5.0, 5.0, 11.0, 11.0])
+    assert np.allclose(r1.coef_, r3.coef_)
+
+
+def test_ridge_classifier_parity_with_sklearn():
+    from sklearn.linear_model import RidgeClassifier as SklearnRC
+
+    rng = np.random.RandomState(42)
+    X = rng.randn(240, 5)
+    weights = rng.uniform(0.3, 4.0, size=240)
+
+    # Binary classification with custom numeric labels (-1.0, 2.0)
+    logits = 1.5 * X[:, 0] - 0.8 * X[:, 1] + 0.3
+    y_bin = np.where(logits > 0.0, 2.0, -1.0)
+
+    # Multiclass classification (3 classes)
+    scores_mc = np.column_stack([
+        X[:, 0] + 0.5 * X[:, 1],
+        -X[:, 0] + X[:, 2],
+        -X[:, 1] - X[:, 2] + 0.4,
+    ])
+    y_mc = np.argmax(scores_mc, axis=1).astype(np.float64)
+
+    for y_cls in [y_bin, y_mc]:
+        for fit_intercept in [True, False]:
+            for sw in [None, weights]:
+                ochre_rc = RidgeClassifier(alpha=1.0, fit_intercept=fit_intercept, device="cpu").fit(
+                    X, y_cls, sample_weight=sw
+                )
+                sk_rc = SklearnRC(alpha=1.0, fit_intercept=fit_intercept).fit(
+                    X, y_cls, sample_weight=sw
+                )
+
+                assert np.array_equal(ochre_rc.classes_, sk_rc.classes_)
+                assert np.allclose(ochre_rc.coef_, sk_rc.coef_, atol=1e-8)
+                assert np.allclose(ochre_rc.intercept_, sk_rc.intercept_, atol=1e-8)
+                assert np.allclose(ochre_rc.decision_function(X), sk_rc.decision_function(X), atol=1e-8)
+                assert np.array_equal(ochre_rc.predict(X), sk_rc.predict(X))
+                assert pytest.approx(ochre_rc.score(X, y_cls, sample_weight=sw), abs=1e-10) == sk_rc.score(
+                    X, y_cls, sample_weight=sw
+                )
+
+
+def test_ridge_cv_parity_with_sklearn():
+    from sklearn.linear_model import RidgeCV as SklearnRidgeCV
+
+    rng = np.random.RandomState(99)
+    X = rng.randn(150, 8)
+    y_1d = X @ np.array([2.0, -1.5, 0.5, 0.0, 1.0, -0.5, 0.2, 0.0]) + 3.0 + rng.randn(150) * 0.8
+    Y_2d = X @ rng.randn(8, 3) + np.array([1.0, -1.0, 2.0]) + rng.randn(150, 3) * 0.8
+    weights = rng.uniform(0.5, 3.0, size=150)
+    alphas = (0.01, 0.1, 1.0, 10.0, 100.0)
+
+    for fit_intercept in [True, False]:
+        for sw in [None, weights]:
+            ochre_1d = RidgeCV(alphas=alphas, fit_intercept=fit_intercept, device="cpu").fit(
+                X, y_1d, sample_weight=sw
+            )
+            sk_1d = SklearnRidgeCV(alphas=alphas, fit_intercept=fit_intercept).fit(
+                X, y_1d, sample_weight=sw
+            )
+            assert ochre_1d.alpha_ == pytest.approx(float(sk_1d.alpha_))
+            assert ochre_1d.best_score_ == pytest.approx(float(sk_1d.best_score_), abs=1e-7)
+            assert np.allclose(ochre_1d.coef_, sk_1d.coef_, atol=1e-7)
+            assert pytest.approx(float(ochre_1d.intercept_), abs=1e-7) == float(sk_1d.intercept_)
+            assert np.allclose(ochre_1d.predict(X), sk_1d.predict(X), atol=1e-7)
+
+            ochre_2d = RidgeCV(alphas=alphas, fit_intercept=fit_intercept, device="cpu").fit(
+                X, Y_2d, sample_weight=sw
+            )
+            sk_2d = SklearnRidgeCV(alphas=alphas, fit_intercept=fit_intercept).fit(
+                X, Y_2d, sample_weight=sw
+            )
+            assert ochre_2d.alpha_ == pytest.approx(float(sk_2d.alpha_))
+            assert ochre_2d.best_score_ == pytest.approx(float(sk_2d.best_score_), abs=1e-7)
+            assert np.allclose(ochre_2d.coef_, sk_2d.coef_, atol=1e-7)
+            if fit_intercept:
+                assert np.allclose(ochre_2d.intercept_, sk_2d.intercept_, atol=1e-7)
+            assert np.allclose(ochre_2d.predict(X), sk_2d.predict(X), atol=1e-7)
+
+    # K-Fold CV parity check
+    ochre_kf = RidgeCV(alphas=alphas, fit_intercept=True, cv=5, device="cpu").fit(X, y_1d)
+    sk_kf = SklearnRidgeCV(alphas=alphas, fit_intercept=True, cv=5).fit(X, y_1d)
+    assert ochre_kf.alpha_ == pytest.approx(float(sk_kf.alpha_))
+    assert ochre_kf.best_score_ == pytest.approx(float(sk_kf.best_score_), abs=1e-7)
+    assert np.allclose(ochre_kf.coef_, sk_kf.coef_, atol=1e-7)
+    assert pytest.approx(float(ochre_kf.intercept_), abs=1e-7) == float(sk_kf.intercept_)
+
+
+def test_ridge_family_dit_save_load_and_pickle(tmp_path):
+    import pickle
+    import ochreml
+
+    rng = np.random.RandomState(7)
+    X = rng.randn(40, 4)
+    y_1d = X @ np.array([1.5, -2.0, 0.5, 1.0]) + 3.0
+    Y_2d = X @ rng.randn(4, 2) + np.array([1.0, -1.0])
+    y_bin = (y_1d > 3.0).astype(np.float64)
+    y_mc = np.array([0.0, 1.0, 2.0] * 13 + [0.0])
+
+    models = [
+        ("ridge_1d.dit", Ridge(alpha=2.5, device="cpu").fit(X, y_1d)),
+        ("ridge_2d.dit", Ridge(alpha=0.5, device="cpu").fit(X, Y_2d)),
+        ("rc_bin.dit", RidgeClassifier(alpha=1.0, device="cpu").fit(X, y_bin)),
+        ("rc_mc.dit", RidgeClassifier(alpha=1.0, device="cpu").fit(X, y_mc)),
+        ("ridge_cv.dit", RidgeCV(alphas=(0.1, 1.0, 10.0), device="cpu").fit(X, y_1d)),
+    ]
+
+    for fname, model in models:
+        dit_path = str(tmp_path / fname)
+        ochreml.save(model, dit_path)
+        loaded = ochreml.load(dit_path)
+        assert type(loaded) is type(model)
+        assert np.allclose(loaded.coef_, model.coef_)
+        assert np.allclose(loaded.intercept_, model.intercept_)
+        assert np.allclose(loaded.predict(X), model.predict(X))
+        if isinstance(model, RidgeClassifier):
+            assert np.array_equal(loaded.classes_, model.classes_)
+            assert np.allclose(loaded.decision_function(X), model.decision_function(X))
+        if isinstance(model, RidgeCV):
+            assert loaded.alpha_ == model.alpha_
+            assert loaded.best_score_ == pytest.approx(model.best_score_)
+
+        unpickled = pickle.loads(pickle.dumps(model))
+        assert np.allclose(unpickled.predict(X), model.predict(X))
+
+
+def test_ridge_invalid_params_and_unfitted():
+    with pytest.raises(ValueError):
+        Ridge(alpha=-1.0)
+    with pytest.raises(ValueError):
+        Ridge(alpha=float("nan"))
+    with pytest.raises(ValueError):
+        RidgeClassifier(alpha=-0.5)
+    with pytest.raises(ValueError):
+        RidgeCV(alphas=())
+    with pytest.raises(ValueError):
+        RidgeCV(alphas=(-1.0, 1.0))
+    with pytest.raises(ValueError):
+        RidgeCV(alphas=(0.0, 1.0), cv=None)
+    with pytest.raises(ValueError):
+        RidgeCV(alphas=(1.0,), cv=1)
+
+    with pytest.raises(ValueError):
+        Ridge().predict([[1.0, 2.0]])
+    with pytest.raises(ValueError):
+        RidgeClassifier().decision_function([[1.0, 2.0]])
+    with pytest.raises(ValueError):
+        RidgeCV().predict([[1.0, 2.0]])
+
 
 

@@ -1,5 +1,5 @@
 // PyO3 bindings module for OchreML (＾▽＾)
-// Exposes Rust Linear Regression and Decision Tree implementations with Hardware Acceleration to Python.
+// Exposes Rust Linear, Ridge, and Decision Tree implementations with Hardware Acceleration to Python.
 
 pub mod backend;
 pub mod backends;
@@ -8,6 +8,7 @@ pub mod device;
 pub mod error;
 pub mod linear_regression;
 pub mod matrix;
+pub mod ridge;
 
 use decision_tree::{DecisionTreeClassifier, DecisionTreeRegressor, TreeNode};
 use device::parse_device;
@@ -17,6 +18,7 @@ use matrix::Matrix;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use ridge::{Ridge, RidgeCV, RidgeClassifier};
 use std::collections::HashMap;
 use std::fs;
 
@@ -31,6 +33,9 @@ const DIT_MAGIC: &[u8; 4] = b"DIT\x01";
 const TAG_LINEAR_REGRESSION: u8 = 1;
 const TAG_DT_CLASSIFIER: u8 = 2;
 const TAG_DT_REGRESSOR: u8 = 3;
+const TAG_RIDGE: u8 = 4;
+const TAG_RIDGE_CLASSIFIER: u8 = 5;
+const TAG_RIDGE_CV: u8 = 6;
 
 fn validate_dit_path(path: &str) -> OchreResult<()> {
     if !path.trim().to_lowercase().ends_with(".dit") {
@@ -94,6 +99,17 @@ fn write_opt_f64_vec(buf: &mut Vec<u8>, v: &Option<Vec<f64>>) {
         Some(vec) => {
             write_u8(buf, 1);
             write_f64_vec(buf, vec);
+        }
+        None => write_u8(buf, 0),
+    }
+}
+fn write_opt_matrix(buf: &mut Vec<u8>, m: &Option<Matrix>) {
+    match m {
+        Some(mat) => {
+            write_u8(buf, 1);
+            write_usize(buf, mat.rows);
+            write_usize(buf, mat.cols);
+            write_f64_vec(buf, &mat.data);
         }
         None => write_u8(buf, 0),
     }
@@ -208,6 +224,16 @@ impl<'a> ByteReader<'a> {
             Ok(None)
         }
     }
+    fn read_opt_matrix(&mut self) -> OchreResult<Option<Matrix>> {
+        if self.read_bool()? {
+            let rows = self.read_usize()?;
+            let cols = self.read_usize()?;
+            let data = self.read_f64_vec()?;
+            Ok(Some(Matrix::from_vec(rows, cols, data)?))
+        } else {
+            Ok(None)
+        }
+    }
     fn read_tree_node(&mut self) -> OchreResult<TreeNode> {
         match self.read_u8()? {
             0 => {
@@ -261,6 +287,29 @@ fn check_magic_and_tag(reader: &mut ByteReader<'_>, expected_tag: u8) -> OchreRe
     Ok(())
 }
 
+fn resolve_loaded_device(
+    saved_device: Option<String>,
+    is_fitted: bool,
+    device: Option<&str>,
+) -> OchreResult<(device::DeviceType, Option<String>)> {
+    let dev = parse_device(device.or(Some("auto")))?;
+    let device_ = if saved_device.is_some() || is_fitted {
+        Some(dev.to_string())
+    } else {
+        None
+    };
+    Ok((dev, device_))
+}
+
+fn matrix_to_nested_vec(m: &Matrix) -> Vec<Vec<f64>> {
+    let mut out = Vec::with_capacity(m.rows);
+    for r in 0..m.rows {
+        let offset = r * m.cols;
+        out.push(m.data[offset..offset + m.cols].to_vec());
+    }
+    out
+}
+
 impl LinearRegression {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -273,15 +322,7 @@ impl LinearRegression {
         write_opt_usize(&mut buf, self.n_features_in_);
         write_bool(&mut buf, self.is_multi_target_);
         write_usize(&mut buf, self.n_targets_);
-        match &self.coef_multi_ {
-            Some(m) => {
-                write_u8(&mut buf, 1);
-                write_usize(&mut buf, m.rows);
-                write_usize(&mut buf, m.cols);
-                write_f64_vec(&mut buf, &m.data);
-            }
-            None => write_u8(&mut buf, 0),
-        }
+        write_opt_matrix(&mut buf, &self.coef_multi_);
         write_opt_f64_vec(&mut buf, &self.intercept_multi_);
         buf
     }
@@ -294,24 +335,13 @@ impl LinearRegression {
         let coef_ = r.read_opt_f64_vec()?;
         let intercept_ = r.read_opt_f64()?;
         let n_features_in_ = r.read_opt_usize()?;
-        let dev = parse_device(device.or(Some("auto")))?;
-        let device_ = if saved_device.is_some() || coef_.is_some() {
-            Some(dev.to_string())
-        } else {
-            None
-        };
+        let (dev, device_) = resolve_loaded_device(saved_device, coef_.is_some(), device)?;
 
-        let (is_multi_target_, n_targets_, coef_multi_, intercept_multi_) = if r.pos < r.data.len() {
+        let (is_multi_target_, n_targets_, coef_multi_, intercept_multi_) = if r.pos < r.data.len()
+        {
             let is_multi = r.read_bool()?;
             let n_targets = r.read_usize()?;
-            let coef_multi = if r.read_bool()? {
-                let rows = r.read_usize()?;
-                let cols = r.read_usize()?;
-                let data = r.read_f64_vec()?;
-                Some(Matrix::from_vec(rows, cols, data)?)
-            } else {
-                None
-            };
+            let coef_multi = r.read_opt_matrix()?;
             let intercept_multi = r.read_opt_f64_vec()?;
             (is_multi, n_targets, coef_multi, intercept_multi)
         } else {
@@ -327,6 +357,189 @@ impl LinearRegression {
             fit_intercept,
             device: dev,
             device_,
+            coef_,
+            intercept_,
+            coef_multi_,
+            intercept_multi_,
+            is_multi_target_,
+            n_targets_,
+            n_features_in_,
+        })
+    }
+
+    pub fn set_device(&mut self, device: Option<&str>) -> OchreResult<()> {
+        let dev = parse_device(device)?;
+        if self.device_.is_some() {
+            self.device_ = Some(dev.to_string());
+        }
+        self.device = dev;
+        Ok(())
+    }
+}
+
+impl Ridge {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(DIT_MAGIC);
+        write_u8(&mut buf, TAG_RIDGE);
+        write_f64(&mut buf, self.alpha);
+        write_bool(&mut buf, self.fit_intercept);
+        write_opt_str(&mut buf, &self.device_);
+        write_opt_f64_vec(&mut buf, &self.coef_);
+        write_opt_f64(&mut buf, self.intercept_);
+        write_opt_usize(&mut buf, self.n_features_in_);
+        write_bool(&mut buf, self.is_multi_target_);
+        write_usize(&mut buf, self.n_targets_);
+        write_opt_matrix(&mut buf, &self.coef_multi_);
+        write_opt_f64_vec(&mut buf, &self.intercept_multi_);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8], device: Option<&str>) -> OchreResult<Self> {
+        let mut r = ByteReader::new(bytes);
+        check_magic_and_tag(&mut r, TAG_RIDGE)?;
+        let alpha = r.read_f64()?;
+        let fit_intercept = r.read_bool()?;
+        let saved_device = r.read_opt_str()?;
+        let coef_ = r.read_opt_f64_vec()?;
+        let intercept_ = r.read_opt_f64()?;
+        let n_features_in_ = r.read_opt_usize()?;
+        let is_multi_target_ = r.read_bool()?;
+        let n_targets_ = r.read_usize()?;
+        let coef_multi_ = r.read_opt_matrix()?;
+        let intercept_multi_ = r.read_opt_f64_vec()?;
+        let (dev, device_) = resolve_loaded_device(saved_device, coef_.is_some(), device)?;
+
+        Ok(Self {
+            alpha,
+            fit_intercept,
+            device: dev,
+            device_,
+            coef_,
+            intercept_,
+            coef_multi_,
+            intercept_multi_,
+            is_multi_target_,
+            n_targets_,
+            n_features_in_,
+        })
+    }
+
+    pub fn set_device(&mut self, device: Option<&str>) -> OchreResult<()> {
+        let dev = parse_device(device)?;
+        if self.device_.is_some() {
+            self.device_ = Some(dev.to_string());
+        }
+        self.device = dev;
+        Ok(())
+    }
+}
+
+impl RidgeClassifier {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(DIT_MAGIC);
+        write_u8(&mut buf, TAG_RIDGE_CLASSIFIER);
+        write_f64(&mut buf, self.alpha);
+        write_bool(&mut buf, self.fit_intercept);
+        write_opt_str(&mut buf, &self.device_);
+        write_f64_vec(&mut buf, &self.classes_);
+        write_bool(&mut buf, self.is_multiclass_);
+        write_opt_usize(&mut buf, self.n_features_in_);
+        write_opt_f64_vec(&mut buf, &self.coef_);
+        write_opt_f64(&mut buf, self.intercept_);
+        write_opt_matrix(&mut buf, &self.coef_multi_);
+        write_opt_f64_vec(&mut buf, &self.intercept_multi_);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8], device: Option<&str>) -> OchreResult<Self> {
+        let mut r = ByteReader::new(bytes);
+        check_magic_and_tag(&mut r, TAG_RIDGE_CLASSIFIER)?;
+        let alpha = r.read_f64()?;
+        let fit_intercept = r.read_bool()?;
+        let saved_device = r.read_opt_str()?;
+        let classes_ = r.read_f64_vec()?;
+        let is_multiclass_ = r.read_bool()?;
+        let n_features_in_ = r.read_opt_usize()?;
+        let coef_ = r.read_opt_f64_vec()?;
+        let intercept_ = r.read_opt_f64()?;
+        let coef_multi_ = r.read_opt_matrix()?;
+        let intercept_multi_ = r.read_opt_f64_vec()?;
+        let (dev, device_) = resolve_loaded_device(saved_device, !classes_.is_empty(), device)?;
+
+        Ok(Self {
+            alpha,
+            fit_intercept,
+            device: dev,
+            device_,
+            classes_,
+            coef_,
+            intercept_,
+            coef_multi_,
+            intercept_multi_,
+            is_multiclass_,
+            n_features_in_,
+        })
+    }
+
+    pub fn set_device(&mut self, device: Option<&str>) -> OchreResult<()> {
+        let dev = parse_device(device)?;
+        if self.device_.is_some() {
+            self.device_ = Some(dev.to_string());
+        }
+        self.device = dev;
+        Ok(())
+    }
+}
+
+impl RidgeCV {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(DIT_MAGIC);
+        write_u8(&mut buf, TAG_RIDGE_CV);
+        write_f64_vec(&mut buf, &self.alphas);
+        write_bool(&mut buf, self.fit_intercept);
+        write_opt_usize(&mut buf, self.cv);
+        write_opt_str(&mut buf, &self.device_);
+        write_opt_f64(&mut buf, self.alpha_);
+        write_opt_f64(&mut buf, self.best_score_);
+        write_opt_f64_vec(&mut buf, &self.coef_);
+        write_opt_f64(&mut buf, self.intercept_);
+        write_opt_usize(&mut buf, self.n_features_in_);
+        write_bool(&mut buf, self.is_multi_target_);
+        write_usize(&mut buf, self.n_targets_);
+        write_opt_matrix(&mut buf, &self.coef_multi_);
+        write_opt_f64_vec(&mut buf, &self.intercept_multi_);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8], device: Option<&str>) -> OchreResult<Self> {
+        let mut r = ByteReader::new(bytes);
+        check_magic_and_tag(&mut r, TAG_RIDGE_CV)?;
+        let alphas = r.read_f64_vec()?;
+        let fit_intercept = r.read_bool()?;
+        let cv = r.read_opt_usize()?;
+        let saved_device = r.read_opt_str()?;
+        let alpha_ = r.read_opt_f64()?;
+        let best_score_ = r.read_opt_f64()?;
+        let coef_ = r.read_opt_f64_vec()?;
+        let intercept_ = r.read_opt_f64()?;
+        let n_features_in_ = r.read_opt_usize()?;
+        let is_multi_target_ = r.read_bool()?;
+        let n_targets_ = r.read_usize()?;
+        let coef_multi_ = r.read_opt_matrix()?;
+        let intercept_multi_ = r.read_opt_f64_vec()?;
+        let (dev, device_) = resolve_loaded_device(saved_device, coef_.is_some(), device)?;
+
+        Ok(Self {
+            alphas,
+            fit_intercept,
+            cv,
+            device: dev,
+            device_,
+            alpha_,
+            best_score_,
             coef_,
             intercept_,
             coef_multi_,
@@ -477,8 +690,9 @@ fn buffer_to_matrix(py: Python<'_>, x: &pyo3::buffer::PyBuffer<f64>) -> PyResult
     let rows = shape[0];
     let cols = shape[1];
     let mut data = vec![0.0; rows * cols];
-    x.copy_to_slice(py, &mut data)
-        .map_err(|e| PyValueError::new_err(format!("Failed to copy buffer data: {} (´；ω；`)", e)))?;
+    x.copy_to_slice(py, &mut data).map_err(|e| {
+        PyValueError::new_err(format!("Failed to copy buffer data: {} (´；ω；`)", e))
+    })?;
     Ok(Matrix::from_vec(rows, cols, data)?)
 }
 
@@ -491,12 +705,16 @@ fn buffer_to_target_vector(py: Python<'_>, y: &pyo3::buffer::PyBuffer<f64>) -> P
     }
     let count = y.item_count();
     let mut data = vec![0.0; count];
-    y.copy_to_slice(py, &mut data)
-        .map_err(|e| PyValueError::new_err(format!("Failed to copy target buffer: {} (´；ω；`)", e)))?;
+    y.copy_to_slice(py, &mut data).map_err(|e| {
+        PyValueError::new_err(format!("Failed to copy target buffer: {} (´；ω；`)", e))
+    })?;
     Ok(data)
 }
 
-fn buffer_to_target_matrix(py: Python<'_>, y: &pyo3::buffer::PyBuffer<f64>) -> PyResult<(Matrix, bool)> {
+fn buffer_to_target_matrix(
+    py: Python<'_>,
+    y: &pyo3::buffer::PyBuffer<f64>,
+) -> PyResult<(Matrix, bool)> {
     let shape = y.shape();
     let (rows, cols, is_2d) = if shape.len() == 1 {
         (shape[0], 1, false)
@@ -509,8 +727,9 @@ fn buffer_to_target_matrix(py: Python<'_>, y: &pyo3::buffer::PyBuffer<f64>) -> P
         )));
     };
     let mut data = vec![0.0; rows * cols];
-    y.copy_to_slice(py, &mut data)
-        .map_err(|e| PyValueError::new_err(format!("Failed to copy target buffer: {} (´；ω；`)", e)))?;
+    y.copy_to_slice(py, &mut data).map_err(|e| {
+        PyValueError::new_err(format!("Failed to copy target buffer: {} (´；ω；`)", e))
+    })?;
     let mat = Matrix::from_vec(rows, cols, data)?;
     Ok((mat, is_2d))
 }
@@ -525,8 +744,12 @@ fn buffer_to_sample_weight(py: Python<'_>, sw: &pyo3::buffer::PyBuffer<f64>) -> 
     }
     let count = sw.item_count();
     let mut data = vec![0.0; count];
-    sw.copy_to_slice(py, &mut data)
-        .map_err(|e| PyValueError::new_err(format!("Failed to copy sample_weight buffer: {} (´；ω；`)", e)))?;
+    sw.copy_to_slice(py, &mut data).map_err(|e| {
+        PyValueError::new_err(format!(
+            "Failed to copy sample_weight buffer: {} (´；ω；`)",
+            e
+        ))
+    })?;
     Ok(data)
 }
 
@@ -607,7 +830,11 @@ impl PyLinearRegression {
         Ok(out)
     }
 
-    pub fn predict_buffer(&self, py: Python<'_>, x: pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
+    pub fn predict_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<Vec<f64>> {
         let mat = buffer_to_matrix(py, &x)?;
         Ok(self.inner.predict(&mat)?)
     }
@@ -624,7 +851,8 @@ impl PyLinearRegression {
             return Ok(self.inner.score(&x_mat, &y)?);
         }
         let y_mat = Matrix::from_vec(y.len(), 1, y)?;
-        Ok(self.inner
+        Ok(self
+            .inner
             .score_multi(&x_mat, &y_mat, sample_weight.as_deref())?)
     }
 
@@ -637,7 +865,8 @@ impl PyLinearRegression {
     ) -> PyResult<f64> {
         let x_mat = Matrix::from_2d(&x)?;
         let y_mat = Matrix::from_2d(&y)?;
-        Ok(self.inner
+        Ok(self
+            .inner
             .score_multi(&x_mat, &y_mat, sample_weight.as_deref())?)
     }
 
@@ -655,22 +884,23 @@ impl PyLinearRegression {
             Some(ref sw_buf) => Some(buffer_to_sample_weight(py, sw_buf)?),
             None => None,
         };
-        Ok(self.inner
-            .score_multi(&x_mat, &y_mat, sw_vec.as_deref())?)
+        Ok(self.inner.score_multi(&x_mat, &y_mat, sw_vec.as_deref())?)
     }
 
     pub fn save(&self, path: &str) -> PyResult<()> {
         validate_dit_path(path)?;
-        fs::write(path, self.inner.to_bytes())
-            .map_err(|e| PyValueError::new_err(format!("Failed to write .dit file: {} (´；ω；`)", e)))
+        fs::write(path, self.inner.to_bytes()).map_err(|e| {
+            PyValueError::new_err(format!("Failed to write .dit file: {} (´；ω；`)", e))
+        })
     }
 
     #[staticmethod]
     #[pyo3(signature = (path, device = None))]
     pub fn load(path: &str, device: Option<String>) -> PyResult<Self> {
         validate_dit_path(path)?;
-        let bytes = fs::read(path)
-            .map_err(|e| PyValueError::new_err(format!("Failed to read .dit file: {} (´；ω；`)", e)))?;
+        let bytes = fs::read(path).map_err(|e| {
+            PyValueError::new_err(format!("Failed to read .dit file: {} (´；ω；`)", e))
+        })?;
         let inner = LinearRegression::from_bytes(&bytes, device.as_deref())?;
         Ok(Self { inner })
     }
@@ -771,7 +1001,13 @@ impl PyDecisionTreeClassifier {
         min_samples_leaf: Option<usize>,
         device: Option<String>,
     ) -> PyResult<Self> {
-        let inner = DecisionTreeClassifier::new(criterion, max_depth, min_samples_split, min_samples_leaf, device)?;
+        let inner = DecisionTreeClassifier::new(
+            criterion,
+            max_depth,
+            min_samples_split,
+            min_samples_leaf,
+            device,
+        )?;
         Ok(Self { inner })
     }
 
@@ -798,7 +1034,11 @@ impl PyDecisionTreeClassifier {
         Ok(self.inner.predict(&mat)?)
     }
 
-    pub fn predict_buffer(&self, py: Python<'_>, x: pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
+    pub fn predict_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<Vec<f64>> {
         let mat = buffer_to_matrix(py, &x)?;
         Ok(self.inner.predict(&mat)?)
     }
@@ -821,16 +1061,18 @@ impl PyDecisionTreeClassifier {
 
     pub fn save(&self, path: &str) -> PyResult<()> {
         validate_dit_path(path)?;
-        fs::write(path, self.inner.to_bytes())
-            .map_err(|e| PyValueError::new_err(format!("Failed to write .dit file: {} (´；ω；`)", e)))
+        fs::write(path, self.inner.to_bytes()).map_err(|e| {
+            PyValueError::new_err(format!("Failed to write .dit file: {} (´；ω；`)", e))
+        })
     }
 
     #[staticmethod]
     #[pyo3(signature = (path, device = None))]
     pub fn load(path: &str, device: Option<String>) -> PyResult<Self> {
         validate_dit_path(path)?;
-        let bytes = fs::read(path)
-            .map_err(|e| PyValueError::new_err(format!("Failed to read .dit file: {} (´；ω；`)", e)))?;
+        let bytes = fs::read(path).map_err(|e| {
+            PyValueError::new_err(format!("Failed to read .dit file: {} (´；ω；`)", e))
+        })?;
         let inner = DecisionTreeClassifier::from_bytes(&bytes, device.as_deref())?;
         Ok(Self { inner })
     }
@@ -914,7 +1156,13 @@ impl PyDecisionTreeRegressor {
         min_samples_leaf: Option<usize>,
         device: Option<String>,
     ) -> PyResult<Self> {
-        let inner = DecisionTreeRegressor::new(criterion, max_depth, min_samples_split, min_samples_leaf, device)?;
+        let inner = DecisionTreeRegressor::new(
+            criterion,
+            max_depth,
+            min_samples_split,
+            min_samples_leaf,
+            device,
+        )?;
         Ok(Self { inner })
     }
 
@@ -941,7 +1189,11 @@ impl PyDecisionTreeRegressor {
         Ok(self.inner.predict(&mat)?)
     }
 
-    pub fn predict_buffer(&self, py: Python<'_>, x: pyo3::buffer::PyBuffer<f64>) -> PyResult<Vec<f64>> {
+    pub fn predict_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<Vec<f64>> {
         let mat = buffer_to_matrix(py, &x)?;
         Ok(self.inner.predict(&mat)?)
     }
@@ -964,16 +1216,18 @@ impl PyDecisionTreeRegressor {
 
     pub fn save(&self, path: &str) -> PyResult<()> {
         validate_dit_path(path)?;
-        fs::write(path, self.inner.to_bytes())
-            .map_err(|e| PyValueError::new_err(format!("Failed to write .dit file: {} (´；ω；`)", e)))
+        fs::write(path, self.inner.to_bytes()).map_err(|e| {
+            PyValueError::new_err(format!("Failed to write .dit file: {} (´；ω；`)", e))
+        })
     }
 
     #[staticmethod]
     #[pyo3(signature = (path, device = None))]
     pub fn load(path: &str, device: Option<String>) -> PyResult<Self> {
         validate_dit_path(path)?;
-        let bytes = fs::read(path)
-            .map_err(|e| PyValueError::new_err(format!("Failed to read .dit file: {} (´；ω；`)", e)))?;
+        let bytes = fs::read(path).map_err(|e| {
+            PyValueError::new_err(format!("Failed to read .dit file: {} (´；ω；`)", e))
+        })?;
         let inner = DecisionTreeRegressor::from_bytes(&bytes, device.as_deref())?;
         Ok(Self { inner })
     }
@@ -1035,11 +1289,696 @@ impl PyDecisionTreeRegressor {
     }
 }
 
+#[pyclass(from_py_object, name = "Ridge")]
+#[derive(Clone)]
+pub struct PyRidge {
+    inner: Ridge,
+}
+
+#[pymethods]
+impl PyRidge {
+    #[new]
+    #[pyo3(signature = (alpha = 1.0, fit_intercept = true, device = None))]
+    pub fn new(alpha: f64, fit_intercept: bool, device: Option<String>) -> PyResult<Self> {
+        let inner = Ridge::new(alpha, fit_intercept, device)?;
+        Ok(Self { inner })
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn fit(
+        &mut self,
+        x: Vec<Vec<f64>>,
+        y: Vec<f64>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<()> {
+        let mat = Matrix::from_2d(&x)?;
+        self.inner
+            .fit_weighted_1d(&mat, &y, sample_weight.as_deref())?;
+        Ok(())
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn fit_multi(
+        &mut self,
+        x: Vec<Vec<f64>>,
+        y: Vec<Vec<f64>>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<()> {
+        let x_mat = Matrix::from_2d(&x)?;
+        let y_mat = Matrix::from_2d(&y)?;
+        self.inner
+            .fit_multi(&x_mat, &y_mat, sample_weight.as_deref(), true)?;
+        Ok(())
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn fit_buffer(
+        &mut self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+        y: pyo3::buffer::PyBuffer<f64>,
+        sample_weight: Option<pyo3::buffer::PyBuffer<f64>>,
+    ) -> PyResult<()> {
+        let mat = buffer_to_matrix(py, &x)?;
+        let (target_mat, is_2d) = buffer_to_target_matrix(py, &y)?;
+        let sw_vec = match sample_weight {
+            Some(ref sw_buf) => Some(buffer_to_sample_weight(py, sw_buf)?),
+            None => None,
+        };
+        self.inner
+            .fit_multi(&mat, &target_mat, sw_vec.as_deref(), is_2d)?;
+        Ok(())
+    }
+
+    pub fn predict(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<f64>> {
+        let mat = Matrix::from_2d(&x)?;
+        Ok(self.inner.predict(&mat)?)
+    }
+
+    pub fn predict_multi(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<Vec<f64>>> {
+        let mat = Matrix::from_2d(&x)?;
+        let preds = self.inner.predict_multi(&mat)?;
+        Ok(matrix_to_nested_vec(&preds))
+    }
+
+    pub fn predict_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<Vec<f64>> {
+        let mat = buffer_to_matrix(py, &x)?;
+        Ok(self.inner.predict(&mat)?)
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn score(
+        &self,
+        x: Vec<Vec<f64>>,
+        y: Vec<f64>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<f64> {
+        let x_mat = Matrix::from_2d(&x)?;
+        if sample_weight.is_none() && !self.inner.is_multi_target_ {
+            return Ok(self.inner.score(&x_mat, &y)?);
+        }
+        let y_mat = Matrix::from_vec(y.len(), 1, y)?;
+        Ok(self
+            .inner
+            .score_multi(&x_mat, &y_mat, sample_weight.as_deref())?)
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn score_multi(
+        &self,
+        x: Vec<Vec<f64>>,
+        y: Vec<Vec<f64>>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<f64> {
+        let x_mat = Matrix::from_2d(&x)?;
+        let y_mat = Matrix::from_2d(&y)?;
+        Ok(self
+            .inner
+            .score_multi(&x_mat, &y_mat, sample_weight.as_deref())?)
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn score_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+        y: pyo3::buffer::PyBuffer<f64>,
+        sample_weight: Option<pyo3::buffer::PyBuffer<f64>>,
+    ) -> PyResult<f64> {
+        let x_mat = buffer_to_matrix(py, &x)?;
+        let (y_mat, _) = buffer_to_target_matrix(py, &y)?;
+        let sw_vec = match sample_weight {
+            Some(ref sw_buf) => Some(buffer_to_sample_weight(py, sw_buf)?),
+            None => None,
+        };
+        Ok(self.inner.score_multi(&x_mat, &y_mat, sw_vec.as_deref())?)
+    }
+
+    pub fn save(&self, path: &str) -> PyResult<()> {
+        validate_dit_path(path)?;
+        fs::write(path, self.inner.to_bytes()).map_err(|e| {
+            PyValueError::new_err(format!("Failed to write .dit file: {} (´；ω；`)", e))
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (path, device = None))]
+    pub fn load(path: &str, device: Option<String>) -> PyResult<Self> {
+        validate_dit_path(path)?;
+        let bytes = fs::read(path).map_err(|e| {
+            PyValueError::new_err(format!("Failed to read .dit file: {} (´；ω；`)", e))
+        })?;
+        let inner = Ridge::from_bytes(&bytes, device.as_deref())?;
+        Ok(Self { inner })
+    }
+
+    #[pyo3(signature = (device = None))]
+    pub fn set_device(&mut self, device: Option<String>) -> PyResult<()> {
+        self.inner.set_device(device.as_deref())?;
+        Ok(())
+    }
+
+    pub fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.to_bytes())
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (bytes, device = None))]
+    pub fn from_bytes(bytes: &[u8], device: Option<String>) -> PyResult<Self> {
+        let inner = Ridge::from_bytes(bytes, device.as_deref())?;
+        Ok(Self { inner })
+    }
+
+    pub fn __getstate__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.to_bytes())
+    }
+
+    pub fn __setstate__(&mut self, state: &[u8]) -> PyResult<()> {
+        self.inner = Ridge::from_bytes(state, None)?;
+        Ok(())
+    }
+
+    #[getter]
+    pub fn alpha(&self) -> f64 {
+        self.inner.alpha
+    }
+
+    #[getter]
+    pub fn fit_intercept(&self) -> bool {
+        self.inner.fit_intercept
+    }
+
+    #[getter]
+    pub fn coef_(&self) -> Option<Vec<f64>> {
+        self.inner.coef_.clone()
+    }
+
+    #[getter]
+    pub fn coef_multi_(&self) -> Option<Vec<Vec<f64>>> {
+        self.inner.coef_multi_.as_ref().map(matrix_to_nested_vec)
+    }
+
+    #[getter]
+    pub fn intercept_(&self) -> Option<f64> {
+        self.inner.intercept_
+    }
+
+    #[getter]
+    pub fn intercept_multi_(&self) -> Option<Vec<f64>> {
+        self.inner.intercept_multi_.clone()
+    }
+
+    #[getter]
+    pub fn is_multi_target_(&self) -> bool {
+        self.inner.is_multi_target_
+    }
+
+    #[getter]
+    pub fn n_targets_(&self) -> usize {
+        self.inner.n_targets_
+    }
+
+    #[getter]
+    pub fn n_features_in_(&self) -> Option<usize> {
+        self.inner.n_features_in_
+    }
+
+    #[getter]
+    pub fn device_(&self) -> Option<String> {
+        self.inner.device_.clone()
+    }
+}
+
+#[pyclass(from_py_object, name = "RidgeClassifier")]
+#[derive(Clone)]
+pub struct PyRidgeClassifier {
+    inner: RidgeClassifier,
+}
+
+#[pymethods]
+impl PyRidgeClassifier {
+    #[new]
+    #[pyo3(signature = (alpha = 1.0, fit_intercept = true, device = None))]
+    pub fn new(alpha: f64, fit_intercept: bool, device: Option<String>) -> PyResult<Self> {
+        let inner = RidgeClassifier::new(alpha, fit_intercept, device)?;
+        Ok(Self { inner })
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn fit(
+        &mut self,
+        x: Vec<Vec<f64>>,
+        y: Vec<f64>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<()> {
+        let mat = Matrix::from_2d(&x)?;
+        self.inner
+            .fit_weighted(&mat, &y, sample_weight.as_deref())?;
+        Ok(())
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn fit_buffer(
+        &mut self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+        y: pyo3::buffer::PyBuffer<f64>,
+        sample_weight: Option<pyo3::buffer::PyBuffer<f64>>,
+    ) -> PyResult<()> {
+        let mat = buffer_to_matrix(py, &x)?;
+        let target = buffer_to_target_vector(py, &y)?;
+        let sw_vec = match sample_weight {
+            Some(ref sw_buf) => Some(buffer_to_sample_weight(py, sw_buf)?),
+            None => None,
+        };
+        self.inner.fit_weighted(&mat, &target, sw_vec.as_deref())?;
+        Ok(())
+    }
+
+    pub fn predict(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<f64>> {
+        let mat = Matrix::from_2d(&x)?;
+        Ok(self.inner.predict(&mat)?)
+    }
+
+    pub fn predict_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<Vec<f64>> {
+        let mat = buffer_to_matrix(py, &x)?;
+        Ok(self.inner.predict(&mat)?)
+    }
+
+    pub fn decision_function(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<f64>> {
+        let mat = Matrix::from_2d(&x)?;
+        Ok(self.inner.decision_function(&mat)?)
+    }
+
+    pub fn decision_function_multi(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<Vec<f64>>> {
+        let mat = Matrix::from_2d(&x)?;
+        let scores = self.inner.decision_function_multi(&mat)?;
+        Ok(matrix_to_nested_vec(&scores))
+    }
+
+    pub fn decision_function_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<Vec<f64>> {
+        let mat = buffer_to_matrix(py, &x)?;
+        Ok(self.inner.decision_function(&mat)?)
+    }
+
+    pub fn decision_function_multi_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<Vec<Vec<f64>>> {
+        let mat = buffer_to_matrix(py, &x)?;
+        let scores = self.inner.decision_function_multi(&mat)?;
+        Ok(matrix_to_nested_vec(&scores))
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn score(
+        &self,
+        x: Vec<Vec<f64>>,
+        y: Vec<f64>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<f64> {
+        let mat = Matrix::from_2d(&x)?;
+        Ok(self.inner.score(&mat, &y, sample_weight.as_deref())?)
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn score_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+        y: pyo3::buffer::PyBuffer<f64>,
+        sample_weight: Option<pyo3::buffer::PyBuffer<f64>>,
+    ) -> PyResult<f64> {
+        let mat = buffer_to_matrix(py, &x)?;
+        let target = buffer_to_target_vector(py, &y)?;
+        let sw_vec = match sample_weight {
+            Some(ref sw_buf) => Some(buffer_to_sample_weight(py, sw_buf)?),
+            None => None,
+        };
+        Ok(self.inner.score(&mat, &target, sw_vec.as_deref())?)
+    }
+
+    pub fn save(&self, path: &str) -> PyResult<()> {
+        validate_dit_path(path)?;
+        fs::write(path, self.inner.to_bytes()).map_err(|e| {
+            PyValueError::new_err(format!("Failed to write .dit file: {} (´；ω；`)", e))
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (path, device = None))]
+    pub fn load(path: &str, device: Option<String>) -> PyResult<Self> {
+        validate_dit_path(path)?;
+        let bytes = fs::read(path).map_err(|e| {
+            PyValueError::new_err(format!("Failed to read .dit file: {} (´；ω；`)", e))
+        })?;
+        let inner = RidgeClassifier::from_bytes(&bytes, device.as_deref())?;
+        Ok(Self { inner })
+    }
+
+    #[pyo3(signature = (device = None))]
+    pub fn set_device(&mut self, device: Option<String>) -> PyResult<()> {
+        self.inner.set_device(device.as_deref())?;
+        Ok(())
+    }
+
+    pub fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.to_bytes())
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (bytes, device = None))]
+    pub fn from_bytes(bytes: &[u8], device: Option<String>) -> PyResult<Self> {
+        let inner = RidgeClassifier::from_bytes(bytes, device.as_deref())?;
+        Ok(Self { inner })
+    }
+
+    pub fn __getstate__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.to_bytes())
+    }
+
+    pub fn __setstate__(&mut self, state: &[u8]) -> PyResult<()> {
+        self.inner = RidgeClassifier::from_bytes(state, None)?;
+        Ok(())
+    }
+
+    #[getter]
+    pub fn alpha(&self) -> f64 {
+        self.inner.alpha
+    }
+
+    #[getter]
+    pub fn fit_intercept(&self) -> bool {
+        self.inner.fit_intercept
+    }
+
+    #[getter]
+    pub fn classes_(&self) -> Vec<f64> {
+        self.inner.classes_.clone()
+    }
+
+    #[getter]
+    pub fn coef_(&self) -> Option<Vec<f64>> {
+        self.inner.coef_.clone()
+    }
+
+    #[getter]
+    pub fn coef_multi_(&self) -> Option<Vec<Vec<f64>>> {
+        self.inner.coef_multi_.as_ref().map(matrix_to_nested_vec)
+    }
+
+    #[getter]
+    pub fn intercept_(&self) -> Option<f64> {
+        self.inner.intercept_
+    }
+
+    #[getter]
+    pub fn intercept_multi_(&self) -> Option<Vec<f64>> {
+        self.inner.intercept_multi_.clone()
+    }
+
+    #[getter]
+    pub fn is_multiclass_(&self) -> bool {
+        self.inner.is_multiclass_
+    }
+
+    #[getter]
+    pub fn n_features_in_(&self) -> Option<usize> {
+        self.inner.n_features_in_
+    }
+
+    #[getter]
+    pub fn device_(&self) -> Option<String> {
+        self.inner.device_.clone()
+    }
+}
+
+#[pyclass(from_py_object, name = "RidgeCV")]
+#[derive(Clone)]
+pub struct PyRidgeCV {
+    inner: RidgeCV,
+}
+
+#[pymethods]
+impl PyRidgeCV {
+    #[new]
+    #[pyo3(signature = (alphas = None, fit_intercept = true, cv = None, device = None))]
+    pub fn new(
+        alphas: Option<Vec<f64>>,
+        fit_intercept: bool,
+        cv: Option<usize>,
+        device: Option<String>,
+    ) -> PyResult<Self> {
+        let alpha_list = alphas.unwrap_or_else(|| vec![0.1, 1.0, 10.0]);
+        let inner = RidgeCV::new(alpha_list, fit_intercept, cv, device)?;
+        Ok(Self { inner })
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn fit(
+        &mut self,
+        x: Vec<Vec<f64>>,
+        y: Vec<f64>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<()> {
+        let mat = Matrix::from_2d(&x)?;
+        self.inner
+            .fit_weighted_1d(&mat, &y, sample_weight.as_deref())?;
+        Ok(())
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn fit_multi(
+        &mut self,
+        x: Vec<Vec<f64>>,
+        y: Vec<Vec<f64>>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<()> {
+        let x_mat = Matrix::from_2d(&x)?;
+        let y_mat = Matrix::from_2d(&y)?;
+        self.inner
+            .fit_multi(&x_mat, &y_mat, sample_weight.as_deref(), true)?;
+        Ok(())
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn fit_buffer(
+        &mut self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+        y: pyo3::buffer::PyBuffer<f64>,
+        sample_weight: Option<pyo3::buffer::PyBuffer<f64>>,
+    ) -> PyResult<()> {
+        let mat = buffer_to_matrix(py, &x)?;
+        let (target_mat, is_2d) = buffer_to_target_matrix(py, &y)?;
+        let sw_vec = match sample_weight {
+            Some(ref sw_buf) => Some(buffer_to_sample_weight(py, sw_buf)?),
+            None => None,
+        };
+        self.inner
+            .fit_multi(&mat, &target_mat, sw_vec.as_deref(), is_2d)?;
+        Ok(())
+    }
+
+    pub fn predict(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<f64>> {
+        let mat = Matrix::from_2d(&x)?;
+        Ok(self.inner.predict(&mat)?)
+    }
+
+    pub fn predict_multi(&self, x: Vec<Vec<f64>>) -> PyResult<Vec<Vec<f64>>> {
+        let mat = Matrix::from_2d(&x)?;
+        let preds = self.inner.predict_multi(&mat)?;
+        Ok(matrix_to_nested_vec(&preds))
+    }
+
+    pub fn predict_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+    ) -> PyResult<Vec<f64>> {
+        let mat = buffer_to_matrix(py, &x)?;
+        Ok(self.inner.predict(&mat)?)
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn score(
+        &self,
+        x: Vec<Vec<f64>>,
+        y: Vec<f64>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<f64> {
+        let x_mat = Matrix::from_2d(&x)?;
+        if sample_weight.is_none() && !self.inner.is_multi_target_ {
+            return Ok(self.inner.score(&x_mat, &y)?);
+        }
+        let y_mat = Matrix::from_vec(y.len(), 1, y)?;
+        Ok(self
+            .inner
+            .score_multi(&x_mat, &y_mat, sample_weight.as_deref())?)
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn score_multi(
+        &self,
+        x: Vec<Vec<f64>>,
+        y: Vec<Vec<f64>>,
+        sample_weight: Option<Vec<f64>>,
+    ) -> PyResult<f64> {
+        let x_mat = Matrix::from_2d(&x)?;
+        let y_mat = Matrix::from_2d(&y)?;
+        Ok(self
+            .inner
+            .score_multi(&x_mat, &y_mat, sample_weight.as_deref())?)
+    }
+
+    #[pyo3(signature = (x, y, sample_weight = None))]
+    pub fn score_buffer(
+        &self,
+        py: Python<'_>,
+        x: pyo3::buffer::PyBuffer<f64>,
+        y: pyo3::buffer::PyBuffer<f64>,
+        sample_weight: Option<pyo3::buffer::PyBuffer<f64>>,
+    ) -> PyResult<f64> {
+        let x_mat = buffer_to_matrix(py, &x)?;
+        let (y_mat, _) = buffer_to_target_matrix(py, &y)?;
+        let sw_vec = match sample_weight {
+            Some(ref sw_buf) => Some(buffer_to_sample_weight(py, sw_buf)?),
+            None => None,
+        };
+        Ok(self.inner.score_multi(&x_mat, &y_mat, sw_vec.as_deref())?)
+    }
+
+    pub fn save(&self, path: &str) -> PyResult<()> {
+        validate_dit_path(path)?;
+        fs::write(path, self.inner.to_bytes()).map_err(|e| {
+            PyValueError::new_err(format!("Failed to write .dit file: {} (´；ω；`)", e))
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (path, device = None))]
+    pub fn load(path: &str, device: Option<String>) -> PyResult<Self> {
+        validate_dit_path(path)?;
+        let bytes = fs::read(path).map_err(|e| {
+            PyValueError::new_err(format!("Failed to read .dit file: {} (´；ω；`)", e))
+        })?;
+        let inner = RidgeCV::from_bytes(&bytes, device.as_deref())?;
+        Ok(Self { inner })
+    }
+
+    #[pyo3(signature = (device = None))]
+    pub fn set_device(&mut self, device: Option<String>) -> PyResult<()> {
+        self.inner.set_device(device.as_deref())?;
+        Ok(())
+    }
+
+    pub fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.to_bytes())
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (bytes, device = None))]
+    pub fn from_bytes(bytes: &[u8], device: Option<String>) -> PyResult<Self> {
+        let inner = RidgeCV::from_bytes(bytes, device.as_deref())?;
+        Ok(Self { inner })
+    }
+
+    pub fn __getstate__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.to_bytes())
+    }
+
+    pub fn __setstate__(&mut self, state: &[u8]) -> PyResult<()> {
+        self.inner = RidgeCV::from_bytes(state, None)?;
+        Ok(())
+    }
+
+    #[getter]
+    pub fn alphas(&self) -> Vec<f64> {
+        self.inner.alphas.clone()
+    }
+
+    #[getter]
+    pub fn fit_intercept(&self) -> bool {
+        self.inner.fit_intercept
+    }
+
+    #[getter]
+    pub fn cv(&self) -> Option<usize> {
+        self.inner.cv
+    }
+
+    #[getter]
+    pub fn alpha_(&self) -> Option<f64> {
+        self.inner.alpha_
+    }
+
+    #[getter]
+    pub fn best_score_(&self) -> Option<f64> {
+        self.inner.best_score_
+    }
+
+    #[getter]
+    pub fn coef_(&self) -> Option<Vec<f64>> {
+        self.inner.coef_.clone()
+    }
+
+    #[getter]
+    pub fn coef_multi_(&self) -> Option<Vec<Vec<f64>>> {
+        self.inner.coef_multi_.as_ref().map(matrix_to_nested_vec)
+    }
+
+    #[getter]
+    pub fn intercept_(&self) -> Option<f64> {
+        self.inner.intercept_
+    }
+
+    #[getter]
+    pub fn intercept_multi_(&self) -> Option<Vec<f64>> {
+        self.inner.intercept_multi_.clone()
+    }
+
+    #[getter]
+    pub fn is_multi_target_(&self) -> bool {
+        self.inner.is_multi_target_
+    }
+
+    #[getter]
+    pub fn n_targets_(&self) -> usize {
+        self.inner.n_targets_
+    }
+
+    #[getter]
+    pub fn n_features_in_(&self) -> Option<usize> {
+        self.inner.n_features_in_
+    }
+
+    #[getter]
+    pub fn device_(&self) -> Option<String> {
+        self.inner.device_.clone()
+    }
+}
+
 #[pymodule]
 fn _ochreml(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_available_devices, m)?)?;
     m.add_function(wrap_pyfunction!(get_device_info, m)?)?;
     m.add_class::<PyLinearRegression>()?;
+    m.add_class::<PyRidge>()?;
+    m.add_class::<PyRidgeClassifier>()?;
+    m.add_class::<PyRidgeCV>()?;
     m.add_class::<PyDecisionTreeClassifier>()?;
     m.add_class::<PyDecisionTreeRegressor>()?;
     Ok(())

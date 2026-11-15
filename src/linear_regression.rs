@@ -1,9 +1,171 @@
-use crate::device::{parse_device, DeviceType};
+// OchreML Linear Regression Module (＾▽＾)
+// Implements OLS LinearRegression and shared normal-equation solvers/predictors.
+
+use crate::device::{DeviceType, parse_device};
 use crate::error::{OchreError, OchreResult};
 use crate::matrix::{
-    compute_normal_equation_mats, compute_normal_equation_mats_multi, r2_score, r2_score_multi,
-    solve_cholesky, solve_cholesky_multi, Matrix,
+    Matrix, compute_normal_equation_mats, compute_normal_equation_mats_multi, r2_score,
+    r2_score_multi, solve_cholesky, solve_cholesky_multi,
 };
+use std::borrow::Cow;
+
+pub(crate) fn solve_from_normal_mats_1d(
+    xt_x: &Matrix,
+    xt_y: &[f64],
+    n_features: usize,
+    fit_intercept: bool,
+    alpha: f64,
+) -> OchreResult<(Vec<f64>, f64)> {
+    let mat: Cow<'_, Matrix> = if alpha > 0.0 {
+        let mut reg_xtx = xt_x.clone();
+        reg_xtx.add_ridge_feature_diagonal(alpha, n_features);
+        Cow::Owned(reg_xtx)
+    } else {
+        Cow::Borrowed(xt_x)
+    };
+
+    let theta = solve_cholesky(&mat, xt_y)?;
+    if fit_intercept {
+        Ok((theta[0..n_features].to_vec(), theta[n_features]))
+    } else {
+        Ok((theta, 0.0))
+    }
+}
+
+pub(crate) fn solve_from_normal_mats_multi(
+    xt_x: &Matrix,
+    xt_y: &Matrix,
+    n_features: usize,
+    fit_intercept: bool,
+    alpha: f64,
+) -> OchreResult<(Matrix, Vec<f64>)> {
+    let mat: Cow<'_, Matrix> = if alpha > 0.0 {
+        let mut reg_xtx = xt_x.clone();
+        reg_xtx.add_ridge_feature_diagonal(alpha, n_features);
+        Cow::Owned(reg_xtx)
+    } else {
+        Cow::Borrowed(xt_x)
+    };
+
+    let theta = solve_cholesky_multi(&mat, xt_y)?;
+    let k_targets = xt_y.cols;
+    let mut coef_mat = Matrix::zeros(k_targets, n_features);
+    let mut intercept_vec = vec![0.0; k_targets];
+
+    for t in 0..k_targets {
+        for c in 0..n_features {
+            coef_mat[(t, c)] = theta[(c, t)];
+        }
+        if fit_intercept {
+            intercept_vec[t] = theta[(n_features, t)];
+        }
+    }
+
+    Ok((coef_mat, intercept_vec))
+}
+
+pub(crate) fn compute_and_solve_normal_1d(
+    x: &Matrix,
+    y: &[f64],
+    fit_intercept: bool,
+    alpha: f64,
+    device: &DeviceType,
+) -> OchreResult<(Vec<f64>, f64)> {
+    let (xt_x, xt_y) = compute_normal_equation_mats(x, y, fit_intercept, device)?;
+    match solve_from_normal_mats_1d(&xt_x, &xt_y, x.cols, fit_intercept, alpha) {
+        Ok(res) => Ok(res),
+        Err(_) if *device == DeviceType::Wgpu => {
+            let (cpu_xtx, cpu_xty) =
+                compute_normal_equation_mats(x, y, fit_intercept, &DeviceType::Cpu)?;
+            solve_from_normal_mats_1d(&cpu_xtx, &cpu_xty, x.cols, fit_intercept, alpha)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn compute_and_solve_normal_multi(
+    x: &Matrix,
+    y: &Matrix,
+    sample_weight: Option<&[f64]>,
+    fit_intercept: bool,
+    alpha: f64,
+    device: &DeviceType,
+) -> OchreResult<(Matrix, Vec<f64>)> {
+    let (xt_x, xt_y) =
+        compute_normal_equation_mats_multi(x, y, sample_weight, fit_intercept, device)?;
+    match solve_from_normal_mats_multi(&xt_x, &xt_y, x.cols, fit_intercept, alpha) {
+        Ok(res) => Ok(res),
+        Err(_) if *device == DeviceType::Wgpu => {
+            let (cpu_xtx, cpu_xty) = compute_normal_equation_mats_multi(
+                x,
+                y,
+                sample_weight,
+                fit_intercept,
+                &DeviceType::Cpu,
+            )?;
+            solve_from_normal_mats_multi(&cpu_xtx, &cpu_xty, x.cols, fit_intercept, alpha)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn predict_linear_1d(x: &Matrix, coef: &[f64], intercept: f64) -> OchreResult<Vec<f64>> {
+    if x.cols != coef.len() {
+        return Err(OchreError::FeatureCountMismatch {
+            features: x.cols,
+            expected: coef.len(),
+        });
+    }
+
+    let mut predictions = Vec::with_capacity(x.rows);
+    for r in 0..x.rows {
+        let offset = r * x.cols;
+        let row_slice = &x.data[offset..offset + x.cols];
+        let mut val = intercept;
+        for c in 0..x.cols {
+            val += row_slice[c] * coef[c];
+        }
+        predictions.push(val);
+    }
+
+    Ok(predictions)
+}
+
+pub(crate) fn predict_linear_multi(
+    x: &Matrix,
+    coef_mat: &Matrix,
+    intercept_vec: &[f64],
+) -> OchreResult<Matrix> {
+    if x.cols != coef_mat.cols {
+        return Err(OchreError::FeatureCountMismatch {
+            features: x.cols,
+            expected: coef_mat.cols,
+        });
+    }
+    if intercept_vec.len() != coef_mat.rows {
+        return Err(OchreError::VectorLengthMismatch);
+    }
+
+    let k_targets = coef_mat.rows;
+    let mut preds = Matrix::zeros(x.rows, k_targets);
+
+    for r in 0..x.rows {
+        let x_offset = r * x.cols;
+        let x_row = &x.data[x_offset..x_offset + x.cols];
+        let pred_offset = r * k_targets;
+        for (t, &intercept_t) in intercept_vec.iter().enumerate() {
+            let c_offset = t * x.cols;
+            let c_row = &coef_mat.data[c_offset..c_offset + x.cols];
+            let mut val = intercept_t;
+            for (&xr, &cr) in x_row.iter().zip(c_row.iter()) {
+                val += xr * cr;
+            }
+            preds.data[pred_offset + t] = val;
+        }
+    }
+
+    Ok(preds)
+}
 
 #[derive(Debug, Clone)]
 pub struct LinearRegression {
@@ -68,22 +230,8 @@ impl LinearRegression {
         self.is_multi_target_ = false;
         self.n_targets_ = 1;
 
-        let (xt_x, xt_y) = compute_normal_equation_mats(x, y, self.fit_intercept, &self.device)?;
-        let theta = match solve_cholesky(&xt_x, &xt_y) {
-            Ok(t) => t,
-            Err(_) if self.device == DeviceType::Wgpu => {
-                let (cpu_xtx, cpu_xty) =
-                    compute_normal_equation_mats(x, y, self.fit_intercept, &DeviceType::Cpu)?;
-                solve_cholesky(&cpu_xtx, &cpu_xty)?
-            }
-            Err(e) => return Err(e),
-        };
-
-        let (coef_vec, intercept_val) = if self.fit_intercept {
-            (theta[0..x.cols].to_vec(), theta[x.cols])
-        } else {
-            (theta, 0.0)
-        };
+        let (coef_vec, intercept_val) =
+            compute_and_solve_normal_1d(x, y, self.fit_intercept, 0.0, &self.device)?;
 
         self.coef_multi_ = Some(Matrix::from_vec(1, x.cols, coef_vec.clone())?);
         self.intercept_multi_ = Some(vec![intercept_val]);
@@ -120,40 +268,14 @@ impl LinearRegression {
         self.is_multi_target_ = is_2d_input;
         self.n_targets_ = y.cols;
 
-        let (xt_x, xt_y) = compute_normal_equation_mats_multi(
+        let (coef_mat, intercept_vec) = compute_and_solve_normal_multi(
             x,
             y,
             sample_weight,
             self.fit_intercept,
+            0.0,
             &self.device,
         )?;
-        let theta = match solve_cholesky_multi(&xt_x, &xt_y) {
-            Ok(t) => t,
-            Err(_) if self.device == DeviceType::Wgpu => {
-                let (cpu_xtx, cpu_xty) = compute_normal_equation_mats_multi(
-                    x,
-                    y,
-                    sample_weight,
-                    self.fit_intercept,
-                    &DeviceType::Cpu,
-                )?;
-                solve_cholesky_multi(&cpu_xtx, &cpu_xty)?
-            }
-            Err(e) => return Err(e),
-        };
-
-        let k_targets = y.cols;
-        let mut coef_mat = Matrix::zeros(k_targets, x.cols);
-        let mut intercept_vec = vec![0.0; k_targets];
-
-        for t in 0..k_targets {
-            for c in 0..x.cols {
-                coef_mat[(t, c)] = theta[(c, t)];
-            }
-            if self.fit_intercept {
-                intercept_vec[t] = theta[(x.cols, t)];
-            }
-        }
 
         self.coef_ = Some(coef_mat.data[0..x.cols].to_vec());
         self.intercept_ = Some(intercept_vec[0]);
@@ -165,70 +287,19 @@ impl LinearRegression {
 
     // Predict 1D continuous target values for new feature data X
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
-        let coef = match &self.coef_ {
-            Some(c) => c,
-            None => return Err(OchreError::NotFitted),
-        };
+        let coef = self.coef_.as_ref().ok_or(OchreError::NotFitted)?;
         let intercept = self.intercept_.unwrap_or(0.0);
-
-        if x.cols != coef.len() {
-            return Err(OchreError::FeatureCountMismatch {
-                features: x.cols,
-                expected: coef.len(),
-            });
-        }
-
-        let mut predictions = Vec::with_capacity(x.rows);
-        for r in 0..x.rows {
-            let offset = r * x.cols;
-            let row_slice = &x.data[offset..offset + x.cols];
-            let mut val = intercept;
-            for c in 0..x.cols {
-                val += row_slice[c] * coef[c];
-            }
-            predictions.push(val);
-        }
-
-        Ok(predictions)
+        predict_linear_1d(x, coef, intercept)
     }
 
     // Predict multi-target continuous values of shape (n_samples, n_targets) (＾▽＾)
     pub fn predict_multi(&self, x: &Matrix) -> OchreResult<Matrix> {
-        let coef_mat = match &self.coef_multi_ {
-            Some(c) => c,
-            None => return Err(OchreError::NotFitted),
-        };
-        let intercept_vec = match &self.intercept_multi_ {
-            Some(v) => v,
-            None => return Err(OchreError::NotFitted),
-        };
-
-        if x.cols != coef_mat.cols {
-            return Err(OchreError::FeatureCountMismatch {
-                features: x.cols,
-                expected: coef_mat.cols,
-            });
-        }
-
-        let k_targets = coef_mat.rows;
-        let mut preds = Matrix::zeros(x.rows, k_targets);
-
-        for r in 0..x.rows {
-            let x_offset = r * x.cols;
-            let x_row = &x.data[x_offset..x_offset + x.cols];
-            let pred_offset = r * k_targets;
-            for t in 0..k_targets {
-                let c_offset = t * x.cols;
-                let c_row = &coef_mat.data[c_offset..c_offset + x.cols];
-                let mut val = intercept_vec[t];
-                for c in 0..x.cols {
-                    val += x_row[c] * c_row[c];
-                }
-                preds.data[pred_offset + t] = val;
-            }
-        }
-
-        Ok(preds)
+        let coef_mat = self.coef_multi_.as_ref().ok_or(OchreError::NotFitted)?;
+        let intercept_vec = self
+            .intercept_multi_
+            .as_ref()
+            .ok_or(OchreError::NotFitted)?;
+        predict_linear_multi(x, coef_mat, intercept_vec)
     }
 
     // Compute R^2 score on 1D test data
@@ -263,13 +334,8 @@ mod tests {
 
     #[test]
     fn test_linear_regression_simple() {
-        let x = Matrix::from_2d(&vec![
-            vec![1.0],
-            vec![2.0],
-            vec![3.0],
-            vec![4.0],
-            vec![5.0],
-        ]).unwrap();
+        let x =
+            Matrix::from_2d(&vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0]]).unwrap();
         let y = vec![3.0, 5.0, 7.0, 9.0, 11.0];
 
         let mut model = LinearRegression::new(true, None).unwrap();
@@ -298,7 +364,8 @@ mod tests {
             vec![0.0, 1.0],
             vec![1.0, 1.0],
             vec![2.0, 3.0],
-        ]).unwrap();
+        ])
+        .unwrap();
         // Target 0: y0 = 2*x0 + 3*x1 + 1
         // Target 1: y1 = 4*x0 - 1*x1 + 5
         let y = Matrix::from_2d(&vec![
@@ -306,7 +373,8 @@ mod tests {
             vec![4.0, 4.0],
             vec![6.0, 8.0],
             vec![14.0, 10.0],
-        ]).unwrap();
+        ])
+        .unwrap();
         let weights = vec![1.0, 2.0, 1.5, 3.0];
 
         let mut model = LinearRegression::new(true, None).unwrap();

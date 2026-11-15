@@ -5,7 +5,7 @@
 // Any missing library, ABI mismatch, or compile failure returns `None` for seamless CPU fallback.
 
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
@@ -286,7 +286,8 @@ pub struct PjrtApiPrefix {
     pub error_message: Option<unsafe extern "C" fn(*mut PjrtErrorMessageArgs)>,
     pub error_get_code: *const c_void,
 
-    pub plugin_initialize: Option<unsafe extern "C" fn(*mut PjrtPluginInitializeArgs) -> *mut PjrtError>,
+    pub plugin_initialize:
+        Option<unsafe extern "C" fn(*mut PjrtPluginInitializeArgs) -> *mut PjrtError>,
     pub plugin_attributes: *const c_void,
 
     pub event_destroy: Option<unsafe extern "C" fn(*mut PjrtEventDestroyArgs) -> *mut PjrtError>,
@@ -419,7 +420,10 @@ fn destroy_pjrt_error(api: &PjrtApiPrefix, err: *mut PjrtError) {
 }
 
 fn tpu_debug_enabled() -> bool {
-    matches!(std::env::var("OCHREML_DEBUG").as_deref(), Ok("1") | Ok("true"))
+    matches!(
+        std::env::var("OCHREML_DEBUG").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 fn check_pjrt_error(api: &PjrtApiPrefix, err: *mut PjrtError) -> bool {
@@ -607,7 +611,10 @@ fn try_init_tpu_context() -> Option<TpuContext> {
         }
 
         let devices_slice = unsafe {
-            std::slice::from_raw_parts(dev_args.addressable_devices, dev_args.num_addressable_devices)
+            std::slice::from_raw_parts(
+                dev_args.addressable_devices,
+                dev_args.num_addressable_devices,
+            )
         };
         let devices = devices_slice.iter().copied().map(SendDevice).collect();
 
@@ -824,14 +831,13 @@ fn destroy_pjrt_buffer(api: &PjrtApiPrefix, buffer: *mut PjrtBuffer) {
     }
 }
 
-fn execute_tpu_dot(
-    device_id: usize,
-    op: TpuOpKind,
-    a: &Matrix,
-    b: &Matrix,
-) -> Option<Matrix> {
+fn execute_tpu_dot(device_id: usize, op: TpuOpKind, a: &Matrix, b: &Matrix) -> Option<Matrix> {
     let ctx = get_tpu_context()?;
-    let device = ctx.devices.get(device_id).or_else(|| ctx.devices.first())?.0;
+    let device = ctx
+        .devices
+        .get(device_id)
+        .or_else(|| ctx.devices.first())?
+        .0;
     let api = unsafe { &*ctx.api.0 };
 
     let (m, k, n) = match op {
@@ -948,7 +954,8 @@ fn execute_tpu_dot(
         event: ptr::null_mut(),
     };
     let err = unsafe { to_host_fn(&mut to_host_args) };
-    let transfer_ok = check_pjrt_error(api, err) && await_and_destroy_event(api, to_host_args.event);
+    let transfer_ok =
+        check_pjrt_error(api, err) && await_and_destroy_event(api, to_host_args.event);
     destroy_pjrt_buffer(api, out_ptrs[0]);
 
     if !transfer_ok {
