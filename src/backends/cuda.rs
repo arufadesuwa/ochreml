@@ -10,14 +10,14 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
-type CuResult = i32;
-type CuDevice = i32;
-type CuContext = *mut c_void;
-type CuDevicePtr = u64;
+pub(crate) type CuResult = i32;
+pub(crate) type CuDevice = i32;
+pub(crate) type CuContext = *mut c_void;
+pub(crate) type CuDevicePtr = u64;
 type CublasStatus = i32;
 type CublasHandle = *mut c_void;
 
-const CUDA_SUCCESS: CuResult = 0;
+pub(crate) const CUDA_SUCCESS: CuResult = 0;
 const CUBLAS_STATUS_SUCCESS: CublasStatus = 0;
 const CUBLAS_OP_N: i32 = 0;
 const CUBLAS_OP_T: i32 = 1;
@@ -96,8 +96,8 @@ type FnCublasDdgmm = unsafe extern "C" fn(
     i32,
 ) -> CublasStatus;
 
-struct CudaDeviceCtx {
-    ctx: CuContext,
+pub(crate) struct CudaDeviceCtx {
+    pub(crate) ctx: CuContext,
     handle: CublasHandle,
     workspace_ptr: CuDevicePtr,
     workspace_len: usize,
@@ -130,12 +130,12 @@ fn align32(len_f64: usize) -> usize {
 }
 
 #[inline]
-fn offset_ptr(base: CuDevicePtr, offset_f64: usize) -> CuDevicePtr {
+pub(crate) fn offset_ptr(base: CuDevicePtr, offset_f64: usize) -> CuDevicePtr {
     base + (offset_f64 * std::mem::size_of::<f64>()) as u64
 }
 
 impl CudaDeviceCtx {
-    fn ensure_workspace(
+    pub(crate) fn ensure_workspace(
         &mut self,
         driver: &CudaDriver,
         required_f64: usize,
@@ -169,17 +169,17 @@ impl CudaDeviceCtx {
     }
 }
 
-struct CudaDriver {
-    _cuda_lib: Library,
+pub(crate) struct CudaDriver {
+    pub(crate) _cuda_lib: Library,
     _cublas_lib: Library,
     cu_device_get: FnCuDeviceGet,
     cu_primary_ctx_retain: Option<FnCuDevicePrimaryCtxRetain>,
     cu_ctx_create: FnCuCtxCreate,
-    cu_ctx_set_current: FnCuCtxSetCurrent,
-    cu_mem_alloc: FnCuMemAlloc,
-    cu_mem_free: FnCuMemFree,
-    cu_memcpy_htod: FnCuMemcpyHtoD,
-    cu_memcpy_dtoh: FnCuMemcpyDtoH,
+    pub(crate) cu_ctx_set_current: FnCuCtxSetCurrent,
+    pub(crate) cu_mem_alloc: FnCuMemAlloc,
+    pub(crate) cu_mem_free: FnCuMemFree,
+    pub(crate) cu_memcpy_htod: FnCuMemcpyHtoD,
+    pub(crate) cu_memcpy_dtoh: FnCuMemcpyDtoH,
     cublas_create: FnCublasCreate,
     cublas_dgemm: FnCublasDgemm,
     cublas_dsyrk: FnCublasDsyrk,
@@ -272,7 +272,7 @@ fn init_cuda_driver() -> Option<CudaDriver> {
     }
 }
 
-fn get_driver() -> Option<&'static CudaDriver> {
+pub(crate) fn get_driver() -> Option<&'static CudaDriver> {
     CUDA_DRIVER.get_or_init(init_cuda_driver).as_ref()
 }
 
@@ -293,7 +293,7 @@ pub fn is_available() -> bool {
 }
 
 #[inline]
-fn copy_htod_raw(driver: &CudaDriver, dst: CuDevicePtr, src: &[f64]) -> OchreResult<()> {
+pub(crate) fn copy_htod_raw(driver: &CudaDriver, dst: CuDevicePtr, src: &[f64]) -> OchreResult<()> {
     let bytes = std::mem::size_of_val(src);
     if bytes > 0 {
         // SAFETY: `dst` points to a valid device allocation with at least `bytes` capacity.
@@ -309,7 +309,11 @@ fn copy_htod_raw(driver: &CudaDriver, dst: CuDevicePtr, src: &[f64]) -> OchreRes
 }
 
 #[inline]
-fn copy_dtoh_raw(driver: &CudaDriver, dst: &mut [f64], src: CuDevicePtr) -> OchreResult<()> {
+pub(crate) fn copy_dtoh_raw(
+    driver: &CudaDriver,
+    dst: &mut [f64],
+    src: CuDevicePtr,
+) -> OchreResult<()> {
     let bytes = std::mem::size_of_val(dst);
     if bytes > 0 {
         // SAFETY: `src` points to a valid device allocation and `dst` has `bytes` capacity.
@@ -325,7 +329,7 @@ fn copy_dtoh_raw(driver: &CudaDriver, dst: &mut [f64], src: CuDevicePtr) -> Ochr
 }
 
 impl CudaDriver {
-    fn get_device_ctx(&self, gpu_id: usize) -> OchreResult<Arc<Mutex<CudaDeviceCtx>>> {
+    pub(crate) fn get_device_ctx(&self, gpu_id: usize) -> OchreResult<Arc<Mutex<CudaDeviceCtx>>> {
         let mut map = self.contexts.lock().map_err(|_| {
             OchreError::DeviceError("CUDA context cache mutex poisoned ( >_< )".to_string())
         })?;

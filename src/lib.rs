@@ -8,6 +8,7 @@ pub mod device;
 pub mod error;
 pub mod linear_regression;
 pub mod matrix;
+pub mod primitives;
 pub mod ridge;
 
 use decision_tree::{DecisionTreeClassifier, DecisionTreeRegressor, TreeNode};
@@ -2045,10 +2046,139 @@ impl PyRidgeCV {
     }
 }
 
+// --- Thin PyO3 Diagnostic & Benchmark Wrappers for Primitives N1..N6 (*≧ω≦*) ---
+
+#[pyfunction]
+#[pyo3(signature = (x_buf, device = "cpu"))]
+fn _prim_n1_col_stats(
+    py: Python<'_>,
+    x_buf: &Bound<'_, PyAny>,
+    device: &str,
+) -> PyResult<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> {
+    let dev = parse_device(Some(device))?;
+    let buf = pyo3::buffer::PyBuffer::<f64>::get(x_buf)?;
+    let x = buffer_to_matrix(py, &buf)?;
+    let stats = backend::get_backend(&dev).col_reduce_stats(&x, None)?;
+    Ok((stats.mean, stats.std, stats.min, stats.max))
+}
+
+#[pyfunction]
+#[pyo3(signature = (x_buf, op = "relu", param = 0.0, device = "cpu"))]
+fn _prim_n2_elementwise(
+    py: Python<'_>,
+    x_buf: &Bound<'_, PyAny>,
+    op: &str,
+    param: f64,
+    device: &str,
+) -> PyResult<Vec<Vec<f64>>> {
+    use primitives::ElementwiseOp;
+    let dev = parse_device(Some(device))?;
+    let buf = pyo3::buffer::PyBuffer::<f64>::get(x_buf)?;
+    let x = buffer_to_matrix(py, &buf)?;
+    let ew_op = match op {
+        "sigmoid" => ElementwiseOp::Sigmoid,
+        "tanh" => ElementwiseOp::Tanh,
+        "relu" => ElementwiseOp::Relu,
+        "exp" => ElementwiseOp::Exp,
+        "log" => ElementwiseOp::Log {
+            eps: param.max(1e-12),
+        },
+        "soft_threshold" => ElementwiseOp::SoftThreshold { lambda: param },
+        "affine" => ElementwiseOp::Affine {
+            scale: param,
+            shift: 1.0,
+        },
+        _ => ElementwiseOp::Clip {
+            min: -param.abs(),
+            max: param.abs(),
+        },
+    };
+    let out = backend::get_backend(&dev).elementwise_op(&x, ew_op)?;
+    Ok(matrix_to_nested_vec(&out))
+}
+
+#[pyfunction]
+#[pyo3(signature = (a_buf, b_buf, device = "cpu"))]
+fn _prim_n3_pairwise_l2(
+    py: Python<'_>,
+    a_buf: &Bound<'_, PyAny>,
+    b_buf: &Bound<'_, PyAny>,
+    device: &str,
+) -> PyResult<Vec<Vec<f64>>> {
+    let dev = parse_device(Some(device))?;
+    let a_py = pyo3::buffer::PyBuffer::<f64>::get(a_buf)?;
+    let b_py = pyo3::buffer::PyBuffer::<f64>::get(b_buf)?;
+    let a = buffer_to_matrix(py, &a_py)?;
+    let b = buffer_to_matrix(py, &b_py)?;
+    let out = backend::get_backend(&dev).pairwise_l2_sq(&a, &b)?;
+    Ok(matrix_to_nested_vec(&out))
+}
+
+#[pyfunction]
+#[pyo3(signature = (d_buf, k = 1, device = "cpu"))]
+fn _prim_n4_topk_argmin(
+    py: Python<'_>,
+    d_buf: &Bound<'_, PyAny>,
+    k: usize,
+    device: &str,
+) -> PyResult<(Vec<usize>, Vec<f64>)> {
+    let dev = parse_device(Some(device))?;
+    let d_py = pyo3::buffer::PyBuffer::<f64>::get(d_buf)?;
+    let d = buffer_to_matrix(py, &d_py)?;
+    let b = backend::get_backend(&dev);
+    if k == 1 {
+        return Ok(b.row_argmin(&d)?);
+    }
+    let (idx, dists) = b.topk_argmin(&d, k)?;
+    Ok((idx, dists.data))
+}
+
+#[pyfunction]
+#[pyo3(signature = (x_buf, center = true, device = "cpu"))]
+fn _prim_n5_gram_svd(
+    py: Python<'_>,
+    x_buf: &Bound<'_, PyAny>,
+    center: bool,
+    device: &str,
+) -> PyResult<(Vec<f64>, Vec<Vec<f64>>, Vec<f64>)> {
+    let dev = parse_device(Some(device))?;
+    let x_py = pyo3::buffer::PyBuffer::<f64>::get(x_buf)?;
+    let x = buffer_to_matrix(py, &x_py)?;
+    let (svals, v, mean) = backend::get_backend(&dev).gram_svd(&x, center)?;
+    Ok((svals, matrix_to_nested_vec(&v), mean))
+}
+
+#[pyfunction]
+#[pyo3(signature = (x_buf, grad, hess, max_bins = 64, device = "cpu"))]
+fn _prim_n6_histogram_split(
+    py: Python<'_>,
+    x_buf: &Bound<'_, PyAny>,
+    grad: Vec<f64>,
+    hess: Vec<f64>,
+    max_bins: usize,
+    device: &str,
+) -> PyResult<Option<(usize, usize, f64, f64)>> {
+    let dev = parse_device(Some(device))?;
+    let x_py = pyo3::buffer::PyBuffer::<f64>::get(x_buf)?;
+    let x = buffer_to_matrix(py, &x_py)?;
+    let b = backend::get_backend(&dev);
+    let binned = b.quantize_features(&x, max_bins)?;
+    let all_idx: Vec<u32> = (0..x.rows as u32).collect();
+    let hist = b.batched_histogram_grad(&binned, &all_idx, &grad, &hess)?;
+    let split = b.find_best_histogram_split(&binned, &hist, 1.0, 1)?;
+    Ok(split.map(|s| (s.feature_idx, s.bin_idx, s.threshold, s.gain)))
+}
+
 #[pymodule]
 fn _ochreml(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_available_devices, m)?)?;
     m.add_function(wrap_pyfunction!(get_device_info, m)?)?;
+    m.add_function(wrap_pyfunction!(_prim_n1_col_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(_prim_n2_elementwise, m)?)?;
+    m.add_function(wrap_pyfunction!(_prim_n3_pairwise_l2, m)?)?;
+    m.add_function(wrap_pyfunction!(_prim_n4_topk_argmin, m)?)?;
+    m.add_function(wrap_pyfunction!(_prim_n5_gram_svd, m)?)?;
+    m.add_function(wrap_pyfunction!(_prim_n6_histogram_split, m)?)?;
     m.add_class::<PyLinearRegression>()?;
     m.add_class::<PyRidge>()?;
     m.add_class::<PyRidgeClassifier>()?;

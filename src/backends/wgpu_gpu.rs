@@ -181,8 +181,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 pub struct WgpuContext {
     adapter_name: String,
     backend_name: String,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
     matmul_pipeline: wgpu::ComputePipeline,
     matmul_at_b_pipeline: wgpu::ComputePipeline,
     matvec_pipeline: wgpu::ComputePipeline,
@@ -270,7 +270,7 @@ fn init_wgpu_context() -> Option<WgpuContext> {
     })
 }
 
-fn get_ctx() -> Option<&'static WgpuContext> {
+pub(crate) fn get_ctx() -> Option<&'static WgpuContext> {
     WGPU_CTX.get_or_init(init_wgpu_context).as_ref()
 }
 

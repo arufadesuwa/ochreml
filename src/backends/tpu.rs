@@ -965,6 +965,179 @@ fn execute_tpu_dot(device_id: usize, op: TpuOpKind, a: &Matrix, b: &Matrix) -> O
     Some(unpad_f32_to_matrix(&out_host, n_pad, m, n))
 }
 
+static UNARY_EXEC_CACHE: OnceLock<Mutex<HashMap<String, SendExecutable>>> = OnceLock::new();
+
+fn compile_or_get_unary(
+    ctx: &TpuContext,
+    key: String,
+    mlir_source: &str,
+) -> Option<*mut PjrtLoadedExecutable> {
+    let cache_mutex = UNARY_EXEC_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache_mutex.lock()
+        && let Some(exec) = cache.get(&key)
+    {
+        return Some(exec.0);
+    }
+
+    let code_cstr = CString::new(mlir_source).ok()?;
+    let format_cstr = CString::new("mlir").ok()?;
+    // SAFETY: `ctx.api.0` points to a static PJRT C API table loaded from libtpu.
+    let api = unsafe { &*ctx.api.0 };
+    let compile_fn = api.client_compile?;
+
+    let program = PjrtProgram {
+        struct_size: std::mem::size_of::<PjrtProgram>(),
+        extension_start: ptr::null_mut(),
+        code: code_cstr.as_ptr(),
+        code_size: code_cstr.as_bytes().len(),
+        format: format_cstr.as_ptr(),
+        format_size: format_cstr.as_bytes().len(),
+    };
+    const COMPILE_OPTIONS_PROTO: [u8; 6] = [0x1A, 0x04, 0x20, 0x01, 0x28, 0x01];
+    let mut compile_args = PjrtClientCompileArgs {
+        struct_size: std::mem::size_of::<PjrtClientCompileArgs>(),
+        extension_start: ptr::null_mut(),
+        client: ctx.client.0,
+        program: &program,
+        compile_options: COMPILE_OPTIONS_PROTO.as_ptr() as *const c_char,
+        compile_options_size: COMPILE_OPTIONS_PROTO.len(),
+        executable: ptr::null_mut(),
+    };
+
+    // SAFETY: `compile_args` and `program` are valid for the duration of `client_compile`.
+    let err = unsafe { compile_fn(&mut compile_args) };
+    if !check_pjrt_error(api, err) || compile_args.executable.is_null() {
+        return None;
+    }
+
+    let exec_ptr = compile_args.executable;
+    if let Ok(mut cache) = cache_mutex.lock() {
+        cache.insert(key, SendExecutable(exec_ptr));
+    }
+    Some(exec_ptr)
+}
+
+/// Execute a cached 1-input -> 1-output 2D `f32` StableHLO program on TPU.
+pub(crate) fn execute_tpu_unary_program(
+    device_id: usize,
+    key: String,
+    mlir_source: &str,
+    input: &Matrix,
+    out_rows: usize,
+    out_cols: usize,
+    pad_rows: usize,
+    pad_cols: usize,
+) -> Option<Matrix> {
+    let ctx = get_tpu_context()?;
+    let device = ctx
+        .devices
+        .get(device_id)
+        .or_else(|| ctx.devices.first())?
+        .0;
+    // SAFETY: `ctx.api.0` points to a valid PJRT C API table.
+    let api = unsafe { &*ctx.api.0 };
+    let exec = compile_or_get_unary(ctx, key, mlir_source)?;
+
+    let in_pad_rows = next_pow2_dim(input.rows, 16);
+    let in_pad_cols = next_pow2_dim(input.cols, 16);
+    let in_f32 = pad_matrix_to_f32(input, in_pad_rows, in_pad_cols);
+    let buf_in = upload_f32_buffer(api, ctx.client.0, device, &in_f32, in_pad_rows, in_pad_cols)?;
+
+    let exec_fn = api.loaded_executable_execute?;
+    let options = PjrtExecuteOptions {
+        struct_size: std::mem::size_of::<PjrtExecuteOptions>(),
+        extension_start: ptr::null_mut(),
+        send_callbacks: ptr::null_mut(),
+        recv_callbacks: ptr::null_mut(),
+        num_send_ops: 0,
+        num_recv_ops: 0,
+        launch_id: 0,
+        non_donatable_input_indices: ptr::null(),
+        num_non_donatable_input_indices: 0,
+        context: ptr::null_mut(),
+        call_location: ptr::null(),
+        num_tasks: 0,
+        task_ids: ptr::null_mut(),
+        incarnation_ids: ptr::null_mut(),
+        multi_slice_config: ptr::null_mut(),
+        use_major_to_minor_data_layout_for_callbacks: false,
+        hlo_output_callbacks: ptr::null_mut(),
+        num_hlo_output_callbacks: 0,
+        custom_options: ptr::null(),
+        num_custom_options: 0,
+    };
+    let in_ptrs: [*mut PjrtBuffer; 1] = [buf_in];
+    let arg_lists: [*const *mut PjrtBuffer; 1] = [in_ptrs.as_ptr()];
+    let mut out_ptrs: [*mut PjrtBuffer; 1] = [ptr::null_mut()];
+    let out_lists: [*mut *mut PjrtBuffer; 1] = [out_ptrs.as_mut_ptr()];
+    let mut complete_event: *mut PjrtEvent = ptr::null_mut();
+    let mut exec_args = PjrtLoadedExecutableExecuteArgs {
+        struct_size: std::mem::size_of::<PjrtLoadedExecutableExecuteArgs>(),
+        extension_start: ptr::null_mut(),
+        executable: exec,
+        options: &options,
+        argument_lists: arg_lists.as_ptr(),
+        num_devices: 1,
+        num_args: 1,
+        output_lists: out_lists.as_ptr(),
+        device_complete_events: &mut complete_event,
+        execute_device: ptr::null_mut(),
+    };
+
+    // SAFETY: `exec` and `buf_in` are valid PJRT handles; `out_ptrs` receives 1 output buffer.
+    let err = unsafe { exec_fn(&mut exec_args) };
+    destroy_pjrt_buffer(api, buf_in);
+
+    if !check_pjrt_error(api, err)
+        || out_ptrs[0].is_null()
+        || !await_and_destroy_event(api, complete_event)
+    {
+        if !out_ptrs[0].is_null() {
+            destroy_pjrt_buffer(api, out_ptrs[0]);
+        }
+        return None;
+    }
+
+    let mut out_host = vec![0.0f32; pad_rows * pad_cols];
+    let row_major_order: [i64; 2] = [1, 0];
+    let mut host_layout = PjrtBufferMemoryLayout {
+        struct_size: std::mem::size_of::<PjrtBufferMemoryLayout>(),
+        extension_start: ptr::null_mut(),
+        layout: PjrtBufferMemoryLayoutUnion {
+            tiled: PjrtBufferMemoryLayoutTiled {
+                struct_size: std::mem::size_of::<PjrtBufferMemoryLayoutTiled>(),
+                extension_start: ptr::null_mut(),
+                minor_to_major: row_major_order.as_ptr(),
+                minor_to_major_size: row_major_order.len(),
+                tile_dims: ptr::null(),
+                tile_dim_sizes: ptr::null(),
+                num_tiles: 0,
+            },
+        },
+        layout_type: PJRT_BUFFER_MEMORY_LAYOUT_TYPE_TILED,
+    };
+    let to_host_fn = api.buffer_to_host_buffer?;
+    let mut to_host_args = PjrtBufferToHostBufferArgs {
+        struct_size: std::mem::size_of::<PjrtBufferToHostBufferArgs>(),
+        extension_start: ptr::null_mut(),
+        src: out_ptrs[0],
+        host_layout: (&mut host_layout as *mut PjrtBufferMemoryLayout) as *mut c_void,
+        dst: out_host.as_mut_ptr() as *mut c_void,
+        dst_size: out_host.len() * std::mem::size_of::<f32>(),
+        event: ptr::null_mut(),
+    };
+    // SAFETY: `out_host` has `pad_rows * pad_cols` `f32` elements matching the row-major layout.
+    let err = unsafe { to_host_fn(&mut to_host_args) };
+    let transfer_ok =
+        check_pjrt_error(api, err) && await_and_destroy_event(api, to_host_args.event);
+    destroy_pjrt_buffer(api, out_ptrs[0]);
+    if !transfer_ok {
+        return None;
+    }
+
+    Some(unpad_f32_to_matrix(&out_host, pad_cols, out_rows, out_cols))
+}
+
 // --- Public OchreML Backend Entry Points ---
 
 pub fn tpu_matmul(device_id: usize, a: &Matrix, b: &Matrix) -> Option<OchreResult<Matrix>> {

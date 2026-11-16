@@ -74,6 +74,9 @@ pub enum OchreError {
     #[error("{0}")]
     DeviceError(String),
 
+    #[error("Invalid parameter: {0} ( >_< )")]
+    InvalidParameter(String),
+
     #[error("Invalid file extension for '{0}'. Model files must use the '.dit' extension ( >_< )")]
     InvalidModelExtension(String),
 
