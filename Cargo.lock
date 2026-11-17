@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "ochreml"
-version = "0.3.2-beta.3"
+version = "0.3.2-beta.4"
 dependencies = [
  "bytemuck",
  "libloading",

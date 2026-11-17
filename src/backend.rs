@@ -229,24 +229,7 @@ impl<'a> Backend<'a> {
                     return res;
                 }
 
-                let block_size = 64;
-                let mut total_xt_x = Matrix::zeros(p, p);
-                let mut total_xt_y = vec![0.0; p];
-
-                let mut start_row = 0;
-                while start_row < x.rows {
-                    let end_row = (start_row + block_size).min(x.rows);
-                    let (tile_xt_x, tile_xt_y) =
-                        compute_normal_equation_range(x, y, fit_intercept, start_row, end_row)?;
-                    for i in 0..(p * p) {
-                        total_xt_x.data[i] += tile_xt_x.data[i];
-                    }
-                    for i in 0..p {
-                        total_xt_y[i] += tile_xt_y[i];
-                    }
-                    start_row = end_row;
-                }
-                Ok((total_xt_x, total_xt_y))
+                cpu_normal_equation_1d(x, y, fit_intercept, p)
             }
         }
     }
@@ -354,30 +337,7 @@ impl<'a> Backend<'a> {
                     return res;
                 }
 
-                let block_size = 64;
-                let mut total_xt_x = Matrix::zeros(p, p);
-                let mut total_xt_y = Matrix::zeros(p, k_targets);
-
-                let mut start_row = 0;
-                while start_row < x.rows {
-                    let end_row = (start_row + block_size).min(x.rows);
-                    let (tile_xt_x, tile_xt_y) = compute_normal_equation_multi_range(
-                        x,
-                        y,
-                        sample_weight,
-                        fit_intercept,
-                        start_row,
-                        end_row,
-                    )?;
-                    for i in 0..(p * p) {
-                        total_xt_x.data[i] += tile_xt_x.data[i];
-                    }
-                    for i in 0..(p * k_targets) {
-                        total_xt_y.data[i] += tile_xt_y.data[i];
-                    }
-                    start_row = end_row;
-                }
-                Ok((total_xt_x, total_xt_y))
+                cpu_normal_equation_multi(x, y, sample_weight, fit_intercept, p, k_targets)
             }
         }
     }

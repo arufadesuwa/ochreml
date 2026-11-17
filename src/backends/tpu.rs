@@ -847,7 +847,19 @@ fn destroy_pjrt_buffer(api: &PjrtApiPrefix, buffer: *mut PjrtBuffer) {
     }
 }
 
+const MIN_TPU_DOT_OPS: usize = 8_000_000;
+const MIN_TPU_NE_COLS: usize = 16;
+
 fn execute_tpu_dot(device_id: usize, op: TpuOpKind, a: &Matrix, b: &Matrix) -> Option<Matrix> {
+    let (m, k, n) = match op {
+        TpuOpKind::MatMul => (a.rows, a.cols, b.cols),
+        TpuOpKind::MatMulAtB => (a.cols, a.rows, b.cols),
+    };
+    // Small or narrow matmuls are faster and full FP64 on CPU than padding to f32 over PJRT.
+    if m.saturating_mul(k).saturating_mul(n) < MIN_TPU_DOT_OPS {
+        return None;
+    }
+
     let ctx = get_tpu_context()?;
     let device = ctx
         .devices
@@ -855,11 +867,6 @@ fn execute_tpu_dot(device_id: usize, op: TpuOpKind, a: &Matrix, b: &Matrix) -> O
         .or_else(|| ctx.devices.first())?
         .0;
     let api = unsafe { &*ctx.api.0 };
-
-    let (m, k, n) = match op {
-        TpuOpKind::MatMul => (a.rows, a.cols, b.cols),
-        TpuOpKind::MatMulAtB => (a.cols, a.rows, b.cols),
-    };
 
     let m_pad = next_pow2_dim(m, 16);
     let k_pad = next_pow2_dim(k, 16);
@@ -1202,6 +1209,12 @@ pub fn tpu_compute_normal_equation_multi(
     let n = x.rows;
     let p_in = x.cols;
     let k = y.cols;
+    // Narrow or light normal equations are faster and full FP64 on CPU than host-scaling + PJRT f32.
+    if p_in < MIN_TPU_NE_COLS
+        || n.saturating_mul(p_in).saturating_mul(p_in.max(k)) < MIN_TPU_DOT_OPS
+    {
+        return None;
+    }
     let p = if fit_intercept { p_in + 1 } else { p_in };
 
     let mut x_scales = vec![1.0f64; p_in];
@@ -1332,5 +1345,17 @@ mod tests {
             assert!(tpu_matmul_at_b(0, &a, &b).is_none());
             assert!(tpu_matvec(0, &a, &[1.0, 2.0]).is_none());
         }
+    }
+
+    #[test]
+    fn test_tpu_small_matrix_threshold_returns_none() {
+        let x = Matrix::from_vec(20_000, 3, vec![1.0; 60_000]).unwrap();
+        let y = vec![2.0; 20_000];
+        let v = vec![1.0; 3];
+        assert!(tpu_matvec(0, &x, &v).is_none());
+        assert!(tpu_compute_normal_equation(0, &x, &y, true).is_none());
+        let small = Matrix::from_vec(64, 64, vec![1.0; 4096]).unwrap();
+        assert!(tpu_matmul(0, &small, &small).is_none());
+        assert!(tpu_matmul_at_b(0, &small, &small).is_none());
     }
 }

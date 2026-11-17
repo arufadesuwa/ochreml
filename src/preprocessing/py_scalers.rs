@@ -2,7 +2,7 @@
 
 use crate::preprocessing::features::{KernelCenterer, PolynomialFeatures, SplineTransformer};
 use crate::preprocessing::py_helpers::{
-    buffer_to_f64_1d, buffer_to_matrix, buffer_to_pooled_matrix, matrix_to_pybytes,
+    PooledMatrix, buffer_to_f64_1d, buffer_to_matrix, buffer_to_pooled_matrix, matrix_to_pybytes,
     write_slice_to_pybuffer,
 };
 use crate::preprocessing::scalers::{
@@ -573,6 +573,30 @@ crate::pymethods_with_dit!(PyBinarizer, Binarizer, {
     }
 });
 
+fn center_cells_into_pybuffer(
+    py: Python<'_>,
+    cells: &[pyo3::buffer::ReadOnlyCell<f64>],
+    rows: usize,
+    cols: usize,
+    fit_rows: &[f64],
+    fit_all: f64,
+    out: &PyBuffer<f64>,
+) -> PyResult<()> {
+    let mut out_pooled = PooledMatrix::with_len(rows, cols)?;
+    let inv_cols = 1.0 / cols as f64;
+    for (src_row, dst_row) in cells
+        .chunks_exact(cols)
+        .zip(out_pooled.mat.data.chunks_exact_mut(cols))
+    {
+        let row_sum: f64 = src_row.iter().map(|c| c.get()).sum();
+        let shift = fit_all - row_sum * inv_cols;
+        for ((src, dst), &fr) in src_row.iter().zip(dst_row.iter_mut()).zip(fit_rows.iter()) {
+            *dst = src.get() - fr + shift;
+        }
+    }
+    write_slice_to_pybuffer(py, &out_pooled.mat.data, out)
+}
+
 #[pyclass(from_py_object, name = "KernelCenterer")]
 #[derive(Clone)]
 pub struct PyKernelCenterer {
@@ -610,6 +634,35 @@ crate::pymethods_with_dit!(PyKernelCenterer, KernelCenterer, {
         k: PyBuffer<f64>,
         out: PyBuffer<f64>,
     ) -> PyResult<()> {
+        let shape = k.shape();
+        if shape.len() == 2
+            && k.is_c_contiguous()
+            && shape[0].saturating_mul(shape[1]) < 524_288
+            && let Some(cells) = k.as_slice(py)
+        {
+            let rows = shape[0];
+            let cols = shape[1];
+            let fit_rows = self
+                .inner
+                .k_fit_rows_
+                .as_ref()
+                .ok_or(crate::error::OchreError::NotFitted)?;
+            let fit_all = self
+                .inner
+                .k_fit_all_
+                .ok_or(crate::error::OchreError::NotFitted)?;
+            if Some(cols) != self.inner.n_features_in_ {
+                return Err(crate::error::OchreError::FeatureCountMismatch {
+                    features: cols,
+                    expected: self.inner.n_features_in_.unwrap_or(0),
+                }
+                .into());
+            }
+            if rows == 0 {
+                return Ok(());
+            }
+            return center_cells_into_pybuffer(py, cells, rows, cols, fit_rows, fit_all, &out);
+        }
         let mut mat = buffer_to_pooled_matrix(py, &k)?;
         self.inner.transform_inplace(&mut mat)?;
         write_slice_to_pybuffer(py, &mat.data, &out)
@@ -621,6 +674,42 @@ crate::pymethods_with_dit!(PyKernelCenterer, KernelCenterer, {
         k: PyBuffer<f64>,
         out: PyBuffer<f64>,
     ) -> PyResult<()> {
+        let shape = k.shape();
+        if shape.len() == 2
+            && k.is_c_contiguous()
+            && shape[0].saturating_mul(shape[1]) < 524_288
+            && let Some(cells) = k.as_slice(py)
+        {
+            let rows = shape[0];
+            let cols = shape[1];
+            if rows == 0 || cols == 0 {
+                return Err(crate::error::OchreError::EmptyData.into());
+            }
+            if rows != cols {
+                return Err(crate::error::OchreError::NonSquareMatrix.into());
+            }
+            let inv_rows = 1.0 / rows as f64;
+            let mut col_means = vec![0.0f64; cols];
+            for src_row in cells.chunks_exact(cols) {
+                for (acc, cell) in col_means.iter_mut().zip(src_row.iter()) {
+                    *acc += cell.get();
+                }
+            }
+            for m in col_means.iter_mut() {
+                *m *= inv_rows;
+            }
+            self.inner.set_fitted_means(col_means, cols);
+            let fit_rows = self
+                .inner
+                .k_fit_rows_
+                .as_ref()
+                .ok_or(crate::error::OchreError::NotFitted)?;
+            let fit_all = self
+                .inner
+                .k_fit_all_
+                .ok_or(crate::error::OchreError::NotFitted)?;
+            return center_cells_into_pybuffer(py, cells, rows, cols, fit_rows, fit_all, &out);
+        }
         let mut mat = buffer_to_pooled_matrix(py, &k)?;
         self.inner.fit(&mat)?;
         self.inner.transform_inplace(&mut mat)?;

@@ -752,7 +752,53 @@ impl SplineTransformer {
 }
 
 /// Center an arbitrary kernel matrix in the feature space (*≧ω≦*)
-/// Uses Backend::col_reduce_stats (N1) for column means.
+fn compute_kernel_col_means(k: &Matrix, device: &DeviceType) -> OchreResult<Vec<f64>> {
+    let rows = k.rows;
+    let cols = k.cols;
+    if matches!(device, DeviceType::Gpu(_) | DeviceType::MultiGpu(_))
+        && cols >= 256
+        && rows.saturating_mul(cols) >= 4_000_000
+    {
+        return Ok(get_backend(device).col_reduce_stats(k, None)?.mean);
+    }
+    let inv_rows = 1.0 / rows as f64;
+    let mut means = if rows.saturating_mul(cols) >= 65_536 && rows >= 512 {
+        k.data
+            .par_chunks(1024 * cols)
+            .map(|chunk| {
+                let mut local = vec![0.0f64; cols];
+                for row in chunk.chunks_exact(cols) {
+                    for (acc, &val) in local.iter_mut().zip(row.iter()) {
+                        *acc += val;
+                    }
+                }
+                local
+            })
+            .reduce(
+                || vec![0.0f64; cols],
+                |mut a, b| {
+                    for (acc, v) in a.iter_mut().zip(b.iter()) {
+                        *acc += v;
+                    }
+                    a
+                },
+            )
+    } else {
+        let mut local = vec![0.0f64; cols];
+        for row in k.data.chunks_exact(cols) {
+            for (acc, &val) in local.iter_mut().zip(row.iter()) {
+                *acc += val;
+            }
+        }
+        local
+    };
+    for m in means.iter_mut() {
+        *m *= inv_rows;
+    }
+    Ok(means)
+}
+
+/// Center an arbitrary kernel matrix (＾▽＾)
 #[derive(Debug, Clone)]
 pub struct KernelCenterer {
     pub device: DeviceType,
@@ -774,6 +820,14 @@ impl KernelCenterer {
         })
     }
 
+    pub fn set_fitted_means(&mut self, col_means: Vec<f64>, cols: usize) {
+        let mean_all: f64 = col_means.iter().sum::<f64>() / cols as f64;
+        self.k_fit_rows_ = Some(col_means);
+        self.k_fit_all_ = Some(mean_all);
+        self.n_features_in_ = Some(cols);
+        self.device_ = Some(self.device.to_string());
+    }
+
     pub fn fit(&mut self, k: &Matrix) -> OchreResult<()> {
         if k.rows == 0 || k.cols == 0 {
             return Err(OchreError::EmptyData);
@@ -781,12 +835,8 @@ impl KernelCenterer {
         if k.rows != k.cols {
             return Err(OchreError::NonSquareMatrix);
         }
-        let stats = get_backend(&self.device).col_reduce_stats(k, None)?;
-        let mean_all: f64 = stats.mean.iter().sum::<f64>() / stats.mean.len() as f64;
-        self.k_fit_rows_ = Some(stats.mean);
-        self.k_fit_all_ = Some(mean_all);
-        self.n_features_in_ = Some(k.cols);
-        self.device_ = Some(self.device.to_string());
+        let means = compute_kernel_col_means(k, &self.device)?;
+        self.set_fitted_means(means, k.cols);
         Ok(())
     }
 

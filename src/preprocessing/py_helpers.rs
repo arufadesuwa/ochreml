@@ -35,6 +35,19 @@ pub struct PooledMatrix {
     pub mat: Matrix,
 }
 
+impl PooledMatrix {
+    pub fn with_len(rows: usize, cols: usize) -> PyResult<Self> {
+        let len = rows
+            .checked_mul(cols)
+            .ok_or_else(|| PyValueError::new_err("Matrix dimensions overflow ( >_< )"))?;
+        let mut data = pop_pooled_vec(len);
+        data.resize(len, 0.0);
+        Ok(Self {
+            mat: Matrix::from_vec(rows, cols, data)?,
+        })
+    }
+}
+
 impl Deref for PooledMatrix {
     type Target = Matrix;
     #[inline]

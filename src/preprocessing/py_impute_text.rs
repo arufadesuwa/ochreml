@@ -11,7 +11,7 @@ use crate::preprocessing::text_fe::{
 };
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyString};
+use pyo3::types::{PyAny, PyBool, PyByteArray, PyBytes, PyDict, PyString};
 use std::collections::{HashMap, HashSet};
 
 fn extract_py_dict_pairs(
@@ -92,24 +92,35 @@ crate::pymethods_with_dit!(PyMissingIndicator, MissingIndicator, {
         &self,
         py: Python<'py>,
         x: PyBuffer<f64>,
-    ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
+    ) -> PyResult<(usize, usize, Bound<'py, PyByteArray>)> {
         let mat = buffer_to_pooled_matrix(py, &x)?;
         let out = self.inner.transform_u8(&mat)?;
         let n_out = self.inner.features_.as_ref().map_or(0, |f| f.len());
-        let bytes = PyBytes::new(py, &out);
+        let bytes = PyByteArray::new(py, &out);
         Ok((mat.rows, n_out, bytes))
+    }
+
+    pub fn transform_u8_into(
+        &self,
+        py: Python<'_>,
+        x: PyBuffer<f64>,
+        out: PyBuffer<u8>,
+    ) -> PyResult<()> {
+        let mat = buffer_to_pooled_matrix(py, &x)?;
+        let buf = self.inner.transform_u8(&mat)?;
+        write_slice_to_pybuffer(py, &buf, &out)
     }
 
     pub fn fit_transform_u8_buffer<'py>(
         &mut self,
         py: Python<'py>,
         x: PyBuffer<f64>,
-    ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
+    ) -> PyResult<(usize, usize, Bound<'py, PyByteArray>)> {
         let mat = buffer_to_pooled_matrix(py, &x)?;
         self.inner.fit(&mat)?;
         let out = self.inner.transform_u8(&mat)?;
         let n_out = self.inner.features_.as_ref().map_or(0, |f| f.len());
-        let bytes = PyBytes::new(py, &out);
+        let bytes = PyByteArray::new(py, &out);
         Ok((mat.rows, n_out, bytes))
     }
 

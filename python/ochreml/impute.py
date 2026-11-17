@@ -106,8 +106,8 @@ class MissingIndicator:
         self._model.fit_buffer(self._prep_x(X))
         return self
 
-    def _u8_to_output(self, rows: int, cols: int, raw: bytes) -> Any:
-        arr = np.frombuffer(raw, dtype=bool).reshape(rows, cols).copy()
+    def _u8_to_output(self, rows: int, cols: int, raw: Any) -> Any:
+        arr = np.frombuffer(raw, dtype=bool).reshape(rows, cols)
         if self.sparse is True:
             from scipy import sparse
 
@@ -116,7 +116,13 @@ class MissingIndicator:
 
     def transform(self, X: Any) -> Any:
         """Generate missing values indicator for X (＾▽＾)."""
-        rows, cols, raw = self._model.transform_u8_buffer(self._prep_x(X))
+        X_buf = self._prep_x(X)
+        feat = self._model.features_
+        if feat is not None and not self.sparse:
+            out = np.empty((X_buf.shape[0], len(feat)), dtype=np.uint8)
+            self._model.transform_u8_into(X_buf, out)
+            return out.view(bool)
+        rows, cols, raw = self._model.transform_u8_buffer(X_buf)
         return self._u8_to_output(rows, cols, raw)
 
     def fit_transform(self, X: Any, y: Optional[Any] = None) -> Any:

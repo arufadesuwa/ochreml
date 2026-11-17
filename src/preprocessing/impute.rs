@@ -134,29 +134,87 @@ impl MissingIndicator {
         let mv = self.missing_values;
         let n_out = features.len();
         let mut out = vec![0.0; x.rows * n_out];
-        for r in 0..x.rows {
-            for (k, &j) in features.iter().enumerate() {
-                out[r * n_out + k] = if is_missing_f64(x.data[r * expected + j], mv) {
-                    1.0
-                } else {
-                    0.0
-                };
+        if x.rows == 0 || n_out == 0 {
+            return Matrix::from_vec(x.rows, n_out, out);
+        }
+        let identity = n_out == expected && features.iter().enumerate().all(|(k, &j)| k == j);
+        let fill_row = |(in_row, out_row): (&[f64], &mut [f64])| {
+            if identity {
+                for (&v, dst) in in_row.iter().zip(out_row.iter_mut()) {
+                    *dst = if is_missing_f64(v, mv) { 1.0 } else { 0.0 };
+                }
+            } else {
+                for (&j, dst) in features.iter().zip(out_row.iter_mut()) {
+                    *dst = if is_missing_f64(in_row[j], mv) {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                }
             }
+        };
+        if x.rows * n_out < 16_384 {
+            x.data
+                .chunks_exact(expected)
+                .zip(out.chunks_exact_mut(n_out))
+                .for_each(fill_row);
+        } else {
+            x.data
+                .par_chunks_exact(expected)
+                .zip(out.par_chunks_exact_mut(n_out))
+                .for_each(fill_row);
         }
         Matrix::from_vec(x.rows, n_out, out)
     }
 
-    pub fn transform_u8(&self, x: &Matrix) -> OchreResult<Vec<u8>> {
+    pub fn transform_u8_into(&self, x: &Matrix, out: &mut [u8]) -> OchreResult<usize> {
         let features = self.validate_transform_features(x)?;
         let expected = x.cols;
         let mv = self.missing_values;
         let n_out = features.len();
-        let mut out = vec![0u8; x.rows * n_out];
-        for r in 0..x.rows {
-            for (k, &j) in features.iter().enumerate() {
-                out[r * n_out + k] = u8::from(is_missing_f64(x.data[r * expected + j], mv));
-            }
+        let expected_len = x.rows.checked_mul(n_out).ok_or_else(|| {
+            OchreError::InvalidParameter("Indicator buffer overflow ( >_< )".into())
+        })?;
+        if out.len() != expected_len {
+            return Err(OchreError::LengthMismatch {
+                features: expected_len,
+                targets: out.len(),
+            });
         }
+        if x.rows == 0 || n_out == 0 {
+            return Ok(n_out);
+        }
+        let identity = n_out == expected && features.iter().enumerate().all(|(k, &j)| k == j);
+        let fill_row = |(in_row, out_row): (&[f64], &mut [u8])| {
+            if identity {
+                for (&v, dst) in in_row.iter().zip(out_row.iter_mut()) {
+                    *dst = u8::from(is_missing_f64(v, mv));
+                }
+            } else {
+                for (&j, dst) in features.iter().zip(out_row.iter_mut()) {
+                    *dst = u8::from(is_missing_f64(in_row[j], mv));
+                }
+            }
+        };
+        if expected_len < 16_384 {
+            x.data
+                .chunks_exact(expected)
+                .zip(out.chunks_exact_mut(n_out))
+                .for_each(fill_row);
+        } else {
+            x.data
+                .par_chunks_exact(expected)
+                .zip(out.par_chunks_exact_mut(n_out))
+                .for_each(fill_row);
+        }
+        Ok(n_out)
+    }
+
+    pub fn transform_u8(&self, x: &Matrix) -> OchreResult<Vec<u8>> {
+        let features = self.validate_transform_features(x)?;
+        let n_out = features.len();
+        let mut out = vec![0u8; x.rows * n_out];
+        self.transform_u8_into(x, &mut out)?;
         Ok(out)
     }
 
