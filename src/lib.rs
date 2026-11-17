@@ -5,9 +5,11 @@ pub mod backend;
 pub mod backends;
 pub mod decision_tree;
 pub mod device;
+pub mod dit_io;
 pub mod error;
 pub mod linear_regression;
 pub mod matrix;
+pub mod preprocessing;
 pub mod primitives;
 pub mod ridge;
 
@@ -37,6 +39,37 @@ const TAG_DT_REGRESSOR: u8 = 3;
 const TAG_RIDGE: u8 = 4;
 const TAG_RIDGE_CLASSIFIER: u8 = 5;
 const TAG_RIDGE_CV: u8 = 6;
+pub const TAG_STANDARD_SCALER: u8 = preprocessing::scalers::TAG_STANDARD_SCALER;
+pub const TAG_MINMAX_SCALER: u8 = preprocessing::scalers::TAG_MINMAX_SCALER;
+pub const TAG_MAXABS_SCALER: u8 = preprocessing::scalers::TAG_MAXABS_SCALER;
+pub const TAG_ROBUST_SCALER: u8 = preprocessing::scalers::TAG_ROBUST_SCALER;
+pub const TAG_NORMALIZER: u8 = preprocessing::scalers::TAG_NORMALIZER;
+pub const TAG_BINARIZER: u8 = preprocessing::transforms::TAG_BINARIZER;
+pub const TAG_KERNEL_CENTERER: u8 = preprocessing::features::TAG_KERNEL_CENTERER;
+pub const TAG_POLYNOMIAL_FEATURES: u8 = preprocessing::features::TAG_POLYNOMIAL_FEATURES;
+pub const TAG_KBINS_DISCRETIZER: u8 = preprocessing::transforms::TAG_KBINS_DISCRETIZER;
+pub const TAG_POWER_TRANSFORMER: u8 = preprocessing::transforms::TAG_POWER_TRANSFORMER;
+pub const TAG_QUANTILE_TRANSFORMER: u8 = preprocessing::transforms::TAG_QUANTILE_TRANSFORMER;
+pub const TAG_SPLINE_TRANSFORMER: u8 = preprocessing::features::TAG_SPLINE_TRANSFORMER;
+pub const TAG_ONE_HOT_ENCODER: u8 = preprocessing::encoders::TAG_ONE_HOT_ENCODER;
+pub const TAG_ORDINAL_ENCODER: u8 = preprocessing::encoders::TAG_ORDINAL_ENCODER;
+pub const TAG_LABEL_ENCODER: u8 = preprocessing::encoders::TAG_LABEL_ENCODER;
+pub const TAG_LABEL_BINARIZER: u8 = preprocessing::encoders::TAG_LABEL_BINARIZER;
+pub const TAG_MULTILABEL_BINARIZER: u8 = preprocessing::encoders::TAG_MULTILABEL_BINARIZER;
+pub const TAG_TARGET_ENCODER: u8 = preprocessing::encoders::TAG_TARGET_ENCODER;
+pub const TAG_SIMPLE_IMPUTER: u8 = preprocessing::impute::TAG_SIMPLE_IMPUTER;
+pub const TAG_MISSING_INDICATOR: u8 = preprocessing::impute::TAG_MISSING_INDICATOR;
+pub const TAG_KNN_IMPUTER: u8 = preprocessing::impute::TAG_KNN_IMPUTER;
+pub const TAG_DICT_VECTORIZER: u8 = preprocessing::text_fe::TAG_DICT_VECTORIZER;
+pub const TAG_FEATURE_HASHER: u8 = preprocessing::text_fe::TAG_FEATURE_HASHER;
+pub const TAG_COUNT_VECTORIZER: u8 = preprocessing::text_fe::TAG_COUNT_VECTORIZER;
+pub const TAG_TFIDF_TRANSFORMER: u8 = preprocessing::text_fe::TAG_TFIDF_TRANSFORMER;
+pub const TAG_TFIDF_VECTORIZER: u8 = preprocessing::text_fe::TAG_TFIDF_VECTORIZER;
+pub const TAG_HASHING_VECTORIZER: u8 = preprocessing::text_fe::TAG_HASHING_VECTORIZER;
+pub const TAG_ITERATIVE_IMPUTER: u8 = 34;
+pub const TAG_FUNCTION_TRANSFORMER: u8 = 35;
+pub const TAG_COLUMN_TRANSFORMER: u8 = 36;
+pub const TAG_TRANSFORMED_TARGET_REGRESSOR: u8 = 37;
 
 fn validate_dit_path(path: &str) -> OchreResult<()> {
     if !path.trim().to_lowercase().ends_with(".dit") {
@@ -2193,5 +2226,6 @@ fn _ochreml(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRidgeCV>()?;
     m.add_class::<PyDecisionTreeClassifier>()?;
     m.add_class::<PyDecisionTreeRegressor>()?;
+    preprocessing::register_py_module(m)?;
     Ok(())
 }

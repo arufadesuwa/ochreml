@@ -37,7 +37,7 @@ from ._ochreml import (
     get_device_info as _get_device_info,
 )
 
-__version__ = "0.3.2a2"
+__version__ = "0.3.2b1"
 __all__ = [
     "LinearRegression",
     "Ridge",
@@ -51,6 +51,43 @@ __all__ = [
     "get_device_info",
     "get_default_device",
     "set_default_device",
+    "preprocessing",
+    "impute",
+    "feature_extraction",
+    "compose",
+    "StandardScaler",
+    "MinMaxScaler",
+    "MaxAbsScaler",
+    "RobustScaler",
+    "Normalizer",
+    "OneHotEncoder",
+    "OrdinalEncoder",
+    "TargetEncoder",
+    "LabelEncoder",
+    "LabelBinarizer",
+    "MultiLabelBinarizer",
+    "PowerTransformer",
+    "QuantileTransformer",
+    "FunctionTransformer",
+    "KBinsDiscretizer",
+    "Binarizer",
+    "PolynomialFeatures",
+    "SplineTransformer",
+    "KernelCenterer",
+    "SimpleImputer",
+    "MissingIndicator",
+    "KNNImputer",
+    "IterativeImputer",
+    "DictVectorizer",
+    "FeatureHasher",
+    "CountVectorizer",
+    "TfidfTransformer",
+    "TfidfVectorizer",
+    "HashingVectorizer",
+    "ColumnTransformer",
+    "TransformedTargetRegressor",
+    "make_column_transformer",
+    "make_column_selector",
 ]
 
 _DEFAULT_DEVICE: str = "auto"
@@ -143,6 +180,8 @@ def load(path: str, device: Optional[str] = None) -> Any:
             return RidgeClassifier._from_rust(_RustRidgeClassifier.from_bytes(data, target_dev), target_dev)
         if tag == 6:
             return RidgeCV._from_rust(_RustRidgeCV.from_bytes(data, target_dev), target_dev)
+        if 7 <= tag <= 37:
+            return _load_preprocessing_dit_tag(tag, data, path_str, target_dev)
         raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
     # Fallback if the .dit file was written via joblib.dump or pickle.dump
@@ -1302,3 +1341,116 @@ class DecisionTreeRegressor:
             f"DecisionTreeRegressor(criterion='{self.criterion}', "
             f"max_depth={self.max_depth}, device='{self.device}') (o´∀｀o)"
         )
+
+
+def _load_preprocessing_dit_tag(tag: int, data: bytes, path_str: str, target_dev: str) -> Any:
+    """Dispatch additive DIT\\x01 tags 7..=37 for preprocessing, impute, feature_extraction, and compose (＾▽＾)."""
+    from ._ochreml import (
+        Binarizer as _RustBinarizer,
+        CountVectorizer as _RustCountVectorizer,
+        DictVectorizer as _RustDictVectorizer,
+        FeatureHasher as _RustFeatureHasher,
+        HashingVectorizer as _RustHashingVectorizer,
+        KBinsDiscretizer as _RustKBinsDiscretizer,
+        KNNImputer as _RustKNNImputer,
+        KernelCenterer as _RustKernelCenterer,
+        LabelBinarizer as _RustLabelBinarizer,
+        LabelEncoder as _RustLabelEncoder,
+        MaxAbsScaler as _RustMaxAbsScaler,
+        MinMaxScaler as _RustMinMaxScaler,
+        MissingIndicator as _RustMissingIndicator,
+        MultiLabelBinarizer as _RustMultiLabelBinarizer,
+        Normalizer as _RustNormalizer,
+        OneHotEncoder as _RustOneHotEncoder,
+        OrdinalEncoder as _RustOrdinalEncoder,
+        PolynomialFeatures as _RustPolynomialFeatures,
+        PowerTransformer as _RustPowerTransformer,
+        QuantileTransformer as _RustQuantileTransformer,
+        RobustScaler as _RustRobustScaler,
+        SimpleImputer as _RustSimpleImputer,
+        SplineTransformer as _RustSplineTransformer,
+        StandardScaler as _RustStandardScaler,
+        TargetEncoder as _RustTargetEncoder,
+        TfidfTransformer as _RustTfidfTransformer,
+    )
+
+    rust_dispatch = {
+        7: (StandardScaler, _RustStandardScaler),
+        8: (MinMaxScaler, _RustMinMaxScaler),
+        9: (MaxAbsScaler, _RustMaxAbsScaler),
+        10: (RobustScaler, _RustRobustScaler),
+        11: (Normalizer, _RustNormalizer),
+        12: (Binarizer, _RustBinarizer),
+        13: (KernelCenterer, _RustKernelCenterer),
+        14: (PolynomialFeatures, _RustPolynomialFeatures),
+        15: (KBinsDiscretizer, _RustKBinsDiscretizer),
+        16: (PowerTransformer, _RustPowerTransformer),
+        17: (QuantileTransformer, _RustQuantileTransformer),
+        18: (SplineTransformer, _RustSplineTransformer),
+        19: (OneHotEncoder, _RustOneHotEncoder),
+        20: (OrdinalEncoder, _RustOrdinalEncoder),
+        21: (LabelEncoder, _RustLabelEncoder),
+        22: (LabelBinarizer, _RustLabelBinarizer),
+        23: (MultiLabelBinarizer, _RustMultiLabelBinarizer),
+        24: (TargetEncoder, _RustTargetEncoder),
+        25: (SimpleImputer, _RustSimpleImputer),
+        26: (MissingIndicator, _RustMissingIndicator),
+        27: (KNNImputer, _RustKNNImputer),
+        28: (DictVectorizer, _RustDictVectorizer),
+        29: (FeatureHasher, _RustFeatureHasher),
+        30: (CountVectorizer, _RustCountVectorizer),
+        31: (TfidfTransformer, _RustTfidfTransformer),
+        33: (HashingVectorizer, _RustHashingVectorizer),
+    }
+    if tag in rust_dispatch:
+        py_cls, rust_cls = rust_dispatch[tag]
+        return py_cls._from_rust(rust_cls.from_bytes(data, target_dev), target_dev)
+    if tag == 32:
+        return TfidfVectorizer.load(path_str, target_dev)
+    if tag == 34:
+        return IterativeImputer.load(path_str, target_dev)
+    if tag == 35:
+        return FunctionTransformer.load(path_str, target_dev)
+    if tag == 36:
+        return ColumnTransformer.load(path_str, target_dev)
+    if tag == 37:
+        return TransformedTargetRegressor.load(path_str, target_dev)
+    raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
+
+
+from . import compose, feature_extraction, impute, preprocessing
+from .compose import (
+    ColumnTransformer,
+    TransformedTargetRegressor,
+    make_column_selector,
+    make_column_transformer,
+)
+from .feature_extraction import DictVectorizer, FeatureHasher
+from .feature_extraction.text import (
+    CountVectorizer,
+    HashingVectorizer,
+    TfidfTransformer,
+    TfidfVectorizer,
+)
+from .impute import IterativeImputer, KNNImputer, MissingIndicator, SimpleImputer
+from .preprocessing import (
+    Binarizer,
+    FunctionTransformer,
+    KBinsDiscretizer,
+    KernelCenterer,
+    LabelBinarizer,
+    LabelEncoder,
+    MultiLabelBinarizer,
+    MaxAbsScaler,
+    MinMaxScaler,
+    Normalizer,
+    OneHotEncoder,
+    OrdinalEncoder,
+    PolynomialFeatures,
+    PowerTransformer,
+    QuantileTransformer,
+    RobustScaler,
+    SplineTransformer,
+    StandardScaler,
+    TargetEncoder,
+)
