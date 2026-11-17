@@ -5,6 +5,19 @@ Equipped with Zero-Copy Python Buffer Protocol and SIMD / Rayon solvers (o´∀�
 """
 
 from typing import Any, Dict, List, Optional
+import os as _os
+
+# Auto-discover Python-packaged libtpu.so (e.g., Google Colab / Kaggle TPU v6e-1) before loading _ochreml
+if "TPU_LIBRARY_PATH" not in _os.environ and "PJRT_PLUGIN_LIBRARY_PATH" not in _os.environ:
+    try:
+        import libtpu as _libtpu  # type: ignore
+
+        _tpu_lib = _libtpu.get_library_path()
+        if _tpu_lib and _os.path.exists(_tpu_lib):
+            _os.environ["TPU_LIBRARY_PATH"] = _tpu_lib
+    except Exception:
+        pass
+
 from ._utils import (
     process_features,
     process_sample_weight,
@@ -24,7 +37,7 @@ from ._ochreml import (
     get_device_info as _get_device_info,
 )
 
-__version__ = "0.3.2a1"
+__version__ = "0.3.2a2"
 __all__ = [
     "LinearRegression",
     "Ridge",

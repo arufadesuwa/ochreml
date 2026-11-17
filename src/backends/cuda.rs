@@ -919,6 +919,10 @@ pub fn cuda_compute_normal_equation(
     }
 
     let total_elems = x.rows.saturating_mul(x.cols);
+    // Small/medium tall-skinny matrices (< 2 MB) finish in ~1ms on CPU L2/L3 cache without PCIe/cuBLAS overhead
+    if total_elems <= 262_144 && x.cols <= 64 {
+        return None;
+    }
     if gpu_ids.len() == 1 || x.rows < gpu_ids.len() || total_elems < MULTI_GPU_MIN_ELEMENTS {
         return Some(cuda_normal_eq_1d_chunk(
             driver,
@@ -1209,6 +1213,10 @@ pub fn cuda_compute_normal_equation_multi(
     }
 
     let total_elems = x.rows.saturating_mul(x.cols);
+    // Small/medium tall-skinny matrices (< 2 MB) finish in ~1ms on CPU L2/L3 cache without PCIe/cuBLAS overhead
+    if total_elems <= 262_144 && x.cols <= 64 {
+        return None;
+    }
     if gpu_ids.len() == 1 || x.rows < gpu_ids.len() || total_elems < MULTI_GPU_MIN_ELEMENTS {
         return Some(cuda_normal_eq_multi_chunk(
             driver,

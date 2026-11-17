@@ -2062,15 +2062,23 @@ fn _prim_n1_col_stats(
     Ok((stats.mean, stats.std, stats.min, stats.max))
 }
 
+fn matrix_to_pybytes<'py>(py: Python<'py>, mat: &Matrix) -> (usize, usize, Bound<'py, PyBytes>) {
+    let mut raw = Vec::with_capacity(mat.data.len() * std::mem::size_of::<f64>());
+    for &v in &mat.data {
+        raw.extend_from_slice(&v.to_le_bytes());
+    }
+    (mat.rows, mat.cols, PyBytes::new(py, &raw))
+}
+
 #[pyfunction]
 #[pyo3(signature = (x_buf, op = "relu", param = 0.0, device = "cpu"))]
-fn _prim_n2_elementwise(
-    py: Python<'_>,
-    x_buf: &Bound<'_, PyAny>,
+fn _prim_n2_elementwise<'py>(
+    py: Python<'py>,
+    x_buf: &Bound<'py, PyAny>,
     op: &str,
     param: f64,
     device: &str,
-) -> PyResult<Vec<Vec<f64>>> {
+) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
     use primitives::ElementwiseOp;
     let dev = parse_device(Some(device))?;
     let buf = pyo3::buffer::PyBuffer::<f64>::get(x_buf)?;
@@ -2094,24 +2102,24 @@ fn _prim_n2_elementwise(
         },
     };
     let out = backend::get_backend(&dev).elementwise_op(&x, ew_op)?;
-    Ok(matrix_to_nested_vec(&out))
+    Ok(matrix_to_pybytes(py, &out))
 }
 
 #[pyfunction]
 #[pyo3(signature = (a_buf, b_buf, device = "cpu"))]
-fn _prim_n3_pairwise_l2(
-    py: Python<'_>,
-    a_buf: &Bound<'_, PyAny>,
-    b_buf: &Bound<'_, PyAny>,
+fn _prim_n3_pairwise_l2<'py>(
+    py: Python<'py>,
+    a_buf: &Bound<'py, PyAny>,
+    b_buf: &Bound<'py, PyAny>,
     device: &str,
-) -> PyResult<Vec<Vec<f64>>> {
+) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
     let dev = parse_device(Some(device))?;
     let a_py = pyo3::buffer::PyBuffer::<f64>::get(a_buf)?;
     let b_py = pyo3::buffer::PyBuffer::<f64>::get(b_buf)?;
     let a = buffer_to_matrix(py, &a_py)?;
     let b = buffer_to_matrix(py, &b_py)?;
     let out = backend::get_backend(&dev).pairwise_l2_sq(&a, &b)?;
-    Ok(matrix_to_nested_vec(&out))
+    Ok(matrix_to_pybytes(py, &out))
 }
 
 #[pyfunction]

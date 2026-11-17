@@ -121,15 +121,34 @@ fn probe_tpus() -> (bool, Option<String>) {
         return (true, tpu_type.or(tpu_name));
     }
 
-    // Check PJRT TPU libraries in system paths
+    // Check PJRT TPU libraries in system and Python site-packages paths
     let pjrt_paths = [
         "/usr/local/lib/libpjrt_c_api_tpu.so",
         "/usr/lib/libpjrt_c_api_tpu.so",
+        "/usr/local/lib/libtpu.so",
+        "/usr/lib/libtpu.so",
         "/usr/local/lib/libpjrt_c_api.so",
     ];
     for p in &pjrt_paths {
         if Path::new(p).exists() {
             return (true, Some("PJRT TPU Runtime".to_string()));
+        }
+    }
+    if let Ok(entries) = fs::read_dir("/usr/local/lib") {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("python3") {
+                for pkg_dir in ["dist-packages", "site-packages"] {
+                    if entry
+                        .path()
+                        .join(pkg_dir)
+                        .join("libtpu")
+                        .join("libtpu.so")
+                        .exists()
+                    {
+                        return (true, Some("PJRT TPU Runtime".to_string()));
+                    }
+                }
+            }
         }
     }
 

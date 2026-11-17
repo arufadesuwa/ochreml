@@ -36,7 +36,7 @@ type FnCuLaunchKernel = unsafe extern "C" fn(
 ) -> CuResult;
 type FnCuCtxSynchronize = unsafe extern "C" fn() -> CuResult;
 
-const MIN_GPU_ELEMENTS: usize = 65_536;
+const MIN_GPU_ELEMENTS: usize = 524_288;
 
 // Universal sm_50 PTX kernels for exact FP64 elementwise, column reduction, argmin, and histogram.
 const OCHRE_PRIMITIVES_PTX: &str = r#"

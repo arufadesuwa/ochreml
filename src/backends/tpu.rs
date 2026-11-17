@@ -482,10 +482,10 @@ fn await_and_destroy_event(api: &PjrtApiPrefix, event: *mut PjrtEvent) -> bool {
 fn candidate_pjrt_paths() -> Vec<String> {
     let mut paths = Vec::new();
     for var in ["PJRT_PLUGIN_LIBRARY_PATH", "TPU_LIBRARY_PATH"] {
-        if let Ok(env_path) = std::env::var(var) {
-            if !env_path.is_empty() {
-                paths.push(env_path);
-            }
+        if let Ok(env_path) = std::env::var(var)
+            && !env_path.is_empty()
+        {
+            paths.push(env_path);
         }
     }
     paths.extend(
@@ -501,6 +501,22 @@ fn candidate_pjrt_paths() -> Vec<String> {
         .into_iter()
         .map(String::from),
     );
+    // Scan Python site-packages / dist-packages for pip-installed `libtpu` (Colab TPU v6e-1)
+    for base in ["/usr/local/lib", "/usr/lib"] {
+        if let Ok(entries) = std::fs::read_dir(base) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("python3") {
+                    for pkg_dir in ["dist-packages", "site-packages"] {
+                        let cand = entry.path().join(pkg_dir).join("libtpu").join("libtpu.so");
+                        if cand.exists() {
+                            paths.push(cand.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
     paths
 }
 
