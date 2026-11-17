@@ -10,9 +10,66 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyBytes, PyFloat, PyInt, PyNone, PyString};
+use std::cell::RefCell;
 use std::fs;
+use std::ops::{Deref, DerefMut};
 
-pub fn buffer_to_matrix(py: Python<'_>, x: &PyBuffer<f64>) -> PyResult<Matrix> {
+thread_local! {
+    static PREPROC_BUF_POOL: RefCell<Vec<Vec<f64>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn pop_pooled_vec(min_cap: usize) -> Vec<f64> {
+    PREPROC_BUF_POOL
+        .with(|pool| {
+            let mut slots = pool.borrow_mut();
+            if let Some(pos) = slots.iter().position(|v| v.capacity() >= min_cap) {
+                Some(slots.swap_remove(pos))
+            } else {
+                slots.pop()
+            }
+        })
+        .unwrap_or_default()
+}
+
+pub struct PooledMatrix {
+    pub mat: Matrix,
+}
+
+impl Deref for PooledMatrix {
+    type Target = Matrix;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.mat
+    }
+}
+
+impl DerefMut for PooledMatrix {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.mat
+    }
+}
+
+impl Drop for PooledMatrix {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.mat.data);
+        if buf.capacity() <= 16 * 1024 * 1024 {
+            PREPROC_BUF_POOL.with(|pool| {
+                if let Ok(mut slots) = pool.try_borrow_mut() {
+                    if slots.len() < 3 {
+                        slots.push(buf);
+                    } else if let Some(min_slot) = slots.iter_mut().min_by_key(|v| v.capacity())
+                        && buf.capacity() > min_slot.capacity()
+                    {
+                        *min_slot = buf;
+                    }
+                }
+            });
+        }
+    }
+}
+
+pub fn buffer_to_pooled_matrix(py: Python<'_>, x: &PyBuffer<f64>) -> PyResult<PooledMatrix> {
     let shape = x.shape();
     if shape.len() != 2 {
         return Err(PyValueError::new_err(format!(
@@ -27,20 +84,50 @@ pub fn buffer_to_matrix(py: Python<'_>, x: &PyBuffer<f64>) -> PyResult<Matrix> {
         .ok_or_else(|| PyValueError::new_err("Matrix dimensions overflow ( >_< )"))?;
 
     if x.is_c_contiguous() {
-        let mut data = vec![0.0; len];
+        let mut data = pop_pooled_vec(len);
+        data.resize(len, 0.0);
         x.copy_to_slice(py, &mut data[..len]).map_err(|e| {
             PyValueError::new_err(format!("Failed to copy buffer data: {} (´；ω；`)", e))
         })?;
-        return Ok(Matrix::from_vec(rows, cols, data)?);
+        return Ok(PooledMatrix {
+            mat: Matrix::from_vec(rows, cols, data)?,
+        });
     }
 
     let data = x.to_vec(py).map_err(|e| {
         PyValueError::new_err(format!("Failed to copy buffer data: {} (´；ω；`)", e))
     })?;
-    Ok(Matrix::from_vec(rows, cols, data)?)
+    Ok(PooledMatrix {
+        mat: Matrix::from_vec(rows, cols, data)?,
+    })
 }
 
-pub fn buffer_to_vec(py: Python<'_>, v: &PyBuffer<f64>) -> PyResult<Vec<f64>> {
+pub fn buffer_to_matrix(py: Python<'_>, x: &PyBuffer<f64>) -> PyResult<Matrix> {
+    let mut pooled = buffer_to_pooled_matrix(py, x)?;
+    Ok(std::mem::replace(
+        &mut pooled.mat,
+        Matrix {
+            rows: 0,
+            cols: 0,
+            data: Vec::new(),
+        },
+    ))
+}
+
+pub fn write_slice_to_pybuffer<T: pyo3::buffer::Element + Copy>(
+    py: Python<'_>,
+    data: &[T],
+    out: &PyBuffer<T>,
+) -> PyResult<()> {
+    out.copy_from_slice(py, data).map_err(|e| {
+        PyValueError::new_err(format!("Failed to write output buffer: {} (´；ω；`)", e))
+    })
+}
+
+pub fn buffer_to_typed_1d<T: pyo3::buffer::Element + Copy + Default>(
+    py: Python<'_>,
+    v: &PyBuffer<T>,
+) -> PyResult<Vec<T>> {
     let shape = v.shape();
     if shape.len() != 1 {
         return Err(PyValueError::new_err(format!(
@@ -48,8 +135,54 @@ pub fn buffer_to_vec(py: Python<'_>, v: &PyBuffer<f64>) -> PyResult<Vec<f64>> {
             shape.len()
         )));
     }
+    let len = shape[0];
+    if v.is_c_contiguous() {
+        let mut data = vec![T::default(); len];
+        v.copy_to_slice(py, &mut data[..len]).map_err(|e| {
+            PyValueError::new_err(format!("Failed to copy 1D buffer: {} (´；ω；`)", e))
+        })?;
+        return Ok(data);
+    }
     v.to_vec(py)
         .map_err(|e| PyValueError::new_err(format!("Failed to copy 1D buffer: {} (´；ω；`)", e)))
+}
+
+pub fn buffer_to_f64_1d(py: Python<'_>, v: &PyBuffer<f64>) -> PyResult<Vec<f64>> {
+    buffer_to_typed_1d(py, v)
+}
+
+pub fn buffer_to_u32_1d(py: Python<'_>, v: &PyBuffer<u32>) -> PyResult<Vec<u32>> {
+    buffer_to_typed_1d(py, v)
+}
+
+pub fn buffer_to_usize_1d(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
+    if let Ok(b64) = PyBuffer::<i64>::get(obj) {
+        let len = b64.item_count();
+        let mut tmp = vec![0i64; len];
+        if b64.is_c_contiguous() {
+            b64.copy_to_slice(py, &mut tmp)?;
+        } else {
+            tmp = b64.to_vec(py)?;
+        }
+        return Ok(tmp.into_iter().map(|v| v as usize).collect());
+    }
+    if let Ok(b32) = PyBuffer::<i32>::get(obj) {
+        let len = b32.item_count();
+        let mut tmp = vec![0i32; len];
+        if b32.is_c_contiguous() {
+            b32.copy_to_slice(py, &mut tmp)?;
+        } else {
+            tmp = b32.to_vec(py)?;
+        }
+        return Ok(tmp.into_iter().map(|v| v as usize).collect());
+    }
+    Err(PyValueError::new_err(
+        "Expected 1D int32 or int64 buffer for CSR indices/indptr ( >_< )",
+    ))
+}
+
+pub fn buffer_to_vec(py: Python<'_>, v: &PyBuffer<f64>) -> PyResult<Vec<f64>> {
+    buffer_to_f64_1d(py, v)
 }
 
 pub fn matrix_to_pybytes<'py>(

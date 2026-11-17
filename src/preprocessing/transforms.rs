@@ -1134,6 +1134,18 @@ impl Binarizer {
         binarize_matrix(x, self.threshold)
     }
 
+    pub fn transform_inplace(&self, x: &mut Matrix) -> OchreResult<()> {
+        if let Some(expected) = self.n_features_in_
+            && x.cols != expected
+        {
+            return Err(OchreError::FeatureCountMismatch {
+                features: x.cols,
+                expected,
+            });
+        }
+        binarize_matrix_inplace(x, self.threshold)
+    }
+
     pub fn set_device(&mut self, device: Option<String>) -> OchreResult<()> {
         let dev = parse_device(device.as_deref())?;
         if self.device_.is_some() {
@@ -1165,6 +1177,29 @@ impl Binarizer {
             n_features_in_,
         })
     }
+}
+
+pub fn binarize_matrix_inplace(x: &mut Matrix, threshold: f64) -> OchreResult<()> {
+    if x.rows == 0 || x.cols == 0 {
+        return Err(OchreError::EmptyData);
+    }
+    if x.data.iter().any(|v| v.is_nan()) {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN values which Binarizer cannot threshold ( >_< )".to_string(),
+        ));
+    }
+    if x.data.len() < 16_384 {
+        for v in &mut x.data {
+            *v = if *v > threshold { 1.0 } else { 0.0 };
+        }
+    } else {
+        x.data.par_chunks_mut(4096).for_each(|chunk| {
+            for v in chunk {
+                *v = if *v > threshold { 1.0 } else { 0.0 };
+            }
+        });
+    }
+    Ok(())
 }
 
 pub fn binarize_matrix(x: &Matrix, threshold: f64) -> OchreResult<Matrix> {

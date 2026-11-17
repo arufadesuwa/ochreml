@@ -37,7 +37,7 @@ from ._ochreml import (
     get_device_info as _get_device_info,
 )
 
-__version__ = "0.3.2b1"
+__version__ = "0.3.2b2"
 __all__ = [
     "LinearRegression",
     "Ridge",

@@ -218,7 +218,7 @@ pub fn wgpu_col_reduce_stats(
     x: &Matrix,
     sample_weight: Option<&[f64]>,
 ) -> Option<OchreResult<ColStats>> {
-    if sample_weight.is_some() || x.rows * x.cols < MIN_WGPU_ELEMENTS {
+    if sample_weight.is_some() || x.cols < 256 || x.rows * x.cols < 4_000_000 {
         return None;
     }
     let (ctx, pipes) = get_pipelines()?;

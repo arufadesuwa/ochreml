@@ -98,6 +98,67 @@ def as_1d_list(y: Any) -> Any:
     return arr.tolist()
 
 
+def as_utf32_2d_view(X: Any) -> Optional[Tuple[Any, int, int, int]]:
+    """Return `(flat_u32_buf, n_rows, n_cols, width)` for 2D Unicode NumPy arrays, else None."""
+    import numpy as np
+
+    if hasattr(X, "to_numpy"):
+        arr = X.to_numpy()
+    elif isinstance(X, np.ndarray):
+        arr = X
+    else:
+        arr = np.asarray(X)
+
+    if arr.ndim == 2 and arr.dtype.kind == "U" and arr.dtype.itemsize >= 4:
+        width = arr.dtype.itemsize // 4
+        if arr.dtype.byteorder == ">":
+            arr = arr.astype(f"<U{width}")
+        u32 = np.ascontiguousarray(arr).view(np.uint32).reshape(-1)
+        return u32, int(arr.shape[0]), int(arr.shape[1]), int(width)
+    return None
+
+
+def as_utf32_1d_view(y: Any) -> Optional[Tuple[Any, int, int]]:
+    """Return `(flat_u32_buf, n_rows, width)` for 1D Unicode NumPy arrays, else None."""
+    import numpy as np
+
+    if hasattr(y, "to_numpy"):
+        arr = y.to_numpy()
+    elif isinstance(y, np.ndarray):
+        arr = y
+    else:
+        arr = np.asarray(y)
+
+    if arr.ndim == 1 and arr.dtype.kind == "U" and arr.dtype.itemsize >= 4:
+        width = arr.dtype.itemsize // 4
+        if arr.dtype.byteorder == ">":
+            arr = arr.astype(f"<U{width}")
+        u32 = np.ascontiguousarray(arr).view(np.uint32).reshape(-1)
+        return u32, int(arr.shape[0]), int(width)
+    return None
+
+
+def as_object_col_lists(X: Any) -> Optional[Any]:
+    """Return `[col_list, ...]` for non-numeric 2D object/DataFrame inputs to avoid row-wise tolist."""
+    import numpy as np
+
+    module = type(X).__module__
+    if "pandas" in module and hasattr(X, "columns"):
+        if all(not (np.issubdtype(dt, np.number) or dt == np.bool_) for dt in X.dtypes if isinstance(dt, np.dtype)):
+            return [X[c].tolist() for c in X.columns]
+        arr = X.to_numpy()
+    elif hasattr(X, "to_numpy"):
+        arr = X.to_numpy()
+    elif isinstance(X, np.ndarray):
+        arr = X
+    else:
+        arr = np.asarray(X)
+
+    if arr.ndim == 2 and not (np.issubdtype(arr.dtype, np.number) or arr.dtype == np.bool_):
+        return [arr[:, j].tolist() for j in range(arr.shape[1])]
+    return None
+
+
 def save_dit_envelope(tag: int, state: Any, path: str) -> None:
     path_str = validate_dit_path(path)
     payload = _DIT_MAGIC + bytes([tag]) + pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)

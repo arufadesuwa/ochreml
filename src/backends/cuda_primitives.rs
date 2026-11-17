@@ -358,7 +358,9 @@ pub fn cuda_col_reduce_stats(
     x: &Matrix,
     sample_weight: Option<&[f64]>,
 ) -> Option<OchreResult<ColStats>> {
-    if x.rows * x.cols < MIN_GPU_ELEMENTS {
+    // Kernel launches 1 thread per column; when cols < 256 GPU SM occupancy is too low
+    // to amortize PCIe HtoD transfer, so CPU Rayon SIMD is strictly faster.
+    if x.cols < 256 || x.rows * x.cols < 4_000_000 {
         return None;
     }
     let driver = get_driver()?;

@@ -348,7 +348,14 @@ class CountVectorizer(_TextVectorizerMixin):
     def fit_transform(self, raw_documents: Iterable[Any], y: Optional[Any] = None) -> Any:
         """Learn the vocabulary dictionary and return document-term matrix (o´∀｀o)."""
         docs = _read_docs(raw_documents, self.input, self.encoding, self.decode_error)
-        return self.fit(docs, y).transform(docs)
+        if self._can_use_rust_analyzer():
+            parts = self._model.fit_transform_docs_csr(docs)
+            return csr_bytes_to_scipy(parts, dtype=self.dtype)
+        analyze = self.build_analyzer()
+        tokenized = [analyze(d) for d in docs]
+        self._model.fit_tokenized(tokenized)
+        parts = self._model.transform_tokenized_csr(tokenized)
+        return csr_bytes_to_scipy(parts, dtype=self.dtype)
 
     def inverse_transform(self, X: Any) -> List[np.ndarray]:
         """Return terms per document with nonzero entries in X (＾▽＾)."""
@@ -464,13 +471,10 @@ class TfidfTransformer:
         """Learn the idf vector (global term weights) (*≧ω≦*)."""
         if hasattr(X, "tocsr"):
             csr = X.tocsr()
-            self._model.fit_csr(
-                csr.data.astype(np.float64).tolist(),
-                csr.indices.astype(np.int64).tolist(),
-                csr.indptr.astype(np.int64).tolist(),
-                csr.shape[0],
-                csr.shape[1],
-            )
+            data = np.ascontiguousarray(csr.data, dtype=np.float64)
+            indices = np.ascontiguousarray(csr.indices)
+            indptr = np.ascontiguousarray(csr.indptr)
+            self._model.fit_csr_buffer(data, indices, indptr, csr.shape[0], csr.shape[1])
         else:
             arr = np.ascontiguousarray(X, dtype=np.float64)
             self._model.fit_buffer(arr)
@@ -480,17 +484,29 @@ class TfidfTransformer:
         """Transform a count matrix to a tf or tf-idf representation (o´∀｀o)."""
         if hasattr(X, "tocsr"):
             csr = X.tocsr()
-            parts = self._model.transform_csr(
-                csr.data.astype(np.float64).tolist(),
-                csr.indices.astype(np.int64).tolist(),
-                csr.indptr.astype(np.int64).tolist(),
-                csr.shape[0],
-                csr.shape[1],
+            data = np.ascontiguousarray(csr.data, dtype=np.float64)
+            indices = np.ascontiguousarray(csr.indices)
+            indptr = np.ascontiguousarray(csr.indptr)
+            parts = self._model.transform_csr_buffer(
+                data, indices, indptr, csr.shape[0], csr.shape[1]
             )
             return csr_bytes_to_scipy(parts, dtype=np.float64)
         arr = np.ascontiguousarray(X, dtype=np.float64)
         rows, cols, raw = self._model.transform_buffer(arr)
         return bytes_to_f64_2d(rows, cols, raw)
+
+    def fit_transform(self, X: Any, y: Optional[Any] = None) -> Any:
+        """Fit to X and return transformed TF-IDF matrix in one pass (*≧ω≦*)."""
+        if hasattr(X, "tocsr"):
+            csr = X.tocsr()
+            data = np.ascontiguousarray(csr.data, dtype=np.float64)
+            indices = np.ascontiguousarray(csr.indices)
+            indptr = np.ascontiguousarray(csr.indptr)
+            parts = self._model.fit_transform_csr_buffer(
+                data, indices, indptr, csr.shape[0], csr.shape[1]
+            )
+            return csr_bytes_to_scipy(parts, dtype=np.float64)
+        return self.fit(X, y).transform(X)
 
     def fit_transform(self, X: Any, y: Optional[Any] = None) -> Any:
         """Fit and transform X (＾▽＾)."""
@@ -599,7 +615,12 @@ class TfidfVectorizer(CountVectorizer):
 
     def transform(self, raw_documents: Iterable[Any]) -> Any:
         """Transform documents to document-term TF-IDF matrix (*≧ω≦*)."""
-        X_cnt = CountVectorizer.transform(self, raw_documents)
+        docs = _read_docs(raw_documents, self.input, self.encoding, self.decode_error)
+        if self._can_use_rust_analyzer():
+            parts = self._model.transform_docs_tfidf_csr(docs, self._tfidf._model)
+            res = csr_bytes_to_scipy(parts, dtype=self.dtype)
+            return res
+        X_cnt = CountVectorizer.transform(self, docs)
         res = self._tfidf.transform(X_cnt)
         if np.dtype(self.dtype) != np.float64:
             res = res.astype(self.dtype)
@@ -608,6 +629,9 @@ class TfidfVectorizer(CountVectorizer):
     def fit_transform(self, raw_documents: Iterable[Any], y: Optional[Any] = None) -> Any:
         """Learn vocabulary and idf, return document-term matrix (o´∀｀o)."""
         docs = _read_docs(raw_documents, self.input, self.encoding, self.decode_error)
+        if self._can_use_rust_analyzer():
+            parts = self._model.fit_transform_docs_tfidf_csr(docs, self._tfidf._model)
+            return csr_bytes_to_scipy(parts, dtype=self.dtype)
         CountVectorizer.fit(self, docs)
         X_cnt = CountVectorizer.transform(self, docs)
         res = self._tfidf.fit_transform(X_cnt)

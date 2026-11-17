@@ -106,19 +106,23 @@ class MissingIndicator:
         self._model.fit_buffer(self._prep_x(X))
         return self
 
-    def transform(self, X: Any) -> Any:
-        """Generate missing values indicator for X (＾▽＾)."""
-        rows, cols, raw = self._model.transform_buffer(self._prep_x(X))
-        arr = bytes_to_f64_2d(rows, cols, raw).astype(bool)
+    def _u8_to_output(self, rows: int, cols: int, raw: bytes) -> Any:
+        arr = np.frombuffer(raw, dtype=bool).reshape(rows, cols).copy()
         if self.sparse is True:
             from scipy import sparse
 
             return sparse.csr_matrix(arr)
         return arr
 
+    def transform(self, X: Any) -> Any:
+        """Generate missing values indicator for X (＾▽＾)."""
+        rows, cols, raw = self._model.transform_u8_buffer(self._prep_x(X))
+        return self._u8_to_output(rows, cols, raw)
+
     def fit_transform(self, X: Any, y: Optional[Any] = None) -> Any:
         """Generate missing values indicator for X (o´∀｀o)."""
-        return self.fit(X, y).transform(X)
+        rows, cols, raw = self._model.fit_transform_u8_buffer(self._prep_x(X))
+        return self._u8_to_output(rows, cols, raw)
 
     @property
     def features_(self) -> Optional[np.ndarray]:
@@ -256,6 +260,10 @@ class SimpleImputer:
         """Impute all missing values in X (＾▽＾)."""
         is_num, payload = as_2d_array_or_rows(X)
         if is_num and self._is_numeric:
+            if not self.add_indicator and len(self._model.keep_cols_) == payload.shape[1]:
+                out = np.empty(payload.shape, dtype=np.float64)
+                if self._model.try_transform_into(payload, out):
+                    return out
             rows, cols, raw = self._model.transform_buffer(payload)
             return bytes_to_f64_2d(rows, cols, raw)
         rows_in = payload.tolist() if is_num else payload
@@ -263,7 +271,18 @@ class SimpleImputer:
 
     def fit_transform(self, X: Any, y: Optional[Any] = None) -> np.ndarray:
         """Fit to data, then transform it (o´∀｀o)."""
-        return self.fit(X, y).transform(X)
+        is_num, payload = as_2d_array_or_rows(X)
+        self._is_numeric = is_num
+        if is_num:
+            if not self.add_indicator:
+                out = np.empty(payload.shape, dtype=np.float64)
+                if self._model.try_fit_transform_into(payload, out):
+                    return out
+            self._model.fit_buffer(payload)
+            rows, cols, raw = self._model.transform_buffer(payload)
+            return bytes_to_f64_2d(rows, cols, raw)
+        self._model.fit_objects(payload)
+        return np.asarray(self._model.transform_objects(payload), dtype=object)
 
     def inverse_transform(self, X: Any) -> np.ndarray:
         """Convert the data back to the original representation when add_indicator=True (＾▽＾)."""

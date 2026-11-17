@@ -12,7 +12,7 @@ from .._ochreml import (
     KBinsDiscretizer as _RustKBinsDiscretizer,
     PowerTransformer as _RustPowerTransformer,
     QuantileTransformer as _RustQuantileTransformer,
-    _rust_binarize_buffer,
+    _rust_binarize_into,
 )
 from .._preproc_utils import (
     bytes_to_f64_2d,
@@ -606,8 +606,17 @@ class Binarizer(_BaseTransform):
 
     def transform(self, X: Any) -> np.ndarray:
         """Binarize each element of X (*≧ω≦*)."""
-        rows, cols, raw = self._model.transform_buffer(self._fit_x(X))
-        return bytes_to_f64_2d(rows, cols, raw)
+        X_data = self._fit_x(X)
+        out = np.empty(X_data.shape, dtype=np.float64)
+        self._model.transform_into(X_data, out)
+        return out
+
+    def fit_transform(self, X: Any, y: Optional[Any] = None) -> np.ndarray:
+        """Fit and binarize each element of X in one pass (*≧ω≦*)."""
+        X_data = self._fit_x(X)
+        out = np.empty(X_data.shape, dtype=np.float64)
+        self._model.fit_transform_into(X_data, out)
+        return out
 
     def __repr__(self) -> str:
         return f"Binarizer(threshold={self.threshold}) (*≧ω≦*)"
@@ -624,6 +633,7 @@ def binarize(
     arr = np.ascontiguousarray(X, dtype=np.float64)
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D array, got {arr.ndim}D ( >_< )")
-    rows, cols, raw = _rust_binarize_buffer(arr, threshold=float(threshold))
-    return bytes_to_f64_2d(rows, cols, raw)
+    out = np.empty(arr.shape, dtype=np.float64)
+    _rust_binarize_into(arr, out, threshold=float(threshold))
+    return out
 

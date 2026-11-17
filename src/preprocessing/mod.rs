@@ -19,7 +19,9 @@ use pyo3::prelude::*;
 /// Register all preprocessing, imputation, and feature extraction classes/functions on `_ochreml`.
 pub fn register_py_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_scalers::_rust_normalize_buffer, m)?)?;
+    m.add_function(wrap_pyfunction!(py_scalers::_rust_normalize_into, m)?)?;
     m.add_function(wrap_pyfunction!(py_scalers::_rust_binarize_buffer, m)?)?;
+    m.add_function(wrap_pyfunction!(py_scalers::_rust_binarize_into, m)?)?;
 
     m.add_class::<py_scalers::PyStandardScaler>()?;
     m.add_class::<py_scalers::PyMinMaxScaler>()?;

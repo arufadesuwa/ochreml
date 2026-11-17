@@ -203,6 +203,108 @@ fn build_cat_map(cats: &[CatValue]) -> HashMap<CatValue, usize> {
     map
 }
 
+fn trim_u32_cell(cell: &[u32]) -> &[u32] {
+    let mut end = cell.len();
+    while end > 0 && cell[end - 1] == 0 {
+        end -= 1;
+    }
+    &cell[..end]
+}
+
+fn u32_cell_to_string(cell: &[u32]) -> OchreResult<String> {
+    let mut s = String::with_capacity(cell.len() * 2);
+    for &cp in cell {
+        let ch = char::from_u32(cp).ok_or_else(|| {
+            OchreError::InvalidParameter(format!(
+                "Invalid Unicode code point {} in string array ( >_< )",
+                cp
+            ))
+        })?;
+        s.push(ch);
+    }
+    Ok(s)
+}
+
+fn intern_u32_column(
+    data: &[u32],
+    n_rows: usize,
+    n_cols: usize,
+    width: usize,
+    col_idx: usize,
+) -> OchreResult<(Vec<CatValue>, Vec<usize>, Vec<usize>)> {
+    let mut map: HashMap<&[u32], usize> = HashMap::new();
+    let mut raw_keys: Vec<&[u32]> = Vec::new();
+    let mut raw_counts: Vec<usize> = Vec::new();
+    let mut raw_ids = Vec::with_capacity(n_rows);
+    let stride = n_cols * width;
+    let col_off = col_idx * width;
+
+    for r in 0..n_rows {
+        let start = r * stride + col_off;
+        let cell = trim_u32_cell(&data[start..start + width]);
+        let id = if let Some(&existing) = map.get(cell) {
+            raw_counts[existing] += 1;
+            existing
+        } else {
+            let new_id = raw_keys.len();
+            map.insert(cell, new_id);
+            raw_keys.push(cell);
+            raw_counts.push(1);
+            new_id
+        };
+        raw_ids.push(id);
+    }
+
+    let n_uniq = raw_keys.len();
+    let mut cats_raw = Vec::with_capacity(n_uniq);
+    for key in raw_keys {
+        cats_raw.push(CatValue::Str(u32_cell_to_string(key)?));
+    }
+
+    let mut order: Vec<usize> = (0..n_uniq).collect();
+    order.sort_by(|&a, &b| cats_raw[a].sort_cmp(&cats_raw[b]));
+
+    let mut sorted_cats = Vec::with_capacity(n_uniq);
+    let mut sorted_counts = Vec::with_capacity(n_uniq);
+    let mut raw_to_sorted = vec![0usize; n_uniq];
+    for (sorted_pos, &orig_idx) in order.iter().enumerate() {
+        sorted_cats.push(cats_raw[orig_idx].clone());
+        sorted_counts.push(raw_counts[orig_idx]);
+        raw_to_sorted[orig_idx] = sorted_pos;
+    }
+    for id in &mut raw_ids {
+        *id = raw_to_sorted[*id];
+    }
+    Ok((sorted_cats, sorted_counts, raw_ids))
+}
+
+fn build_u32_patterns(cats: &[CatValue]) -> Vec<Option<Vec<u32>>> {
+    cats.iter()
+        .map(|c| match c {
+            CatValue::Str(s) => Some(s.chars().map(|ch| ch as u32).collect()),
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn u32_buf_to_cat_cols(
+    data: &[u32],
+    n_rows: usize,
+    n_cols: usize,
+    width: usize,
+) -> OchreResult<Vec<Vec<CatValue>>> {
+    if n_rows == 0 || n_cols == 0 || width == 0 {
+        return Err(OchreError::EmptyData);
+    }
+    (0..n_cols)
+        .into_par_iter()
+        .map(|j| {
+            let (cats, _, row_ids) = intern_u32_column(data, n_rows, n_cols, width, j)?;
+            Ok(row_ids.into_iter().map(|id| cats[id].clone()).collect())
+        })
+        .collect()
+}
+
 /// Encode categorical features as a one-hot numeric array (*≧ω≦*)
 #[derive(Debug, Clone)]
 pub struct OneHotEncoder {
@@ -308,6 +410,15 @@ impl OneHotEncoder {
             })
             .collect();
 
+        self.apply_fit_per_col(per_col, explicit_drop)
+    }
+
+    fn apply_fit_per_col(
+        &mut self,
+        per_col: Vec<(Vec<CatValue>, Vec<usize>, Vec<bool>)>,
+        explicit_drop: Option<&[Option<CatValue>]>,
+    ) -> OchreResult<()> {
+        let n_features = per_col.len();
         let mut categories = Vec::with_capacity(n_features);
         let mut infreq_indices = Vec::with_capacity(n_features);
         let mut drop_indices: Vec<Option<usize>> = Vec::with_capacity(n_features);
@@ -483,32 +594,230 @@ impl OneHotEncoder {
                 Ok(res)
             })
             .collect::<OchreResult<Vec<Vec<Option<usize>>>>>()?;
+        Ok(Self::assemble_csr_from_encoded_cols(
+            &col_encoded,
+            n_samples,
+            total_cols,
+        ))
+    }
 
+    pub fn assemble_csr_from_encoded_cols(
+        col_encoded: &[Vec<Option<usize>>],
+        n_samples: usize,
+        total_cols: usize,
+    ) -> (Vec<usize>, Vec<usize>, usize, usize) {
+        let n_features = col_encoded.len();
         let mut indices = Vec::with_capacity(n_samples * n_features);
         let mut indptr = Vec::with_capacity(n_samples + 1);
         indptr.push(0);
         for r in 0..n_samples {
-            for col in &col_encoded {
+            for col in col_encoded {
                 if let Some(c_idx) = col[r] {
                     indices.push(c_idx);
                 }
             }
             indptr.push(indices.len());
         }
-        Ok((indices, indptr, n_samples, total_cols))
+        (indices, indptr, n_samples, total_cols)
     }
 
-    pub fn transform_dense(&self, cols_data: &[Vec<CatValue>]) -> OchreResult<Matrix> {
-        let (indices, indptr, n_samples, total_cols) = self.transform_csr(cols_data)?;
+    pub fn fit_utf32(
+        &mut self,
+        data: &[u32],
+        n_rows: usize,
+        n_cols: usize,
+        width: usize,
+        explicit_drop: Option<&[Option<CatValue>]>,
+    ) -> OchreResult<()> {
+        if n_rows == 0 || n_cols == 0 || width == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        let per_col = (0..n_cols)
+            .into_par_iter()
+            .map(|j| {
+                let (cats, counts, _) = intern_u32_column(data, n_rows, n_cols, width, j)?;
+                let mask = identify_infrequent_mask(
+                    &counts,
+                    n_rows,
+                    self.min_frequency,
+                    self.max_categories,
+                );
+                Ok((cats, counts, mask))
+            })
+            .collect::<OchreResult<Vec<_>>>()?;
+        self.apply_fit_per_col(per_col, explicit_drop)
+    }
+
+    pub fn fit_interned_cols(
+        &mut self,
+        interned: Vec<(Vec<CatValue>, Vec<usize>)>,
+        n_rows: usize,
+        explicit_drop: Option<&[Option<CatValue>]>,
+    ) -> OchreResult<()> {
+        let per_col = interned
+            .into_iter()
+            .map(|(cats, counts)| {
+                let mask = identify_infrequent_mask(
+                    &counts,
+                    n_rows,
+                    self.min_frequency,
+                    self.max_categories,
+                );
+                (cats, counts, mask)
+            })
+            .collect();
+        self.apply_fit_per_col(per_col, explicit_drop)
+    }
+
+    pub fn fit_transform_interned_csr(
+        &mut self,
+        interned: Vec<(Vec<CatValue>, Vec<usize>, Vec<usize>)>,
+        n_rows: usize,
+        explicit_drop: Option<&[Option<CatValue>]>,
+    ) -> OchreResult<(Vec<usize>, Vec<usize>, usize, usize)> {
+        let n_cols = interned.len();
+        let mut per_col = Vec::with_capacity(n_cols);
+        let mut row_ids_cols = Vec::with_capacity(n_cols);
+        for (cats, counts, rids) in interned {
+            let mask =
+                identify_infrequent_mask(&counts, n_rows, self.min_frequency, self.max_categories);
+            per_col.push((cats, counts, mask));
+            row_ids_cols.push(rids);
+        }
+        self.apply_fit_per_col(per_col, explicit_drop)?;
+
+        let mut total_cols = 0usize;
+        let col_encoded: Vec<Vec<Option<usize>>> = (0..n_cols)
+            .map(|j| {
+                let off = total_cols;
+                total_cols += self.n_out_per_feat_[j];
+                let out_map = &self.feature_out_map_[j];
+                row_ids_cols[j]
+                    .iter()
+                    .map(|&cat_idx| out_map[cat_idx].map(|l| off + l))
+                    .collect()
+            })
+            .collect();
+        Ok(Self::assemble_csr_from_encoded_cols(
+            &col_encoded,
+            n_rows,
+            total_cols,
+        ))
+    }
+
+    pub fn fit_transform_utf32_csr(
+        &mut self,
+        data: &[u32],
+        n_rows: usize,
+        n_cols: usize,
+        width: usize,
+        explicit_drop: Option<&[Option<CatValue>]>,
+    ) -> OchreResult<(Vec<usize>, Vec<usize>, usize, usize)> {
+        if n_rows == 0 || n_cols == 0 || width == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        let interned = (0..n_cols)
+            .into_par_iter()
+            .map(|j| intern_u32_column(data, n_rows, n_cols, width, j))
+            .collect::<OchreResult<Vec<_>>>()?;
+        self.fit_transform_interned_csr(interned, n_rows, explicit_drop)
+    }
+
+    pub fn transform_utf32_csr(
+        &self,
+        data: &[u32],
+        n_rows: usize,
+        n_cols: usize,
+        width: usize,
+    ) -> OchreResult<(Vec<usize>, Vec<usize>, usize, usize)> {
+        let n_features = self.n_features_in_.ok_or(OchreError::NotFitted)?;
+        if n_cols != n_features {
+            return Err(OchreError::FeatureCountMismatch {
+                features: n_cols,
+                expected: n_features,
+            });
+        }
+        if n_rows == 0 || width == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        let categories = self.categories_.as_ref().ok_or(OchreError::NotFitted)?;
+        let infreq = self
+            .infrequent_indices_
+            .as_ref()
+            .ok_or(OchreError::NotFitted)?;
+
+        let mut offsets = Vec::with_capacity(n_features);
+        let mut total_cols = 0usize;
+        for &nout in &self.n_out_per_feat_ {
+            offsets.push(total_cols);
+            total_cols += nout;
+        }
+
+        let stride = n_cols * width;
+        let col_encoded: Vec<Vec<Option<usize>>> = (0..n_features)
+            .into_par_iter()
+            .map(|j| {
+                let patterns = build_u32_patterns(&categories[j]);
+                let mut map: HashMap<&[u32], usize> = HashMap::with_capacity(patterns.len());
+                for (idx, opt_p) in patterns.iter().enumerate() {
+                    if let Some(p) = opt_p {
+                        map.insert(p.as_slice(), idx);
+                    }
+                }
+                let out_map = &self.feature_out_map_[j];
+                let off = offsets[j];
+                let inf_out: Option<usize> = infreq[j]
+                    .first()
+                    .and_then(|&cat_i| out_map[cat_i])
+                    .map(|l| off + l);
+
+                let col_off = j * width;
+                let mut res = Vec::with_capacity(n_rows);
+                for r in 0..n_rows {
+                    let start = r * stride + col_off;
+                    let cell = trim_u32_cell(&data[start..start + width]);
+                    if let Some(&cat_idx) = map.get(cell) {
+                        res.push(out_map[cat_idx].map(|l| off + l));
+                    } else if self.handle_unknown == "ignore" {
+                        res.push(None);
+                    } else if self.handle_unknown == "infrequent_if_exist" {
+                        res.push(inf_out);
+                    } else {
+                        let key = u32_cell_to_string(cell)?;
+                        return Err(OchreError::InvalidParameter(format!(
+                            "Found unknown category '{}' in column {} during transform ( >_< )",
+                            key, j
+                        )));
+                    }
+                }
+                Ok(res)
+            })
+            .collect::<OchreResult<Vec<_>>>()?;
+        Ok(Self::assemble_csr_from_encoded_cols(
+            &col_encoded,
+            n_rows,
+            total_cols,
+        ))
+    }
+
+    pub fn csr_to_dense(
+        indices: &[usize],
+        indptr: &[usize],
+        n_samples: usize,
+        total_cols: usize,
+    ) -> OchreResult<Matrix> {
         let mut data = vec![0.0; n_samples * total_cols];
         for r in 0..n_samples {
-            let start = indptr[r];
-            let end = indptr[r + 1];
-            for &c_idx in &indices[start..end] {
+            for &c_idx in &indices[indptr[r]..indptr[r + 1]] {
                 data[r * total_cols + c_idx] = 1.0;
             }
         }
         Matrix::from_vec(n_samples, total_cols, data)
+    }
+
+    pub fn transform_dense(&self, cols_data: &[Vec<CatValue>]) -> OchreResult<Matrix> {
+        let (indices, indptr, n_samples, total_cols) = self.transform_csr(cols_data)?;
+        Self::csr_to_dense(&indices, &indptr, n_samples, total_cols)
     }
 
     pub fn inverse_transform(&self, x: &Matrix) -> OchreResult<Vec<Vec<Option<CatValue>>>> {
@@ -800,6 +1109,11 @@ impl OrdinalEncoder {
             })
             .collect();
 
+        self.apply_fit_per_col(per_col)
+    }
+
+    fn apply_fit_per_col(&mut self, per_col: Vec<(Vec<CatValue>, Vec<bool>)>) -> OchreResult<()> {
+        let n_features = per_col.len();
         let mut categories = Vec::with_capacity(n_features);
         let mut infreq_indices = Vec::with_capacity(n_features);
         let mut cat_to_code = Vec::with_capacity(n_features);
@@ -892,6 +1206,156 @@ impl OrdinalEncoder {
             }
         }
         Matrix::from_vec(n_samples, n_features, out)
+    }
+
+    pub fn fit_utf32(
+        &mut self,
+        data: &[u32],
+        n_rows: usize,
+        n_cols: usize,
+        width: usize,
+    ) -> OchreResult<()> {
+        if n_rows == 0 || n_cols == 0 || width == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        let per_col = (0..n_cols)
+            .into_par_iter()
+            .map(|j| {
+                let (cats, counts, _) = intern_u32_column(data, n_rows, n_cols, width, j)?;
+                let mask = identify_infrequent_mask(
+                    &counts,
+                    n_rows,
+                    self.min_frequency,
+                    self.max_categories,
+                );
+                Ok((cats, mask))
+            })
+            .collect::<OchreResult<Vec<_>>>()?;
+        self.apply_fit_per_col(per_col)
+    }
+
+    pub fn fit_interned_cols(
+        &mut self,
+        interned: Vec<(Vec<CatValue>, Vec<usize>)>,
+        n_rows: usize,
+    ) -> OchreResult<()> {
+        let per_col = interned
+            .into_iter()
+            .map(|(cats, counts)| {
+                let mask = identify_infrequent_mask(
+                    &counts,
+                    n_rows,
+                    self.min_frequency,
+                    self.max_categories,
+                );
+                (cats, mask)
+            })
+            .collect();
+        self.apply_fit_per_col(per_col)
+    }
+
+    pub fn fit_transform_interned(
+        &mut self,
+        interned: Vec<(Vec<CatValue>, Vec<usize>, Vec<usize>)>,
+        n_rows: usize,
+    ) -> OchreResult<Matrix> {
+        let n_cols = interned.len();
+        let mut per_col = Vec::with_capacity(n_cols);
+        let mut row_ids_cols = Vec::with_capacity(n_cols);
+        for (cats, counts, rids) in interned {
+            let mask =
+                identify_infrequent_mask(&counts, n_rows, self.min_frequency, self.max_categories);
+            per_col.push((cats, mask));
+            row_ids_cols.push(rids);
+        }
+        self.apply_fit_per_col(per_col)?;
+
+        let mut out = vec![0.0; n_rows * n_cols];
+        for j in 0..n_cols {
+            let codes = &self.cat_to_code_[j];
+            let rids = &row_ids_cols[j];
+            for r in 0..n_rows {
+                out[r * n_cols + j] = codes[rids[r]] as f64;
+            }
+        }
+        Matrix::from_vec(n_rows, n_cols, out)
+    }
+
+    pub fn fit_transform_utf32(
+        &mut self,
+        data: &[u32],
+        n_rows: usize,
+        n_cols: usize,
+        width: usize,
+    ) -> OchreResult<Matrix> {
+        if n_rows == 0 || n_cols == 0 || width == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        let interned = (0..n_cols)
+            .into_par_iter()
+            .map(|j| intern_u32_column(data, n_rows, n_cols, width, j))
+            .collect::<OchreResult<Vec<_>>>()?;
+        self.fit_transform_interned(interned, n_rows)
+    }
+
+    pub fn transform_utf32(
+        &self,
+        data: &[u32],
+        n_rows: usize,
+        n_cols: usize,
+        width: usize,
+    ) -> OchreResult<Matrix> {
+        let n_features = self.n_features_in_.ok_or(OchreError::NotFitted)?;
+        if n_cols != n_features {
+            return Err(OchreError::FeatureCountMismatch {
+                features: n_cols,
+                expected: n_features,
+            });
+        }
+        if n_rows == 0 || width == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        let categories = self.categories_.as_ref().ok_or(OchreError::NotFitted)?;
+        let stride = n_cols * width;
+        let encoded_cols: Vec<Vec<f64>> = (0..n_features)
+            .into_par_iter()
+            .map(|j| {
+                let patterns = build_u32_patterns(&categories[j]);
+                let mut map: HashMap<&[u32], usize> = HashMap::with_capacity(patterns.len());
+                for (idx, opt_p) in patterns.iter().enumerate() {
+                    if let Some(p) = opt_p {
+                        map.insert(p.as_slice(), idx);
+                    }
+                }
+                let codes = &self.cat_to_code_[j];
+                let col_off = j * width;
+                let mut out_col = Vec::with_capacity(n_rows);
+                for r in 0..n_rows {
+                    let start = r * stride + col_off;
+                    let cell = trim_u32_cell(&data[start..start + width]);
+                    if let Some(&cat_idx) = map.get(cell) {
+                        out_col.push(codes[cat_idx] as f64);
+                    } else if self.handle_unknown == "use_encoded_value" {
+                        out_col.push(self.unknown_value.unwrap_or(f64::NAN));
+                    } else {
+                        let key = u32_cell_to_string(cell)?;
+                        return Err(OchreError::InvalidParameter(format!(
+                            "Found unknown category '{}' in column {} during transform ( >_< )",
+                            key, j
+                        )));
+                    }
+                }
+                Ok(out_col)
+            })
+            .collect::<OchreResult<Vec<_>>>()?;
+
+        let mut out = vec![0.0; n_rows * n_features];
+        for r in 0..n_rows {
+            for j in 0..n_features {
+                out[r * n_features + j] = encoded_cols[j][r];
+            }
+        }
+        Matrix::from_vec(n_rows, n_features, out)
     }
 
     pub fn inverse_transform(&self, x: &Matrix) -> OchreResult<Vec<Vec<Option<CatValue>>>> {
@@ -1090,6 +1554,65 @@ impl LabelEncoder {
         Ok(())
     }
 
+    pub fn fit_utf32(&mut self, data: &[u32], n_rows: usize, width: usize) -> OchreResult<()> {
+        if n_rows == 0 || width == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        let (classes, _, _) = intern_u32_column(data, n_rows, 1, width, 0)?;
+        self.classes_ = Some(classes);
+        self.device_ = Some(self.device.to_string());
+        Ok(())
+    }
+
+    pub fn fit_transform_utf32(
+        &mut self,
+        data: &[u32],
+        n_rows: usize,
+        width: usize,
+    ) -> OchreResult<Vec<i64>> {
+        if n_rows == 0 || width == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        let (classes, _, ids) = intern_u32_column(data, n_rows, 1, width, 0)?;
+        self.classes_ = Some(classes);
+        self.device_ = Some(self.device.to_string());
+        Ok(ids.into_iter().map(|i| i as i64).collect())
+    }
+
+    pub fn transform_utf32(
+        &self,
+        data: &[u32],
+        n_rows: usize,
+        width: usize,
+    ) -> OchreResult<Vec<i64>> {
+        let classes = self.classes_.as_ref().ok_or(OchreError::NotFitted)?;
+        if n_rows == 0 || width == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        let patterns = build_u32_patterns(classes);
+        let mut map: HashMap<&[u32], usize> = HashMap::with_capacity(patterns.len());
+        for (idx, opt_p) in patterns.iter().enumerate() {
+            if let Some(p) = opt_p {
+                map.insert(p.as_slice(), idx);
+            }
+        }
+        let mut out = Vec::with_capacity(n_rows);
+        for r in 0..n_rows {
+            let start = r * width;
+            let cell = trim_u32_cell(&data[start..start + width]);
+            if let Some(&idx) = map.get(cell) {
+                out.push(idx as i64);
+            } else {
+                let key = u32_cell_to_string(cell)?;
+                return Err(OchreError::InvalidParameter(format!(
+                    "y contains previously unseen label: '{}' ( >_< )",
+                    key
+                )));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn transform(&self, y: &[CatValue]) -> OchreResult<Vec<usize>> {
         let classes = self.classes_.as_ref().ok_or(OchreError::NotFitted)?;
         let map = build_cat_map(classes);
@@ -1214,6 +1737,86 @@ impl LabelBinarizer {
         self.classes_ = Some(classes);
         self.device_ = Some(self.device.to_string());
         Ok(())
+    }
+
+    fn binarize_class_ids(
+        &self,
+        ids: &[Option<usize>],
+        n_classes: usize,
+    ) -> (usize, usize, Vec<i64>) {
+        let n_cols = if n_classes <= 2 { 1 } else { n_classes };
+        let n_rows = ids.len();
+        let mut out = vec![self.neg_label; n_rows * n_cols];
+        for (r, opt_idx) in ids.iter().enumerate() {
+            if let Some(idx) = opt_idx {
+                if n_classes == 1 {
+                    out[r] = self.pos_label;
+                } else if n_classes == 2 {
+                    out[r] = if *idx == 1 {
+                        self.pos_label
+                    } else {
+                        self.neg_label
+                    };
+                } else {
+                    out[r * n_cols + *idx] = self.pos_label;
+                }
+            }
+        }
+        (n_rows, n_cols, out)
+    }
+
+    pub fn fit_utf32(&mut self, data: &[u32], n_rows: usize, width: usize) -> OchreResult<()> {
+        if n_rows == 0 || width == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        let (classes, _, _) = intern_u32_column(data, n_rows, 1, width, 0)?;
+        self.classes_ = Some(classes);
+        self.device_ = Some(self.device.to_string());
+        Ok(())
+    }
+
+    pub fn fit_transform_utf32(
+        &mut self,
+        data: &[u32],
+        n_rows: usize,
+        width: usize,
+    ) -> OchreResult<(usize, usize, Vec<i64>)> {
+        if n_rows == 0 || width == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        let (classes, _, row_ids) = intern_u32_column(data, n_rows, 1, width, 0)?;
+        let n_classes = classes.len();
+        self.classes_ = Some(classes);
+        self.device_ = Some(self.device.to_string());
+        let opt_ids: Vec<Option<usize>> = row_ids.into_iter().map(Some).collect();
+        Ok(self.binarize_class_ids(&opt_ids, n_classes))
+    }
+
+    pub fn transform_utf32(
+        &self,
+        data: &[u32],
+        n_rows: usize,
+        width: usize,
+    ) -> OchreResult<(usize, usize, Vec<i64>)> {
+        let classes = self.classes_.as_ref().ok_or(OchreError::NotFitted)?;
+        if n_rows == 0 || width == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        let patterns = build_u32_patterns(classes);
+        let mut map: HashMap<&[u32], usize> = HashMap::with_capacity(patterns.len());
+        for (idx, opt_p) in patterns.iter().enumerate() {
+            if let Some(p) = opt_p {
+                map.insert(p.as_slice(), idx);
+            }
+        }
+        let ids: Vec<Option<usize>> = (0..n_rows)
+            .map(|r| {
+                let start = r * width;
+                let cell = trim_u32_cell(&data[start..start + width]);
+                map.get(cell).copied()
+            })
+            .collect();
+        Ok(self.binarize_class_ids(&ids, classes.len()))
     }
 
     pub fn transform(&self, y: &[CatValue]) -> OchreResult<(usize, usize, Vec<i64>)> {

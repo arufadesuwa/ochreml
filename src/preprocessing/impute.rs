@@ -100,7 +100,7 @@ impl MissingIndicator {
         Ok(())
     }
 
-    pub fn transform(&self, x: &Matrix) -> OchreResult<Matrix> {
+    fn validate_transform_features(&self, x: &Matrix) -> OchreResult<&[usize]> {
         let expected = self.n_features_in_.ok_or(OchreError::NotFitted)?;
         if x.cols != expected {
             return Err(OchreError::FeatureCountMismatch {
@@ -125,7 +125,13 @@ impl MissingIndicator {
                 }
             }
         }
+        Ok(features.as_slice())
+    }
 
+    pub fn transform(&self, x: &Matrix) -> OchreResult<Matrix> {
+        let features = self.validate_transform_features(x)?;
+        let expected = x.cols;
+        let mv = self.missing_values;
         let n_out = features.len();
         let mut out = vec![0.0; x.rows * n_out];
         for r in 0..x.rows {
@@ -138,6 +144,20 @@ impl MissingIndicator {
             }
         }
         Matrix::from_vec(x.rows, n_out, out)
+    }
+
+    pub fn transform_u8(&self, x: &Matrix) -> OchreResult<Vec<u8>> {
+        let features = self.validate_transform_features(x)?;
+        let expected = x.cols;
+        let mv = self.missing_values;
+        let n_out = features.len();
+        let mut out = vec![0u8; x.rows * n_out];
+        for r in 0..x.rows {
+            for (k, &j) in features.iter().enumerate() {
+                out[r * n_out + k] = u8::from(is_missing_f64(x.data[r * expected + j], mv));
+            }
+        }
+        Ok(out)
     }
 
     pub fn set_device(&mut self, device: Option<String>) -> OchreResult<()> {
@@ -407,11 +427,17 @@ impl SimpleImputer {
         Ok(())
     }
 
-    pub fn transform_numeric(&self, x: &Matrix) -> OchreResult<Matrix> {
+    pub fn can_transform_numeric_inplace(&self, n_cols: usize) -> bool {
+        self.indicator_.is_none()
+            && self.keep_cols_.len() == n_cols
+            && self.keep_cols_.iter().enumerate().all(|(k, &j)| k == j)
+    }
+
+    fn numeric_fill_params(&self, x_cols: usize) -> OchreResult<(f64, Vec<f64>)> {
         let expected = self.n_features_in_.ok_or(OchreError::NotFitted)?;
-        if x.cols != expected {
+        if x_cols != expected {
             return Err(OchreError::FeatureCountMismatch {
-                features: x.cols,
+                features: x_cols,
                 expected,
             });
         }
@@ -431,6 +457,35 @@ impl SimpleImputer {
                 _ => f64::NAN,
             })
             .collect();
+        Ok((mv, fill_vals))
+    }
+
+    pub fn transform_numeric_inplace(&self, x: &mut Matrix) -> OchreResult<()> {
+        let (mv, fill_vals) = self.numeric_fill_params(x.cols)?;
+        let cols = x.cols;
+        if mv.is_nan() {
+            x.data.par_chunks_mut(cols).for_each(|row| {
+                for (v, &fill) in row.iter_mut().zip(fill_vals.iter()) {
+                    if v.is_nan() {
+                        *v = fill;
+                    }
+                }
+            });
+        } else {
+            x.data.par_chunks_mut(cols).for_each(|row| {
+                for (v, &fill) in row.iter_mut().zip(fill_vals.iter()) {
+                    if *v == mv {
+                        *v = fill;
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+
+    pub fn transform_numeric(&self, x: &Matrix) -> OchreResult<Matrix> {
+        let (mv, fill_vals) = self.numeric_fill_params(x.cols)?;
+        let expected = x.cols;
 
         let ind_mat = if let Some(ref ind) = self.indicator_ {
             Some(ind.transform(x)?)

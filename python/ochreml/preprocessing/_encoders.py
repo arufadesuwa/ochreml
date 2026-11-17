@@ -17,6 +17,9 @@ from .._ochreml import (
 from .._preproc_utils import (
     as_1d_list,
     as_2d_array_or_rows,
+    as_object_col_lists,
+    as_utf32_1d_view,
+    as_utf32_2d_view,
     bytes_to_f64_2d,
     bytes_to_i64_1d,
     bytes_to_i64_2d,
@@ -164,7 +167,6 @@ class OneHotEncoder(_BaseEncoder):
 
     def fit(self, X: Any, y: Optional[Any] = None) -> "OneHotEncoder":
         """Fit OneHotEncoder to X (＾▽＾)."""
-        is_num, payload = as_2d_array_or_rows(X)
         explicit_cats = (
             None
             if isinstance(self.categories, str) and self.categories == "auto"
@@ -175,6 +177,16 @@ class OneHotEncoder(_BaseEncoder):
             if (self.drop is None or isinstance(self.drop, str))
             else [d for d in self.drop]
         )
+        if explicit_cats is None:
+            u32_view = as_utf32_2d_view(X)
+            if u32_view is not None:
+                self._model.fit_utf32(*u32_view, explicit_drop)
+                return self
+            col_lists = as_object_col_lists(X)
+            if col_lists is not None:
+                self._model.fit_col_lists(col_lists, explicit_drop)
+                return self
+        is_num, payload = as_2d_array_or_rows(X)
         if is_num:
             self._model.fit_buffer(payload, explicit_cats, explicit_drop)
         else:
@@ -183,6 +195,24 @@ class OneHotEncoder(_BaseEncoder):
 
     def transform(self, X: Any) -> Any:
         """Transform X using one-hot encoding (*≧ω≦*)."""
+        u32_view = as_utf32_2d_view(X)
+        if u32_view is not None:
+            if self.sparse_output:
+                parts = self._model.transform_utf32_csr(*u32_view)
+                return csr_bytes_to_scipy(parts, dtype=self.dtype)
+            rows, cols, raw = self._model.transform_utf32_dense(*u32_view)
+            arr = bytes_to_f64_2d(rows, cols, raw)
+            return arr.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else arr
+
+        col_lists = as_object_col_lists(X)
+        if col_lists is not None:
+            if self.sparse_output:
+                parts = self._model.transform_col_lists_csr(col_lists)
+                return csr_bytes_to_scipy(parts, dtype=self.dtype)
+            rows, cols, raw = self._model.transform_col_lists_dense(col_lists)
+            arr = bytes_to_f64_2d(rows, cols, raw)
+            return arr.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else arr
+
         is_num, payload = as_2d_array_or_rows(X)
         if self.sparse_output:
             parts = (
@@ -198,6 +228,32 @@ class OneHotEncoder(_BaseEncoder):
         )
         arr = bytes_to_f64_2d(rows, cols, raw)
         return arr.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else arr
+
+    def fit_transform(self, X: Any, y: Optional[Any] = None) -> Any:
+        """Fit OneHotEncoder and transform X in one pass (*≧ω≦*)."""
+        if isinstance(self.categories, str) and self.categories == "auto":
+            explicit_drop = (
+                None
+                if (self.drop is None or isinstance(self.drop, str))
+                else [d for d in self.drop]
+            )
+            u32_view = as_utf32_2d_view(X)
+            if u32_view is not None:
+                if self.sparse_output:
+                    parts = self._model.fit_transform_utf32_csr(*u32_view, explicit_drop)
+                    return csr_bytes_to_scipy(parts, dtype=self.dtype)
+                rows, cols, raw = self._model.fit_transform_utf32_dense(*u32_view, explicit_drop)
+                arr = bytes_to_f64_2d(rows, cols, raw)
+                return arr.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else arr
+            col_lists = as_object_col_lists(X)
+            if col_lists is not None:
+                if self.sparse_output:
+                    parts = self._model.fit_transform_col_lists_csr(col_lists, explicit_drop)
+                    return csr_bytes_to_scipy(parts, dtype=self.dtype)
+                rows, cols, raw = self._model.fit_transform_col_lists_dense(col_lists, explicit_drop)
+                arr = bytes_to_f64_2d(rows, cols, raw)
+                return arr.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else arr
+        return self.fit(X, y).transform(X)
 
     def inverse_transform(self, X: Any) -> np.ndarray:
         """Convert the data back to the original representation (o´∀｀o)."""
@@ -345,12 +401,21 @@ class OrdinalEncoder(_BaseEncoder):
 
     def fit(self, X: Any, y: Optional[Any] = None) -> "OrdinalEncoder":
         """Fit the OrdinalEncoder to X (o´∀｀o)."""
-        is_num, payload = as_2d_array_or_rows(X)
         explicit_cats = (
             None
             if isinstance(self.categories, str) and self.categories == "auto"
             else [list(c) for c in self.categories]
         )
+        if explicit_cats is None:
+            u32_view = as_utf32_2d_view(X)
+            if u32_view is not None:
+                self._model.fit_utf32(*u32_view)
+                return self
+            col_lists = as_object_col_lists(X)
+            if col_lists is not None:
+                self._model.fit_col_lists(col_lists)
+                return self
+        is_num, payload = as_2d_array_or_rows(X)
         if is_num:
             self._model.fit_buffer(payload, explicit_cats)
         else:
@@ -359,6 +424,16 @@ class OrdinalEncoder(_BaseEncoder):
 
     def transform(self, X: Any) -> np.ndarray:
         """Transform X to ordinal codes (*≧ω≦*)."""
+        u32_view = as_utf32_2d_view(X)
+        if u32_view is not None:
+            out = np.empty((u32_view[1], u32_view[2]), dtype=np.float64)
+            self._model.transform_utf32_into(*u32_view, out)
+            return out.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else out
+        col_lists = as_object_col_lists(X)
+        if col_lists is not None:
+            out = np.empty((len(col_lists[0]), len(col_lists)), dtype=np.float64)
+            self._model.transform_col_lists_into(col_lists, out)
+            return out.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else out
         is_num, payload = as_2d_array_or_rows(X)
         rows, cols, raw = (
             self._model.transform_buffer(payload)
@@ -367,6 +442,21 @@ class OrdinalEncoder(_BaseEncoder):
         )
         arr = bytes_to_f64_2d(rows, cols, raw)
         return arr.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else arr
+
+    def fit_transform(self, X: Any, y: Optional[Any] = None) -> np.ndarray:
+        """Fit OrdinalEncoder and transform X in one pass (*≧ω≦*)."""
+        if isinstance(self.categories, str) and self.categories == "auto":
+            u32_view = as_utf32_2d_view(X)
+            if u32_view is not None:
+                out = np.empty((u32_view[1], u32_view[2]), dtype=np.float64)
+                self._model.fit_transform_utf32_into(*u32_view, out)
+                return out.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else out
+            col_lists = as_object_col_lists(X)
+            if col_lists is not None:
+                out = np.empty((len(col_lists[0]), len(col_lists)), dtype=np.float64)
+                self._model.fit_transform_col_lists_into(col_lists, out)
+                return out.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else out
+        return self.fit(X, y).transform(X)
 
     def inverse_transform(self, X: Any) -> np.ndarray:
         """Convert the data back to the original representation (＾▽＾)."""
@@ -429,16 +519,30 @@ class LabelEncoder(_BaseEncoder):
 
     def fit(self, y: Any) -> "LabelEncoder":
         """Fit label encoder (＾▽＾)."""
+        u32_view = as_utf32_1d_view(y)
+        if u32_view is not None:
+            self._model.fit_utf32(*u32_view)
+            return self
         self._model.fit_objects(as_1d_list(y))
         return self
 
     def transform(self, y: Any) -> np.ndarray:
         """Transform labels to normalized encoding (*≧ω≦*)."""
+        u32_view = as_utf32_1d_view(y)
+        if u32_view is not None:
+            out = np.empty(u32_view[1], dtype=np.int64)
+            self._model.transform_utf32_into(*u32_view, out)
+            return out
         raw = self._model.transform_objects(as_1d_list(y))
         return bytes_to_i64_1d(raw)
 
     def fit_transform(self, y: Any) -> np.ndarray:
         """Fit label encoder and return encoded labels (o´∀｀o)."""
+        u32_view = as_utf32_1d_view(y)
+        if u32_view is not None:
+            out = np.empty(u32_view[1], dtype=np.int64)
+            self._model.fit_transform_utf32_into(*u32_view, out)
+            return out
         return self.fit(y).transform(y)
 
     def inverse_transform(self, y: Any) -> np.ndarray:
@@ -498,12 +602,14 @@ class LabelBinarizer(_BaseEncoder):
 
     def fit(self, y: Any) -> "LabelBinarizer":
         """Fit label binarizer (＾▽＾)."""
+        u32_view = as_utf32_1d_view(y)
+        if u32_view is not None:
+            self._model.fit_utf32(*u32_view)
+            return self
         self._model.fit_objects(as_1d_list(y))
         return self
 
-    def transform(self, y: Any) -> Any:
-        """Transform multi-class labels to binary labels (*≧ω≦*)."""
-        rows, cols, raw = self._model.transform_objects(as_1d_list(y))
+    def _finish_binarized(self, rows: int, cols: int, raw: bytes) -> Any:
         arr = bytes_to_i64_2d(rows, cols, raw)
         if self.sparse_output:
             from scipy import sparse
@@ -511,8 +617,21 @@ class LabelBinarizer(_BaseEncoder):
             return sparse.csr_matrix(arr)
         return arr
 
+    def transform(self, y: Any) -> Any:
+        """Transform multi-class labels to binary labels (*≧ω≦*)."""
+        u32_view = as_utf32_1d_view(y)
+        if u32_view is not None:
+            rows, cols, raw = self._model.transform_utf32(*u32_view)
+            return self._finish_binarized(rows, cols, raw)
+        rows, cols, raw = self._model.transform_objects(as_1d_list(y))
+        return self._finish_binarized(rows, cols, raw)
+
     def fit_transform(self, y: Any) -> Any:
         """Fit label binarizer and transform multi-class labels to binary labels (o´∀｀o)."""
+        u32_view = as_utf32_1d_view(y)
+        if u32_view is not None:
+            rows, cols, raw = self._model.fit_transform_utf32(*u32_view)
+            return self._finish_binarized(rows, cols, raw)
         return self.fit(y).transform(y)
 
     def inverse_transform(self, Y: Any, threshold: Optional[float] = None) -> np.ndarray:
@@ -775,21 +894,27 @@ class TargetEncoder(_BaseEncoder):
 
     def fit(self, X: Any, y: Any) -> "TargetEncoder":
         """Fit target encoder on all (X, y) data (*≧ω≦*)."""
-        _, payload = as_2d_array_or_rows(X)
-        rows = payload.tolist() if isinstance(payload, np.ndarray) else payload
         y_cols, classes, inferred, _ = _infer_target_and_prepare(y, self.target_type)
         explicit_cats = (
             None
             if isinstance(self.categories, str) and self.categories == "auto"
             else [list(c) for c in self.categories]
         )
+        u32_view = as_utf32_2d_view(X)
+        if u32_view is not None:
+            self._model.fit_utf32(*u32_view, y_cols, classes, inferred, explicit_cats)
+            return self
+        col_lists = as_object_col_lists(X)
+        if col_lists is not None:
+            self._model.fit_col_lists(col_lists, y_cols, classes, inferred, explicit_cats)
+            return self
+        _, payload = as_2d_array_or_rows(X)
+        rows = payload.tolist() if isinstance(payload, np.ndarray) else payload
         self._model.fit_objects(rows, y_cols, classes, inferred, explicit_cats)
         return self
 
     def fit_transform(self, X: Any, y: Any) -> np.ndarray:
         """Fit on full data and return cross-fitted encodings to avoid leakage (＾▽＾)."""
-        _, payload = as_2d_array_or_rows(X)
-        rows = payload.tolist() if isinstance(payload, np.ndarray) else payload
         y_cols, classes, inferred, y_strat = _infer_target_and_prepare(y, self.target_type)
         fold_ids = _build_cv_fold_ids(
             y_strat, inferred, self.cv, self.shuffle, self.random_state
@@ -799,6 +924,20 @@ class TargetEncoder(_BaseEncoder):
             if isinstance(self.categories, str) and self.categories == "auto"
             else [list(c) for c in self.categories]
         )
+        u32_view = as_utf32_2d_view(X)
+        if u32_view is not None:
+            n_rows, n_cols, raw = self._model.fit_transform_utf32(
+                *u32_view, y_cols, classes, inferred, fold_ids, explicit_cats
+            )
+            return bytes_to_f64_2d(n_rows, n_cols, raw)
+        col_lists = as_object_col_lists(X)
+        if col_lists is not None:
+            n_rows, n_cols, raw = self._model.fit_transform_col_lists(
+                col_lists, y_cols, classes, inferred, fold_ids, explicit_cats
+            )
+            return bytes_to_f64_2d(n_rows, n_cols, raw)
+        _, payload = as_2d_array_or_rows(X)
+        rows = payload.tolist() if isinstance(payload, np.ndarray) else payload
         n_rows, n_cols, raw = self._model.fit_transform_objects(
             rows, y_cols, classes, inferred, fold_ids, explicit_cats
         )
@@ -806,6 +945,14 @@ class TargetEncoder(_BaseEncoder):
 
     def transform(self, X: Any) -> np.ndarray:
         """Transform X using learned target encodings (o´∀｀o)."""
+        u32_view = as_utf32_2d_view(X)
+        if u32_view is not None:
+            n_rows, n_cols, raw = self._model.transform_utf32(*u32_view)
+            return bytes_to_f64_2d(n_rows, n_cols, raw)
+        col_lists = as_object_col_lists(X)
+        if col_lists is not None:
+            n_rows, n_cols, raw = self._model.transform_col_lists(col_lists)
+            return bytes_to_f64_2d(n_rows, n_cols, raw)
         _, payload = as_2d_array_or_rows(X)
         rows = payload.tolist() if isinstance(payload, np.ndarray) else payload
         n_rows, n_cols, raw = self._model.transform_objects(rows)

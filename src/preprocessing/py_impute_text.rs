@@ -2,16 +2,55 @@
 
 use crate::preprocessing::impute::{KNNImputer, MissingIndicator, SimpleImputer};
 use crate::preprocessing::py_helpers::{
-    PyCsrTuple, buffer_to_matrix, catvalue_to_py, csr_parts_to_py, matrix_to_pybytes,
-    py_rows_to_cols, pyany_to_catvalue,
+    PyCsrTuple, buffer_to_f64_1d, buffer_to_pooled_matrix, buffer_to_usize_1d, catvalue_to_py,
+    csr_parts_to_py, matrix_to_pybytes, py_rows_to_cols, pyany_to_catvalue,
+    write_slice_to_pybuffer,
 };
 use crate::preprocessing::text_fe::{
     CountVectorizer, DictVectorizer, FeatureHasher, HashingVectorizer, TfidfTransformer,
 };
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes};
+use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyString};
 use std::collections::{HashMap, HashSet};
+
+fn extract_py_dict_pairs(
+    rows: &Bound<'_, PyAny>,
+    separator: &str,
+) -> PyResult<Vec<Vec<(String, f64)>>> {
+    let iter = rows.try_iter()?;
+    let mut out = Vec::new();
+    for item in iter {
+        let item = item?;
+        let dict = item.cast::<PyDict>()?;
+        let mut row = Vec::with_capacity(dict.len());
+        for (k, v) in dict.iter() {
+            let key_str: String = if let Ok(s) = k.cast::<PyString>() {
+                s.to_str()?.to_owned()
+            } else {
+                k.str()?.to_str()?.to_owned()
+            };
+            if let Ok(sv) = v.cast::<PyString>() {
+                let mut combined =
+                    String::with_capacity(key_str.len() + separator.len() + sv.len()?);
+                combined.push_str(&key_str);
+                combined.push_str(separator);
+                combined.push_str(sv.to_str()?);
+                row.push((combined, 1.0));
+            } else if v.is_instance_of::<PyBool>() {
+                let b: bool = v.extract()?;
+                row.push((key_str, if b { 1.0 } else { 0.0 }));
+            } else {
+                let val: f64 = v.extract()?;
+                if val != 0.0 {
+                    row.push((key_str, val));
+                }
+            }
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
 
 #[pyclass(from_py_object, name = "MissingIndicator")]
 #[derive(Clone)]
@@ -34,7 +73,7 @@ crate::pymethods_with_dit!(PyMissingIndicator, MissingIndicator, {
     }
 
     pub fn fit_buffer(&mut self, py: Python<'_>, x: PyBuffer<f64>) -> PyResult<()> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mat = buffer_to_pooled_matrix(py, &x)?;
         self.inner.fit(&mat)?;
         Ok(())
     }
@@ -44,9 +83,34 @@ crate::pymethods_with_dit!(PyMissingIndicator, MissingIndicator, {
         py: Python<'py>,
         x: PyBuffer<f64>,
     ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mat = buffer_to_pooled_matrix(py, &x)?;
         let out = self.inner.transform(&mat)?;
         matrix_to_pybytes(py, &out)
+    }
+
+    pub fn transform_u8_buffer<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyBuffer<f64>,
+    ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
+        let mat = buffer_to_pooled_matrix(py, &x)?;
+        let out = self.inner.transform_u8(&mat)?;
+        let n_out = self.inner.features_.as_ref().map_or(0, |f| f.len());
+        let bytes = PyBytes::new(py, &out);
+        Ok((mat.rows, n_out, bytes))
+    }
+
+    pub fn fit_transform_u8_buffer<'py>(
+        &mut self,
+        py: Python<'py>,
+        x: PyBuffer<f64>,
+    ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
+        let mat = buffer_to_pooled_matrix(py, &x)?;
+        self.inner.fit(&mat)?;
+        let out = self.inner.transform_u8(&mat)?;
+        let n_out = self.inner.features_.as_ref().map_or(0, |f| f.len());
+        let bytes = PyBytes::new(py, &out);
+        Ok((mat.rows, n_out, bytes))
     }
 
     #[getter]
@@ -91,7 +155,7 @@ crate::pymethods_with_dit!(PySimpleImputer, SimpleImputer, {
     }
 
     pub fn fit_buffer(&mut self, py: Python<'_>, x: PyBuffer<f64>) -> PyResult<()> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mat = buffer_to_pooled_matrix(py, &x)?;
         self.inner.fit_numeric(&mat)?;
         Ok(())
     }
@@ -107,9 +171,44 @@ crate::pymethods_with_dit!(PySimpleImputer, SimpleImputer, {
         py: Python<'py>,
         x: PyBuffer<f64>,
     ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mut mat = buffer_to_pooled_matrix(py, &x)?;
+        if self.inner.can_transform_numeric_inplace(mat.cols) {
+            self.inner.transform_numeric_inplace(&mut mat)?;
+            return matrix_to_pybytes(py, &mat);
+        }
         let out = self.inner.transform_numeric(&mat)?;
         matrix_to_pybytes(py, &out)
+    }
+
+    pub fn try_transform_into(
+        &self,
+        py: Python<'_>,
+        x: PyBuffer<f64>,
+        out: PyBuffer<f64>,
+    ) -> PyResult<bool> {
+        let mut mat = buffer_to_pooled_matrix(py, &x)?;
+        if !self.inner.can_transform_numeric_inplace(mat.cols) {
+            return Ok(false);
+        }
+        self.inner.transform_numeric_inplace(&mut mat)?;
+        write_slice_to_pybuffer(py, &mat.data, &out)?;
+        Ok(true)
+    }
+
+    pub fn try_fit_transform_into(
+        &mut self,
+        py: Python<'_>,
+        x: PyBuffer<f64>,
+        out: PyBuffer<f64>,
+    ) -> PyResult<bool> {
+        let mut mat = buffer_to_pooled_matrix(py, &x)?;
+        self.inner.fit_numeric(&mat)?;
+        if !self.inner.can_transform_numeric_inplace(mat.cols) {
+            return Ok(false);
+        }
+        self.inner.transform_numeric_inplace(&mut mat)?;
+        write_slice_to_pybuffer(py, &mat.data, &out)?;
+        Ok(true)
     }
 
     pub fn transform_objects<'py>(
@@ -190,7 +289,7 @@ crate::pymethods_with_dit!(PyKNNImputer, KNNImputer, {
     }
 
     pub fn fit_buffer(&mut self, py: Python<'_>, x: PyBuffer<f64>) -> PyResult<()> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mat = buffer_to_pooled_matrix(py, &x)?;
         self.inner.fit(&mat)?;
         Ok(())
     }
@@ -200,7 +299,7 @@ crate::pymethods_with_dit!(PyKNNImputer, KNNImputer, {
         py: Python<'py>,
         x: PyBuffer<f64>,
     ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mat = buffer_to_pooled_matrix(py, &x)?;
         let out = self.inner.transform(&mat)?;
         matrix_to_pybytes(py, &out)
     }
@@ -247,6 +346,16 @@ crate::pymethods_with_dit!(PyFeatureHasher, FeatureHasher, {
         csr_parts_to_py(py, parts)
     }
 
+    pub fn transform_dicts_csr<'py>(
+        &self,
+        py: Python<'py>,
+        rows: &Bound<'py, PyAny>,
+    ) -> PyResult<PyCsrTuple<'py>> {
+        let pairs = extract_py_dict_pairs(rows, "=")?;
+        let parts = self.inner.transform_pairs(&pairs)?;
+        csr_parts_to_py(py, parts)
+    }
+
     #[getter]
     pub fn n_features(&self) -> usize {
         self.inner.n_features
@@ -281,12 +390,39 @@ crate::pymethods_with_dit!(PyDictVectorizer, DictVectorizer, {
         Ok(())
     }
 
+    pub fn fit_dicts(&mut self, rows: &Bound<'_, PyAny>) -> PyResult<()> {
+        let pairs = extract_py_dict_pairs(rows, &self.inner.separator)?;
+        self.inner.fit(&pairs)?;
+        Ok(())
+    }
+
     pub fn transform_pairs_csr<'py>(
         &self,
         py: Python<'py>,
         rows: Vec<Vec<(String, f64)>>,
     ) -> PyResult<PyCsrTuple<'py>> {
         let parts = self.inner.transform(&rows)?;
+        csr_parts_to_py(py, parts)
+    }
+
+    pub fn transform_dicts_csr<'py>(
+        &self,
+        py: Python<'py>,
+        rows: &Bound<'py, PyAny>,
+    ) -> PyResult<PyCsrTuple<'py>> {
+        let pairs = extract_py_dict_pairs(rows, &self.inner.separator)?;
+        let parts = self.inner.transform(&pairs)?;
+        csr_parts_to_py(py, parts)
+    }
+
+    pub fn fit_transform_dicts_csr<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: &Bound<'py, PyAny>,
+    ) -> PyResult<PyCsrTuple<'py>> {
+        let pairs = extract_py_dict_pairs(rows, &self.inner.separator)?;
+        self.inner.fit(&pairs)?;
+        let parts = self.inner.transform(&pairs)?;
         csr_parts_to_py(py, parts)
     }
 
@@ -365,6 +501,51 @@ crate::pymethods_with_dit!(PyCountVectorizer, CountVectorizer, {
         csr_parts_to_py(py, parts)
     }
 
+    pub fn fit_transform_docs_csr<'py>(
+        &mut self,
+        py: Python<'py>,
+        docs: Vec<String>,
+    ) -> PyResult<PyCsrTuple<'py>> {
+        let tokens = self.inner.analyze_docs(&docs);
+        self.inner.fit_from_tokenized(&tokens)?;
+        let parts = self.inner.transform_from_tokenized(&tokens)?;
+        csr_parts_to_py(py, parts)
+    }
+
+    pub fn fit_transform_docs_tfidf_csr<'py>(
+        &mut self,
+        py: Python<'py>,
+        docs: Vec<String>,
+        tfidf: &mut PyTfidfTransformer,
+    ) -> PyResult<PyCsrTuple<'py>> {
+        let tokens = self.inner.analyze_docs(&docs);
+        self.inner.fit_from_tokenized(&tokens)?;
+        let (data, indices, indptr, n_rows, n_cols) =
+            self.inner.transform_from_tokenized(&tokens)?;
+        tfidf
+            .inner
+            .fit_csr(&data, &indices, &indptr, n_rows, n_cols)?;
+        let parts = tfidf
+            .inner
+            .transform_csr(&data, &indices, &indptr, n_rows, n_cols)?;
+        csr_parts_to_py(py, parts)
+    }
+
+    pub fn transform_docs_tfidf_csr<'py>(
+        &self,
+        py: Python<'py>,
+        docs: Vec<String>,
+        tfidf: &PyTfidfTransformer,
+    ) -> PyResult<PyCsrTuple<'py>> {
+        let tokens = self.inner.analyze_docs(&docs);
+        let (data, indices, indptr, n_rows, n_cols) =
+            self.inner.transform_from_tokenized(&tokens)?;
+        let parts = tfidf
+            .inner
+            .transform_csr(&data, &indices, &indptr, n_rows, n_cols)?;
+        csr_parts_to_py(py, parts)
+    }
+
     pub fn transform_tokenized_csr<'py>(
         &self,
         py: Python<'py>,
@@ -410,7 +591,7 @@ crate::pymethods_with_dit!(PyTfidfTransformer, TfidfTransformer, {
     }
 
     pub fn fit_buffer(&mut self, py: Python<'_>, x: PyBuffer<f64>) -> PyResult<()> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mat = buffer_to_pooled_matrix(py, &x)?;
         self.inner.fit_dense(&mat)?;
         Ok(())
     }
@@ -428,12 +609,28 @@ crate::pymethods_with_dit!(PyTfidfTransformer, TfidfTransformer, {
         Ok(())
     }
 
+    pub fn fit_csr_buffer(
+        &mut self,
+        py: Python<'_>,
+        data: PyBuffer<f64>,
+        indices: Bound<'_, PyAny>,
+        indptr: Bound<'_, PyAny>,
+        n_rows: usize,
+        n_cols: usize,
+    ) -> PyResult<()> {
+        let d = buffer_to_f64_1d(py, &data)?;
+        let idx = buffer_to_usize_1d(py, &indices)?;
+        let ptr = buffer_to_usize_1d(py, &indptr)?;
+        self.inner.fit_csr(&d, &idx, &ptr, n_rows, n_cols)?;
+        Ok(())
+    }
+
     pub fn transform_buffer<'py>(
         &self,
         py: Python<'py>,
         x: PyBuffer<f64>,
     ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mat = buffer_to_pooled_matrix(py, &x)?;
         let out = self.inner.transform_dense(&mat)?;
         matrix_to_pybytes(py, &out)
     }
@@ -450,6 +647,39 @@ crate::pymethods_with_dit!(PyTfidfTransformer, TfidfTransformer, {
         let parts = self
             .inner
             .transform_csr(&data, &indices, &indptr, n_rows, n_cols)?;
+        csr_parts_to_py(py, parts)
+    }
+
+    pub fn transform_csr_buffer<'py>(
+        &self,
+        py: Python<'py>,
+        data: PyBuffer<f64>,
+        indices: Bound<'py, PyAny>,
+        indptr: Bound<'py, PyAny>,
+        n_rows: usize,
+        n_cols: usize,
+    ) -> PyResult<PyCsrTuple<'py>> {
+        let d = buffer_to_f64_1d(py, &data)?;
+        let idx = buffer_to_usize_1d(py, &indices)?;
+        let ptr = buffer_to_usize_1d(py, &indptr)?;
+        let parts = self.inner.transform_csr(&d, &idx, &ptr, n_rows, n_cols)?;
+        csr_parts_to_py(py, parts)
+    }
+
+    pub fn fit_transform_csr_buffer<'py>(
+        &mut self,
+        py: Python<'py>,
+        data: PyBuffer<f64>,
+        indices: Bound<'py, PyAny>,
+        indptr: Bound<'py, PyAny>,
+        n_rows: usize,
+        n_cols: usize,
+    ) -> PyResult<PyCsrTuple<'py>> {
+        let d = buffer_to_f64_1d(py, &data)?;
+        let idx = buffer_to_usize_1d(py, &indices)?;
+        let ptr = buffer_to_usize_1d(py, &indptr)?;
+        self.inner.fit_csr(&d, &idx, &ptr, n_rows, n_cols)?;
+        let parts = self.inner.transform_csr(&d, &idx, &ptr, n_rows, n_cols)?;
         csr_parts_to_py(py, parts)
     }
 

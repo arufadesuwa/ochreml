@@ -99,21 +99,20 @@ class DictVectorizer:
 
     def fit(self, X: Iterable[Dict[str, Any]], y: Optional[Any] = None) -> "DictVectorizer":
         """Learn a list of feature name -> indices mappings (*≧ω≦*)."""
-        rows = [_dict_to_pairs(d, self.separator) for d in X]
-        self._model.fit_pairs(rows)
+        self._model.fit_dicts(X)
         return self
 
     def transform(self, X: Iterable[Dict[str, Any]]) -> Any:
         """Transform feature->value dicts to array or sparse matrix (o´∀｀o)."""
-        rows = [_dict_to_pairs(d, self.separator) for d in X]
-        parts = self._model.transform_pairs_csr(rows)
+        parts = self._model.transform_dicts_csr(X)
         mat = csr_bytes_to_scipy(parts, dtype=self.dtype)
         return mat if self.sparse else mat.toarray()
 
     def fit_transform(self, X: Iterable[Dict[str, Any]], y: Optional[Any] = None) -> Any:
         """Learn a list of feature name -> indices mappings and transform X (＾▽＾)."""
-        X_list = list(X)
-        return self.fit(X_list, y).transform(X_list)
+        parts = self._model.fit_transform_dicts_csr(X)
+        mat = csr_bytes_to_scipy(parts, dtype=self.dtype)
+        return mat if self.sparse else mat.toarray()
 
     def inverse_transform(self, X: Any, dict_type: Any = dict) -> List[Dict[str, Any]]:
         """Transform array or sparse matrix X back to feature mappings (*≧ω≦*)."""
@@ -258,11 +257,11 @@ class FeatureHasher:
 
     def transform(self, raw_X: Iterable[Any]) -> Any:
         """Transform a sequence of instances to a scipy.sparse matrix (*≧ω≦*)."""
-        rows: List[List[Tuple[str, float]]] = []
         if self.input_type == "dict":
-            for d in raw_X:
-                rows.append(_dict_to_pairs(d, "="))
-        elif self.input_type == "pair":
+            parts = self._model.transform_dicts_csr(raw_X)
+            return csr_bytes_to_scipy(parts, dtype=self.dtype)
+        rows: List[List[Tuple[str, float]]] = []
+        if self.input_type == "pair":
             for r in raw_X:
                 rows.append([(str(k), float(v)) for k, v in r])
         else:

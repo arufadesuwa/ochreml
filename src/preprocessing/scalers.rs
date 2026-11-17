@@ -11,9 +11,9 @@ use crate::dit_io::{
 use crate::error::{OchreError, OchreResult};
 use crate::matrix::Matrix;
 use crate::preprocessing::math_utils::{
-    compute_nan_col_stats, handle_zeros_in_scale, ndtri, percentile_sorted, slice_has_nan,
+    compute_nan_col_stats, handle_zeros_in_scale, ndtri, percentile_sorted,
 };
-use crate::primitives::ElementwiseOp;
+use crate::primitives::{cpu_col_scale_shift_clipped, cpu_col_scale_shift_inplace};
 use rayon::prelude::*;
 
 pub const TAG_STANDARD_SCALER: u8 = 7;
@@ -115,15 +115,16 @@ impl StandardScaler {
             return Ok(());
         }
 
-        let (batch_mean, batch_var, batch_w): (Vec<f64>, Vec<f64>, Vec<f64>) =
-            if slice_has_nan(&x.data) {
+        let (batch_mean, batch_var, batch_w): (Vec<f64>, Vec<f64>, Vec<f64>) = {
+            let stats = get_backend(&self.device).col_reduce_stats(x, sample_weight)?;
+            if stats.mean.iter().any(|v| v.is_nan()) {
                 let ns = compute_nan_col_stats(x, sample_weight)?;
                 (ns.mean, ns.var, ns.count)
             } else {
-                let stats = get_backend(&self.device).col_reduce_stats(x, sample_weight)?;
                 let w = vec![stats.total_weight; x.cols];
                 (stats.mean, stats.var, w)
-            };
+            }
+        };
 
         if self.mean_.is_none() {
             self.col_weights_ = batch_w;
@@ -176,15 +177,11 @@ impl StandardScaler {
         Ok(())
     }
 
-    pub fn transform(&self, x: &Matrix) -> OchreResult<Matrix> {
-        let cols = validate_fitted_cols(self.n_features_in_, x.cols)?;
-        if x.rows == 0 {
-            return Matrix::from_vec(0, cols, Vec::new());
-        }
+    fn scale_shift_params(&self, cols: usize) -> OchreResult<(Vec<f64>, Vec<f64>)> {
         let shift = if self.with_mean {
-            self.mean_.as_deref().ok_or(OchreError::NotFitted)?
+            self.mean_.clone().ok_or(OchreError::NotFitted)?
         } else {
-            &vec![0.0; cols]
+            vec![0.0; cols]
         };
         let inv_scale: Vec<f64> = if self.with_std {
             self.scale_
@@ -196,7 +193,25 @@ impl StandardScaler {
         } else {
             vec![1.0; cols]
         };
-        get_backend(&self.device).col_scale_shift(x, &inv_scale, shift)
+        Ok((inv_scale, shift))
+    }
+
+    pub fn transform(&self, x: &Matrix) -> OchreResult<Matrix> {
+        let cols = validate_fitted_cols(self.n_features_in_, x.cols)?;
+        if x.rows == 0 {
+            return Matrix::from_vec(0, cols, Vec::new());
+        }
+        let (inv_scale, shift) = self.scale_shift_params(cols)?;
+        get_backend(&self.device).col_scale_shift(x, &inv_scale, &shift)
+    }
+
+    pub fn transform_inplace(&self, x: &mut Matrix) -> OchreResult<()> {
+        let cols = validate_fitted_cols(self.n_features_in_, x.cols)?;
+        if x.rows == 0 {
+            return Ok(());
+        }
+        let (inv_scale, shift) = self.scale_shift_params(cols)?;
+        cpu_col_scale_shift_inplace(x, &inv_scale, &shift, None)
     }
 
     pub fn inverse_transform(&self, x: &Matrix) -> OchreResult<Matrix> {
@@ -331,12 +346,14 @@ impl MinMaxScaler {
         self.device_ = Some(self.device.to_string());
         self.n_samples_seen_ += x.rows;
 
-        let (batch_min, batch_max) = if slice_has_nan(&x.data) {
-            let ns = compute_nan_col_stats(x, None)?;
-            (ns.min, ns.max)
-        } else {
+        let (batch_min, batch_max) = {
             let stats = get_backend(&self.device).col_reduce_stats(x, None)?;
-            (stats.min, stats.max)
+            if stats.min.iter().any(|v| v.is_nan()) || stats.max.iter().any(|v| v.is_nan()) {
+                let ns = compute_nan_col_stats(x, None)?;
+                (ns.min, ns.max)
+            } else {
+                (stats.min, stats.max)
+            }
         };
 
         let (data_min, data_max) = match (self.data_min_.take(), self.data_max_.take()) {
@@ -382,18 +399,28 @@ impl MinMaxScaler {
         let scale = self.scale_.as_ref().ok_or(OchreError::NotFitted)?;
         let min_offset = self.min_.as_ref().ok_or(OchreError::NotFitted)?;
         let shift: Vec<f64> = (0..cols).map(|j| -min_offset[j] / scale[j]).collect();
-        let backend = get_backend(&self.device);
-        let out = backend.col_scale_shift(x, scale, &shift)?;
-        if self.clip {
-            return backend.elementwise_op(
-                &out,
-                ElementwiseOp::Clip {
-                    min: self.feature_range.0,
-                    max: self.feature_range.1,
-                },
-            );
+        let clip_range = if self.clip {
+            Some(self.feature_range)
+        } else {
+            None
+        };
+        cpu_col_scale_shift_clipped(x, scale, &shift, clip_range)
+    }
+
+    pub fn transform_inplace(&self, x: &mut Matrix) -> OchreResult<()> {
+        let cols = validate_fitted_cols(self.n_features_in_, x.cols)?;
+        if x.rows == 0 {
+            return Ok(());
         }
-        Ok(out)
+        let scale = self.scale_.as_ref().ok_or(OchreError::NotFitted)?;
+        let min_offset = self.min_.as_ref().ok_or(OchreError::NotFitted)?;
+        let shift: Vec<f64> = (0..cols).map(|j| -min_offset[j] / scale[j]).collect();
+        let clip_range = if self.clip {
+            Some(self.feature_range)
+        } else {
+            None
+        };
+        cpu_col_scale_shift_inplace(x, scale, &shift, clip_range)
     }
 
     pub fn inverse_transform(&self, x: &Matrix) -> OchreResult<Matrix> {
@@ -503,12 +530,14 @@ impl MaxAbsScaler {
         self.device_ = Some(self.device.to_string());
         self.n_samples_seen_ += x.rows;
 
-        let (bmin, bmax) = if slice_has_nan(&x.data) {
-            let ns = compute_nan_col_stats(x, None)?;
-            (ns.min, ns.max)
-        } else {
+        let (bmin, bmax) = {
             let stats = get_backend(&self.device).col_reduce_stats(x, None)?;
-            (stats.min, stats.max)
+            if stats.min.iter().any(|v| v.is_nan()) || stats.max.iter().any(|v| v.is_nan()) {
+                let ns = compute_nan_col_stats(x, None)?;
+                (ns.min, ns.max)
+            } else {
+                (stats.min, stats.max)
+            }
         };
 
         let batch_abs: Vec<f64> = (0..x.cols)
@@ -540,6 +569,17 @@ impl MaxAbsScaler {
         let inv_scale: Vec<f64> = scale.iter().map(|&s| 1.0 / s).collect();
         let zeros = vec![0.0; cols];
         get_backend(&self.device).col_scale_shift(x, &inv_scale, &zeros)
+    }
+
+    pub fn transform_inplace(&self, x: &mut Matrix) -> OchreResult<()> {
+        let cols = validate_fitted_cols(self.n_features_in_, x.cols)?;
+        if x.rows == 0 {
+            return Ok(());
+        }
+        let scale = self.scale_.as_ref().ok_or(OchreError::NotFitted)?;
+        let inv_scale: Vec<f64> = scale.iter().map(|&s| 1.0 / s).collect();
+        let zeros = vec![0.0; cols];
+        cpu_col_scale_shift_inplace(x, &inv_scale, &zeros, None)
     }
 
     pub fn inverse_transform(&self, x: &Matrix) -> OchreResult<Matrix> {
@@ -711,6 +751,29 @@ impl RobustScaler {
         get_backend(&self.device).col_scale_shift(x, &inv_scale, shift)
     }
 
+    pub fn transform_inplace(&self, x: &mut Matrix) -> OchreResult<()> {
+        let cols = validate_fitted_cols(self.n_features_in_, x.cols)?;
+        if x.rows == 0 {
+            return Ok(());
+        }
+        let shift = if self.with_centering {
+            self.center_.clone().ok_or(OchreError::NotFitted)?
+        } else {
+            vec![0.0; cols]
+        };
+        let inv_scale: Vec<f64> = if self.with_scaling {
+            self.scale_
+                .as_ref()
+                .ok_or(OchreError::NotFitted)?
+                .iter()
+                .map(|&s| 1.0 / s)
+                .collect()
+        } else {
+            vec![1.0; cols]
+        };
+        cpu_col_scale_shift_inplace(x, &inv_scale, &shift, None)
+    }
+
     pub fn inverse_transform(&self, x: &Matrix) -> OchreResult<Matrix> {
         let cols = validate_fitted_cols(self.n_features_in_, x.cols)?;
         if x.rows == 0 {
@@ -873,6 +936,74 @@ pub fn normalize_matrix(x: &Matrix, norm: &str, axis: usize) -> OchreResult<(Mat
     Ok((out, norms))
 }
 
+pub fn normalize_matrix_inplace(x: &mut Matrix, norm: &str, axis: usize) -> OchreResult<Vec<f64>> {
+    validate_norm_kind(norm)?;
+    if axis > 1 {
+        return Err(OchreError::InvalidParameter(format!(
+            "axis must be 0 or 1, got {} ( >_< )",
+            axis
+        )));
+    }
+    if x.rows == 0 || x.cols == 0 {
+        return Err(OchreError::EmptyData);
+    }
+
+    if axis == 1 {
+        let cols = x.cols;
+        let mut norms = vec![0.0; x.rows];
+        let process = |(row, norm_out): (&mut [f64], &mut f64)| {
+            let n = match norm {
+                "l1" => row.iter().map(|v| v.abs()).sum::<f64>(),
+                "l2" => row.iter().map(|v| v * v).sum::<f64>().sqrt(),
+                _ => row.iter().fold(0.0f64, |acc, v| acc.max(v.abs())),
+            };
+            *norm_out = n;
+            if n != 0.0 {
+                let inv = 1.0 / n;
+                for v in row.iter_mut() {
+                    *v *= inv;
+                }
+            }
+        };
+        if x.rows * cols < 16_384 {
+            x.data
+                .chunks_exact_mut(cols)
+                .zip(norms.iter_mut())
+                .for_each(process);
+        } else {
+            x.data
+                .par_chunks_mut(cols)
+                .zip(norms.par_iter_mut())
+                .for_each(process);
+        }
+        return Ok(norms);
+    }
+
+    let rows = x.rows;
+    let cols = x.cols;
+    let norms: Vec<f64> = (0..cols)
+        .into_par_iter()
+        .map(|j| match norm {
+            "l1" => (0..rows).map(|r| x.data[r * cols + j].abs()).sum::<f64>(),
+            "l2" => (0..rows)
+                .map(|r| {
+                    let v = x.data[r * cols + j];
+                    v * v
+                })
+                .sum::<f64>()
+                .sqrt(),
+            _ => (0..rows).fold(0.0f64, |acc, r| acc.max(x.data[r * cols + j].abs())),
+        })
+        .collect();
+    let inv_scale: Vec<f64> = norms
+        .iter()
+        .map(|&n| if n == 0.0 { 1.0 } else { 1.0 / n })
+        .collect();
+    let zeros = vec![0.0; cols];
+    cpu_col_scale_shift_inplace(x, &inv_scale, &zeros, None)?;
+    Ok(norms)
+}
+
 impl Normalizer {
     pub fn new(norm: String, device: Option<String>) -> OchreResult<Self> {
         validate_norm_kind(&norm)?;
@@ -905,6 +1036,19 @@ impl Normalizer {
         }
         let (out, _) = normalize_matrix(x, &self.norm, 1)?;
         Ok(out)
+    }
+
+    pub fn transform_inplace(&self, x: &mut Matrix) -> OchreResult<()> {
+        if let Some(expected) = self.n_features_in_
+            && x.cols != expected
+        {
+            return Err(OchreError::FeatureCountMismatch {
+                features: x.cols,
+                expected,
+            });
+        }
+        let _ = normalize_matrix_inplace(x, &self.norm, 1)?;
+        Ok(())
     }
 
     pub fn set_device(&mut self, device: Option<String>) -> OchreResult<()> {

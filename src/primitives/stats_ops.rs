@@ -197,8 +197,13 @@ pub fn cpu_col_reduce_stats(x: &Matrix, sample_weight: Option<&[f64]>) -> OchreR
     })
 }
 
-/// Apply `(x[i, j] - shift[j]) * scale[j]` across columns in parallel.
-pub fn cpu_col_scale_shift(x: &Matrix, scale: &[f64], shift: &[f64]) -> OchreResult<Matrix> {
+/// Apply `(x[i, j] - shift[j]) * scale[j]` with optional `[min, max]` clamp across columns in parallel.
+pub fn cpu_col_scale_shift_clipped(
+    x: &Matrix,
+    scale: &[f64],
+    shift: &[f64],
+    clip: Option<(f64, f64)>,
+) -> OchreResult<Matrix> {
     if scale.len() != x.cols || shift.len() != x.cols {
         return Err(OchreError::FeatureCountMismatch {
             features: scale.len().max(shift.len()),
@@ -208,28 +213,79 @@ pub fn cpu_col_scale_shift(x: &Matrix, scale: &[f64], shift: &[f64]) -> OchreRes
     let cols = x.cols;
     let mut out = vec![0.0; x.rows * cols];
 
-    if x.rows * cols < 16_384 {
-        for (dst_row, src_row) in out.chunks_exact_mut(cols).zip(x.data.chunks_exact(cols)) {
-            for j in 0..cols {
-                dst_row[j] = (src_row[j] - shift[j]) * scale[j];
-            }
-        }
-    } else {
-        out.par_chunks_mut(cols * 512)
-            .zip(x.data.par_chunks(cols * 512))
-            .for_each(|(dst_blk, src_blk)| {
-                for (dst_row, src_row) in dst_blk
-                    .chunks_exact_mut(cols)
-                    .zip(src_blk.chunks_exact(cols))
-                {
+    let apply_block = |(dst_blk, src_blk): (&mut [f64], &[f64])| {
+        for (dst_row, src_row) in dst_blk
+            .chunks_exact_mut(cols)
+            .zip(src_blk.chunks_exact(cols))
+        {
+            match clip {
+                Some((cmin, cmax)) => {
+                    for j in 0..cols {
+                        dst_row[j] = ((src_row[j] - shift[j]) * scale[j]).clamp(cmin, cmax);
+                    }
+                }
+                None => {
                     for j in 0..cols {
                         dst_row[j] = (src_row[j] - shift[j]) * scale[j];
                     }
                 }
-            });
+            }
+        }
+    };
+
+    if x.rows * cols < 16_384 {
+        apply_block((&mut out, &x.data));
+    } else {
+        out.par_chunks_mut(cols * 512)
+            .zip(x.data.par_chunks(cols * 512))
+            .for_each(apply_block);
     }
 
     Matrix::from_vec(x.rows, cols, out)
+}
+
+/// Apply `(x[i, j] - shift[j]) * scale[j]` in-place across columns in parallel.
+pub fn cpu_col_scale_shift_inplace(
+    x: &mut Matrix,
+    scale: &[f64],
+    shift: &[f64],
+    clip: Option<(f64, f64)>,
+) -> OchreResult<()> {
+    if scale.len() != x.cols || shift.len() != x.cols {
+        return Err(OchreError::FeatureCountMismatch {
+            features: scale.len().max(shift.len()),
+            expected: x.cols,
+        });
+    }
+    let cols = x.cols;
+    let apply_block = |blk: &mut [f64]| {
+        for row in blk.chunks_exact_mut(cols) {
+            match clip {
+                Some((cmin, cmax)) => {
+                    for j in 0..cols {
+                        row[j] = ((row[j] - shift[j]) * scale[j]).clamp(cmin, cmax);
+                    }
+                }
+                None => {
+                    for j in 0..cols {
+                        row[j] = (row[j] - shift[j]) * scale[j];
+                    }
+                }
+            }
+        }
+    };
+
+    if x.rows * cols < 16_384 {
+        apply_block(&mut x.data);
+    } else {
+        x.data.par_chunks_mut(cols * 512).for_each(apply_block);
+    }
+    Ok(())
+}
+
+/// Apply `(x[i, j] - shift[j]) * scale[j]` across columns in parallel.
+pub fn cpu_col_scale_shift(x: &Matrix, scale: &[f64], shift: &[f64]) -> OchreResult<Matrix> {
+    cpu_col_scale_shift_clipped(x, scale, shift, None)
 }
 
 /// Apply an elementwise operation out-of-place on CPU.

@@ -12,7 +12,7 @@ from .._ochreml import (
     Normalizer as _RustNormalizer,
     RobustScaler as _RustRobustScaler,
     StandardScaler as _RustStandardScaler,
-    _rust_normalize_buffer,
+    _rust_normalize_into,
 )
 from .._preproc_utils import bytes_to_f64_2d, validate_dit_path
 from .._utils import process_features, process_sample_weight
@@ -39,9 +39,18 @@ class _BaseScaler:
             X_data = np.asarray(X_data, dtype=np.float64)
         return X_data
 
+    def _transform_into(self, X: Any) -> np.ndarray:
+        X_data = self._fit_x(X)
+        out = np.empty(X_data.shape, dtype=np.float64)
+        self._model.transform_into(X_data, out)
+        return out
+
     def fit_transform(self, X: Any, y: Optional[Any] = None, **fit_params: Any) -> Any:
         """Fit to data, then transform it (*≧ω≦*)."""
-        return self.fit(X, y, **fit_params).transform(X)
+        X_data = self._fit_x(X)
+        out = np.empty(X_data.shape, dtype=np.float64)
+        self._model.fit_transform_into(X_data, out)
+        return out
 
     def save(self, path: str) -> None:
         """Save fitted scaler to a binary '.dit' file (＾▽＾)."""
@@ -158,11 +167,21 @@ class StandardScaler(_BaseScaler):
         self._model.partial_fit_buffer(X_data, sw_data)
         return self
 
+    def fit_transform(
+        self, X: Any, y: Optional[Any] = None, sample_weight: Optional[Any] = None
+    ) -> np.ndarray:
+        """Fit to data, then standardize it in one fused pass (*≧ω≦*)."""
+        X_data = self._fit_x(X)
+        _, sw_data = process_sample_weight(sample_weight)
+        if sw_data is not None and not isinstance(sw_data, np.ndarray):
+            sw_data = np.asarray(sw_data, dtype=np.float64)
+        out = np.empty(X_data.shape, dtype=np.float64)
+        self._model.fit_transform_into(X_data, out, sw_data)
+        return out
+
     def transform(self, X: Any) -> np.ndarray:
         """Perform standardization by centering and scaling (*≧ω≦*)."""
-        X_data = self._fit_x(X)
-        rows, cols, raw = self._model.transform_buffer(X_data)
-        return bytes_to_f64_2d(rows, cols, raw)
+        return self._transform_into(X)
 
     def inverse_transform(self, X: Any) -> np.ndarray:
         """Scale back the data to the original representation (＾▽＾)."""
@@ -259,8 +278,7 @@ class MinMaxScaler(_BaseScaler):
 
     def transform(self, X: Any) -> np.ndarray:
         """Scale features of X according to feature_range (o´∀｀o)."""
-        rows, cols, raw = self._model.transform_buffer(self._fit_x(X))
-        return bytes_to_f64_2d(rows, cols, raw)
+        return self._transform_into(X)
 
     def inverse_transform(self, X: Any) -> np.ndarray:
         """Undo the scaling of X according to feature_range (＾▽＾)."""
@@ -345,8 +363,7 @@ class MaxAbsScaler(_BaseScaler):
 
     def transform(self, X: Any) -> np.ndarray:
         """Scale the data (*≧ω≦*)."""
-        rows, cols, raw = self._model.transform_buffer(self._fit_x(X))
-        return bytes_to_f64_2d(rows, cols, raw)
+        return self._transform_into(X)
 
     def inverse_transform(self, X: Any) -> np.ndarray:
         """Scale back the data to the original representation (＾▽＾)."""
@@ -446,8 +463,7 @@ class RobustScaler(_BaseScaler):
 
     def transform(self, X: Any) -> np.ndarray:
         """Center and scale the data (＾▽＾)."""
-        rows, cols, raw = self._model.transform_buffer(self._fit_x(X))
-        return bytes_to_f64_2d(rows, cols, raw)
+        return self._transform_into(X)
 
     def inverse_transform(self, X: Any) -> np.ndarray:
         """Scale back the data to the original representation (o´∀｀o)."""
@@ -516,8 +532,7 @@ class Normalizer(_BaseScaler):
 
     def transform(self, X: Any, copy: Optional[bool] = None) -> np.ndarray:
         """Scale each non zero row of X to unit norm (*≧ω≦*)."""
-        rows, cols, raw = self._model.transform_buffer(self._fit_x(X))
-        return bytes_to_f64_2d(rows, cols, raw)
+        return self._transform_into(X)
 
     def __repr__(self) -> str:
         return f"Normalizer(norm='{self.norm}', device='{self.device}') (o´∀｀o)"
@@ -640,8 +655,8 @@ def normalize(
     else:
         raise ValueError(f"Expected 1D or 2D array, got {arr.ndim}D ( >_< )")
 
-    rows, cols, raw, norms = _rust_normalize_buffer(arr2d, norm=norm, axis=axis)
-    out = bytes_to_f64_2d(rows, cols, raw)
+    out = np.empty(arr2d.shape, dtype=np.float64)
+    norms = _rust_normalize_into(arr2d, out, norm=norm, axis=axis)
     if was_1d:
         out = out.ravel()
     if return_norm:

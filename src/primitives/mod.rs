@@ -20,7 +20,8 @@ pub use histogram::{
 };
 pub use stats_ops::{
     ColStats, ElementwiseOp, cpu_axpy, cpu_col_reduce_stats, cpu_col_scale_shift,
-    cpu_elementwise_op, cpu_elementwise_op_inplace, cpu_row_softmax,
+    cpu_col_scale_shift_clipped, cpu_col_scale_shift_inplace, cpu_elementwise_op,
+    cpu_elementwise_op_inplace, cpu_row_softmax,
 };
 
 impl<'a> Backend<'a> {
