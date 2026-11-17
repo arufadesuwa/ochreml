@@ -7,7 +7,7 @@ use crate::preprocessing::py_helpers::{
 };
 use crate::preprocessing::scalers::{
     MaxAbsScaler, MinMaxScaler, Normalizer, RobustScaler, StandardScaler, normalize_matrix,
-    normalize_matrix_inplace,
+    normalize_matrix_inplace_opt,
 };
 use crate::preprocessing::transforms::{
     Binarizer, KBinsDiscretizer, PowerTransformer, QuantileTransformer, binarize_matrix,
@@ -589,7 +589,7 @@ crate::pymethods_with_dit!(PyKernelCenterer, KernelCenterer, {
     }
 
     pub fn fit_buffer(&mut self, py: Python<'_>, k: PyBuffer<f64>) -> PyResult<()> {
-        let mat = buffer_to_matrix(py, &k)?;
+        let mat = buffer_to_pooled_matrix(py, &k)?;
         self.inner.fit(&mat)?;
         Ok(())
     }
@@ -599,9 +599,32 @@ crate::pymethods_with_dit!(PyKernelCenterer, KernelCenterer, {
         py: Python<'py>,
         k: PyBuffer<f64>,
     ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
-        let mat = buffer_to_matrix(py, &k)?;
-        let out = self.inner.transform(&mat)?;
-        matrix_to_pybytes(py, &out)
+        let mut mat = buffer_to_pooled_matrix(py, &k)?;
+        self.inner.transform_inplace(&mut mat)?;
+        matrix_to_pybytes(py, &mat)
+    }
+
+    pub fn transform_into(
+        &self,
+        py: Python<'_>,
+        k: PyBuffer<f64>,
+        out: PyBuffer<f64>,
+    ) -> PyResult<()> {
+        let mut mat = buffer_to_pooled_matrix(py, &k)?;
+        self.inner.transform_inplace(&mut mat)?;
+        write_slice_to_pybuffer(py, &mat.data, &out)
+    }
+
+    pub fn fit_transform_into(
+        &mut self,
+        py: Python<'_>,
+        k: PyBuffer<f64>,
+        out: PyBuffer<f64>,
+    ) -> PyResult<()> {
+        let mut mat = buffer_to_pooled_matrix(py, &k)?;
+        self.inner.fit(&mat)?;
+        self.inner.transform_inplace(&mut mat)?;
+        write_slice_to_pybuffer(py, &mat.data, &out)
     }
 
     #[getter]
@@ -653,6 +676,11 @@ crate::pymethods_with_dit!(PyPolynomialFeatures, PolynomialFeatures, {
         Ok(())
     }
 
+    pub fn fit_dims(&mut self, n_features: usize) -> PyResult<()> {
+        self.inner.fit_dims(n_features)?;
+        Ok(())
+    }
+
     pub fn transform_buffer<'py>(
         &self,
         py: Python<'py>,
@@ -661,6 +689,22 @@ crate::pymethods_with_dit!(PyPolynomialFeatures, PolynomialFeatures, {
         let mat = buffer_to_pooled_matrix(py, &x)?;
         let out = self.inner.transform(&mat)?;
         matrix_to_pybytes(py, &out)
+    }
+
+    pub fn transform_into(
+        &self,
+        py: Python<'_>,
+        x: PyBuffer<f64>,
+        out: PyBuffer<f64>,
+    ) -> PyResult<()> {
+        let mat = buffer_to_pooled_matrix(py, &x)?;
+        let n_out = self
+            .inner
+            .n_output_features_
+            .ok_or(crate::error::OchreError::NotFitted)?;
+        let mut buf = vec![0.0; mat.rows * n_out];
+        self.inner.transform_to_slice(&mat, &mut buf)?;
+        write_slice_to_pybuffer(py, &buf, &out)
     }
 
     #[getter]
@@ -735,12 +779,12 @@ crate::pymethods_with_dit!(PySplineTransformer, SplineTransformer, {
         x: PyBuffer<f64>,
         custom_knots: Option<PyBuffer<f64>>,
     ) -> PyResult<()> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mat = buffer_to_pooled_matrix(py, &x)?;
         let ck = match custom_knots {
-            Some(ref b) => Some(buffer_to_matrix(py, b)?),
+            Some(ref b) => Some(buffer_to_pooled_matrix(py, b)?),
             None => None,
         };
-        self.inner.fit(&mat, ck.as_ref())?;
+        self.inner.fit(&mat, ck.as_deref())?;
         Ok(())
     }
 
@@ -749,9 +793,20 @@ crate::pymethods_with_dit!(PySplineTransformer, SplineTransformer, {
         py: Python<'py>,
         x: PyBuffer<f64>,
     ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mat = buffer_to_pooled_matrix(py, &x)?;
         let out = self.inner.transform(&mat)?;
         matrix_to_pybytes(py, &out)
+    }
+
+    pub fn transform_into(
+        &self,
+        py: Python<'_>,
+        x: PyBuffer<f64>,
+        out: PyBuffer<f64>,
+    ) -> PyResult<()> {
+        let mat = buffer_to_pooled_matrix(py, &x)?;
+        let res = self.inner.transform(&mat)?;
+        write_slice_to_pybuffer(py, &res.data, &out)
     }
 
     #[getter]
@@ -808,7 +863,7 @@ crate::pymethods_with_dit!(PyPowerTransformer, PowerTransformer, {
     }
 
     pub fn fit_buffer(&mut self, py: Python<'_>, x: PyBuffer<f64>) -> PyResult<()> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mat = buffer_to_pooled_matrix(py, &x)?;
         self.inner.fit(&mat)?;
         Ok(())
     }
@@ -818,7 +873,7 @@ crate::pymethods_with_dit!(PyPowerTransformer, PowerTransformer, {
         py: Python<'py>,
         x: PyBuffer<f64>,
     ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mat = buffer_to_pooled_matrix(py, &x)?;
         let out = self.inner.fit_transform(&mat)?;
         matrix_to_pybytes(py, &out)
     }
@@ -828,9 +883,31 @@ crate::pymethods_with_dit!(PyPowerTransformer, PowerTransformer, {
         py: Python<'py>,
         x: PyBuffer<f64>,
     ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mat = buffer_to_pooled_matrix(py, &x)?;
         let out = self.inner.transform(&mat)?;
         matrix_to_pybytes(py, &out)
+    }
+
+    pub fn transform_into(
+        &self,
+        py: Python<'_>,
+        x: PyBuffer<f64>,
+        out: PyBuffer<f64>,
+    ) -> PyResult<()> {
+        let mat = buffer_to_pooled_matrix(py, &x)?;
+        let res = self.inner.transform(&mat)?;
+        write_slice_to_pybuffer(py, &res.data, &out)
+    }
+
+    pub fn fit_transform_into(
+        &mut self,
+        py: Python<'_>,
+        x: PyBuffer<f64>,
+        out: PyBuffer<f64>,
+    ) -> PyResult<()> {
+        let mat = buffer_to_pooled_matrix(py, &x)?;
+        let res = self.inner.fit_transform(&mat)?;
+        write_slice_to_pybuffer(py, &res.data, &out)
     }
 
     pub fn inverse_transform_buffer<'py>(
@@ -838,7 +915,7 @@ crate::pymethods_with_dit!(PyPowerTransformer, PowerTransformer, {
         py: Python<'py>,
         x: PyBuffer<f64>,
     ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
-        let mat = buffer_to_matrix(py, &x)?;
+        let mat = buffer_to_pooled_matrix(py, &x)?;
         let out = self.inner.inverse_transform(&mat)?;
         matrix_to_pybytes(py, &out)
     }
@@ -1032,16 +1109,17 @@ pub fn _rust_normalize_buffer<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (x, out, norm = "l2", axis = 1))]
+#[pyo3(signature = (x, out, norm = "l2", axis = 1, return_norms = true))]
 pub fn _rust_normalize_into(
     py: Python<'_>,
     x: PyBuffer<f64>,
     out: PyBuffer<f64>,
     norm: &str,
     axis: usize,
+    return_norms: bool,
 ) -> PyResult<Vec<f64>> {
     let mut mat = buffer_to_pooled_matrix(py, &x)?;
-    let norms = normalize_matrix_inplace(&mut mat, norm, axis)?;
+    let norms = normalize_matrix_inplace_opt(&mut mat, norm, axis, return_norms)?;
     write_slice_to_pybuffer(py, &mat.data, &out)?;
     Ok(norms)
 }

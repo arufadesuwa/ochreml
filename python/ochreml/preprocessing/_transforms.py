@@ -144,13 +144,17 @@ class PowerTransformer(_BaseTransform):
 
     def fit_transform(self, X: Any, y: Optional[Any] = None) -> np.ndarray:
         """Fit and transform X in a single fused Rust pass (*≧ω≦*)."""
-        rows, cols, raw = self._model.fit_transform_buffer(self._fit_x(X))
-        return bytes_to_f64_2d(rows, cols, raw)
+        X_data = self._fit_x(X)
+        out = np.empty(X_data.shape, dtype=np.float64)
+        self._model.fit_transform_into(X_data, out)
+        return out
 
     def transform(self, X: Any) -> np.ndarray:
         """Apply the power transform to each feature using fitted lambdas (o´∀｀o)."""
-        rows, cols, raw = self._model.transform_buffer(self._fit_x(X))
-        return bytes_to_f64_2d(rows, cols, raw)
+        X_data = self._fit_x(X)
+        out = np.empty(X_data.shape, dtype=np.float64)
+        self._model.transform_into(X_data, out)
+        return out
 
     def inverse_transform(self, X: Any) -> np.ndarray:
         """Apply the inverse power transformation using fitted lambdas (＾▽＾)."""

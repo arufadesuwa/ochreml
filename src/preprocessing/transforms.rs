@@ -109,34 +109,51 @@ fn box_cox_inverse_scalar(x: f64, lmbda: f64) -> f64 {
     }
 }
 
-fn yeo_johnson_neg_llf(vals: &[f64], lmbda: f64) -> f64 {
+fn variance_with_scratch(vals: &[f64], ys: &[f64]) -> f64 {
     let n = vals.len() as f64;
-    let mut ys = Vec::with_capacity(vals.len());
-    let mut sum = 0.0;
-    let mut log_jacobian = 0.0;
-    for &x in vals {
-        let y = yeo_johnson_transform_scalar(x, lmbda);
+    let sum: f64 = ys.iter().sum();
+    let mean = sum / n;
+    (ys.iter().map(|&y| (y - mean) * (y - mean)).sum::<f64>() / n).max(1e-300)
+}
+
+fn yeo_johnson_neg_llf_pre(
+    s_logs: &[f64],
+    is_nonneg: &[bool],
+    log_jacobian: f64,
+    lmbda: f64,
+    ys: &mut [f64],
+) -> f64 {
+    let n = s_logs.len() as f64;
+    let pos_small = lmbda.abs() < 1e-15;
+    let neg_l = 2.0 - lmbda;
+    let neg_small = neg_l.abs() < 1e-15;
+    for i in 0..s_logs.len() {
+        let sl = s_logs[i];
+        let y = if is_nonneg[i] {
+            if pos_small {
+                sl
+            } else {
+                (lmbda * sl).exp_m1() / lmbda
+            }
+        } else if neg_small {
+            sl
+        } else {
+            -((-neg_l * sl).exp_m1()) / neg_l
+        };
         if !y.is_finite() {
             return f64::INFINITY;
         }
-        ys.push(y);
-        sum += y;
-        let sgn_log = if x >= 0.0 { x.ln_1p() } else { -(-x).ln_1p() };
-        log_jacobian += sgn_log;
+        ys[i] = y;
     }
-    let mean = sum / n;
-    let var = (ys.iter().map(|&y| (y - mean) * (y - mean)).sum::<f64>() / n).max(1e-300);
+    let var = variance_with_scratch(s_logs, ys);
     0.5 * n * var.ln() - (lmbda - 1.0) * log_jacobian
 }
 
-fn box_cox_neg_llf(vals: &[f64], lmbda: f64) -> f64 {
-    let n = vals.len() as f64;
-    let mut ys = Vec::with_capacity(vals.len());
-    let mut sum = 0.0;
-    let mut log_sum = 0.0;
-    for &x in vals {
-        let lx = x.ln();
-        let y = if lmbda.abs() < 1e-15 {
+fn box_cox_neg_llf_pre(logs: &[f64], log_sum: f64, lmbda: f64, ys: &mut [f64]) -> f64 {
+    let n = logs.len() as f64;
+    let is_small = lmbda.abs() < 1e-15;
+    for (dst, &lx) in ys.iter_mut().zip(logs.iter()) {
+        let y = if is_small {
             lx
         } else {
             (lmbda * lx).exp_m1() / lmbda
@@ -144,12 +161,9 @@ fn box_cox_neg_llf(vals: &[f64], lmbda: f64) -> f64 {
         if !y.is_finite() {
             return f64::INFINITY;
         }
-        ys.push(y);
-        sum += y;
-        log_sum += lx;
+        *dst = y;
     }
-    let mean = sum / n;
-    let var = (ys.iter().map(|&y| (y - mean) * (y - mean)).sum::<f64>() / n).max(1e-300);
+    let var = variance_with_scratch(logs, ys);
     0.5 * n * var.ln() - (lmbda - 1.0) * log_sum
 }
 
@@ -232,9 +246,33 @@ impl PowerTransformer {
                     return Ok(1.0);
                 }
                 let opt = if is_box_cox {
-                    brent_minimize(|lam| box_cox_neg_llf(&col_vals, lam), -2.0, 2.0, 1e-11)
+                    let logs: Vec<f64> = col_vals.iter().map(|&x| x.ln()).collect();
+                    let log_sum: f64 = logs.iter().sum();
+                    let mut ys = vec![0.0; logs.len()];
+                    brent_minimize(
+                        |lam| box_cox_neg_llf_pre(&logs, log_sum, lam, &mut ys),
+                        -2.0,
+                        2.0,
+                        1e-11,
+                    )
                 } else {
-                    brent_minimize(|lam| yeo_johnson_neg_llf(&col_vals, lam), -2.0, 2.0, 1e-11)
+                    let mut s_logs = Vec::with_capacity(col_vals.len());
+                    let mut is_nonneg = Vec::with_capacity(col_vals.len());
+                    let mut log_jacobian = 0.0;
+                    for &x in &col_vals {
+                        let nn = x >= 0.0;
+                        let sl = if nn { x.ln_1p() } else { -(-x).ln_1p() };
+                        s_logs.push(sl);
+                        is_nonneg.push(nn);
+                        log_jacobian += sl;
+                    }
+                    let mut ys = vec![0.0; s_logs.len()];
+                    brent_minimize(
+                        |lam| yeo_johnson_neg_llf_pre(&s_logs, &is_nonneg, log_jacobian, lam, &mut ys),
+                        -2.0,
+                        2.0,
+                        1e-11,
+                    )
                 };
                 Ok(opt)
             })
@@ -249,17 +287,15 @@ impl PowerTransformer {
             return Ok(None);
         }
 
-        let transformed = self.apply_power_only(x, &lambdas)?;
+        let mut transformed = self.apply_power_only(x, &lambdas)?;
         if self.standardize {
             let mut scaler = StandardScaler::new(true, true, Some(self.device.to_string()))?;
             scaler.fit(&transformed, None)?;
-            let out = if return_out {
-                Some(scaler.transform(&transformed)?)
-            } else {
-                None
-            };
+            if return_out {
+                scaler.transform_inplace(&mut transformed)?;
+            }
             self.scaler_ = Some(scaler);
-            Ok(out)
+            Ok(if return_out { Some(transformed) } else { None })
         } else {
             self.scaler_ = None;
             Ok(if return_out { Some(transformed) } else { None })

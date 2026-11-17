@@ -211,7 +211,7 @@ pub fn ndtri(p: f64) -> f64 {
 }
 
 /// Brent's 1D minimization over bracket `(ax, bx, cx)` or `[a, b]` matching `scipy.optimize.brent`.
-pub fn brent_minimize<F: Fn(f64) -> f64>(f: F, mut a: f64, mut b: f64, tol: f64) -> f64 {
+pub fn brent_minimize<F: FnMut(f64) -> f64>(mut f: F, mut a: f64, mut b: f64, tol: f64) -> f64 {
     const CGOLD: f64 = 0.381_966_011_250_105_1;
     const ZEPS: f64 = 1e-15;
 

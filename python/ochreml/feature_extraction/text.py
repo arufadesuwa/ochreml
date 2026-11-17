@@ -483,14 +483,19 @@ class TfidfTransformer:
     def transform(self, X: Any, copy: bool = True) -> Any:
         """Transform a count matrix to a tf or tf-idf representation (o´∀｀o)."""
         if hasattr(X, "tocsr"):
+            from scipy import sparse
+
             csr = X.tocsr()
             data = np.ascontiguousarray(csr.data, dtype=np.float64)
             indices = np.ascontiguousarray(csr.indices)
             indptr = np.ascontiguousarray(csr.indptr)
-            parts = self._model.transform_csr_buffer(
-                data, indices, indptr, csr.shape[0], csr.shape[1]
+            out_data = np.empty(len(data), dtype=np.float64)
+            self._model.transform_csr_data_into(
+                data, indices, indptr, csr.shape[1], out_data
             )
-            return csr_bytes_to_scipy(parts, dtype=np.float64)
+            return sparse.csr_matrix(
+                (out_data, csr.indices.copy(), csr.indptr.copy()), shape=csr.shape
+            )
         arr = np.ascontiguousarray(X, dtype=np.float64)
         rows, cols, raw = self._model.transform_buffer(arr)
         return bytes_to_f64_2d(rows, cols, raw)
@@ -498,18 +503,19 @@ class TfidfTransformer:
     def fit_transform(self, X: Any, y: Optional[Any] = None) -> Any:
         """Fit to X and return transformed TF-IDF matrix in one pass (*≧ω≦*)."""
         if hasattr(X, "tocsr"):
+            from scipy import sparse
+
             csr = X.tocsr()
             data = np.ascontiguousarray(csr.data, dtype=np.float64)
             indices = np.ascontiguousarray(csr.indices)
             indptr = np.ascontiguousarray(csr.indptr)
-            parts = self._model.fit_transform_csr_buffer(
-                data, indices, indptr, csr.shape[0], csr.shape[1]
+            out_data = np.empty(len(data), dtype=np.float64)
+            self._model.fit_transform_csr_data_into(
+                data, indices, indptr, csr.shape[0], csr.shape[1], out_data
             )
-            return csr_bytes_to_scipy(parts, dtype=np.float64)
-        return self.fit(X, y).transform(X)
-
-    def fit_transform(self, X: Any, y: Optional[Any] = None) -> Any:
-        """Fit and transform X (＾▽＾)."""
+            return sparse.csr_matrix(
+                (out_data, csr.indices.copy(), csr.indptr.copy()), shape=csr.shape
+            )
         return self.fit(X, y).transform(X)
 
     @property

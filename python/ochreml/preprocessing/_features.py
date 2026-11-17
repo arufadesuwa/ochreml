@@ -149,9 +149,24 @@ class PolynomialFeatures(_BaseFeatureEng):
         self._model.fit_buffer(self._fit_x(X))
         return self
 
+    def fit_transform(self, X: Any, y: Optional[Any] = None) -> np.ndarray:
+        """Fit to data and transform to polynomial features in one pass (＾▽＾)."""
+        X_data = self._fit_x(X)
+        if X_data.ndim != 2 or X_data.shape[0] == 0 or X_data.shape[1] == 0:
+            self._model.fit_buffer(X_data)
+            return self.transform(X_data)
+        self._model.fit_dims(X_data.shape[1])
+        return self.transform(X_data)
+
     def transform(self, X: Any) -> np.ndarray:
         """Transform data to polynomial features (o´∀｀o)."""
-        rows, cols, raw = self._model.transform_buffer(self._fit_x(X))
+        X_data = self._fit_x(X)
+        n_out = self._model.n_output_features_
+        if self.order == "C" and n_out is not None and X_data.ndim == 2:
+            out = np.empty((X_data.shape[0], n_out), dtype=np.float64)
+            self._model.transform_into(X_data, out)
+            return out
+        rows, cols, raw = self._model.transform_buffer(X_data)
         return bytes_to_f64_2d(rows, cols, raw, order=self.order)
 
     @property
@@ -302,7 +317,13 @@ class SplineTransformer(_BaseFeatureEng):
 
     def transform(self, X: Any) -> Any:
         """Transform each feature data to B-splines (＾▽＾)."""
-        rows, cols, raw = self._model.transform_buffer(self._fit_x(X))
+        X_data = self._fit_x(X)
+        n_out = self._model.n_features_out_
+        if self.order == "C" and not self.sparse_output and n_out is not None and X_data.ndim == 2:
+            out = np.empty((X_data.shape[0], n_out), dtype=np.float64)
+            self._model.transform_into(X_data, out)
+            return out
+        rows, cols, raw = self._model.transform_buffer(X_data)
         arr = bytes_to_f64_2d(rows, cols, raw, order=self.order)
         if self.sparse_output:
             from scipy import sparse
@@ -369,10 +390,19 @@ class KernelCenterer(_BaseFeatureEng):
         self._model.fit_buffer(self._fit_x(K))
         return self
 
+    def fit_transform(self, K: Any, y: Optional[Any] = None) -> np.ndarray:
+        """Fit and center kernel matrix K in one fused pass (*≧ω≦*)."""
+        K_data = self._fit_x(K)
+        out = np.empty(K_data.shape, dtype=np.float64)
+        self._model.fit_transform_into(K_data, out)
+        return out
+
     def transform(self, K: Any, copy: bool = True) -> np.ndarray:
         """Center kernel matrix K (*≧ω≦*)."""
-        rows, cols, raw = self._model.transform_buffer(self._fit_x(K))
-        return bytes_to_f64_2d(rows, cols, raw)
+        K_data = self._fit_x(K)
+        out = np.empty(K_data.shape, dtype=np.float64)
+        self._model.transform_into(K_data, out)
+        return out
 
     @property
     def K_fit_rows_(self) -> Optional[np.ndarray]:

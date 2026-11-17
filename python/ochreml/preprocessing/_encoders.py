@@ -46,6 +46,26 @@ def _cats_to_numpy_list(cats: Optional[List[List[Any]]]) -> Optional[List[np.nda
     return out
 
 
+def _csr_parts_to_dense(parts: Any, dtype: Any) -> np.ndarray:
+    _, idx_b, ptr_b, nr, nc = parts
+    out = np.zeros((nr, nc), dtype=dtype)
+    if nr == 0 or nc == 0:
+        return out
+    indices = np.frombuffer(idx_b, dtype=np.int64)
+    if indices.size == 0:
+        return out
+    indptr = np.frombuffer(ptr_b, dtype=np.int64)
+    counts = np.diff(indptr)
+    if counts.min() == counts.max():
+        k = int(counts[0])
+        rows = np.arange(nr, dtype=np.int64)[:, None]
+        out.ravel()[(rows * nc + indices.reshape(nr, k)).ravel()] = 1.0
+    else:
+        rows = np.repeat(np.arange(nr, dtype=np.int64), counts)
+        out.ravel()[rows * nc + indices] = 1.0
+    return out
+
+
 class _BaseEncoder:
     """Shared persistence & device mixin for OchreML encoders (＾▽＾)."""
 
@@ -197,37 +217,21 @@ class OneHotEncoder(_BaseEncoder):
         """Transform X using one-hot encoding (*≧ω≦*)."""
         u32_view = as_utf32_2d_view(X)
         if u32_view is not None:
-            if self.sparse_output:
-                parts = self._model.transform_utf32_csr(*u32_view)
-                return csr_bytes_to_scipy(parts, dtype=self.dtype)
-            rows, cols, raw = self._model.transform_utf32_dense(*u32_view)
-            arr = bytes_to_f64_2d(rows, cols, raw)
-            return arr.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else arr
+            parts = self._model.transform_utf32_csr(*u32_view)
+            return csr_bytes_to_scipy(parts, dtype=self.dtype) if self.sparse_output else _csr_parts_to_dense(parts, self.dtype)
 
         col_lists = as_object_col_lists(X)
         if col_lists is not None:
-            if self.sparse_output:
-                parts = self._model.transform_col_lists_csr(col_lists)
-                return csr_bytes_to_scipy(parts, dtype=self.dtype)
-            rows, cols, raw = self._model.transform_col_lists_dense(col_lists)
-            arr = bytes_to_f64_2d(rows, cols, raw)
-            return arr.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else arr
+            parts = self._model.transform_col_lists_csr(col_lists)
+            return csr_bytes_to_scipy(parts, dtype=self.dtype) if self.sparse_output else _csr_parts_to_dense(parts, self.dtype)
 
         is_num, payload = as_2d_array_or_rows(X)
-        if self.sparse_output:
-            parts = (
-                self._model.transform_buffer_csr(payload)
-                if is_num
-                else self._model.transform_objects_csr(payload)
-            )
-            return csr_bytes_to_scipy(parts, dtype=self.dtype)
-        rows, cols, raw = (
-            self._model.transform_buffer_dense(payload)
+        parts = (
+            self._model.transform_buffer_csr(payload)
             if is_num
-            else self._model.transform_objects_dense(payload)
+            else self._model.transform_objects_csr(payload)
         )
-        arr = bytes_to_f64_2d(rows, cols, raw)
-        return arr.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else arr
+        return csr_bytes_to_scipy(parts, dtype=self.dtype) if self.sparse_output else _csr_parts_to_dense(parts, self.dtype)
 
     def fit_transform(self, X: Any, y: Optional[Any] = None) -> Any:
         """Fit OneHotEncoder and transform X in one pass (*≧ω≦*)."""
@@ -239,20 +243,12 @@ class OneHotEncoder(_BaseEncoder):
             )
             u32_view = as_utf32_2d_view(X)
             if u32_view is not None:
-                if self.sparse_output:
-                    parts = self._model.fit_transform_utf32_csr(*u32_view, explicit_drop)
-                    return csr_bytes_to_scipy(parts, dtype=self.dtype)
-                rows, cols, raw = self._model.fit_transform_utf32_dense(*u32_view, explicit_drop)
-                arr = bytes_to_f64_2d(rows, cols, raw)
-                return arr.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else arr
+                parts = self._model.fit_transform_utf32_csr(*u32_view, explicit_drop)
+                return csr_bytes_to_scipy(parts, dtype=self.dtype) if self.sparse_output else _csr_parts_to_dense(parts, self.dtype)
             col_lists = as_object_col_lists(X)
             if col_lists is not None:
-                if self.sparse_output:
-                    parts = self._model.fit_transform_col_lists_csr(col_lists, explicit_drop)
-                    return csr_bytes_to_scipy(parts, dtype=self.dtype)
-                rows, cols, raw = self._model.fit_transform_col_lists_dense(col_lists, explicit_drop)
-                arr = bytes_to_f64_2d(rows, cols, raw)
-                return arr.astype(self.dtype, copy=False) if np.dtype(self.dtype) != np.float64 else arr
+                parts = self._model.fit_transform_col_lists_csr(col_lists, explicit_drop)
+                return csr_bytes_to_scipy(parts, dtype=self.dtype) if self.sparse_output else _csr_parts_to_dense(parts, self.dtype)
         return self.fit(X, y).transform(X)
 
     def inverse_transform(self, X: Any) -> np.ndarray:
@@ -718,8 +714,7 @@ class MultiLabelBinarizer(_BaseEncoder):
 
     def transform(self, y: Sequence[Sequence[Any]]) -> Any:
         """Transform the given label sets (*≧ω≦*)."""
-        rows = [list(row) for row in y]
-        n_rows, n_cols, raw = self._model.transform_objects(rows)
+        n_rows, n_cols, raw = self._model.transform_py_rows(y)
         arr = bytes_to_i64_2d(n_rows, n_cols, raw)
         if self.sparse_output:
             from scipy import sparse
@@ -729,6 +724,14 @@ class MultiLabelBinarizer(_BaseEncoder):
 
     def fit_transform(self, y: Sequence[Sequence[Any]]) -> Any:
         """Fit and transform label sets (o´∀｀o)."""
+        if self.classes is None:
+            n_rows, n_cols, raw = self._model.fit_transform_py_rows(y)
+            arr = bytes_to_i64_2d(n_rows, n_cols, raw)
+            if self.sparse_output:
+                from scipy import sparse
+
+                return sparse.csr_matrix(arr)
+            return arr
         return self.fit(y).transform(y)
 
     def inverse_transform(self, yt: Any) -> List[tuple]:

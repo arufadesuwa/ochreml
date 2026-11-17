@@ -937,6 +937,15 @@ pub fn normalize_matrix(x: &Matrix, norm: &str, axis: usize) -> OchreResult<(Mat
 }
 
 pub fn normalize_matrix_inplace(x: &mut Matrix, norm: &str, axis: usize) -> OchreResult<Vec<f64>> {
+    normalize_matrix_inplace_opt(x, norm, axis, true)
+}
+
+pub fn normalize_matrix_inplace_opt(
+    x: &mut Matrix,
+    norm: &str,
+    axis: usize,
+    return_norms: bool,
+) -> OchreResult<Vec<f64>> {
     validate_norm_kind(norm)?;
     if axis > 1 {
         return Err(OchreError::InvalidParameter(format!(
@@ -950,6 +959,27 @@ pub fn normalize_matrix_inplace(x: &mut Matrix, norm: &str, axis: usize) -> Ochr
 
     if axis == 1 {
         let cols = x.cols;
+        if !return_norms {
+            let process_no_norm = |row: &mut [f64]| {
+                let n = match norm {
+                    "l1" => row.iter().map(|v| v.abs()).sum::<f64>(),
+                    "l2" => row.iter().map(|v| v * v).sum::<f64>().sqrt(),
+                    _ => row.iter().fold(0.0f64, |acc, v| acc.max(v.abs())),
+                };
+                if n != 0.0 {
+                    let inv = 1.0 / n;
+                    for v in row.iter_mut() {
+                        *v *= inv;
+                    }
+                }
+            };
+            if x.rows * cols < 16_384 {
+                x.data.chunks_exact_mut(cols).for_each(process_no_norm);
+            } else {
+                x.data.par_chunks_mut(cols).for_each(process_no_norm);
+            }
+            return Ok(Vec::new());
+        }
         let mut norms = vec![0.0; x.rows];
         let process = |(row, norm_out): (&mut [f64], &mut f64)| {
             let n = match norm {
@@ -1001,7 +1031,7 @@ pub fn normalize_matrix_inplace(x: &mut Matrix, norm: &str, axis: usize) -> Ochr
         .collect();
     let zeros = vec![0.0; cols];
     cpu_col_scale_shift_inplace(x, &inv_scale, &zeros, None)?;
-    Ok(norms)
+    Ok(if return_norms { norms } else { Vec::new() })
 }
 
 impl Normalizer {

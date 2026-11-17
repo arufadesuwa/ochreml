@@ -683,6 +683,43 @@ crate::pymethods_with_dit!(PyTfidfTransformer, TfidfTransformer, {
         csr_parts_to_py(py, parts)
     }
 
+    pub fn transform_csr_data_into(
+        &self,
+        py: Python<'_>,
+        data: PyBuffer<f64>,
+        indices: Bound<'_, PyAny>,
+        indptr: Bound<'_, PyAny>,
+        n_cols: usize,
+        out_data: PyBuffer<f64>,
+    ) -> PyResult<()> {
+        let mut d = buffer_to_f64_1d(py, &data)?;
+        let idx = buffer_to_usize_1d(py, &indices)?;
+        let ptr = buffer_to_usize_1d(py, &indptr)?;
+        self.inner
+            .transform_csr_data_inplace(&mut d, &idx, &ptr, n_cols)?;
+        write_slice_to_pybuffer(py, &d, &out_data)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fit_transform_csr_data_into(
+        &mut self,
+        py: Python<'_>,
+        data: PyBuffer<f64>,
+        indices: Bound<'_, PyAny>,
+        indptr: Bound<'_, PyAny>,
+        n_rows: usize,
+        n_cols: usize,
+        out_data: PyBuffer<f64>,
+    ) -> PyResult<()> {
+        let mut d = buffer_to_f64_1d(py, &data)?;
+        let idx = buffer_to_usize_1d(py, &indices)?;
+        let ptr = buffer_to_usize_1d(py, &indptr)?;
+        self.inner.fit_csr(&d, &idx, &ptr, n_rows, n_cols)?;
+        self.inner
+            .transform_csr_data_inplace(&mut d, &idx, &ptr, n_cols)?;
+        write_slice_to_pybuffer(py, &d, &out_data)
+    }
+
     #[getter]
     pub fn idf_(&self) -> Option<Vec<f64>> {
         self.inner.idf_.clone()

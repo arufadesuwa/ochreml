@@ -1254,6 +1254,7 @@ impl OrdinalEncoder {
         self.apply_fit_per_col(per_col)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn fit_transform_interned(
         &mut self,
         interned: Vec<(Vec<CatValue>, Vec<usize>, Vec<usize>)>,
@@ -2183,6 +2184,239 @@ impl TargetEncoder {
             target_type_: None,
             n_features_in_: None,
         })
+    }
+
+    pub fn fit_interned(
+        &mut self,
+        categories: Vec<Vec<CatValue>>,
+        ord_cols: &[Vec<Option<usize>>],
+        n_samples: usize,
+        y_cols: &[Vec<f64>],
+        classes: Option<Vec<CatValue>>,
+        inferred_target_type: String,
+    ) -> OchreResult<()> {
+        let n_features = categories.len();
+        let n_targets = y_cols.len();
+
+        let mut target_means = Vec::with_capacity(n_targets);
+        let mut target_vars = Vec::with_capacity(n_targets);
+        for yc in y_cols {
+            let mean = yc.iter().sum::<f64>() / (n_samples as f64);
+            let var = yc.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>() / (n_samples as f64);
+            target_means.push(mean);
+            target_vars.push(var);
+        }
+
+        let mut encodings = Vec::with_capacity(n_features * n_targets);
+        for j in 0..n_features {
+            let n_cats = categories[j].len();
+            for t in 0..n_targets {
+                encodings.push(fit_single_col_encoding(
+                    &ord_cols[j],
+                    n_cats,
+                    &y_cols[t],
+                    target_means[t],
+                    target_vars[t],
+                    self.smooth,
+                ));
+            }
+        }
+
+        self.categories_ = Some(categories);
+        self.encodings_ = Some(encodings);
+        self.target_mean_ = Some(target_means);
+        self.classes_ = classes;
+        self.target_type_ = Some(inferred_target_type);
+        self.n_features_in_ = Some(n_features);
+        self.device_ = Some(self.device.to_string());
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fit_transform_interned(
+        &mut self,
+        categories: Vec<Vec<CatValue>>,
+        ord_cols: Vec<Vec<Option<usize>>>,
+        n_samples: usize,
+        y_cols: &[Vec<f64>],
+        classes: Option<Vec<CatValue>>,
+        inferred_target_type: String,
+        fold_ids: &[usize],
+    ) -> OchreResult<Matrix> {
+        let n_features = categories.len();
+        self.fit_interned(
+            categories,
+            &ord_cols,
+            n_samples,
+            y_cols,
+            classes,
+            inferred_target_type,
+        )?;
+        let n_targets = y_cols.len();
+        let categories_ref = self.categories_.as_ref().ok_or(OchreError::NotFitted)?;
+        let n_folds = fold_ids.iter().copied().max().unwrap_or(0) + 1;
+        let out_cols = n_features * n_targets;
+        let mut out = vec![0.0; n_samples * out_cols];
+
+        for fold in 0..n_folds {
+            let train_idx: Vec<usize> = (0..n_samples).filter(|&i| fold_ids[i] != fold).collect();
+            let val_idx: Vec<usize> = (0..n_samples).filter(|&i| fold_ids[i] == fold).collect();
+            if train_idx.is_empty() || val_idx.is_empty() {
+                continue;
+            }
+            for (t, y_col) in y_cols.iter().enumerate().take(n_targets) {
+                let y_tr: Vec<f64> = train_idx.iter().map(|&i| y_col[i]).collect();
+                let y_mean = y_tr.iter().sum::<f64>() / (y_tr.len() as f64);
+                let y_var = y_tr
+                    .iter()
+                    .map(|&v| (v - y_mean) * (v - y_mean))
+                    .sum::<f64>()
+                    / (y_tr.len() as f64);
+                for j in 0..n_features {
+                    let n_cats = categories_ref[j].len();
+                    let ord_tr: Vec<Option<usize>> =
+                        train_idx.iter().map(|&i| ord_cols[j][i]).collect();
+                    let enc =
+                        fit_single_col_encoding(&ord_tr, n_cats, &y_tr, y_mean, y_var, self.smooth);
+                    let col_out_idx = j * n_targets + t;
+                    for &vi in &val_idx {
+                        out[vi * out_cols + col_out_idx] = match ord_cols[j][vi] {
+                            Some(cat_i) => enc[cat_i],
+                            None => y_mean,
+                        };
+                    }
+                }
+            }
+        }
+        Matrix::from_vec(n_samples, out_cols, out)
+    }
+
+    pub fn transform_ord_cols(
+        &self,
+        ord_cols: &[Vec<Option<usize>>],
+        n_samples: usize,
+    ) -> OchreResult<Matrix> {
+        let n_features = self.n_features_in_.ok_or(OchreError::NotFitted)?;
+        let encodings = self.encodings_.as_ref().ok_or(OchreError::NotFitted)?;
+        let target_means = self.target_mean_.as_ref().ok_or(OchreError::NotFitted)?;
+        let n_targets = target_means.len();
+        let out_cols = n_features * n_targets;
+        let mut out = vec![0.0; n_samples * out_cols];
+        for j in 0..n_features {
+            for (r, &opt_c) in ord_cols[j].iter().enumerate() {
+                for t in 0..n_targets {
+                    let enc_vec = &encodings[j * n_targets + t];
+                    out[r * out_cols + j * n_targets + t] = match opt_c {
+                        Some(cat_i) => enc_vec[cat_i],
+                        None => target_means[t],
+                    };
+                }
+            }
+        }
+        Matrix::from_vec(n_samples, out_cols, out)
+    }
+
+    pub fn transform_utf32(
+        &self,
+        data: &[u32],
+        n_rows: usize,
+        n_cols: usize,
+        width: usize,
+    ) -> OchreResult<Matrix> {
+        let n_features = self.n_features_in_.ok_or(OchreError::NotFitted)?;
+        if n_cols != n_features {
+            return Err(OchreError::FeatureCountMismatch {
+                features: n_cols,
+                expected: n_features,
+            });
+        }
+        let categories = self.categories_.as_ref().ok_or(OchreError::NotFitted)?;
+        let stride = n_cols * width;
+        let ord_cols: Vec<Vec<Option<usize>>> = (0..n_features)
+            .into_par_iter()
+            .map(|j| {
+                let patterns = build_u32_patterns(&categories[j]);
+                let mut map: HashMap<&[u32], usize> = HashMap::with_capacity(patterns.len());
+                for (idx, opt_p) in patterns.iter().enumerate() {
+                    if let Some(p) = opt_p {
+                        map.insert(p.as_slice(), idx);
+                    }
+                }
+                let col_off = j * width;
+                (0..n_rows)
+                    .map(|r| {
+                        let start = r * stride + col_off;
+                        let cell = trim_u32_cell(&data[start..start + width]);
+                        map.get(cell).copied()
+                    })
+                    .collect()
+            })
+            .collect();
+        self.transform_ord_cols(&ord_cols, n_rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fit_utf32_fast(
+        &mut self,
+        data: &[u32],
+        n_rows: usize,
+        n_cols: usize,
+        width: usize,
+        y_cols: &[Vec<f64>],
+        classes: Option<Vec<CatValue>>,
+        inferred_target_type: String,
+    ) -> OchreResult<()> {
+        let per_col = (0..n_cols)
+            .into_par_iter()
+            .map(|j| intern_u32_column(data, n_rows, n_cols, width, j))
+            .collect::<OchreResult<Vec<_>>>()?;
+        let mut categories = Vec::with_capacity(n_cols);
+        let mut ord_cols = Vec::with_capacity(n_cols);
+        for (cats, _, rids) in per_col {
+            categories.push(cats);
+            ord_cols.push(rids.into_iter().map(Some).collect());
+        }
+        self.fit_interned(
+            categories,
+            &ord_cols,
+            n_rows,
+            y_cols,
+            classes,
+            inferred_target_type,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fit_transform_utf32_fast(
+        &mut self,
+        data: &[u32],
+        n_rows: usize,
+        n_cols: usize,
+        width: usize,
+        y_cols: &[Vec<f64>],
+        classes: Option<Vec<CatValue>>,
+        inferred_target_type: String,
+        fold_ids: &[usize],
+    ) -> OchreResult<Matrix> {
+        let per_col = (0..n_cols)
+            .into_par_iter()
+            .map(|j| intern_u32_column(data, n_rows, n_cols, width, j))
+            .collect::<OchreResult<Vec<_>>>()?;
+        let mut categories = Vec::with_capacity(n_cols);
+        let mut ord_cols = Vec::with_capacity(n_cols);
+        for (cats, _, rids) in per_col {
+            categories.push(cats);
+            ord_cols.push(rids.into_iter().map(Some).collect());
+        }
+        self.fit_transform_interned(
+            categories,
+            ord_cols,
+            n_rows,
+            y_cols,
+            classes,
+            inferred_target_type,
+            fold_ids,
+        )
     }
 
     pub fn fit_from_precomputed(

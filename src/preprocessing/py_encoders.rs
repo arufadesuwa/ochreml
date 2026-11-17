@@ -1084,6 +1084,102 @@ crate::pymethods_with_dit!(PyMultiLabelBinarizer, MultiLabelBinarizer, {
         Ok(())
     }
 
+    pub fn fit_transform_py_rows<'py>(
+        &mut self,
+        py: Python<'py>,
+        y: &Bound<'py, PyAny>,
+    ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
+        let mut str_map: HashMap<String, usize> = HashMap::new();
+        let mut cat_map: HashMap<CatValue, usize> = HashMap::new();
+        let mut raw_cats: Vec<CatValue> = Vec::new();
+        let mut row_ids: Vec<Vec<usize>> = Vec::new();
+
+        for row_item in y.try_iter()? {
+            let row_obj = row_item?;
+            let mut rids = Vec::new();
+            for item in row_obj.try_iter()? {
+                let item = item?;
+                let id = if let Ok(ps) = item.cast::<PyString>() {
+                    let s = ps.to_str()?;
+                    if let Some(&existing) = str_map.get(s) {
+                        existing
+                    } else {
+                        let owned = s.to_owned();
+                        let new_id = raw_cats.len();
+                        str_map.insert(owned.clone(), new_id);
+                        raw_cats.push(CatValue::Str(owned));
+                        new_id
+                    }
+                } else {
+                    let cv = pyany_to_catvalue(&item)?;
+                    if let Some(&existing) = cat_map.get(&cv) {
+                        existing
+                    } else {
+                        let new_id = raw_cats.len();
+                        cat_map.insert(cv.clone(), new_id);
+                        raw_cats.push(cv);
+                        new_id
+                    }
+                };
+                rids.push(id);
+            }
+            row_ids.push(rids);
+        }
+
+        let n_classes = raw_cats.len();
+        let mut order: Vec<usize> = (0..n_classes).collect();
+        order.sort_by(|&a, &b| raw_cats[a].sort_cmp(&raw_cats[b]));
+        let mut sorted_cats = Vec::with_capacity(n_classes);
+        let mut raw_to_sorted = vec![0usize; n_classes];
+        for (pos, &orig) in order.iter().enumerate() {
+            sorted_cats.push(raw_cats[orig].clone());
+            raw_to_sorted[orig] = pos;
+        }
+        self.inner.classes_ = Some(sorted_cats);
+        self.inner.device_ = Some(self.inner.device.to_string());
+
+        let n_rows = row_ids.len();
+        let mut out = vec![0i64; n_rows * n_classes];
+        for (r, rids) in row_ids.into_iter().enumerate() {
+            let row_off = r * n_classes;
+            for raw_id in rids {
+                out[row_off + raw_to_sorted[raw_id]] = 1;
+            }
+        }
+        let bytes = i64_slice_to_pybytes(py, &out)?;
+        Ok((n_rows, n_classes, bytes))
+    }
+
+    pub fn transform_py_rows<'py>(
+        &self,
+        py: Python<'py>,
+        y: &Bound<'py, PyAny>,
+    ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
+        let classes = self
+            .inner
+            .classes_
+            .as_ref()
+            .ok_or(crate::error::OchreError::NotFitted)?;
+        let n_cols = classes.len();
+        let (str_map, other_map) = build_py_col_lookup_maps(classes);
+        let mut rows_out: Vec<i64> = Vec::new();
+        let mut n_rows = 0usize;
+        for row_item in y.try_iter()? {
+            let row_obj = row_item?;
+            let start = rows_out.len();
+            rows_out.resize(start + n_cols, 0);
+            for item in row_obj.try_iter()? {
+                let item = item?;
+                if let Ok(idx) = lookup_py_col_item(&item, &str_map, &other_map)? {
+                    rows_out[start + idx] = 1;
+                }
+            }
+            n_rows += 1;
+        }
+        let bytes = i64_slice_to_pybytes(py, &rows_out)?;
+        Ok((n_rows, n_cols, bytes))
+    }
+
     pub fn transform_objects<'py>(
         &self,
         py: Python<'py>,
@@ -1218,8 +1314,6 @@ crate::pymethods_with_dit!(PyTargetEncoder, TargetEncoder, {
         inferred_target_type: String,
         explicit_categories: Option<Vec<Vec<Bound<'_, PyAny>>>>,
     ) -> PyResult<()> {
-        let cols = py_col_lists_to_cat_cols(&col_lists)?;
-        let ec = parse_explicit_cats(explicit_categories)?;
         let cls = classes
             .map(|c| {
                 c.iter()
@@ -1227,6 +1321,30 @@ crate::pymethods_with_dit!(PyTargetEncoder, TargetEncoder, {
                     .collect::<PyResult<Vec<_>>>()
             })
             .transpose()?;
+        if explicit_categories.is_none() {
+            if col_lists.is_empty() || col_lists[0].is_empty() {
+                return Err(crate::error::OchreError::EmptyData.into());
+            }
+            let n_samples = col_lists[0].len();
+            let mut categories = Vec::with_capacity(col_lists.len());
+            let mut ord_cols = Vec::with_capacity(col_lists.len());
+            for py_col in &col_lists {
+                let (cats, _, row_ids) = intern_py_col_list(py_col)?;
+                categories.push(cats);
+                ord_cols.push(row_ids.into_iter().map(Some).collect());
+            }
+            self.inner.fit_interned(
+                categories,
+                &ord_cols,
+                n_samples,
+                &y_cols,
+                cls,
+                inferred_target_type,
+            )?;
+            return Ok(());
+        }
+        let cols = py_col_lists_to_cat_cols(&col_lists)?;
+        let ec = parse_explicit_cats(explicit_categories)?;
         self.inner.fit_from_precomputed(
             &cols,
             ec.as_deref(),
@@ -1249,8 +1367,6 @@ crate::pymethods_with_dit!(PyTargetEncoder, TargetEncoder, {
         fold_ids: Vec<usize>,
         explicit_categories: Option<Vec<Vec<Bound<'_, PyAny>>>>,
     ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
-        let cols = py_col_lists_to_cat_cols(&col_lists)?;
-        let ec = parse_explicit_cats(explicit_categories)?;
         let cls = classes
             .map(|c| {
                 c.iter()
@@ -1258,6 +1374,31 @@ crate::pymethods_with_dit!(PyTargetEncoder, TargetEncoder, {
                     .collect::<PyResult<Vec<_>>>()
             })
             .transpose()?;
+        if explicit_categories.is_none() {
+            if col_lists.is_empty() || col_lists[0].is_empty() {
+                return Err(crate::error::OchreError::EmptyData.into());
+            }
+            let n_samples = col_lists[0].len();
+            let mut categories = Vec::with_capacity(col_lists.len());
+            let mut ord_cols = Vec::with_capacity(col_lists.len());
+            for py_col in &col_lists {
+                let (cats, _, row_ids) = intern_py_col_list(py_col)?;
+                categories.push(cats);
+                ord_cols.push(row_ids.into_iter().map(Some).collect());
+            }
+            let out = self.inner.fit_transform_interned(
+                categories,
+                ord_cols,
+                n_samples,
+                &y_cols,
+                cls,
+                inferred_target_type,
+                &fold_ids,
+            )?;
+            return matrix_to_pybytes(py, &out);
+        }
+        let cols = py_col_lists_to_cat_cols(&col_lists)?;
+        let ec = parse_explicit_cats(explicit_categories)?;
         let out = self.inner.fit_transform_with_folds(
             &cols,
             ec.as_deref(),
@@ -1274,8 +1415,36 @@ crate::pymethods_with_dit!(PyTargetEncoder, TargetEncoder, {
         py: Python<'py>,
         col_lists: Vec<Bound<'_, PyList>>,
     ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
-        let cols = py_col_lists_to_cat_cols(&col_lists)?;
-        let out = self.inner.transform(&cols)?;
+        if col_lists.is_empty() || col_lists[0].is_empty() {
+            return Err(crate::error::OchreError::EmptyData.into());
+        }
+        let n_features = self
+            .inner
+            .n_features_in_
+            .ok_or(crate::error::OchreError::NotFitted)?;
+        if col_lists.len() != n_features {
+            return Err(crate::error::OchreError::FeatureCountMismatch {
+                features: col_lists.len(),
+                expected: n_features,
+            }
+            .into());
+        }
+        let categories = self
+            .inner
+            .categories_
+            .as_ref()
+            .ok_or(crate::error::OchreError::NotFitted)?;
+        let n_rows = col_lists[0].len();
+        let mut ord_cols = Vec::with_capacity(n_features);
+        for (j, py_col) in col_lists.iter().enumerate() {
+            let (str_map, other_map) = build_py_col_lookup_maps(&categories[j]);
+            let mut col_ids = Vec::with_capacity(n_rows);
+            for item in py_col.iter() {
+                col_ids.push(lookup_py_col_item(&item, &str_map, &other_map)?.ok());
+            }
+            ord_cols.push(col_ids);
+        }
+        let out = self.inner.transform_ord_cols(&ord_cols, n_rows)?;
         matrix_to_pybytes(py, &out)
     }
 
@@ -1294,8 +1463,6 @@ crate::pymethods_with_dit!(PyTargetEncoder, TargetEncoder, {
         explicit_categories: Option<Vec<Vec<Bound<'_, PyAny>>>>,
     ) -> PyResult<()> {
         let buf = buffer_to_u32_1d(py, &data)?;
-        let cols = u32_buf_to_cat_cols(&buf, n_rows, n_cols, width)?;
-        let ec = parse_explicit_cats(explicit_categories)?;
         let cls = classes
             .map(|c| {
                 c.iter()
@@ -1303,6 +1470,20 @@ crate::pymethods_with_dit!(PyTargetEncoder, TargetEncoder, {
                     .collect::<PyResult<Vec<_>>>()
             })
             .transpose()?;
+        if explicit_categories.is_none() {
+            self.inner.fit_utf32_fast(
+                &buf,
+                n_rows,
+                n_cols,
+                width,
+                &y_cols,
+                cls,
+                inferred_target_type,
+            )?;
+            return Ok(());
+        }
+        let cols = u32_buf_to_cat_cols(&buf, n_rows, n_cols, width)?;
+        let ec = parse_explicit_cats(explicit_categories)?;
         self.inner.fit_from_precomputed(
             &cols,
             ec.as_deref(),
@@ -1329,8 +1510,6 @@ crate::pymethods_with_dit!(PyTargetEncoder, TargetEncoder, {
         explicit_categories: Option<Vec<Vec<Bound<'_, PyAny>>>>,
     ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
         let buf = buffer_to_u32_1d(py, &data)?;
-        let cols = u32_buf_to_cat_cols(&buf, n_rows, n_cols, width)?;
-        let ec = parse_explicit_cats(explicit_categories)?;
         let cls = classes
             .map(|c| {
                 c.iter()
@@ -1338,6 +1517,21 @@ crate::pymethods_with_dit!(PyTargetEncoder, TargetEncoder, {
                     .collect::<PyResult<Vec<_>>>()
             })
             .transpose()?;
+        if explicit_categories.is_none() {
+            let out = self.inner.fit_transform_utf32_fast(
+                &buf,
+                n_rows,
+                n_cols,
+                width,
+                &y_cols,
+                cls,
+                inferred_target_type,
+                &fold_ids,
+            )?;
+            return matrix_to_pybytes(py, &out);
+        }
+        let cols = u32_buf_to_cat_cols(&buf, n_rows, n_cols, width)?;
+        let ec = parse_explicit_cats(explicit_categories)?;
         let out = self.inner.fit_transform_with_folds(
             &cols,
             ec.as_deref(),
@@ -1358,8 +1552,7 @@ crate::pymethods_with_dit!(PyTargetEncoder, TargetEncoder, {
         width: usize,
     ) -> PyResult<(usize, usize, Bound<'py, PyBytes>)> {
         let buf = buffer_to_u32_1d(py, &data)?;
-        let cols = u32_buf_to_cat_cols(&buf, n_rows, n_cols, width)?;
-        let out = self.inner.transform(&cols)?;
+        let out = self.inner.transform_utf32(&buf, n_rows, n_cols, width)?;
         matrix_to_pybytes(py, &out)
     }
 

@@ -2,6 +2,7 @@
 // Provides fundamental matrix structures, trait-based indexing, and linear equation solvers.
 
 use crate::error::{OchreError, OchreResult};
+use rayon::prelude::*;
 use std::ops::{Index, IndexMut};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -148,13 +149,27 @@ impl Matrix {
         }
 
         let mut res = Self::zeros(self.rows, other.cols);
-        for r in 0..self.rows {
-            for k in 0..self.cols {
-                let a_rk = self[(r, k)];
-                for c in 0..other.cols {
-                    res[(r, c)] += a_rk * other[(k, c)];
+        let other_cols = other.cols;
+        let inner_k = self.cols;
+        let mul_row = |(r, out_row): (usize, &mut [f64])| {
+            let a_row = &self.data[r * inner_k..(r + 1) * inner_k];
+            for (k, &a_rk) in a_row.iter().enumerate() {
+                let b_row = &other.data[k * other_cols..(k + 1) * other_cols];
+                for (dst, &b_kc) in out_row.iter_mut().zip(b_row.iter()) {
+                    *dst += a_rk * b_kc;
                 }
             }
+        };
+        if self.rows >= 64 && self.rows * other_cols * inner_k >= 65_536 {
+            res.data
+                .par_chunks_mut(other_cols)
+                .enumerate()
+                .for_each(mul_row);
+        } else {
+            res.data
+                .chunks_exact_mut(other_cols)
+                .enumerate()
+                .for_each(mul_row);
         }
         Ok(res)
     }

@@ -128,7 +128,13 @@ impl PolynomialFeatures {
         if x.rows == 0 || x.cols == 0 {
             return Err(OchreError::EmptyData);
         }
-        let n_features = x.cols;
+        self.fit_dims(x.cols)
+    }
+
+    pub fn fit_dims(&mut self, n_features: usize) -> OchreResult<()> {
+        if n_features == 0 {
+            return Err(OchreError::EmptyData);
+        }
         let start_deg = if self.include_bias && self.min_degree == 0 {
             0
         } else {
@@ -164,14 +170,24 @@ impl PolynomialFeatures {
     }
 
     pub fn transform(&self, x: &Matrix) -> OchreResult<Matrix> {
+        let _ = validate_cols(self.n_features_in_, x.cols)?;
+        let n_out = self.n_output_features_.ok_or(OchreError::NotFitted)?;
+        if x.rows == 0 {
+            return Matrix::from_vec(0, n_out, Vec::new());
+        }
+        let mut out = vec![0.0; x.rows * n_out];
+        self.transform_to_slice(x, &mut out)?;
+        Matrix::from_vec(x.rows, n_out, out)
+    }
+
+    pub fn transform_to_slice(&self, x: &Matrix, out: &mut [f64]) -> OchreResult<()> {
         let cols = validate_cols(self.n_features_in_, x.cols)?;
         let n_out = self.n_output_features_.ok_or(OchreError::NotFitted)?;
         let powers = self.powers_.as_ref().ok_or(OchreError::NotFitted)?;
         if x.rows == 0 {
-            return Matrix::from_vec(0, n_out, Vec::new());
+            return Ok(());
         }
 
-        // Pre-compile sparse non-zero `(feature_idx, exponent)` pairs per output feature
         let term_specs: Vec<Vec<(usize, usize)>> = (0..n_out)
             .map(|k| {
                 let row = &powers[k * cols..(k + 1) * cols];
@@ -183,7 +199,6 @@ impl PolynomialFeatures {
             })
             .collect();
 
-        let mut out = vec![0.0; x.rows * n_out];
         let process_row = |(dst, src): (&mut [f64], &[f64])| {
             for (k, spec) in term_specs.iter().enumerate() {
                 let mut prod = 1.0;
@@ -210,7 +225,7 @@ impl PolynomialFeatures {
                 .zip(x.data.par_chunks(cols))
                 .for_each(process_row);
         }
-        Matrix::from_vec(x.rows, n_out, out)
+        Ok(())
     }
 
     pub fn set_device(&mut self, device: Option<String>) -> OchreResult<()> {
@@ -776,30 +791,31 @@ impl KernelCenterer {
     }
 
     pub fn transform(&self, k: &Matrix) -> OchreResult<Matrix> {
+        let mut out = Matrix::from_vec(k.rows, k.cols, k.data.clone())?;
+        self.transform_inplace(&mut out)?;
+        Ok(out)
+    }
+
+    pub fn transform_inplace(&self, k: &mut Matrix) -> OchreResult<()> {
         let cols = validate_cols(self.n_features_in_, k.cols)?;
         let fit_rows = self.k_fit_rows_.as_ref().ok_or(OchreError::NotFitted)?;
         let fit_all = self.k_fit_all_.ok_or(OchreError::NotFitted)?;
         if k.rows == 0 {
-            return Matrix::from_vec(0, cols, Vec::new());
+            return Ok(());
         }
-        let mut out = vec![0.0; k.rows * cols];
-        let process_row = |(dst, src): (&mut [f64], &[f64])| {
-            let row_mean: f64 = src.iter().sum::<f64>() / cols as f64;
+        let process_row = |row: &mut [f64]| {
+            let row_mean: f64 = row.iter().sum::<f64>() / cols as f64;
             let shift = fit_all - row_mean;
-            for j in 0..cols {
-                dst[j] = src[j] - fit_rows[j] + shift;
+            for (dst, &fr) in row.iter_mut().zip(fit_rows.iter()) {
+                *dst = *dst - fr + shift;
             }
         };
         if k.rows * cols < 16_384 {
-            out.chunks_exact_mut(cols)
-                .zip(k.data.chunks_exact(cols))
-                .for_each(process_row);
+            k.data.chunks_exact_mut(cols).for_each(process_row);
         } else {
-            out.par_chunks_mut(cols)
-                .zip(k.data.par_chunks(cols))
-                .for_each(process_row);
+            k.data.par_chunks_mut(cols).for_each(process_row);
         }
-        Matrix::from_vec(k.rows, cols, out)
+        Ok(())
     }
 
     pub fn set_device(&mut self, device: Option<String>) -> OchreResult<()> {

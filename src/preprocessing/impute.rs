@@ -845,62 +845,129 @@ impl KNNImputer {
             }
 
             let k_eff = self.n_neighbors.min(donors.len());
-            // Build `(n_receivers x n_donors)` distance submatrix and call Backend::topk_argmin (N4)
-            let mut sub_d = Vec::with_capacity(receiver_rows.len() * donors.len());
-            for &ri in &receiver_rows {
-                let row_off = ri * nf;
-                for &di in &donors {
-                    sub_d.push(dist_sq_mat.data[row_off + di]);
-                }
-            }
-            let sub_mat = Matrix::from_vec(receiver_rows.len(), donors.len(), sub_d)?;
-            let (topk_local_idx, topk_dist_sq) = backend.topk_argmin(&sub_mat, k_eff)?;
-
-            for (r_pos, &ri) in receiver_rows.iter().enumerate() {
-                let idx_slice = &topk_local_idx[r_pos * k_eff..(r_pos + 1) * k_eff];
-                let dsq_slice = &topk_dist_sq.data[r_pos * k_eff..(r_pos + 1) * k_eff];
-
-                // Filter out unreachable donors (`INFINITY`, no overlapping non-missing coords)
-                let mut valid_pairs: Vec<(f64, f64)> = Vec::with_capacity(k_eff);
-                for (&loc_d, &dsq) in idx_slice.iter().zip(dsq_slice.iter()) {
-                    if dsq.is_finite() {
-                        let donor_row = donors[loc_d];
-                        valid_pairs.push((dsq.sqrt(), fit_x.data[donor_row * expected + j]));
+            let use_cpu_fast = matches!(self.device, DeviceType::Cpu)
+                || receiver_rows.len() * donors.len() < 16_384;
+            let imputed_vals: Vec<(usize, f64)> = if use_cpu_fast {
+                receiver_rows
+                    .par_iter()
+                    .map(|&ri| {
+                        let d_row = &dist_sq_mat.data[ri * nf..(ri + 1) * nf];
+                        let mut best: Vec<(f64, usize)> = Vec::with_capacity(k_eff + 1);
+                        for (loc_d, &di) in donors.iter().enumerate() {
+                            let d = d_row[di];
+                            if !d.is_finite() {
+                                continue;
+                            }
+                            if best.len() < k_eff {
+                                let pos = best
+                                    .partition_point(|&(bd, bi)| bd < d || (bd == d && bi < loc_d));
+                                best.insert(pos, (d, loc_d));
+                            } else if let Some(&(worst_d, worst_i)) = best.last()
+                                && (d < worst_d || (d == worst_d && loc_d < worst_i))
+                            {
+                                best.pop();
+                                let pos = best
+                                    .partition_point(|&(bd, bi)| bd < d || (bd == d && bi < loc_d));
+                                best.insert(pos, (d, loc_d));
+                            }
+                        }
+                        if best.is_empty() {
+                            let mean_donor: f64 = donors
+                                .iter()
+                                .map(|&di| fit_x.data[di * expected + j])
+                                .sum::<f64>()
+                                / (donors.len() as f64);
+                            return (ri, mean_donor);
+                        }
+                        let val = if !is_dist_weight {
+                            let sum: f64 = best
+                                .iter()
+                                .map(|&(_, loc_d)| fit_x.data[donors[loc_d] * expected + j])
+                                .sum();
+                            sum / (best.len() as f64)
+                        } else if let Some(&(_, zero_loc)) =
+                            best.iter().find(|&&(dsq, _)| dsq == 0.0)
+                        {
+                            let zero_vals: Vec<f64> = best
+                                .iter()
+                                .filter(|&&(dsq, _)| dsq == 0.0)
+                                .map(|&(_, loc_d)| fit_x.data[donors[loc_d] * expected + j])
+                                .collect();
+                            let _ = zero_loc;
+                            zero_vals.iter().sum::<f64>() / (zero_vals.len() as f64)
+                        } else {
+                            let mut w_sum = 0.0;
+                            let mut v_sum = 0.0;
+                            for &(dsq, loc_d) in &best {
+                                let w = 1.0 / dsq.sqrt();
+                                w_sum += w;
+                                v_sum += w * fit_x.data[donors[loc_d] * expected + j];
+                            }
+                            v_sum / w_sum
+                        };
+                        (ri, val)
+                    })
+                    .collect()
+            } else {
+                // Build `(n_receivers x n_donors)` distance submatrix and call Backend::topk_argmin (N4)
+                let mut sub_d = Vec::with_capacity(receiver_rows.len() * donors.len());
+                for &ri in &receiver_rows {
+                    let row_off = ri * nf;
+                    for &di in &donors {
+                        sub_d.push(dist_sq_mat.data[row_off + di]);
                     }
                 }
+                let sub_mat = Matrix::from_vec(receiver_rows.len(), donors.len(), sub_d)?;
+                let (topk_local_idx, topk_dist_sq) = backend.topk_argmin(&sub_mat, k_eff)?;
 
-                if valid_pairs.is_empty() {
-                    // Fallback: mean of all potential donors for column `j`
-                    let mean_donor: f64 = donors
-                        .iter()
-                        .map(|&di| fit_x.data[di * expected + j])
-                        .sum::<f64>()
-                        / (donors.len() as f64);
-                    imputed[ri * expected + j] = mean_donor;
-                    continue;
-                }
+                let mut res_vals = Vec::with_capacity(receiver_rows.len());
+                for (r_pos, &ri) in receiver_rows.iter().enumerate() {
+                    let idx_slice = &topk_local_idx[r_pos * k_eff..(r_pos + 1) * k_eff];
+                    let dsq_slice = &topk_dist_sq.data[r_pos * k_eff..(r_pos + 1) * k_eff];
 
-                let val = if !is_dist_weight {
-                    valid_pairs.iter().map(|&(_, v)| v).sum::<f64>() / (valid_pairs.len() as f64)
-                } else {
-                    let zero_vals: Vec<f64> = valid_pairs
-                        .iter()
-                        .filter(|&&(d, _)| d == 0.0)
-                        .map(|&(_, v)| v)
-                        .collect();
-                    if !zero_vals.is_empty() {
-                        zero_vals.iter().sum::<f64>() / (zero_vals.len() as f64)
+                    let mut valid_pairs: Vec<(f64, f64)> = Vec::with_capacity(k_eff);
+                    for (&loc_d, &dsq) in idx_slice.iter().zip(dsq_slice.iter()) {
+                        if dsq.is_finite() {
+                            let donor_row = donors[loc_d];
+                            valid_pairs.push((dsq.sqrt(), fit_x.data[donor_row * expected + j]));
+                        }
+                    }
+
+                    if valid_pairs.is_empty() {
+                        let mean_donor: f64 = donors
+                            .iter()
+                            .map(|&di| fit_x.data[di * expected + j])
+                            .sum::<f64>()
+                            / (donors.len() as f64);
+                        res_vals.push((ri, mean_donor));
+                        continue;
+                    }
+
+                    let val = if !is_dist_weight {
+                        valid_pairs.iter().map(|&(_, v)| v).sum::<f64>()
+                            / (valid_pairs.len() as f64)
+                    } else if valid_pairs.iter().any(|&(d, _)| d == 0.0) {
+                        let zvals: Vec<f64> = valid_pairs
+                            .iter()
+                            .filter(|&&(d, _)| d == 0.0)
+                            .map(|&(_, v)| v)
+                            .collect();
+                        zvals.iter().sum::<f64>() / (zvals.len() as f64)
                     } else {
                         let mut w_sum = 0.0;
-                        let mut vw_sum = 0.0;
-                        for (d, v) in valid_pairs {
+                        let mut v_sum = 0.0;
+                        for &(d, v) in &valid_pairs {
                             let w = 1.0 / d;
                             w_sum += w;
-                            vw_sum += w * v;
+                            v_sum += w * v;
                         }
-                        vw_sum / w_sum
-                    }
-                };
+                        v_sum / w_sum
+                    };
+                    res_vals.push((ri, val));
+                }
+                res_vals
+            };
+            for (ri, val) in imputed_vals {
                 imputed[ri * expected + j] = val;
             }
         }

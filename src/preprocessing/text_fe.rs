@@ -858,14 +858,13 @@ impl TfidfTransformer {
         Ok(())
     }
 
-    pub fn transform_csr(
+    pub fn transform_csr_data_inplace(
         &self,
-        data: &[f64],
+        out_data: &mut [f64],
         indices: &[usize],
         indptr: &[usize],
-        n_rows: usize,
         n_cols: usize,
-    ) -> OchreResult<CsrParts> {
+    ) -> OchreResult<()> {
         let expected = self.n_features_in_.ok_or(OchreError::NotFitted)?;
         if n_cols != expected {
             return Err(OchreError::FeatureCountMismatch {
@@ -873,9 +872,8 @@ impl TfidfTransformer {
                 expected,
             });
         }
-        let mut out_data = data.to_vec();
         if self.sublinear_tf {
-            for v in &mut out_data {
+            for v in out_data.iter_mut() {
                 if *v > 0.0 {
                     *v = 1.0 + v.ln();
                 }
@@ -888,8 +886,21 @@ impl TfidfTransformer {
             }
         }
         if let Some(ref norm) = self.norm {
-            normalize_csr_rows(&mut out_data, indptr, norm);
+            normalize_csr_rows(out_data, indptr, norm);
         }
+        Ok(())
+    }
+
+    pub fn transform_csr(
+        &self,
+        data: &[f64],
+        indices: &[usize],
+        indptr: &[usize],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> OchreResult<CsrParts> {
+        let mut out_data = data.to_vec();
+        self.transform_csr_data_inplace(&mut out_data, indices, indptr, n_cols)?;
         Ok((out_data, indices.to_vec(), indptr.to_vec(), n_rows, n_cols))
     }
 

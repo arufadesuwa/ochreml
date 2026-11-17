@@ -656,7 +656,7 @@ def normalize(
         raise ValueError(f"Expected 1D or 2D array, got {arr.ndim}D ( >_< )")
 
     out = np.empty(arr2d.shape, dtype=np.float64)
-    norms = _rust_normalize_into(arr2d, out, norm=norm, axis=axis)
+    norms = _rust_normalize_into(arr2d, out, norm=norm, axis=axis, return_norms=return_norm)
     if was_1d:
         out = out.ravel()
     if return_norm:
