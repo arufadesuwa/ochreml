@@ -31,18 +31,37 @@ from ._ochreml import (
     Ridge as _RustRidge,
     RidgeClassifier as _RustRidgeClassifier,
     RidgeCV as _RustRidgeCV,
+    LogisticRegression as _RustLogisticRegression,
+    Lasso as _RustLasso,
+    ElasticNet as _RustElasticNet,
+    SGDClassifier as _RustSGDClassifier,
+    SGDRegressor as _RustSGDRegressor,
     DecisionTreeClassifier as _RustDecisionTreeClassifier,
     DecisionTreeRegressor as _RustDecisionTreeRegressor,
     get_available_devices as _get_available_devices,
     get_device_info as _get_device_info,
 )
+from . import linear_model
+from .linear_model import (
+    ElasticNet,
+    Lasso,
+    LogisticRegression,
+    SGDClassifier,
+    SGDRegressor,
+)
 
-__version__ = "0.3.2b4"
+__version__ = "0.3.3b1"
 __all__ = [
     "LinearRegression",
     "Ridge",
     "RidgeClassifier",
     "RidgeCV",
+    "LogisticRegression",
+    "Lasso",
+    "ElasticNet",
+    "SGDClassifier",
+    "SGDRegressor",
+    "linear_model",
     "DecisionTreeClassifier",
     "DecisionTreeRegressor",
     "save",
@@ -182,6 +201,16 @@ def load(path: str, device: Optional[str] = None) -> Any:
             return RidgeCV._from_rust(_RustRidgeCV.from_bytes(data, target_dev), target_dev)
         if 7 <= tag <= 37:
             return _load_preprocessing_dit_tag(tag, data, path_str, target_dev)
+        if tag == 38:
+            return LogisticRegression._from_rust(_RustLogisticRegression.from_bytes(data, target_dev), target_dev)
+        if tag == 39:
+            return Lasso._from_rust(_RustLasso.from_bytes(data, target_dev), target_dev)
+        if tag == 40:
+            return ElasticNet._from_rust(_RustElasticNet.from_bytes(data, target_dev), target_dev)
+        if tag == 41:
+            return SGDClassifier._from_rust(_RustSGDClassifier.from_bytes(data, target_dev), target_dev)
+        if tag == 42:
+            return SGDRegressor._from_rust(_RustSGDRegressor.from_bytes(data, target_dev), target_dev)
         raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
     # Fallback if the .dit file was written via joblib.dump or pickle.dump

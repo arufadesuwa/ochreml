@@ -388,6 +388,20 @@ pub fn get_device_info_map() -> HashMap<String, String> {
     map
 }
 
+pub fn resolve_loaded_device(
+    saved_device: Option<String>,
+    is_fitted: bool,
+    device: Option<&str>,
+) -> OchreResult<(DeviceType, Option<String>)> {
+    let dev = parse_device(device.or(Some("auto")))?;
+    let device_ = if saved_device.is_some() || is_fitted {
+        Some(dev.to_string())
+    } else {
+        None
+    };
+    Ok((dev, device_))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

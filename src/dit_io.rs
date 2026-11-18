@@ -63,6 +63,16 @@ pub fn write_opt_usize(buf: &mut Vec<u8>, v: Option<usize>) {
     }
 }
 
+pub fn write_opt_u64(buf: &mut Vec<u8>, v: Option<u64>) {
+    match v {
+        Some(val) => {
+            write_u8(buf, 1);
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+        None => write_u8(buf, 0),
+    }
+}
+
 pub fn write_opt_f64(buf: &mut Vec<u8>, v: Option<f64>) {
     match v {
         Some(val) => {
@@ -211,6 +221,17 @@ impl<'a> ByteReader<'a> {
     pub fn read_opt_usize(&mut self) -> OchreResult<Option<usize>> {
         if self.read_bool()? {
             Ok(Some(self.read_usize()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn read_opt_u64(&mut self) -> OchreResult<Option<u64>> {
+        if self.read_bool()? {
+            let b = self.read_exact(8)?;
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(b);
+            Ok(Some(u64::from_le_bytes(arr)))
         } else {
             Ok(None)
         }

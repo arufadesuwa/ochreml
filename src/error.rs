@@ -112,6 +112,22 @@ pub enum OchreError {
     #[error("Number of cross-validation folds ({0}) must be between 2 and n_samples ( >_< )")]
     InvalidCvFolds(usize),
 
+    #[error(
+        "Inverse regularization strength C ({0}) must be a strictly positive finite number (・`ω´・)"
+    )]
+    InvalidC(f64),
+
+    #[error("l1_ratio ({0}) must be a finite number in [0.0, 1.0] (・`ω´・)")]
+    InvalidL1Ratio(f64),
+
+    #[error("LogisticRegression requires at least 2 distinct classes in y, got {0} (´；ω；`)")]
+    InsufficientClasses(usize),
+
+    #[error(
+        "predict_proba is not supported for loss='{0}'; use 'log_loss' or 'modified_huber' (・`ω´・)"
+    )]
+    UnsupportedPredictProbaLoss(String),
+
     #[error("{0}")]
     General(String),
 }
