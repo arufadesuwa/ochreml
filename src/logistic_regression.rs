@@ -12,6 +12,7 @@ use crate::primitives::ElementwiseOp;
 
 pub const TAG_LOGISTIC_REGRESSION: u8 = 38;
 const LBFGS_HISTORY: usize = 10;
+const SMALL_MATRIX_GPU_THRESHOLD: usize = 262_144;
 
 fn validate_c(c: f64) -> OchreResult<()> {
     if c <= 0.0 || !c.is_finite() {
@@ -166,6 +167,36 @@ fn eval_binary_loss_grad(
     let w = &theta[..p];
     let b = if fit_intercept { theta[p] } else { 0.0 };
 
+    let mut data_loss = 0.0;
+    let mut grad_b = 0.0;
+
+    if matches!(backend, Backend::Cpu) {
+        grad_out[..p].fill(0.0);
+        for i in 0..n {
+            let row = &x.data[i * p..(i + 1) * p];
+            let z = dot_unrolled(row, w) + b;
+            let prob = stable_sigmoid(z);
+            let wi = weights[i];
+            let yi = y01[i];
+            data_loss += wi * (softplus(z) - yi * z);
+            let r = wi * (prob - yi);
+            grad_b += r;
+            for j in 0..p {
+                grad_out[j] += r * row[j];
+            }
+        }
+        let mut reg_loss = 0.0;
+        for j in 0..p {
+            let wj = w[j];
+            reg_loss += wj * wj;
+            grad_out[j] += inv_c * wj;
+        }
+        if fit_intercept {
+            grad_out[p] = grad_b;
+        }
+        return Ok(data_loss + 0.5 * inv_c * reg_loss);
+    }
+
     let mut logits = backend.matvec(x, w)?;
     if b != 0.0 {
         for z in &mut logits {
@@ -180,9 +211,7 @@ fn eval_binary_loss_grad(
         logits.iter().map(|&z| stable_sigmoid(z)).collect()
     };
 
-    let mut data_loss = 0.0;
     let mut residuals = Vec::with_capacity(n);
-    let mut grad_b = 0.0;
     for i in 0..n {
         let wi = weights[i];
         let z = logits[i];
@@ -513,7 +542,12 @@ impl LogisticRegression {
 
         let p = x.cols;
         let inv_c = 1.0 / self.c;
-        let backend = get_backend(&self.device);
+        // Avoid repeated PCIe/kernel-launch overhead per L-BFGS step on small matrices
+        let backend = if x.rows.saturating_mul(p) < SMALL_MATRIX_GPU_THRESHOLD {
+            Backend::Cpu
+        } else {
+            get_backend(&self.device)
+        };
 
         if n_classes == 2 {
             let y01: Vec<f64> = y_idx.iter().map(|&idx| idx as f64).collect();
