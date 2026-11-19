@@ -3,8 +3,14 @@ OchreML Scaling & Normalization Estimators & Functions (*≧ω≦*)
 Accelerated by Rust Backend N1 (col_reduce_stats, col_scale_shift) and N2 (elementwise_op).
 """
 
+from __future__ import annotations
+
 from typing import Any, Optional, Tuple, Union
-import numpy as np
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore[assignment]
 
 from .._ochreml import (
     MaxAbsScaler as _RustMaxAbsScaler,

@@ -3,8 +3,14 @@ OchreML Feature Extraction Submodule (*≧ω≦*)
 Provides DictVectorizer, FeatureHasher (MurmurHash3), and the text subpackage.
 """
 
+from __future__ import annotations
+
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-import numpy as np
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore[assignment]
 
 from .._ochreml import (
     DictVectorizer as _RustDictVectorizer,
@@ -59,13 +65,13 @@ class DictVectorizer:
     def __init__(
         self,
         *,
-        dtype: Any = np.float64,
+        dtype: Any = None,
         separator: str = "=",
         sparse: bool = True,
         sort: bool = True,
         device: Optional[str] = None,
     ):
-        self.dtype = dtype
+        self.dtype = (np.float64 if np is not None else float) if dtype is None else dtype
         self.separator = separator
         self.sparse = sparse
         self.sort = sort
@@ -212,13 +218,13 @@ class FeatureHasher:
         n_features: int = 2**20,
         *,
         input_type: str = "dict",
-        dtype: Any = np.float64,
+        dtype: Any = None,
         alternate_sign: bool = True,
         device: Optional[str] = None,
     ):
         self.n_features = n_features
         self.input_type = input_type
-        self.dtype = dtype
+        self.dtype = (np.float64 if np is not None else float) if dtype is None else dtype
         self.alternate_sign = alternate_sign
         self.device = _resolve_device(device)
         self._model = _RustFeatureHasher(

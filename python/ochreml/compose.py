@@ -4,10 +4,16 @@ Implements ColumnTransformer, TransformedTargetRegressor, make_column_transforme
 and make_column_selector with .dit persistence and full Scikit-Learn compatibility.
 """
 
+from __future__ import annotations
+
 import copy
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
-import numpy as np
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore[assignment]
 
 from ._preproc_utils import load_dit_envelope, save_dit_envelope, validate_dit_path
 from .preprocessing._transforms import FunctionTransformer

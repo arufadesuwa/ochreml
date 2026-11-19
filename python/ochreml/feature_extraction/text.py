@@ -4,10 +4,16 @@ Implements CountVectorizer, TfidfTransformer, TfidfVectorizer, and HashingVector
 backed by Rust Rayon tokenization, vocabulary indexing, TF-IDF scaling, and MurmurHash3.
 """
 
+from __future__ import annotations
+
 import re
 import unicodedata
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
-import numpy as np
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore[assignment]
 
 from .._ochreml import (
     CountVectorizer as _RustCountVectorizer,
@@ -234,9 +240,11 @@ class CountVectorizer(_TextVectorizerMixin):
         max_features: Optional[int] = None,
         vocabulary: Optional[Union[Dict[str, int], Iterable[str]]] = None,
         binary: bool = False,
-        dtype: Any = np.int64,
+        dtype: Any = None,
         device: Optional[str] = None,
     ):
+        if dtype is None:
+            dtype = np.int64 if np is not None else int
         self.input = input
         self.encoding = encoding
         self.decode_error = decode_error
@@ -572,13 +580,15 @@ class TfidfVectorizer(CountVectorizer):
         max_features: Optional[int] = None,
         vocabulary: Optional[Union[Dict[str, int], Iterable[str]]] = None,
         binary: bool = False,
-        dtype: Any = np.float64,
+        dtype: Any = None,
         norm: Optional[str] = "l2",
         use_idf: bool = True,
         smooth_idf: bool = True,
         sublinear_tf: bool = False,
         device: Optional[str] = None,
     ):
+        if dtype is None:
+            dtype = np.float64 if np is not None else float
         super().__init__(
             input=input,
             encoding=encoding,
@@ -731,9 +741,11 @@ class HashingVectorizer(_TextVectorizerMixin):
         binary: bool = False,
         norm: Optional[str] = "l2",
         alternate_sign: bool = True,
-        dtype: Any = np.float64,
+        dtype: Any = None,
         device: Optional[str] = None,
     ):
+        if dtype is None:
+            dtype = np.float64 if np is not None else float
         self.input = input
         self.encoding = encoding
         self.decode_error = decode_error

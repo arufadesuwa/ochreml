@@ -4,9 +4,15 @@ Implements SimpleImputer (N1), MissingIndicator, KNNImputer (N3+N4),
 and IterativeImputer powered by OchreML Ridge / LinearRegression.
 """
 
+from __future__ import annotations
+
 import copy
 from typing import Any, List, Optional, Tuple, Union
-import numpy as np
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore[assignment]
 
 from ._ochreml import (
     KNNImputer as _RustKNNImputer,
@@ -56,7 +62,7 @@ class MissingIndicator:
     def __init__(
         self,
         *,
-        missing_values: float = np.nan,
+        missing_values: float = float("nan"),
         features: str = "missing-only",
         sparse: Union[str, bool] = "auto",
         error_on_new: bool = True,
@@ -198,7 +204,7 @@ class SimpleImputer:
     def __init__(
         self,
         *,
-        missing_values: Any = np.nan,
+        missing_values: Any = float("nan"),
         strategy: str = "mean",
         fill_value: Optional[Any] = None,
         copy: bool = True,
@@ -366,7 +372,7 @@ class KNNImputer:
     def __init__(
         self,
         *,
-        missing_values: float = np.nan,
+        missing_values: float = float("nan"),
         n_neighbors: int = 5,
         weights: str = "uniform",
         metric: str = "nan_euclidean",
@@ -513,7 +519,7 @@ class IterativeImputer:
         self,
         estimator: Optional[Any] = None,
         *,
-        missing_values: float = np.nan,
+        missing_values: float = float("nan"),
         sample_posterior: bool = False,
         max_iter: int = 10,
         tol: float = 1e-3,
@@ -522,8 +528,8 @@ class IterativeImputer:
         fill_value: Optional[float] = None,
         imputation_order: str = "ascending",
         skip_complete: bool = False,
-        min_value: Union[float, np.ndarray] = -np.inf,
-        max_value: Union[float, np.ndarray] = np.inf,
+        min_value: Union[float, np.ndarray] = float("-inf"),
+        max_value: Union[float, np.ndarray] = float("inf"),
         verbose: int = 0,
         random_state: Optional[int] = None,
         add_indicator: bool = False,

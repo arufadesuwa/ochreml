@@ -3,8 +3,14 @@ OchreML Categorical & Target Encoding Estimators (*≧ω≦*)
 Powered by Rust Rayon hash/sort kernels with zero-copy buffers and .dit persistence.
 """
 
+from __future__ import annotations
+
 from typing import Any, List, Optional, Sequence, Union
-import numpy as np
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore[assignment]
 
 from .._ochreml import (
     LabelBinarizer as _RustLabelBinarizer,
@@ -134,7 +140,7 @@ class OneHotEncoder(_BaseEncoder):
         categories: Union[str, Sequence[Sequence[Any]]] = "auto",
         drop: Optional[Union[str, Sequence[Any]]] = None,
         sparse_output: bool = True,
-        dtype: Any = np.float64,
+        dtype: Any = None,
         handle_unknown: str = "error",
         min_frequency: Optional[Union[int, float]] = None,
         max_categories: Optional[int] = None,
@@ -143,7 +149,7 @@ class OneHotEncoder(_BaseEncoder):
         self.categories = categories
         self.drop = drop
         self.sparse_output = sparse_output
-        self.dtype = dtype
+        self.dtype = (np.float64 if np is not None else float) if dtype is None else dtype
         self.handle_unknown = handle_unknown
         self.min_frequency = min_frequency
         self.max_categories = max_categories
@@ -341,16 +347,16 @@ class OrdinalEncoder(_BaseEncoder):
         self,
         *,
         categories: Union[str, Sequence[Sequence[Any]]] = "auto",
-        dtype: Any = np.float64,
+        dtype: Any = None,
         handle_unknown: str = "error",
         unknown_value: Optional[float] = None,
-        encoded_missing_value: float = np.nan,
+        encoded_missing_value: float = float("nan"),
         min_frequency: Optional[Union[int, float]] = None,
         max_categories: Optional[int] = None,
         device: Optional[str] = None,
     ):
         self.categories = categories
-        self.dtype = dtype
+        self.dtype = (np.float64 if np is not None else float) if dtype is None else dtype
         self.handle_unknown = handle_unknown
         self.unknown_value = unknown_value
         self.encoded_missing_value = encoded_missing_value

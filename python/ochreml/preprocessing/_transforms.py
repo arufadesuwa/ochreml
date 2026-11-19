@@ -4,8 +4,14 @@ Implements PowerTransformer, QuantileTransformer, FunctionTransformer,
 KBinsDiscretizer, Binarizer, and their stateless counterparts.
 """
 
+from __future__ import annotations
+
 from typing import Any, Callable, Dict, Optional, Sequence, Union
-import numpy as np
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore[assignment]
 
 from .._ochreml import (
     Binarizer as _RustBinarizer,

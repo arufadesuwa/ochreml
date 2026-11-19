@@ -3,8 +3,14 @@ OchreML Feature Engineering Estimators (*≧ω≦*)
 Implements PolynomialFeatures, SplineTransformer, KernelCenterer, and add_dummy_feature.
 """
 
+from __future__ import annotations
+
 from typing import Any, List, Optional, Tuple, Union
-import numpy as np
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore[assignment]
 
 from .._ochreml import (
     KernelCenterer as _RustKernelCenterer,
