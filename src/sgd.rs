@@ -182,6 +182,109 @@ fn regressor_loss_and_dloss(loss: &str, pred: f64, y: f64, epsilon: f64) -> (f64
     }
 }
 
+const LARGE_N_BLOCK_SHUFFLE_THRESHOLD: usize = 100_000;
+const SHUFFLE_BLOCK_SIZE: usize = 512;
+
+enum EpochOrder {
+    Rows(Vec<usize>),
+    Blocks {
+        block_ids: Vec<usize>,
+        n: usize,
+        block_size: usize,
+    },
+}
+
+impl EpochOrder {
+    fn new(n: usize) -> Self {
+        if n >= LARGE_N_BLOCK_SHUFFLE_THRESHOLD {
+            let n_blocks = n.div_ceil(SHUFFLE_BLOCK_SIZE);
+            Self::Blocks {
+                block_ids: (0..n_blocks).collect(),
+                n,
+                block_size: SHUFFLE_BLOCK_SIZE,
+            }
+        } else {
+            Self::Rows((0..n).collect())
+        }
+    }
+
+    fn shuffle(&mut self, rng: &mut SplitMix64) {
+        match self {
+            Self::Rows(rows) => rng.shuffle(rows),
+            Self::Blocks { block_ids, .. } => rng.shuffle(block_ids),
+        }
+    }
+
+    #[inline]
+    fn for_each<F: FnMut(usize)>(&self, mut f: F) {
+        match self {
+            Self::Rows(rows) => {
+                for &idx in rows {
+                    f(idx);
+                }
+            }
+            Self::Blocks {
+                block_ids,
+                n,
+                block_size,
+            } => {
+                for &bid in block_ids {
+                    let start = bid * block_size;
+                    let end = (start + block_size).min(*n);
+                    for idx in start..end {
+                        f(idx);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn sgd_update_weights(
+    w: &mut [f64],
+    w_scale: &mut f64,
+    row: &[f64],
+    eta: f64,
+    step_g: f64,
+    l1_reg: f64,
+    l2_reg: f64,
+) {
+    let decay = (1.0 - eta * l2_reg).max(0.0);
+    if l1_reg > 0.0 {
+        if (*w_scale - 1.0).abs() > 1e-12 {
+            let s = *w_scale;
+            for v in w.iter_mut() {
+                *v *= s;
+            }
+            *w_scale = 1.0;
+        }
+        let thr = eta * l1_reg;
+        for j in 0..w.len() {
+            let updated = w[j] * decay - step_g * row[j];
+            w[j] = apply_scalar_op(updated, ElementwiseOp::SoftThreshold { lambda: thr });
+        }
+    } else {
+        if decay > 1e-12 {
+            *w_scale *= decay;
+        } else {
+            w.fill(0.0);
+            *w_scale = 1.0;
+        }
+        if *w_scale < 1e-9 {
+            let s = *w_scale;
+            for v in w.iter_mut() {
+                *v *= s;
+            }
+            *w_scale = 1.0;
+        }
+        let adj = step_g / *w_scale;
+        for j in 0..w.len() {
+            w[j] -= adj * row[j];
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fit_sgd_binary_classifier(
     x: &Matrix,
@@ -203,8 +306,9 @@ fn fit_sgd_binary_classifier(
     let n = x.rows;
     let p = x.cols;
     let mut w = vec![0.0; p];
+    let mut w_scale = 1.0_f64;
     let mut b = 0.0_f64;
-    let mut indices: Vec<usize> = (0..n).collect();
+    let mut order = EpochOrder::new(n);
     let t0 = compute_t0_optimal(alpha, loss_name);
     let mut t = 1.0_f64;
     let mut best_loss = f64::INFINITY;
@@ -214,32 +318,20 @@ fn fit_sgd_binary_classifier(
     for epoch in 0..max_iter {
         n_iter = epoch + 1;
         if shuffle {
-            rng.shuffle(&mut indices);
+            order.shuffle(rng);
         }
         let mut epoch_loss = 0.0;
 
-        for &idx in &indices {
+        order.for_each(|idx| {
             let row = &x.data[idx * p..(idx + 1) * p];
             let sw = weights[idx];
-            let pred = dot_unrolled(row, &w) + b;
+            let pred = dot_unrolled(row, &w) * w_scale + b;
             let (l_val, dloss) = classifier_loss_and_dloss(loss_name, pred, y_pm1[idx]);
             epoch_loss += sw * l_val;
 
             let eta = step_size(lr, eta0, power_t, alpha, t, t0);
             let step_g = eta * sw * dloss;
-            let decay = (1.0 - eta * l2_reg).max(0.0);
-
-            if l1_reg > 0.0 {
-                let thr = eta * l1_reg;
-                for j in 0..p {
-                    let updated = w[j] * decay - step_g * row[j];
-                    w[j] = apply_scalar_op(updated, ElementwiseOp::SoftThreshold { lambda: thr });
-                }
-            } else {
-                for j in 0..p {
-                    w[j] = w[j] * decay - step_g * row[j];
-                }
-            }
+            sgd_update_weights(&mut w, &mut w_scale, row, eta, step_g, l1_reg, l2_reg);
 
             if fit_intercept {
                 let intercept_eta = if lr == "optimal" { eta * 0.5 } else { eta };
@@ -247,7 +339,7 @@ fn fit_sgd_binary_classifier(
             }
 
             t += 1.0;
-        }
+        });
 
         let avg_loss = epoch_loss / (n as f64);
         if let Some(tol_val) = tol {
@@ -263,6 +355,11 @@ fn fit_sgd_binary_classifier(
         }
     }
 
+    if (w_scale - 1.0).abs() > 1e-12 {
+        for v in &mut w {
+            *v *= w_scale;
+        }
+    }
     (w, b, n_iter, t - 1.0)
 }
 
@@ -886,8 +983,9 @@ impl SGDRegressor {
         let n = x.rows;
         let p = x.cols;
         let mut w = vec![0.0; p];
+        let mut w_scale = 1.0_f64;
         let mut b = 0.0_f64;
-        let mut indices: Vec<usize> = (0..n).collect();
+        let mut order = EpochOrder::new(n);
         let t0 = compute_t0_optimal(self.alpha, &self.loss);
         let mut t = 1.0_f64;
         let mut best_loss = f64::INFINITY;
@@ -897,14 +995,14 @@ impl SGDRegressor {
         for epoch in 0..self.max_iter {
             n_iter = epoch + 1;
             if self.shuffle {
-                rng.shuffle(&mut indices);
+                order.shuffle(&mut rng);
             }
             let mut epoch_loss = 0.0;
 
-            for &idx in &indices {
+            order.for_each(|idx| {
                 let row = &x.data[idx * p..(idx + 1) * p];
                 let sw = sample_weight.map_or(1.0, |s| s[idx]);
-                let pred = dot_unrolled(row, &w) + b;
+                let pred = dot_unrolled(row, &w) * w_scale + b;
                 let (l_val, dloss) =
                     regressor_loss_and_dloss(&self.loss, pred, y[idx], self.epsilon);
                 epoch_loss += sw * l_val;
@@ -918,20 +1016,7 @@ impl SGDRegressor {
                     t0,
                 );
                 let step_g = eta * sw * dloss;
-                let decay = (1.0 - eta * l2_reg).max(0.0);
-
-                if l1_reg > 0.0 {
-                    let thr = eta * l1_reg;
-                    for j in 0..p {
-                        let updated = w[j] * decay - step_g * row[j];
-                        w[j] =
-                            apply_scalar_op(updated, ElementwiseOp::SoftThreshold { lambda: thr });
-                    }
-                } else {
-                    for j in 0..p {
-                        w[j] = w[j] * decay - step_g * row[j];
-                    }
-                }
+                sgd_update_weights(&mut w, &mut w_scale, row, eta, step_g, l1_reg, l2_reg);
 
                 if self.fit_intercept {
                     let intercept_eta = if self.learning_rate == "optimal" {
@@ -943,7 +1028,7 @@ impl SGDRegressor {
                 }
 
                 t += 1.0;
-            }
+            });
 
             let avg_loss = epoch_loss / (n as f64);
             if let Some(tol_val) = self.tol {
@@ -959,6 +1044,11 @@ impl SGDRegressor {
             }
         }
 
+        if (w_scale - 1.0).abs() > 1e-12 {
+            for v in &mut w {
+                *v *= w_scale;
+            }
+        }
         self.coef_ = Some(w);
         self.intercept_ = Some(b);
         self.n_iter_ = n_iter;

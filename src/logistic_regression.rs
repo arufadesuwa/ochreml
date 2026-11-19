@@ -9,6 +9,7 @@ use crate::error::{OchreError, OchreResult};
 use crate::linear_regression::{dot_unrolled, predict_linear_1d, predict_linear_multi};
 use crate::matrix::Matrix;
 use crate::primitives::ElementwiseOp;
+use rayon::prelude::*;
 
 pub const TAG_LOGISTIC_REGRESSION: u8 = 38;
 const LBFGS_HISTORY: usize = 10;
@@ -171,18 +172,60 @@ fn eval_binary_loss_grad(
     let mut grad_b = 0.0;
 
     if matches!(backend, Backend::Cpu) {
-        grad_out[..p].fill(0.0);
-        for i in 0..n {
-            let row = &x.data[i * p..(i + 1) * p];
-            let z = dot_unrolled(row, w) + b;
-            let prob = stable_sigmoid(z);
-            let wi = weights[i];
-            let yi = y01[i];
-            data_loss += wi * (softplus(z) - yi * z);
-            let r = wi * (prob - yi);
-            grad_b += r;
-            for j in 0..p {
-                grad_out[j] += r * row[j];
+        if n >= 2048 {
+            const CHUNK_ROWS: usize = 2048;
+            let (par_loss, par_grad_w, par_grad_b) = x
+                .data
+                .par_chunks(CHUNK_ROWS * p)
+                .zip(y01.par_chunks(CHUNK_ROWS))
+                .zip(weights.par_chunks(CHUNK_ROWS))
+                .map(|((x_chunk, y_chunk), w_chunk)| {
+                    let mut loc_loss = 0.0;
+                    let mut loc_grad_w = vec![0.0; p];
+                    let mut loc_grad_b = 0.0;
+                    let rows = y_chunk.len();
+                    for i in 0..rows {
+                        let row = &x_chunk[i * p..(i + 1) * p];
+                        let z = dot_unrolled(row, w) + b;
+                        let prob = stable_sigmoid(z);
+                        let wi = w_chunk[i];
+                        let yi = y_chunk[i];
+                        loc_loss += wi * (softplus(z) - yi * z);
+                        let r = wi * (prob - yi);
+                        loc_grad_b += r;
+                        for j in 0..p {
+                            loc_grad_w[j] += r * row[j];
+                        }
+                    }
+                    (loc_loss, loc_grad_w, loc_grad_b)
+                })
+                .reduce(
+                    || (0.0, vec![0.0; p], 0.0),
+                    |(l1, mut gw1, gb1), (l2, gw2, gb2)| {
+                        for j in 0..p {
+                            gw1[j] += gw2[j];
+                        }
+                        (l1 + l2, gw1, gb1 + gb2)
+                    },
+                );
+
+            data_loss = par_loss;
+            grad_b = par_grad_b;
+            grad_out[..p].copy_from_slice(&par_grad_w);
+        } else {
+            grad_out[..p].fill(0.0);
+            for i in 0..n {
+                let row = &x.data[i * p..(i + 1) * p];
+                let z = dot_unrolled(row, w) + b;
+                let prob = stable_sigmoid(z);
+                let wi = weights[i];
+                let yi = y01[i];
+                data_loss += wi * (softplus(z) - yi * z);
+                let r = wi * (prob - yi);
+                grad_b += r;
+                for j in 0..p {
+                    grad_out[j] += r * row[j];
+                }
             }
         }
         let mut reg_loss = 0.0;
@@ -253,6 +296,87 @@ fn eval_multinomial_loss_grad(
     let n = x.rows;
     let p = x.cols;
     let w_len = n_classes * p;
+
+    if matches!(backend, Backend::Cpu) && n >= 2048 {
+        const CHUNK_ROWS: usize = 1024;
+        let b_slice = if fit_intercept {
+            &theta[w_len..w_len + n_classes]
+        } else {
+            &[]
+        };
+        let (par_loss, par_gw, par_gb) = x
+            .data
+            .par_chunks(CHUNK_ROWS * p)
+            .zip(y_idx.par_chunks(CHUNK_ROWS))
+            .zip(weights.par_chunks(CHUNK_ROWS))
+            .map(|((x_chunk, y_chunk), w_chunk)| {
+                let mut loc_loss = 0.0;
+                let mut loc_gw = vec![0.0; w_len];
+                let mut loc_gb = vec![0.0; n_classes];
+                let mut logits = vec![0.0; n_classes];
+                for i in 0..y_chunk.len() {
+                    let row = &x_chunk[i * p..(i + 1) * p];
+                    let mut max_z = f64::NEG_INFINITY;
+                    for c in 0..n_classes {
+                        let w_row = &theta[c * p..(c + 1) * p];
+                        let mut z = dot_unrolled(row, w_row);
+                        if fit_intercept {
+                            z += b_slice[c];
+                        }
+                        logits[c] = z;
+                        if z > max_z {
+                            max_z = z;
+                        }
+                    }
+                    let mut sum_exp = 0.0;
+                    for val in &mut logits {
+                        let e = (*val - max_z).exp();
+                        *val = e;
+                        sum_exp += e;
+                    }
+                    let wi = w_chunk[i];
+                    let yi = y_chunk[i];
+                    let inv_sum = 1.0 / sum_exp;
+                    let p_true = (logits[yi] * inv_sum).max(1e-15);
+                    loc_loss -= wi * p_true.ln();
+
+                    for c in 0..n_classes {
+                        let pc = logits[c] * inv_sum;
+                        let target = if c == yi { 1.0 } else { 0.0 };
+                        let r = wi * (pc - target);
+                        loc_gb[c] += r;
+                        let gw_row = &mut loc_gw[c * p..(c + 1) * p];
+                        for j in 0..p {
+                            gw_row[j] += r * row[j];
+                        }
+                    }
+                }
+                (loc_loss, loc_gw, loc_gb)
+            })
+            .reduce(
+                || (0.0, vec![0.0; w_len], vec![0.0; n_classes]),
+                |(l1, mut gw1, mut gb1), (l2, gw2, gb2)| {
+                    for idx in 0..w_len {
+                        gw1[idx] += gw2[idx];
+                    }
+                    for c in 0..n_classes {
+                        gb1[c] += gb2[c];
+                    }
+                    (l1 + l2, gw1, gb1)
+                },
+            );
+
+        let mut reg_loss = 0.0;
+        for idx in 0..w_len {
+            let wv = theta[idx];
+            reg_loss += wv * wv;
+            grad_out[idx] = par_gw[idx] + inv_c * wv;
+        }
+        if fit_intercept {
+            grad_out[w_len..w_len + n_classes].copy_from_slice(&par_gb);
+        }
+        return Ok(par_loss + 0.5 * inv_c * reg_loss);
+    }
 
     // Build W^T of shape (p, n_classes) for X * W^T
     let mut wt_data = vec![0.0; p * n_classes];
@@ -542,8 +666,8 @@ impl LogisticRegression {
 
         let p = x.cols;
         let inv_c = 1.0 / self.c;
-        // Avoid repeated PCIe/kernel-launch overhead per L-BFGS step on small matrices
-        let backend = if x.rows.saturating_mul(p) < SMALL_MATRIX_GPU_THRESHOLD {
+        // Avoid repeated PCIe/kernel-launch overhead per L-BFGS step on small or narrow matrices
+        let backend = if x.rows.saturating_mul(p) < SMALL_MATRIX_GPU_THRESHOLD || p <= 64 {
             Backend::Cpu
         } else {
             get_backend(&self.device)
