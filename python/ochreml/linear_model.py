@@ -61,7 +61,128 @@ def _to_ndarray_or_raw(val: Any) -> Any:
         return val
 
 
-class LogisticRegression:
+def _fast_predict_1d(X_data: Any, w: Any, b: float) -> Any:
+    from . import _fast_linear_predict_1d
+
+    return _fast_linear_predict_1d(X_data, w, b)
+
+
+def _fast_predict_2d(X_data: Any, w_t: Any, b: Any) -> Any:
+    from . import _fast_linear_predict_2d
+
+    return _fast_linear_predict_2d(X_data, w_t, b)
+
+
+class _FastClassifierMixin:
+    """Shared NumPy buffer cache & zero-boxing prediction fast-path for linear classifiers."""
+
+    def _init_cache(self) -> None:
+        self._coef_arr: Optional[Any] = None
+        self._coef_arr_t: Optional[Any] = None
+        self._intercept_val: Any = 0.0
+        self._classes_arr: Optional[Any] = None
+        self._is_mc: bool = False
+        self._n_feat: Optional[int] = None
+
+    def _sync_cache(self) -> None:
+        try:
+            import numpy as np
+
+            classes = self._model.classes_
+            self._classes_arr = np.asarray(classes, dtype=np.float64) if classes else None
+            self._is_mc = bool(self._model.is_multiclass_)
+            self._n_feat = self._model.n_features_in_
+            if self._is_mc:
+                cm = self._model.coef_multi_
+                if cm is not None:
+                    self._coef_arr = np.asarray(cm, dtype=np.float64)
+                    self._coef_arr_t = np.ascontiguousarray(self._coef_arr.T)
+                else:
+                    self._coef_arr = None
+                    self._coef_arr_t = None
+                im = self._model.intercept_multi_
+                self._intercept_val = (
+                    np.asarray(im, dtype=np.float64)
+                    if im is not None
+                    else np.zeros(len(classes), dtype=np.float64)
+                )
+            else:
+                c = self._model.coef_
+                self._coef_arr = np.asarray(c, dtype=np.float64) if c is not None else None
+                self._coef_arr_t = None
+                self._intercept_val = float(self._model.intercept_ or 0.0)
+        except Exception:
+            self._init_cache()
+
+    def _fast_scores(self, X_data: Any) -> Any:
+        expected = self._n_feat
+        if expected is not None and X_data.shape[1] != expected:
+            raise ValueError(
+                f"Number of features in test data ({X_data.shape[1]}) does not match model ({expected}) (・`ω´・)"
+            )
+        if self._is_mc:
+            return _fast_predict_2d(X_data, self._coef_arr_t, self._intercept_val)
+        return _fast_predict_1d(X_data, self._coef_arr, self._intercept_val)
+
+    def _fast_predict_labels(self, X_data: Any) -> Any:
+        import numpy as np
+
+        scores = self._fast_scores(X_data)
+        if self._is_mc:
+            return self._classes_arr[np.argmax(scores, axis=1)]
+        return np.where(scores > 0.0, self._classes_arr[1], self._classes_arr[0])
+
+
+class _FastRegressorMixin:
+    """Shared NumPy buffer cache & zero-boxing prediction fast-path for linear regressors."""
+
+    def _init_cache(self) -> None:
+        self._coef_arr: Optional[Any] = None
+        self._coef_arr_t: Optional[Any] = None
+        self._intercept_val: Any = 0.0
+        self._is_multi: bool = False
+        self._n_feat: Optional[int] = None
+
+    def _sync_cache(self) -> None:
+        try:
+            import numpy as np
+
+            self._is_multi = bool(getattr(self._model, "is_multi_target_", False))
+            self._n_feat = self._model.n_features_in_
+            if self._is_multi:
+                cm = self._model.coef_multi_
+                if cm is not None:
+                    self._coef_arr = np.asarray(cm, dtype=np.float64)
+                    self._coef_arr_t = np.ascontiguousarray(self._coef_arr.T)
+                else:
+                    self._coef_arr = None
+                    self._coef_arr_t = None
+                im = self._model.intercept_multi_
+                self._intercept_val = (
+                    np.asarray(im, dtype=np.float64)
+                    if im is not None
+                    else np.zeros(self._model.n_targets_, dtype=np.float64)
+                )
+            else:
+                c = self._model.coef_
+                self._coef_arr = np.asarray(c, dtype=np.float64) if c is not None else None
+                self._coef_arr_t = None
+                self._intercept_val = float(self._model.intercept_ or 0.0)
+        except Exception:
+            self._init_cache()
+
+    def _fast_predict_reg(self, X_data: Any) -> Any:
+        expected = self._n_feat
+        if expected is not None and X_data.shape[1] != expected:
+            raise ValueError(
+                f"Number of features in test data ({X_data.shape[1]}) does not match model ({expected}) (・`ω´・)"
+            )
+        if self._is_multi:
+            return _fast_predict_2d(X_data, self._coef_arr_t, self._intercept_val)
+        return _fast_predict_1d(X_data, self._coef_arr, self._intercept_val)
+
+
+class LogisticRegression(_FastClassifierMixin):
     """
     L2-regularized Logistic Regression (binary & multinomial) using L-BFGS (＾▽＾)
 
@@ -106,6 +227,7 @@ class LogisticRegression:
             class_weight_map=cw_map,
             device=self.device,
         )
+        self._init_cache()
 
     @classmethod
     def _from_rust(
@@ -119,6 +241,8 @@ class LogisticRegression:
         inst.tol = rust_model.tol
         inst.class_weight = None
         inst.device = rust_model.device_ or device
+        inst._init_cache()
+        inst._sync_cache()
         return inst
 
     def fit(
@@ -138,11 +262,14 @@ class LogisticRegression:
                 sw_data.tolist() if (is_buf_sw and sw_data is not None) else sw_data
             )
             self._model.fit(X_mat, y_vec, sw_list)
+        self._sync_cache()
         return self
 
     def decision_function(self, X: Any) -> Any:
         """Predict confidence scores for samples (*≧ω≦*)."""
         is_buf, X_data = process_features(X)
+        if is_buf and getattr(self, "_coef_arr", None) is not None:
+            return self._fast_scores(X_data)
         if self._model.is_multiclass_:
             res = (
                 self._model.decision_function_multi_buffer(X_data)
@@ -160,6 +287,16 @@ class LogisticRegression:
     def predict_proba(self, X: Any) -> Any:
         """Probability estimates for samples (o´∀｀o)."""
         is_buf, X_data = process_features(X)
+        if is_buf and getattr(self, "_coef_arr", None) is not None:
+            import numpy as np
+
+            scores = self._fast_scores(X_data)
+            if self._is_mc:
+                shifted = scores - np.max(scores, axis=1, keepdims=True)
+                exp_s = np.exp(shifted)
+                return exp_s / np.sum(exp_s, axis=1, keepdims=True)
+            p1 = np.where(scores >= 0.0, 1.0 / (1.0 + np.exp(-scores)), np.exp(np.clip(scores, -500.0, 0.0)) / (1.0 + np.exp(np.clip(scores, -500.0, 0.0))))
+            return np.column_stack((1.0 - p1, p1))
         res = (
             self._model.predict_proba_buffer(X_data)
             if is_buf
@@ -170,6 +307,10 @@ class LogisticRegression:
     def predict_log_proba(self, X: Any) -> Any:
         """Predict logarithm of probability estimates (o´∀｀o)."""
         is_buf, X_data = process_features(X)
+        if is_buf and getattr(self, "_coef_arr", None) is not None:
+            import numpy as np
+
+            return np.log(np.maximum(self.predict_proba(X_data), 1e-15))
         res = (
             self._model.predict_log_proba_buffer(X_data)
             if is_buf
@@ -180,6 +321,8 @@ class LogisticRegression:
     def predict(self, X: Any) -> Any:
         """Predict class labels for samples in X (＾▽＾)."""
         is_buf, X_data = process_features(X)
+        if is_buf and getattr(self, "_coef_arr", None) is not None and self._classes_arr is not None:
+            return self._fast_predict_labels(X_data)
         res = (
             self._model.predict_buffer(X_data)
             if is_buf
@@ -230,6 +373,10 @@ class LogisticRegression:
         self.tol = rust_model.tol
         self.class_weight = data.get("class_weight", None)
         self.device = rust_model.device_ or dev
+        self._init_cache()
+        self._sync_cache()
+        self._init_cache()
+        self._sync_cache()
 
     @property
     def coef_(self) -> Any:
@@ -266,7 +413,7 @@ class LogisticRegression:
         )
 
 
-class _BaseSparseLinearEstimator:
+class _BaseSparseLinearEstimator(_FastRegressorMixin):
     """Shared Python wrapper for Lasso and ElasticNet (*≧ω≦*)."""
 
     _rust_cls: Any = None
@@ -294,10 +441,13 @@ class _BaseSparseLinearEstimator:
             else:
                 y_vec = to_target_vector(y_data) if is_buf_y else y_data
                 self._model.fit(X_mat, y_vec, sw_list)
+        self._sync_cache()
         return self
 
     def predict(self, X: Any) -> Any:
         is_buf, X_data = process_features(X)
+        if is_buf and getattr(self, "_coef_arr", None) is not None:
+            return self._fast_predict_reg(X_data)
         if self._model.is_multi_target_:
             res = (
                 self._model.predict_multi_buffer(X_data)
@@ -421,6 +571,7 @@ class Lasso(_BaseSparseLinearEstimator):
             positive=self.positive,
             device=self.device,
         )
+        self._init_cache()
 
     @classmethod
     def _from_rust(cls, rust_model: _RustLasso, device: str) -> "Lasso":
@@ -432,6 +583,8 @@ class Lasso(_BaseSparseLinearEstimator):
         inst.tol = rust_model.tol
         inst.positive = rust_model.positive
         inst.device = rust_model.device_ or device
+        inst._init_cache()
+        inst._sync_cache()
         return inst
 
     @classmethod
@@ -454,6 +607,8 @@ class Lasso(_BaseSparseLinearEstimator):
         self.tol = rust_model.tol
         self.positive = rust_model.positive
         self.device = rust_model.device_ or dev
+        self._init_cache()
+        self._sync_cache()
 
     def __repr__(self) -> str:
         return (
@@ -513,6 +668,7 @@ class ElasticNet(_BaseSparseLinearEstimator):
             positive=self.positive,
             device=self.device,
         )
+        self._init_cache()
 
     @classmethod
     def _from_rust(cls, rust_model: _RustElasticNet, device: str) -> "ElasticNet":
@@ -525,6 +681,8 @@ class ElasticNet(_BaseSparseLinearEstimator):
         inst.tol = rust_model.tol
         inst.positive = rust_model.positive
         inst.device = rust_model.device_ or device
+        inst._init_cache()
+        inst._sync_cache()
         return inst
 
     @classmethod
@@ -548,6 +706,8 @@ class ElasticNet(_BaseSparseLinearEstimator):
         self.tol = rust_model.tol
         self.positive = rust_model.positive
         self.device = rust_model.device_ or dev
+        self._init_cache()
+        self._sync_cache()
 
     def __repr__(self) -> str:
         return (
@@ -557,7 +717,7 @@ class ElasticNet(_BaseSparseLinearEstimator):
         )
 
 
-class SGDClassifier:
+class SGDClassifier(_FastClassifierMixin):
     """
     Linear classifiers (SVM, logistic regression, etc.) with SGD training (＾▽＾)
 
@@ -642,6 +802,7 @@ class SGDClassifier:
             class_weight_map=cw_map,
             device=self.device,
         )
+        self._init_cache()
 
     @classmethod
     def _from_rust(cls, rust_model: _RustSGDClassifier, device: str) -> "SGDClassifier":
@@ -661,6 +822,8 @@ class SGDClassifier:
         inst.random_state = rust_model.random_state
         inst.class_weight = None
         inst.device = rust_model.device_ or device
+        inst._init_cache()
+        inst._sync_cache()
         return inst
 
     def fit(
@@ -680,11 +843,14 @@ class SGDClassifier:
                 sw_data.tolist() if (is_buf_sw and sw_data is not None) else sw_data
             )
             self._model.fit(X_mat, y_vec, sw_list)
+        self._sync_cache()
         return self
 
     def decision_function(self, X: Any) -> Any:
         """Predict confidence scores for samples (*≧ω≦*)."""
         is_buf, X_data = process_features(X)
+        if is_buf and getattr(self, "_coef_arr", None) is not None:
+            return self._fast_scores(X_data)
         if self._model.is_multiclass_:
             res = (
                 self._model.decision_function_multi_buffer(X_data)
@@ -701,7 +867,27 @@ class SGDClassifier:
 
     def predict_proba(self, X: Any) -> Any:
         """Probability estimates (available for loss='log_loss' or 'modified_huber') (o´∀｀o)."""
+        if self.loss == "hinge":
+            raise ValueError(
+                "predict_proba is not supported for loss='hinge'; use 'log_loss' or 'modified_huber' (・`ω´・)"
+            )
         is_buf, X_data = process_features(X)
+        if is_buf and getattr(self, "_coef_arr", None) is not None:
+            import numpy as np
+
+            scores = self._fast_scores(X_data)
+            if self.loss == "log_loss":
+                p = np.where(
+                    scores >= 0.0,
+                    1.0 / (1.0 + np.exp(-scores)),
+                    np.exp(np.clip(scores, -500.0, 0.0)) / (1.0 + np.exp(np.clip(scores, -500.0, 0.0))),
+                )
+            else:
+                p = np.clip((scores + 1.0) * 0.5, 0.0, 1.0)
+            if self._is_mc:
+                row_sums = np.sum(p, axis=1, keepdims=True)
+                return np.where(row_sums > 0.0, p / row_sums, 1.0 / p.shape[1])
+            return np.column_stack((1.0 - p, p))
         res = (
             self._model.predict_proba_buffer(X_data)
             if is_buf
@@ -712,6 +898,10 @@ class SGDClassifier:
     def predict_log_proba(self, X: Any) -> Any:
         """Log of probability estimates (o´∀｀o)."""
         is_buf, X_data = process_features(X)
+        if is_buf and getattr(self, "_coef_arr", None) is not None:
+            import numpy as np
+
+            return np.log(np.maximum(self.predict_proba(X_data), 1e-15))
         res = (
             self._model.predict_log_proba_buffer(X_data)
             if is_buf
@@ -722,6 +912,8 @@ class SGDClassifier:
     def predict(self, X: Any) -> Any:
         """Predict class labels for samples in X (＾▽＾)."""
         is_buf, X_data = process_features(X)
+        if is_buf and getattr(self, "_coef_arr", None) is not None and self._classes_arr is not None:
+            return self._fast_predict_labels(X_data)
         res = (
             self._model.predict_buffer(X_data)
             if is_buf
@@ -781,6 +973,10 @@ class SGDClassifier:
         self.random_state = rust_model.random_state
         self.class_weight = data.get("class_weight", None)
         self.device = rust_model.device_ or dev
+        self._init_cache()
+        self._sync_cache()
+        self._init_cache()
+        self._sync_cache()
 
     @property
     def coef_(self) -> Any:
@@ -821,7 +1017,7 @@ class SGDClassifier:
         )
 
 
-class SGDRegressor:
+class SGDRegressor(_FastRegressorMixin):
     """
     Linear model fitted by minimizing a regularized empirical loss with SGD (＾▽＾)
 
@@ -904,6 +1100,7 @@ class SGDRegressor:
             random_state=self.random_state,
             device=self.device,
         )
+        self._init_cache()
 
     @classmethod
     def _from_rust(cls, rust_model: _RustSGDRegressor, device: str) -> "SGDRegressor":
@@ -923,6 +1120,8 @@ class SGDRegressor:
         inst.epsilon = rust_model.epsilon
         inst.random_state = rust_model.random_state
         inst.device = rust_model.device_ or device
+        inst._init_cache()
+        inst._sync_cache()
         return inst
 
     def fit(
@@ -942,11 +1141,14 @@ class SGDRegressor:
                 sw_data.tolist() if (is_buf_sw and sw_data is not None) else sw_data
             )
             self._model.fit(X_mat, y_vec, sw_list)
+        self._sync_cache()
         return self
 
     def predict(self, X: Any) -> Any:
         """Predict using the linear model (＾▽＾)."""
         is_buf, X_data = process_features(X)
+        if is_buf and getattr(self, "_coef_arr", None) is not None:
+            return self._fast_predict_reg(X_data)
         res = (
             self._model.predict_buffer(X_data)
             if is_buf
@@ -1000,6 +1202,8 @@ class SGDRegressor:
         self.epsilon = rust_model.epsilon
         self.random_state = rust_model.random_state
         self.device = rust_model.device_ or dev
+        self._init_cache()
+        self._sync_cache()
 
     @property
     def coef_(self) -> Any:

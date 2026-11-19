@@ -329,9 +329,9 @@ fn eval_multinomial_loss_grad(
                         }
                     }
                     let mut sum_exp = 0.0;
-                    for val in &mut logits {
-                        let e = (*val - max_z).exp();
-                        *val = e;
+                    for c in 0..n_classes {
+                        let e = (logits[c] - max_z).exp();
+                        logits[c] = e;
                         sum_exp += e;
                     }
                     let wi = w_chunk[i];
@@ -485,6 +485,7 @@ fn lbfgs_two_loop(
 
 fn run_lbfgs<F>(
     dim: usize,
+    n_samples: usize,
     max_iter: usize,
     tol: f64,
     mut eval_fn: F,
@@ -503,10 +504,11 @@ where
     let mut next_theta = vec![0.0; dim];
     let mut next_grad = vec![0.0; dim];
     let mut n_iter = 0usize;
+    let grad_tol = tol * (n_samples as f64).max(1.0);
 
     for iter in 0..max_iter {
         let g_inf = grad.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        if g_inf <= tol {
+        if g_inf <= grad_tol {
             break;
         }
         n_iter = iter + 1;
@@ -677,7 +679,7 @@ impl LogisticRegression {
             let y01: Vec<f64> = y_idx.iter().map(|&idx| idx as f64).collect();
             let dim = p + usize::from(self.fit_intercept);
             let fit_intercept = self.fit_intercept;
-            let (theta, n_iter) = run_lbfgs(dim, self.max_iter, self.tol, |th, gr| {
+            let (theta, n_iter) = run_lbfgs(dim, x.rows, self.max_iter, self.tol, |th, gr| {
                 eval_binary_loss_grad(&backend, x, &y01, &weights, th, fit_intercept, inv_c, gr)
             })?;
 
@@ -693,7 +695,7 @@ impl LogisticRegression {
             let w_len = n_classes * p;
             let dim = w_len + if self.fit_intercept { n_classes } else { 0 };
             let fit_intercept = self.fit_intercept;
-            let (theta, n_iter) = run_lbfgs(dim, self.max_iter, self.tol, |th, gr| {
+            let (theta, n_iter) = run_lbfgs(dim, x.rows, self.max_iter, self.tol, |th, gr| {
                 eval_multinomial_loss_grad(
                     &backend,
                     x,

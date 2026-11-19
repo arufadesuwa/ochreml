@@ -594,7 +594,7 @@ impl SGDClassifier {
         }
         let coef = self.coef_.as_ref().ok_or(OchreError::NotFitted)?;
         let intercept = self.intercept_.unwrap_or(0.0);
-        if !matches!(self.device, DeviceType::Cpu) {
+        if !matches!(self.device, DeviceType::Cpu) && x.rows.saturating_mul(x.cols) >= 262_144 {
             let mut out = get_backend(&self.device).matvec(x, coef)?;
             if intercept != 0.0 {
                 for v in &mut out {
@@ -1062,7 +1062,7 @@ impl SGDRegressor {
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
         let coef = self.coef_.as_ref().ok_or(OchreError::NotFitted)?;
         let intercept = self.intercept_.unwrap_or(0.0);
-        if !matches!(self.device, DeviceType::Cpu) {
+        if !matches!(self.device, DeviceType::Cpu) && x.rows.saturating_mul(x.cols) >= 262_144 {
             let mut out = get_backend(&self.device).matvec(x, coef)?;
             if intercept != 0.0 {
                 for v in &mut out {
