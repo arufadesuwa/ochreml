@@ -5,6 +5,8 @@ pub mod backend;
 pub mod backends;
 pub mod boosting;
 pub mod cluster;
+pub mod cluster_advanced;
+pub mod cross_decomposition;
 pub mod decision_tree;
 pub mod decomposition;
 pub mod device;
@@ -19,6 +21,7 @@ pub mod kernel_models;
 pub mod linear_regression;
 pub mod linear_svm;
 pub mod logistic_regression;
+pub mod manifold;
 pub mod matrix;
 pub mod mixture;
 pub mod naive_bayes;
@@ -137,6 +140,16 @@ pub const TAG_MLP_CLASSIFIER: u8 = neural_network::TAG_MLP_CLASSIFIER;
 pub const TAG_MLP_REGRESSOR: u8 = neural_network::TAG_MLP_REGRESSOR;
 pub const TAG_GP_REGRESSOR: u8 = gaussian_process::TAG_GP_REGRESSOR;
 pub const TAG_GP_CLASSIFIER: u8 = gaussian_process::TAG_GP_CLASSIFIER;
+pub const TAG_DBSCAN: u8 = cluster_advanced::TAG_DBSCAN;
+pub const TAG_OPTICS: u8 = cluster_advanced::TAG_OPTICS;
+pub const TAG_SPECTRAL_CLUSTERING: u8 = cluster_advanced::TAG_SPECTRAL_CLUSTERING;
+pub const TAG_AGGLOMERATIVE_CLUSTERING: u8 = cluster_advanced::TAG_AGGLOMERATIVE_CLUSTERING;
+pub const TAG_LOCAL_OUTLIER_FACTOR: u8 = cluster_advanced::TAG_LOCAL_OUTLIER_FACTOR;
+pub const TAG_NMF: u8 = cross_decomposition::TAG_NMF;
+pub const TAG_CCA: u8 = cross_decomposition::TAG_CCA;
+pub const TAG_PLS_REGRESSION: u8 = cross_decomposition::TAG_PLS_REGRESSION;
+pub const TAG_TSNE: u8 = manifold::TAG_TSNE;
+pub const TAG_MDS: u8 = manifold::TAG_MDS;
 
 fn validate_dit_path(path: &str) -> OchreResult<()> {
     if !path.trim().to_lowercase().ends_with(".dit") {
@@ -3609,5 +3622,8 @@ fn _ochreml(m: &Bound<'_, PyModule>) -> PyResult<()> {
     kernel_models::register_py_classes(m)?;
     neural_network::register_py_classes(m)?;
     gaussian_process::register_py_classes(m)?;
+    cluster_advanced::register_py_classes(m)?;
+    cross_decomposition::register_py_classes(m)?;
+    manifold::register_py_classes(m)?;
     Ok(())
 }

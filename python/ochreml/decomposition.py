@@ -410,10 +410,12 @@ class TruncatedSVD:
         return self._model.device_
 
 
+from .cross_decomposition import NMF
 from .kernel_svm import KernelPCA
 
 __all__ = [
     "PCA",
     "TruncatedSVD",
     "KernelPCA",
+    "NMF",
 ]

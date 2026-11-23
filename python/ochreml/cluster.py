@@ -510,5 +510,19 @@ class MiniBatchKMeans(_BaseClusterMixin):
         return bytes_to_f64_2d(rows, cols, raw)
 
 
-__all__ = ["KMeans", "MiniBatchKMeans"]
+from .cluster_advanced import (
+    AgglomerativeClustering,
+    DBSCAN,
+    OPTICS,
+    SpectralClustering,
+)
+
+__all__ = [
+    "KMeans",
+    "MiniBatchKMeans",
+    "DBSCAN",
+    "OPTICS",
+    "SpectralClustering",
+    "AgglomerativeClustering",
+]
 

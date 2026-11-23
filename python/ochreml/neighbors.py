@@ -765,3 +765,14 @@ class RadiusNeighborsRegressor(_RadiusNeighborsMixin):
         inst.p = 2.0
         inst.device = rust_model.device_ or target_dev
         return inst
+
+
+from .cluster_advanced import LocalOutlierFactor
+
+__all__ = [
+    "KNeighborsClassifier",
+    "KNeighborsRegressor",
+    "RadiusNeighborsClassifier",
+    "RadiusNeighborsRegressor",
+    "LocalOutlierFactor",
+]

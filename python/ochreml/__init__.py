@@ -80,6 +80,16 @@ from ._ochreml import (
     MLPRegressor as _RustMLPRegressor,
     GaussianProcessRegressor as _RustGaussianProcessRegressor,
     GaussianProcessClassifier as _RustGaussianProcessClassifier,
+    DBSCAN as _RustDBSCAN,
+    OPTICS as _RustOPTICS,
+    SpectralClustering as _RustSpectralClustering,
+    AgglomerativeClustering as _RustAgglomerativeClustering,
+    LocalOutlierFactor as _RustLocalOutlierFactor,
+    NMF as _RustNMF,
+    CCA as _RustCCA,
+    PLSRegression as _RustPLSRegression,
+    TSNE as _RustTSNE,
+    MDS as _RustMDS,
     get_available_devices as _get_available_devices,
     get_device_info as _get_device_info,
 )
@@ -202,6 +212,16 @@ __all__ = [
     "MLPRegressor",
     "GaussianProcessRegressor",
     "GaussianProcessClassifier",
+    "DBSCAN",
+    "OPTICS",
+    "SpectralClustering",
+    "AgglomerativeClustering",
+    "LocalOutlierFactor",
+    "NMF",
+    "CCA",
+    "PLSRegression",
+    "TSNE",
+    "MDS",
 ]
 
 _DEFAULT_DEVICE: str = "auto"
@@ -390,6 +410,26 @@ def load(path: str, device: Optional[str] = None) -> Any:
             return GaussianProcessRegressor._from_rust(_RustGaussianProcessRegressor.from_bytes(data, target_dev), target_dev)
         if tag == 84:
             return GaussianProcessClassifier._from_rust(_RustGaussianProcessClassifier.from_bytes(data, target_dev), target_dev)
+        if tag == 85:
+            return DBSCAN._from_rust(_RustDBSCAN.from_bytes(data, target_dev), target_dev)
+        if tag == 86:
+            return OPTICS._from_rust(_RustOPTICS.from_bytes(data, target_dev), target_dev)
+        if tag == 87:
+            return SpectralClustering._from_rust(_RustSpectralClustering.from_bytes(data, target_dev), target_dev)
+        if tag == 88:
+            return AgglomerativeClustering._from_rust(_RustAgglomerativeClustering.from_bytes(data, target_dev), target_dev)
+        if tag == 89:
+            return LocalOutlierFactor._from_rust(_RustLocalOutlierFactor.from_bytes(data, target_dev), target_dev)
+        if tag == 90:
+            return NMF._from_rust(_RustNMF.from_bytes(data, target_dev), target_dev)
+        if tag == 91:
+            return CCA._from_rust(_RustCCA.from_bytes(data, target_dev), target_dev)
+        if tag == 92:
+            return PLSRegression._from_rust(_RustPLSRegression.from_bytes(data, target_dev), target_dev)
+        if tag == 93:
+            return TSNE._from_rust(_RustTSNE.from_bytes(data, target_dev), target_dev)
+        if tag == 94:
+            return MDS._from_rust(_RustMDS.from_bytes(data, target_dev), target_dev)
         raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
     # Fallback if the .dit file was written via joblib.dump or pickle.dump
@@ -1626,9 +1666,18 @@ def _load_preprocessing_dit_tag(tag: int, data: bytes, path_str: str, target_dev
     raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
 
-from . import cluster, compose, decomposition, discriminant_analysis, ensemble, feature_extraction, gaussian_process, glm, impute, kernel_ridge, mixture, naive_bayes, neighbors, neural_network, preprocessing, svm
+from . import cluster, cluster_advanced, compose, cross_decomposition, decomposition, discriminant_analysis, ensemble, feature_extraction, gaussian_process, glm, impute, kernel_ridge, manifold, mixture, naive_bayes, neighbors, neural_network, preprocessing, svm
 from .cluster import KMeans, MiniBatchKMeans
+from .cluster_advanced import (
+    AgglomerativeClustering,
+    DBSCAN,
+    LocalOutlierFactor,
+    OPTICS,
+    SpectralClustering,
+)
+from .cross_decomposition import CCA, NMF, PLSRegression
 from .decomposition import KernelPCA, PCA, TruncatedSVD
+from .manifold import MDS, TSNE
 from .discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
 from .ensemble import (
     AdaBoostClassifier,
