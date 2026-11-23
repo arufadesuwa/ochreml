@@ -51,6 +51,15 @@ from ._ochreml import (
     TweedieRegressor as _RustTweedieRegressor,
     LinearSVC as _RustLinearSVC,
     LinearSVR as _RustLinearSVR,
+    KNeighborsClassifier as _RustKNeighborsClassifier,
+    KNeighborsRegressor as _RustKNeighborsRegressor,
+    RadiusNeighborsClassifier as _RustRadiusNeighborsClassifier,
+    RadiusNeighborsRegressor as _RustRadiusNeighborsRegressor,
+    GaussianNB as _RustGaussianNB,
+    MultinomialNB as _RustMultinomialNB,
+    BernoulliNB as _RustBernoulliNB,
+    ComplementNB as _RustComplementNB,
+    GaussianMixture as _RustGaussianMixture,
     get_available_devices as _get_available_devices,
     get_device_info as _get_device_info,
 )
@@ -137,6 +146,18 @@ __all__ = [
     "TweedieRegressor",
     "LinearSVC",
     "LinearSVR",
+    "neighbors",
+    "naive_bayes",
+    "mixture",
+    "KNeighborsClassifier",
+    "KNeighborsRegressor",
+    "RadiusNeighborsClassifier",
+    "RadiusNeighborsRegressor",
+    "GaussianNB",
+    "MultinomialNB",
+    "BernoulliNB",
+    "ComplementNB",
+    "GaussianMixture",
 ]
 
 _DEFAULT_DEVICE: str = "auto"
@@ -267,6 +288,24 @@ def load(path: str, device: Optional[str] = None) -> Any:
             return LinearSVC._from_rust(_RustLinearSVC.from_bytes(data, target_dev), target_dev)
         if tag == 55:
             return LinearSVR._from_rust(_RustLinearSVR.from_bytes(data, target_dev), target_dev)
+        if tag == 56:
+            return KNeighborsClassifier._from_rust(_RustKNeighborsClassifier.from_bytes(data, target_dev), target_dev)
+        if tag == 57:
+            return KNeighborsRegressor._from_rust(_RustKNeighborsRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 58:
+            return RadiusNeighborsClassifier._from_rust(_RustRadiusNeighborsClassifier.from_bytes(data, target_dev), target_dev)
+        if tag == 59:
+            return RadiusNeighborsRegressor._from_rust(_RustRadiusNeighborsRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 60:
+            return GaussianNB._from_rust(_RustGaussianNB.from_bytes(data, target_dev), target_dev)
+        if tag == 61:
+            return MultinomialNB._from_rust(_RustMultinomialNB.from_bytes(data, target_dev), target_dev)
+        if tag == 62:
+            return BernoulliNB._from_rust(_RustBernoulliNB.from_bytes(data, target_dev), target_dev)
+        if tag == 63:
+            return ComplementNB._from_rust(_RustComplementNB.from_bytes(data, target_dev), target_dev)
+        if tag == 64:
+            return GaussianMixture._from_rust(_RustGaussianMixture.from_bytes(data, target_dev), target_dev)
         raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
     # Fallback if the .dit file was written via joblib.dump or pickle.dump
@@ -1503,7 +1542,7 @@ def _load_preprocessing_dit_tag(tag: int, data: bytes, path_str: str, target_dev
     raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
 
-from . import cluster, compose, decomposition, discriminant_analysis, feature_extraction, glm, impute, preprocessing, svm
+from . import cluster, compose, decomposition, discriminant_analysis, feature_extraction, glm, impute, mixture, naive_bayes, neighbors, preprocessing, svm
 from .cluster import KMeans, MiniBatchKMeans
 from .decomposition import PCA, TruncatedSVD
 from .discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
@@ -1513,6 +1552,14 @@ from .glm import (
     PoissonRegressor,
     QuantileRegressor,
     TweedieRegressor,
+)
+from .mixture import GaussianMixture
+from .naive_bayes import BernoulliNB, ComplementNB, GaussianNB, MultinomialNB
+from .neighbors import (
+    KNeighborsClassifier,
+    KNeighborsRegressor,
+    RadiusNeighborsClassifier,
+    RadiusNeighborsRegressor,
 )
 from .svm import LinearSVC, LinearSVR
 from .compose import (

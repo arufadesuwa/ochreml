@@ -15,6 +15,9 @@ pub mod linear_regression;
 pub mod linear_svm;
 pub mod logistic_regression;
 pub mod matrix;
+pub mod mixture;
+pub mod naive_bayes;
+pub mod neighbors;
 pub mod preprocessing;
 pub mod primitives;
 pub mod ridge;
@@ -99,6 +102,15 @@ pub const TAG_GAMMA_REGRESSOR: u8 = glm::TAG_GAMMA_REGRESSOR;
 pub const TAG_TWEEDIE_REGRESSOR: u8 = glm::TAG_TWEEDIE_REGRESSOR;
 pub const TAG_LINEAR_SVC: u8 = linear_svm::TAG_LINEAR_SVC;
 pub const TAG_LINEAR_SVR: u8 = linear_svm::TAG_LINEAR_SVR;
+pub const TAG_KNEIGHBORS_CLASSIFIER: u8 = neighbors::TAG_KNEIGHBORS_CLASSIFIER;
+pub const TAG_KNEIGHBORS_REGRESSOR: u8 = neighbors::TAG_KNEIGHBORS_REGRESSOR;
+pub const TAG_RADIUS_NEIGHBORS_CLASSIFIER: u8 = neighbors::TAG_RADIUS_NEIGHBORS_CLASSIFIER;
+pub const TAG_RADIUS_NEIGHBORS_REGRESSOR: u8 = neighbors::TAG_RADIUS_NEIGHBORS_REGRESSOR;
+pub const TAG_GAUSSIAN_NB: u8 = naive_bayes::TAG_GAUSSIAN_NB;
+pub const TAG_MULTINOMIAL_NB: u8 = naive_bayes::TAG_MULTINOMIAL_NB;
+pub const TAG_BERNOULLI_NB: u8 = naive_bayes::TAG_BERNOULLI_NB;
+pub const TAG_COMPLEMENT_NB: u8 = naive_bayes::TAG_COMPLEMENT_NB;
+pub const TAG_GAUSSIAN_MIXTURE: u8 = mixture::TAG_GAUSSIAN_MIXTURE;
 
 fn validate_dit_path(path: &str) -> OchreResult<()> {
     if !path.trim().to_lowercase().ends_with(".dit") {
@@ -3562,5 +3574,8 @@ fn _ochreml(m: &Bound<'_, PyModule>) -> PyResult<()> {
     cluster::register_py_classes(m)?;
     glm::register_py_classes(m)?;
     linear_svm::register_py_classes(m)?;
+    neighbors::register_py_classes(m)?;
+    naive_bayes::register_py_classes(m)?;
+    mixture::register_py_classes(m)?;
     Ok(())
 }
