@@ -408,3 +408,12 @@ class TruncatedSVD:
     @property
     def device_(self) -> Optional[str]:
         return self._model.device_
+
+
+from .kernel_svm import KernelPCA
+
+__all__ = [
+    "PCA",
+    "TruncatedSVD",
+    "KernelPCA",
+]

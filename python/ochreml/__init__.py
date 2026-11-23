@@ -71,6 +71,15 @@ from ._ochreml import (
     AdaBoostClassifier as _RustAdaBoostClassifier,
     AdaBoostRegressor as _RustAdaBoostRegressor,
     IsolationForest as _RustIsolationForest,
+    SVC as _RustSVC,
+    SVR as _RustSVR,
+    OneClassSVM as _RustOneClassSVM,
+    KernelRidge as _RustKernelRidge,
+    KernelPCA as _RustKernelPCA,
+    MLPClassifier as _RustMLPClassifier,
+    MLPRegressor as _RustMLPRegressor,
+    GaussianProcessRegressor as _RustGaussianProcessRegressor,
+    GaussianProcessClassifier as _RustGaussianProcessClassifier,
     get_available_devices as _get_available_devices,
     get_device_info as _get_device_info,
 )
@@ -181,6 +190,18 @@ __all__ = [
     "AdaBoostClassifier",
     "AdaBoostRegressor",
     "IsolationForest",
+    "kernel_ridge",
+    "neural_network",
+    "gaussian_process",
+    "SVC",
+    "SVR",
+    "OneClassSVM",
+    "KernelRidge",
+    "KernelPCA",
+    "MLPClassifier",
+    "MLPRegressor",
+    "GaussianProcessRegressor",
+    "GaussianProcessClassifier",
 ]
 
 _DEFAULT_DEVICE: str = "auto"
@@ -351,6 +372,24 @@ def load(path: str, device: Optional[str] = None) -> Any:
             return AdaBoostRegressor._from_rust(_RustAdaBoostRegressor.from_bytes(data, target_dev), target_dev)
         if tag == 75:
             return IsolationForest._from_rust(_RustIsolationForest.from_bytes(data, target_dev), target_dev)
+        if tag == 76:
+            return SVC._from_rust(_RustSVC.from_bytes(data, target_dev), target_dev)
+        if tag == 77:
+            return SVR._from_rust(_RustSVR.from_bytes(data, target_dev), target_dev)
+        if tag == 78:
+            return OneClassSVM._from_rust(_RustOneClassSVM.from_bytes(data, target_dev), target_dev)
+        if tag == 79:
+            return KernelRidge._from_rust(_RustKernelRidge.from_bytes(data, target_dev), target_dev)
+        if tag == 80:
+            return KernelPCA._from_rust(_RustKernelPCA.from_bytes(data, target_dev), target_dev)
+        if tag == 81:
+            return MLPClassifier._from_rust(_RustMLPClassifier.from_bytes(data, target_dev), target_dev)
+        if tag == 82:
+            return MLPRegressor._from_rust(_RustMLPRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 83:
+            return GaussianProcessRegressor._from_rust(_RustGaussianProcessRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 84:
+            return GaussianProcessClassifier._from_rust(_RustGaussianProcessClassifier.from_bytes(data, target_dev), target_dev)
         raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
     # Fallback if the .dit file was written via joblib.dump or pickle.dump
@@ -1587,9 +1626,9 @@ def _load_preprocessing_dit_tag(tag: int, data: bytes, path_str: str, target_dev
     raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
 
-from . import cluster, compose, decomposition, discriminant_analysis, ensemble, feature_extraction, glm, impute, mixture, naive_bayes, neighbors, preprocessing, svm
+from . import cluster, compose, decomposition, discriminant_analysis, ensemble, feature_extraction, gaussian_process, glm, impute, kernel_ridge, mixture, naive_bayes, neighbors, neural_network, preprocessing, svm
 from .cluster import KMeans, MiniBatchKMeans
-from .decomposition import PCA, TruncatedSVD
+from .decomposition import KernelPCA, PCA, TruncatedSVD
 from .discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
 from .ensemble import (
     AdaBoostClassifier,
@@ -1604,6 +1643,7 @@ from .ensemble import (
     RandomForestClassifier,
     RandomForestRegressor,
 )
+from .gaussian_process import GaussianProcessClassifier, GaussianProcessRegressor
 from .glm import (
     GammaRegressor,
     HuberRegressor,
@@ -1611,6 +1651,7 @@ from .glm import (
     QuantileRegressor,
     TweedieRegressor,
 )
+from .kernel_ridge import KernelRidge
 from .mixture import GaussianMixture
 from .naive_bayes import BernoulliNB, ComplementNB, GaussianNB, MultinomialNB
 from .neighbors import (
@@ -1619,7 +1660,8 @@ from .neighbors import (
     RadiusNeighborsClassifier,
     RadiusNeighborsRegressor,
 )
-from .svm import LinearSVC, LinearSVR
+from .neural_network import MLPClassifier, MLPRegressor
+from .svm import LinearSVC, LinearSVR, OneClassSVM, SVC, SVR
 from .compose import (
     ColumnTransformer,
     TransformedTargetRegressor,

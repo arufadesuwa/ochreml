@@ -12,8 +12,10 @@ pub mod discriminant;
 pub mod dit_io;
 pub mod error;
 pub mod forest;
+pub mod gaussian_process;
 pub mod glm;
 pub mod hist_gradient_boosting;
+pub mod kernel_models;
 pub mod linear_regression;
 pub mod linear_svm;
 pub mod logistic_regression;
@@ -21,6 +23,7 @@ pub mod matrix;
 pub mod mixture;
 pub mod naive_bayes;
 pub mod neighbors;
+pub mod neural_network;
 pub mod preprocessing;
 pub mod primitives;
 pub mod ridge;
@@ -125,6 +128,15 @@ pub const TAG_GB_REGRESSOR: u8 = boosting::TAG_GB_REGRESSOR;
 pub const TAG_ADABOOST_CLASSIFIER: u8 = boosting::TAG_ADABOOST_CLASSIFIER;
 pub const TAG_ADABOOST_REGRESSOR: u8 = boosting::TAG_ADABOOST_REGRESSOR;
 pub const TAG_ISOLATION_FOREST: u8 = forest::TAG_ISOLATION_FOREST;
+pub const TAG_SVC: u8 = kernel_models::TAG_SVC;
+pub const TAG_SVR: u8 = kernel_models::TAG_SVR;
+pub const TAG_ONE_CLASS_SVM: u8 = kernel_models::TAG_ONE_CLASS_SVM;
+pub const TAG_KERNEL_RIDGE: u8 = kernel_models::TAG_KERNEL_RIDGE;
+pub const TAG_KERNEL_PCA: u8 = kernel_models::TAG_KERNEL_PCA;
+pub const TAG_MLP_CLASSIFIER: u8 = neural_network::TAG_MLP_CLASSIFIER;
+pub const TAG_MLP_REGRESSOR: u8 = neural_network::TAG_MLP_REGRESSOR;
+pub const TAG_GP_REGRESSOR: u8 = gaussian_process::TAG_GP_REGRESSOR;
+pub const TAG_GP_CLASSIFIER: u8 = gaussian_process::TAG_GP_CLASSIFIER;
 
 fn validate_dit_path(path: &str) -> OchreResult<()> {
     if !path.trim().to_lowercase().ends_with(".dit") {
@@ -3594,5 +3606,8 @@ fn _ochreml(m: &Bound<'_, PyModule>) -> PyResult<()> {
     hist_gradient_boosting::register_py_classes(m)?;
     forest::register_py_classes(m)?;
     boosting::register_py_classes(m)?;
+    kernel_models::register_py_classes(m)?;
+    neural_network::register_py_classes(m)?;
+    gaussian_process::register_py_classes(m)?;
     Ok(())
 }

@@ -611,3 +611,14 @@ class LinearSVR:
     @property
     def n_iter_(self) -> int:
         return int(self._model.n_iter_)
+
+
+from .kernel_svm import OneClassSVM, SVC, SVR
+
+__all__ = [
+    "LinearSVC",
+    "LinearSVR",
+    "SVC",
+    "SVR",
+    "OneClassSVM",
+]
