@@ -13,17 +13,21 @@ pub mod device;
 pub mod discriminant;
 pub mod dit_io;
 pub mod error;
+pub mod feature_selection;
 pub mod forest;
 pub mod gaussian_process;
 pub mod glm;
 pub mod hist_gradient_boosting;
+pub mod kernel_approx;
 pub mod kernel_models;
 pub mod linear_regression;
 pub mod linear_svm;
 pub mod logistic_regression;
 pub mod manifold;
 pub mod matrix;
+pub mod metrics;
 pub mod mixture;
+pub mod model_selection;
 pub mod naive_bayes;
 pub mod neighbors;
 pub mod neural_network;
@@ -150,6 +154,10 @@ pub const TAG_CCA: u8 = cross_decomposition::TAG_CCA;
 pub const TAG_PLS_REGRESSION: u8 = cross_decomposition::TAG_PLS_REGRESSION;
 pub const TAG_TSNE: u8 = manifold::TAG_TSNE;
 pub const TAG_MDS: u8 = manifold::TAG_MDS;
+pub const TAG_RBF_SAMPLER: u8 = kernel_approx::TAG_RBF_SAMPLER;
+pub const TAG_VARIANCE_THRESHOLD: u8 = feature_selection::TAG_VARIANCE_THRESHOLD;
+pub const TAG_SELECT_K_BEST: u8 = feature_selection::TAG_SELECT_K_BEST;
+pub const TAG_SELECT_PERCENTILE: u8 = feature_selection::TAG_SELECT_PERCENTILE;
 
 fn validate_dit_path(path: &str) -> OchreResult<()> {
     if !path.trim().to_lowercase().ends_with(".dit") {
@@ -3625,5 +3633,9 @@ fn _ochreml(m: &Bound<'_, PyModule>) -> PyResult<()> {
     cluster_advanced::register_py_classes(m)?;
     cross_decomposition::register_py_classes(m)?;
     manifold::register_py_classes(m)?;
+    metrics::register_py_functions(m)?;
+    kernel_approx::register_py_classes(m)?;
+    feature_selection::register_py_classes(m)?;
+    model_selection::register_py_classes(m)?;
     Ok(())
 }

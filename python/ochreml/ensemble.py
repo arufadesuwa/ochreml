@@ -22,6 +22,13 @@ from .ensemble_hgb import (
     HistGradientBoostingRegressor,
 )
 
+from ._meta_ensemble import (
+    BaggingClassifier,
+    BaggingRegressor,
+    StackingClassifier,
+    VotingClassifier,
+)
+
 __all__ = [
     "HistGradientBoostingClassifier",
     "HistGradientBoostingRegressor",
@@ -34,5 +41,9 @@ __all__ = [
     "AdaBoostClassifier",
     "AdaBoostRegressor",
     "IsolationForest",
+    "BaggingClassifier",
+    "BaggingRegressor",
+    "VotingClassifier",
+    "StackingClassifier",
 ]
 

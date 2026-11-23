@@ -90,6 +90,10 @@ from ._ochreml import (
     PLSRegression as _RustPLSRegression,
     TSNE as _RustTSNE,
     MDS as _RustMDS,
+    RBFSampler as _RustRBFSampler,
+    VarianceThreshold as _RustVarianceThreshold,
+    SelectKBest as _RustSelectKBest,
+    SelectPercentile as _RustSelectPercentile,
     get_available_devices as _get_available_devices,
     get_device_info as _get_device_info,
 )
@@ -222,6 +226,38 @@ __all__ = [
     "PLSRegression",
     "TSNE",
     "MDS",
+    "RBFSampler",
+    "VarianceThreshold",
+    "SelectKBest",
+    "SelectPercentile",
+    "f_regression",
+    "f_classif",
+    "chi2",
+    "RFE",
+    "SelectFromModel",
+    "train_test_split",
+    "KFold",
+    "StratifiedKFold",
+    "GroupKFold",
+    "TimeSeriesSplit",
+    "GridSearchCV",
+    "RandomizedSearchCV",
+    "cross_val_score",
+    "Pipeline",
+    "make_pipeline",
+    "OneVsRestClassifier",
+    "MultiOutputRegressor",
+    "BaggingClassifier",
+    "BaggingRegressor",
+    "VotingClassifier",
+    "StackingClassifier",
+    "metrics",
+    "model_selection",
+    "feature_selection",
+    "kernel_approximation",
+    "pipeline",
+    "multiclass",
+    "multioutput",
 ]
 
 _DEFAULT_DEVICE: str = "auto"
@@ -430,6 +466,14 @@ def load(path: str, device: Optional[str] = None) -> Any:
             return TSNE._from_rust(_RustTSNE.from_bytes(data, target_dev), target_dev)
         if tag == 94:
             return MDS._from_rust(_RustMDS.from_bytes(data, target_dev), target_dev)
+        if tag == 95:
+            return RBFSampler._from_rust(_RustRBFSampler.from_bytes(data, target_dev), target_dev)
+        if tag == 96:
+            return VarianceThreshold._from_rust(_RustVarianceThreshold.from_bytes(data, target_dev), target_dev)
+        if tag == 97:
+            return SelectKBest._from_rust(_RustSelectKBest.from_bytes(data, target_dev), target_dev)
+        if tag == 98:
+            return SelectPercentile._from_rust(_RustSelectPercentile.from_bytes(data, target_dev), target_dev)
         raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
     # Fallback if the .dit file was written via joblib.dump or pickle.dump
@@ -1666,7 +1710,34 @@ def _load_preprocessing_dit_tag(tag: int, data: bytes, path_str: str, target_dev
     raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
 
-from . import cluster, cluster_advanced, compose, cross_decomposition, decomposition, discriminant_analysis, ensemble, feature_extraction, gaussian_process, glm, impute, kernel_ridge, manifold, mixture, naive_bayes, neighbors, neural_network, preprocessing, svm
+from . import (
+    cluster,
+    cluster_advanced,
+    compose,
+    cross_decomposition,
+    decomposition,
+    discriminant_analysis,
+    ensemble,
+    feature_extraction,
+    feature_selection,
+    gaussian_process,
+    glm,
+    impute,
+    kernel_approximation,
+    kernel_ridge,
+    manifold,
+    metrics,
+    mixture,
+    model_selection,
+    multiclass,
+    multioutput,
+    naive_bayes,
+    neighbors,
+    neural_network,
+    pipeline,
+    preprocessing,
+    svm,
+)
 from .cluster import KMeans, MiniBatchKMeans
 from .cluster_advanced import (
     AgglomerativeClustering,
@@ -1682,6 +1753,8 @@ from .discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscrimi
 from .ensemble import (
     AdaBoostClassifier,
     AdaBoostRegressor,
+    BaggingClassifier,
+    BaggingRegressor,
     ExtraTreesClassifier,
     ExtraTreesRegressor,
     GradientBoostingClassifier,
@@ -1691,7 +1764,33 @@ from .ensemble import (
     IsolationForest,
     RandomForestClassifier,
     RandomForestRegressor,
+    StackingClassifier,
+    VotingClassifier,
 )
+from .feature_selection import (
+    RFE,
+    SelectFromModel,
+    SelectKBest,
+    SelectPercentile,
+    VarianceThreshold,
+    chi2,
+    f_classif,
+    f_regression,
+)
+from .kernel_approximation import RBFSampler
+from .model_selection import (
+    GridSearchCV,
+    GroupKFold,
+    KFold,
+    RandomizedSearchCV,
+    StratifiedKFold,
+    TimeSeriesSplit,
+    cross_val_score,
+    train_test_split,
+)
+from .multiclass import OneVsRestClassifier
+from .multioutput import MultiOutputRegressor
+from .pipeline import Pipeline, make_pipeline
 from .gaussian_process import GaussianProcessClassifier, GaussianProcessRegressor
 from .glm import (
     GammaRegressor,
