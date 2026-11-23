@@ -44,6 +44,13 @@ from ._ochreml import (
     QuadraticDiscriminantAnalysis as _RustQDA,
     KMeans as _RustKMeans,
     MiniBatchKMeans as _RustMiniBatchKMeans,
+    HuberRegressor as _RustHuberRegressor,
+    QuantileRegressor as _RustQuantileRegressor,
+    PoissonRegressor as _RustPoissonRegressor,
+    GammaRegressor as _RustGammaRegressor,
+    TweedieRegressor as _RustTweedieRegressor,
+    LinearSVC as _RustLinearSVC,
+    LinearSVR as _RustLinearSVR,
     get_available_devices as _get_available_devices,
     get_device_info as _get_device_info,
 )
@@ -122,6 +129,14 @@ __all__ = [
     "QuadraticDiscriminantAnalysis",
     "KMeans",
     "MiniBatchKMeans",
+    "svm",
+    "HuberRegressor",
+    "QuantileRegressor",
+    "PoissonRegressor",
+    "GammaRegressor",
+    "TweedieRegressor",
+    "LinearSVC",
+    "LinearSVR",
 ]
 
 _DEFAULT_DEVICE: str = "auto"
@@ -238,6 +253,20 @@ def load(path: str, device: Optional[str] = None) -> Any:
             return KMeans._from_rust(_RustKMeans.from_bytes(data, target_dev), target_dev)
         if tag == 48:
             return MiniBatchKMeans._from_rust(_RustMiniBatchKMeans.from_bytes(data, target_dev), target_dev)
+        if tag == 49:
+            return HuberRegressor._from_rust(_RustHuberRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 50:
+            return QuantileRegressor._from_rust(_RustQuantileRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 51:
+            return PoissonRegressor._from_rust(_RustPoissonRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 52:
+            return GammaRegressor._from_rust(_RustGammaRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 53:
+            return TweedieRegressor._from_rust(_RustTweedieRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 54:
+            return LinearSVC._from_rust(_RustLinearSVC.from_bytes(data, target_dev), target_dev)
+        if tag == 55:
+            return LinearSVR._from_rust(_RustLinearSVR.from_bytes(data, target_dev), target_dev)
         raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
     # Fallback if the .dit file was written via joblib.dump or pickle.dump
@@ -1474,10 +1503,18 @@ def _load_preprocessing_dit_tag(tag: int, data: bytes, path_str: str, target_dev
     raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
 
-from . import cluster, compose, decomposition, discriminant_analysis, feature_extraction, impute, preprocessing
+from . import cluster, compose, decomposition, discriminant_analysis, feature_extraction, glm, impute, preprocessing, svm
 from .cluster import KMeans, MiniBatchKMeans
 from .decomposition import PCA, TruncatedSVD
 from .discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
+from .glm import (
+    GammaRegressor,
+    HuberRegressor,
+    PoissonRegressor,
+    QuantileRegressor,
+    TweedieRegressor,
+)
+from .svm import LinearSVC, LinearSVR
 from .compose import (
     ColumnTransformer,
     TransformedTargetRegressor,

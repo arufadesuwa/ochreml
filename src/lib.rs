@@ -10,7 +10,9 @@ pub mod device;
 pub mod discriminant;
 pub mod dit_io;
 pub mod error;
+pub mod glm;
 pub mod linear_regression;
+pub mod linear_svm;
 pub mod logistic_regression;
 pub mod matrix;
 pub mod preprocessing;
@@ -90,6 +92,13 @@ pub const TAG_LDA: u8 = discriminant::TAG_LDA;
 pub const TAG_QDA: u8 = discriminant::TAG_QDA;
 pub const TAG_KMEANS: u8 = cluster::TAG_KMEANS;
 pub const TAG_MINI_BATCH_KMEANS: u8 = cluster::TAG_MINI_BATCH_KMEANS;
+pub const TAG_HUBER_REGRESSOR: u8 = glm::TAG_HUBER_REGRESSOR;
+pub const TAG_QUANTILE_REGRESSOR: u8 = glm::TAG_QUANTILE_REGRESSOR;
+pub const TAG_POISSON_REGRESSOR: u8 = glm::TAG_POISSON_REGRESSOR;
+pub const TAG_GAMMA_REGRESSOR: u8 = glm::TAG_GAMMA_REGRESSOR;
+pub const TAG_TWEEDIE_REGRESSOR: u8 = glm::TAG_TWEEDIE_REGRESSOR;
+pub const TAG_LINEAR_SVC: u8 = linear_svm::TAG_LINEAR_SVC;
+pub const TAG_LINEAR_SVR: u8 = linear_svm::TAG_LINEAR_SVR;
 
 fn validate_dit_path(path: &str) -> OchreResult<()> {
     if !path.trim().to_lowercase().ends_with(".dit") {
@@ -3551,5 +3560,7 @@ fn _ochreml(m: &Bound<'_, PyModule>) -> PyResult<()> {
     decomposition::register_py_classes(m)?;
     discriminant::register_py_classes(m)?;
     cluster::register_py_classes(m)?;
+    glm::register_py_classes(m)?;
+    linear_svm::register_py_classes(m)?;
     Ok(())
 }

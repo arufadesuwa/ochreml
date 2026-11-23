@@ -1240,6 +1240,15 @@ class SGDRegressor(_FastRegressorMixin):
         )
 
 
+from .glm import (
+    GammaRegressor,
+    HuberRegressor,
+    PoissonRegressor,
+    QuantileRegressor,
+    TweedieRegressor,
+)
+
+
 def __getattr__(name: str) -> Any:
     if name in ("LinearRegression", "Ridge", "RidgeClassifier", "RidgeCV"):
         import ochreml
@@ -1258,5 +1267,10 @@ __all__ = [
     "ElasticNet",
     "SGDClassifier",
     "SGDRegressor",
+    "HuberRegressor",
+    "QuantileRegressor",
+    "PoissonRegressor",
+    "GammaRegressor",
+    "TweedieRegressor",
 ]
 
