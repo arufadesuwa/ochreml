@@ -38,6 +38,12 @@ from ._ochreml import (
     SGDRegressor as _RustSGDRegressor,
     DecisionTreeClassifier as _RustDecisionTreeClassifier,
     DecisionTreeRegressor as _RustDecisionTreeRegressor,
+    PCA as _RustPCA,
+    TruncatedSVD as _RustTruncatedSVD,
+    LinearDiscriminantAnalysis as _RustLDA,
+    QuadraticDiscriminantAnalysis as _RustQDA,
+    KMeans as _RustKMeans,
+    MiniBatchKMeans as _RustMiniBatchKMeans,
     get_available_devices as _get_available_devices,
     get_device_info as _get_device_info,
 )
@@ -107,6 +113,15 @@ __all__ = [
     "TransformedTargetRegressor",
     "make_column_transformer",
     "make_column_selector",
+    "decomposition",
+    "discriminant_analysis",
+    "cluster",
+    "PCA",
+    "TruncatedSVD",
+    "LinearDiscriminantAnalysis",
+    "QuadraticDiscriminantAnalysis",
+    "KMeans",
+    "MiniBatchKMeans",
 ]
 
 _DEFAULT_DEVICE: str = "auto"
@@ -211,6 +226,18 @@ def load(path: str, device: Optional[str] = None) -> Any:
             return SGDClassifier._from_rust(_RustSGDClassifier.from_bytes(data, target_dev), target_dev)
         if tag == 42:
             return SGDRegressor._from_rust(_RustSGDRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 43:
+            return PCA._from_rust(_RustPCA.from_bytes(data, target_dev), target_dev)
+        if tag == 44:
+            return TruncatedSVD._from_rust(_RustTruncatedSVD.from_bytes(data, target_dev), target_dev)
+        if tag == 45:
+            return LinearDiscriminantAnalysis._from_rust(_RustLDA.from_bytes(data, target_dev), target_dev)
+        if tag == 46:
+            return QuadraticDiscriminantAnalysis._from_rust(_RustQDA.from_bytes(data, target_dev), target_dev)
+        if tag == 47:
+            return KMeans._from_rust(_RustKMeans.from_bytes(data, target_dev), target_dev)
+        if tag == 48:
+            return MiniBatchKMeans._from_rust(_RustMiniBatchKMeans.from_bytes(data, target_dev), target_dev)
         raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
     # Fallback if the .dit file was written via joblib.dump or pickle.dump
@@ -1447,7 +1474,10 @@ def _load_preprocessing_dit_tag(tag: int, data: bytes, path_str: str, target_dev
     raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
 
-from . import compose, feature_extraction, impute, preprocessing
+from . import cluster, compose, decomposition, discriminant_analysis, feature_extraction, impute, preprocessing
+from .cluster import KMeans, MiniBatchKMeans
+from .decomposition import PCA, TruncatedSVD
+from .discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
 from .compose import (
     ColumnTransformer,
     TransformedTargetRegressor,

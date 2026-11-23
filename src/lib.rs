@@ -3,8 +3,11 @@
 
 pub mod backend;
 pub mod backends;
+pub mod cluster;
 pub mod decision_tree;
+pub mod decomposition;
 pub mod device;
+pub mod discriminant;
 pub mod dit_io;
 pub mod error;
 pub mod linear_regression;
@@ -81,6 +84,12 @@ pub const TAG_LASSO: u8 = sparse_linear::TAG_LASSO;
 pub const TAG_ELASTIC_NET: u8 = sparse_linear::TAG_ELASTIC_NET;
 pub const TAG_SGD_CLASSIFIER: u8 = sgd::TAG_SGD_CLASSIFIER;
 pub const TAG_SGD_REGRESSOR: u8 = sgd::TAG_SGD_REGRESSOR;
+pub const TAG_PCA: u8 = decomposition::TAG_PCA;
+pub const TAG_TRUNCATED_SVD: u8 = decomposition::TAG_TRUNCATED_SVD;
+pub const TAG_LDA: u8 = discriminant::TAG_LDA;
+pub const TAG_QDA: u8 = discriminant::TAG_QDA;
+pub const TAG_KMEANS: u8 = cluster::TAG_KMEANS;
+pub const TAG_MINI_BATCH_KMEANS: u8 = cluster::TAG_MINI_BATCH_KMEANS;
 
 fn validate_dit_path(path: &str) -> OchreResult<()> {
     if !path.trim().to_lowercase().ends_with(".dit") {
@@ -3539,5 +3548,8 @@ fn _ochreml(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySGDClassifier>()?;
     m.add_class::<PySGDRegressor>()?;
     preprocessing::register_py_module(m)?;
+    decomposition::register_py_classes(m)?;
+    discriminant::register_py_classes(m)?;
+    cluster::register_py_classes(m)?;
     Ok(())
 }
