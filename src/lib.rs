@@ -3,6 +3,7 @@
 
 pub mod backend;
 pub mod backends;
+pub mod boosting;
 pub mod cluster;
 pub mod decision_tree;
 pub mod decomposition;
@@ -10,7 +11,9 @@ pub mod device;
 pub mod discriminant;
 pub mod dit_io;
 pub mod error;
+pub mod forest;
 pub mod glm;
+pub mod hist_gradient_boosting;
 pub mod linear_regression;
 pub mod linear_svm;
 pub mod logistic_regression;
@@ -111,6 +114,17 @@ pub const TAG_MULTINOMIAL_NB: u8 = naive_bayes::TAG_MULTINOMIAL_NB;
 pub const TAG_BERNOULLI_NB: u8 = naive_bayes::TAG_BERNOULLI_NB;
 pub const TAG_COMPLEMENT_NB: u8 = naive_bayes::TAG_COMPLEMENT_NB;
 pub const TAG_GAUSSIAN_MIXTURE: u8 = mixture::TAG_GAUSSIAN_MIXTURE;
+pub const TAG_HIST_GB_CLASSIFIER: u8 = hist_gradient_boosting::TAG_HIST_GB_CLASSIFIER;
+pub const TAG_HIST_GB_REGRESSOR: u8 = hist_gradient_boosting::TAG_HIST_GB_REGRESSOR;
+pub const TAG_RANDOM_FOREST_CLASSIFIER: u8 = forest::TAG_RANDOM_FOREST_CLASSIFIER;
+pub const TAG_RANDOM_FOREST_REGRESSOR: u8 = forest::TAG_RANDOM_FOREST_REGRESSOR;
+pub const TAG_EXTRA_TREES_CLASSIFIER: u8 = forest::TAG_EXTRA_TREES_CLASSIFIER;
+pub const TAG_EXTRA_TREES_REGRESSOR: u8 = forest::TAG_EXTRA_TREES_REGRESSOR;
+pub const TAG_GB_CLASSIFIER: u8 = boosting::TAG_GB_CLASSIFIER;
+pub const TAG_GB_REGRESSOR: u8 = boosting::TAG_GB_REGRESSOR;
+pub const TAG_ADABOOST_CLASSIFIER: u8 = boosting::TAG_ADABOOST_CLASSIFIER;
+pub const TAG_ADABOOST_REGRESSOR: u8 = boosting::TAG_ADABOOST_REGRESSOR;
+pub const TAG_ISOLATION_FOREST: u8 = forest::TAG_ISOLATION_FOREST;
 
 fn validate_dit_path(path: &str) -> OchreResult<()> {
     if !path.trim().to_lowercase().ends_with(".dit") {
@@ -3577,5 +3591,8 @@ fn _ochreml(m: &Bound<'_, PyModule>) -> PyResult<()> {
     neighbors::register_py_classes(m)?;
     naive_bayes::register_py_classes(m)?;
     mixture::register_py_classes(m)?;
+    hist_gradient_boosting::register_py_classes(m)?;
+    forest::register_py_classes(m)?;
+    boosting::register_py_classes(m)?;
     Ok(())
 }

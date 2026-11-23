@@ -60,6 +60,17 @@ from ._ochreml import (
     BernoulliNB as _RustBernoulliNB,
     ComplementNB as _RustComplementNB,
     GaussianMixture as _RustGaussianMixture,
+    HistGradientBoostingClassifier as _RustHistGradientBoostingClassifier,
+    HistGradientBoostingRegressor as _RustHistGradientBoostingRegressor,
+    RandomForestClassifier as _RustRandomForestClassifier,
+    RandomForestRegressor as _RustRandomForestRegressor,
+    ExtraTreesClassifier as _RustExtraTreesClassifier,
+    ExtraTreesRegressor as _RustExtraTreesRegressor,
+    GradientBoostingClassifier as _RustGradientBoostingClassifier,
+    GradientBoostingRegressor as _RustGradientBoostingRegressor,
+    AdaBoostClassifier as _RustAdaBoostClassifier,
+    AdaBoostRegressor as _RustAdaBoostRegressor,
+    IsolationForest as _RustIsolationForest,
     get_available_devices as _get_available_devices,
     get_device_info as _get_device_info,
 )
@@ -158,6 +169,18 @@ __all__ = [
     "BernoulliNB",
     "ComplementNB",
     "GaussianMixture",
+    "ensemble",
+    "HistGradientBoostingClassifier",
+    "HistGradientBoostingRegressor",
+    "RandomForestClassifier",
+    "RandomForestRegressor",
+    "ExtraTreesClassifier",
+    "ExtraTreesRegressor",
+    "GradientBoostingClassifier",
+    "GradientBoostingRegressor",
+    "AdaBoostClassifier",
+    "AdaBoostRegressor",
+    "IsolationForest",
 ]
 
 _DEFAULT_DEVICE: str = "auto"
@@ -306,6 +329,28 @@ def load(path: str, device: Optional[str] = None) -> Any:
             return ComplementNB._from_rust(_RustComplementNB.from_bytes(data, target_dev), target_dev)
         if tag == 64:
             return GaussianMixture._from_rust(_RustGaussianMixture.from_bytes(data, target_dev), target_dev)
+        if tag == 65:
+            return HistGradientBoostingClassifier._from_rust(_RustHistGradientBoostingClassifier.from_bytes(data, target_dev), target_dev)
+        if tag == 66:
+            return HistGradientBoostingRegressor._from_rust(_RustHistGradientBoostingRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 67:
+            return RandomForestClassifier._from_rust(_RustRandomForestClassifier.from_bytes(data, target_dev), target_dev)
+        if tag == 68:
+            return RandomForestRegressor._from_rust(_RustRandomForestRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 69:
+            return ExtraTreesClassifier._from_rust(_RustExtraTreesClassifier.from_bytes(data, target_dev), target_dev)
+        if tag == 70:
+            return ExtraTreesRegressor._from_rust(_RustExtraTreesRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 71:
+            return GradientBoostingClassifier._from_rust(_RustGradientBoostingClassifier.from_bytes(data, target_dev), target_dev)
+        if tag == 72:
+            return GradientBoostingRegressor._from_rust(_RustGradientBoostingRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 73:
+            return AdaBoostClassifier._from_rust(_RustAdaBoostClassifier.from_bytes(data, target_dev), target_dev)
+        if tag == 74:
+            return AdaBoostRegressor._from_rust(_RustAdaBoostRegressor.from_bytes(data, target_dev), target_dev)
+        if tag == 75:
+            return IsolationForest._from_rust(_RustIsolationForest.from_bytes(data, target_dev), target_dev)
         raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
     # Fallback if the .dit file was written via joblib.dump or pickle.dump
@@ -1542,10 +1587,23 @@ def _load_preprocessing_dit_tag(tag: int, data: bytes, path_str: str, target_dev
     raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
 
-from . import cluster, compose, decomposition, discriminant_analysis, feature_extraction, glm, impute, mixture, naive_bayes, neighbors, preprocessing, svm
+from . import cluster, compose, decomposition, discriminant_analysis, ensemble, feature_extraction, glm, impute, mixture, naive_bayes, neighbors, preprocessing, svm
 from .cluster import KMeans, MiniBatchKMeans
 from .decomposition import PCA, TruncatedSVD
 from .discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
+from .ensemble import (
+    AdaBoostClassifier,
+    AdaBoostRegressor,
+    ExtraTreesClassifier,
+    ExtraTreesRegressor,
+    GradientBoostingClassifier,
+    GradientBoostingRegressor,
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
+    IsolationForest,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
 from .glm import (
     GammaRegressor,
     HuberRegressor,
