@@ -143,6 +143,17 @@ fn stable_sigmoid(z: f64) -> f64 {
     }
 }
 
+#[inline(always)]
+fn sigmoid_and_softplus(z: f64) -> (f64, f64) {
+    if z >= 0.0 {
+        let e = (-z).exp();
+        (1.0 / (1.0 + e), z + e.ln_1p())
+    } else {
+        let e = z.exp();
+        (e / (1.0 + e), e.ln_1p())
+    }
+}
+
 #[inline]
 fn softplus(z: f64) -> f64 {
     if z >= 0.0 {
@@ -173,32 +184,33 @@ fn eval_binary_loss_grad(
 
     if matches!(backend, Backend::Cpu) {
         if n >= 2048 {
-            const CHUNK_ROWS: usize = 2048;
+            const CHUNK_ROWS: usize = 32_768;
             let (par_loss, par_grad_w, par_grad_b) = x
                 .data
                 .par_chunks(CHUNK_ROWS * p)
                 .zip(y01.par_chunks(CHUNK_ROWS))
                 .zip(weights.par_chunks(CHUNK_ROWS))
-                .map(|((x_chunk, y_chunk), w_chunk)| {
-                    let mut loc_loss = 0.0;
-                    let mut loc_grad_w = vec![0.0; p];
-                    let mut loc_grad_b = 0.0;
-                    let rows = y_chunk.len();
-                    for i in 0..rows {
-                        let row = &x_chunk[i * p..(i + 1) * p];
-                        let z = dot_unrolled(row, w) + b;
-                        let prob = stable_sigmoid(z);
-                        let wi = w_chunk[i];
-                        let yi = y_chunk[i];
-                        loc_loss += wi * (softplus(z) - yi * z);
-                        let r = wi * (prob - yi);
-                        loc_grad_b += r;
-                        for j in 0..p {
-                            loc_grad_w[j] += r * row[j];
+                .fold(
+                    || (0.0, vec![0.0; p], 0.0),
+                    |(mut loc_loss, mut loc_grad_w, mut loc_grad_b),
+                     ((x_chunk, y_chunk), w_chunk)| {
+                        let rows = y_chunk.len();
+                        for i in 0..rows {
+                            let row = &x_chunk[i * p..(i + 1) * p];
+                            let z = dot_unrolled(row, w) + b;
+                            let (prob, sp) = sigmoid_and_softplus(z);
+                            let wi = w_chunk[i];
+                            let yi = y_chunk[i];
+                            loc_loss += wi * (sp - yi * z);
+                            let r = wi * (prob - yi);
+                            loc_grad_b += r;
+                            for j in 0..p {
+                                loc_grad_w[j] += r * row[j];
+                            }
                         }
-                    }
-                    (loc_loss, loc_grad_w, loc_grad_b)
-                })
+                        (loc_loss, loc_grad_w, loc_grad_b)
+                    },
+                )
                 .reduce(
                     || (0.0, vec![0.0; p], 0.0),
                     |(l1, mut gw1, gb1), (l2, gw2, gb2)| {
@@ -217,10 +229,10 @@ fn eval_binary_loss_grad(
             for i in 0..n {
                 let row = &x.data[i * p..(i + 1) * p];
                 let z = dot_unrolled(row, w) + b;
-                let prob = stable_sigmoid(z);
+                let (prob, sp) = sigmoid_and_softplus(z);
                 let wi = weights[i];
                 let yi = y01[i];
-                data_loss += wi * (softplus(z) - yi * z);
+                data_loss += wi * (sp - yi * z);
                 let r = wi * (prob - yi);
                 grad_b += r;
                 for j in 0..p {
@@ -523,7 +535,12 @@ where
             dg = -dot_unrolled(&grad, &grad);
         }
 
-        let mut step = 1.0;
+        let mut step = if s_hist.is_empty() {
+            let g_norm = dot_unrolled(&grad, &grad).sqrt();
+            1.0 / g_norm.max(1.0)
+        } else {
+            1.0
+        };
         let c1 = 1e-4;
         let mut accepted = false;
         let mut next_loss = loss;
