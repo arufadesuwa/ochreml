@@ -799,7 +799,7 @@ fn evaluate_loo_batched_eigen(
         local_err
     };
 
-    let sum_sq_looe = if x.rows >= 1024 {
+    let sum_sq_looe = if x.rows.saturating_mul(d) >= 131_072 {
         use rayon::prelude::*;
         let block = 512;
         x.data
