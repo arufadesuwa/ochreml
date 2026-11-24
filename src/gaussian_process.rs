@@ -188,7 +188,7 @@ fn compute_kernel_matrix(
     match params.kind {
         KernelKind::Rbf | KernelKind::RbfWhite => {
             let inv_two_ls_sq = -0.5 / ls_sq;
-            if k.data.len() >= 16_384 {
+            if k.data.len() >= 131_072 {
                 k.data.par_iter_mut().for_each(|d| {
                     *d = d.max(0.0) * inv_two_ls_sq;
                 });
@@ -216,32 +216,61 @@ fn compute_kernel_matrix(
         }
         KernelKind::Matern => {
             let nu = params.nu;
+            let use_par = k.data.len() >= 131_072;
             if (nu - 0.5).abs() <= 1e-12 {
-                k.data.par_iter_mut().for_each(|d| {
-                    let r = d.max(0.0).sqrt() / ls;
-                    *d = c * (-r).exp();
-                });
+                if use_par {
+                    k.data.par_iter_mut().for_each(|d| {
+                        let r = d.max(0.0).sqrt() / ls;
+                        *d = c * (-r).exp();
+                    });
+                } else {
+                    for d in &mut k.data {
+                        let r = d.max(0.0).sqrt() / ls;
+                        *d = c * (-r).exp();
+                    }
+                }
             } else if (nu - 1.5).abs() <= 1e-12 {
                 let s3 = 3.0_f64.sqrt() / ls;
-                k.data.par_iter_mut().for_each(|d| {
-                    let r = d.max(0.0).sqrt() * s3;
-                    *d = c * (1.0 + r) * (-r).exp();
-                });
+                if use_par {
+                    k.data.par_iter_mut().for_each(|d| {
+                        let r = d.max(0.0).sqrt() * s3;
+                        *d = c * (1.0 + r) * (-r).exp();
+                    });
+                } else {
+                    for d in &mut k.data {
+                        let r = d.max(0.0).sqrt() * s3;
+                        *d = c * (1.0 + r) * (-r).exp();
+                    }
+                }
             } else {
                 let s5 = 5.0_f64.sqrt() / ls;
-                k.data.par_iter_mut().for_each(|d| {
-                    let r = d.max(0.0).sqrt() * s5;
-                    *d = c * (1.0 + r + (r * r) / 3.0) * (-r).exp();
-                });
+                if use_par {
+                    k.data.par_iter_mut().for_each(|d| {
+                        let r = d.max(0.0).sqrt() * s5;
+                        *d = c * (1.0 + r + (r * r) / 3.0) * (-r).exp();
+                    });
+                } else {
+                    for d in &mut k.data {
+                        let r = d.max(0.0).sqrt() * s5;
+                        *d = c * (1.0 + r + (r * r) / 3.0) * (-r).exp();
+                    }
+                }
             }
         }
         KernelKind::RationalQuadratic => {
             let alpha = params.rq_alpha;
             let denom = 2.0 * alpha * ls_sq;
-            k.data.par_iter_mut().for_each(|d| {
-                let base = 1.0 + d.max(0.0) / denom;
-                *d = c * base.powf(-alpha);
-            });
+            if k.data.len() >= 131_072 {
+                k.data.par_iter_mut().for_each(|d| {
+                    let base = 1.0 + d.max(0.0) / denom;
+                    *d = c * base.powf(-alpha);
+                });
+            } else {
+                for d in &mut k.data {
+                    let base = 1.0 + d.max(0.0) / denom;
+                    *d = c * base.powf(-alpha);
+                }
+            }
         }
         KernelKind::White => unreachable!(),
     }
@@ -323,7 +352,7 @@ fn invert_lower_triangular_t_into(l: &Matrix, m_t: &mut [f64]) {
 #[inline]
 fn matvec_into(mat: &Matrix, v: &[f64], out: &mut [f64]) {
     let cols = mat.cols;
-    if mat.rows >= 128 && mat.rows.saturating_mul(cols) >= 16_384 {
+    if mat.rows >= 128 && mat.rows.saturating_mul(cols) >= 131_072 {
         out.par_iter_mut()
             .zip(mat.data.par_chunks(cols))
             .for_each(|(dst, row)| {
@@ -339,7 +368,7 @@ fn matvec_into(mat: &Matrix, v: &[f64], out: &mut [f64]) {
 /// Precompute Euclidean distance matrix `D = sqrt(max(D2, 0))` once for Matern optimization.
 fn compute_d_sqrt(d2: &Matrix) -> Matrix {
     let mut out = Matrix::zeros(d2.rows, d2.cols);
-    if d2.data.len() >= 16_384 {
+    if d2.data.len() >= 131_072 {
         out.data
             .par_iter_mut()
             .zip(d2.data.par_iter())
