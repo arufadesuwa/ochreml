@@ -19,6 +19,7 @@ use crate::pymethods_with_dit;
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use rayon::prelude::*;
 
 pub const TAG_NMF: u8 = 90;
 pub const TAG_CCA: u8 = 91;
@@ -268,11 +269,506 @@ fn frobenius_diff(a: &Matrix, b: &Matrix) -> f64 {
     sq.sqrt()
 }
 
+const NMF_PAR_OPS_THRESHOLD: usize = 262_144;
+const NMF_ROW_STRIP: usize = 64;
+const NIPALS_PAR_ELEMS: usize = 65_536;
+
+/// Mirror upper triangle of a `dim x dim` row-major matrix to lower triangle.
+#[inline]
+fn mirror_upper_to_lower(mat: &mut [f64], dim: usize) {
+    for a in 0..dim {
+        for b in (a + 1)..dim {
+            mat[b * dim + a] = mat[a * dim + b];
+        }
+    }
+}
+
+/// 4x4 register-blocked `out = A * A^T` (`rows x rows`, symmetric), where `A` is `rows x cols`.
+fn gemm_aat_sym_4x4(a: &[f64], rows: usize, cols: usize, out: &mut [f64]) {
+    let mut i = 0;
+    while i + 4 <= rows {
+        let a0 = &a[i * cols..(i + 1) * cols];
+        let a1 = &a[(i + 1) * cols..(i + 2) * cols];
+        let a2 = &a[(i + 2) * cols..(i + 3) * cols];
+        let a3 = &a[(i + 3) * cols..(i + 4) * cols];
+
+        // Diagonal 4x4 block (compute upper triangle)
+        for u in 0..4 {
+            let row_u = &a[(i + u) * cols..(i + u + 1) * cols];
+            for v in u..4 {
+                let row_v = &a[(i + v) * cols..(i + v + 1) * cols];
+                out[(i + u) * rows + (i + v)] = dot4(row_u, row_v);
+            }
+        }
+
+        let mut j = i + 4;
+        while j + 4 <= rows {
+            let b0 = &a[j * cols..(j + 1) * cols];
+            let b1 = &a[(j + 1) * cols..(j + 2) * cols];
+            let b2 = &a[(j + 2) * cols..(j + 3) * cols];
+            let b3 = &a[(j + 3) * cols..(j + 4) * cols];
+
+            let mut c0 = [0.0; 4];
+            let mut c1 = [0.0; 4];
+            let mut c2 = [0.0; 4];
+            let mut c3 = [0.0; 4];
+            for k in 0..cols {
+                let va0 = a0[k];
+                let va1 = a1[k];
+                let va2 = a2[k];
+                let va3 = a3[k];
+                let vb0 = b0[k];
+                let vb1 = b1[k];
+                let vb2 = b2[k];
+                let vb3 = b3[k];
+                c0[0] += va0 * vb0;
+                c0[1] += va0 * vb1;
+                c0[2] += va0 * vb2;
+                c0[3] += va0 * vb3;
+                c1[0] += va1 * vb0;
+                c1[1] += va1 * vb1;
+                c1[2] += va1 * vb2;
+                c1[3] += va1 * vb3;
+                c2[0] += va2 * vb0;
+                c2[1] += va2 * vb1;
+                c2[2] += va2 * vb2;
+                c2[3] += va2 * vb3;
+                c3[0] += va3 * vb0;
+                c3[1] += va3 * vb1;
+                c3[2] += va3 * vb2;
+                c3[3] += va3 * vb3;
+            }
+            out[i * rows + j..i * rows + j + 4].copy_from_slice(&c0);
+            out[(i + 1) * rows + j..(i + 1) * rows + j + 4].copy_from_slice(&c1);
+            out[(i + 2) * rows + j..(i + 2) * rows + j + 4].copy_from_slice(&c2);
+            out[(i + 3) * rows + j..(i + 3) * rows + j + 4].copy_from_slice(&c3);
+            j += 4;
+        }
+        while j < rows {
+            let bj = &a[j * cols..(j + 1) * cols];
+            out[i * rows + j] = dot4(a0, bj);
+            out[(i + 1) * rows + j] = dot4(a1, bj);
+            out[(i + 2) * rows + j] = dot4(a2, bj);
+            out[(i + 3) * rows + j] = dot4(a3, bj);
+            j += 1;
+        }
+        i += 4;
+    }
+    while i < rows {
+        let ai = &a[i * cols..(i + 1) * cols];
+        for j in i..rows {
+            let aj = &a[j * cols..(j + 1) * cols];
+            out[i * rows + j] = dot4(ai, aj);
+        }
+        i += 1;
+    }
+    mirror_upper_to_lower(out, rows);
+}
+
+/// 4x4 register-blocked `out = A * B^T` (`a_rows x b_rows`), where `A` is `a_rows x cols` and `B` is `b_rows x cols`.
+fn gemm_abt_4x4(a: &[f64], a_rows: usize, cols: usize, b: &[f64], b_rows: usize, out: &mut [f64]) {
+    let mut i = 0;
+    while i + 4 <= a_rows {
+        let a0 = &a[i * cols..(i + 1) * cols];
+        let a1 = &a[(i + 1) * cols..(i + 2) * cols];
+        let a2 = &a[(i + 2) * cols..(i + 3) * cols];
+        let a3 = &a[(i + 3) * cols..(i + 4) * cols];
+
+        let mut j = 0;
+        while j + 4 <= b_rows {
+            let b0 = &b[j * cols..(j + 1) * cols];
+            let b1 = &b[(j + 1) * cols..(j + 2) * cols];
+            let b2 = &b[(j + 2) * cols..(j + 3) * cols];
+            let b3 = &b[(j + 3) * cols..(j + 4) * cols];
+
+            let mut c0 = [0.0; 4];
+            let mut c1 = [0.0; 4];
+            let mut c2 = [0.0; 4];
+            let mut c3 = [0.0; 4];
+            for k in 0..cols {
+                let va0 = a0[k];
+                let va1 = a1[k];
+                let va2 = a2[k];
+                let va3 = a3[k];
+                let vb0 = b0[k];
+                let vb1 = b1[k];
+                let vb2 = b2[k];
+                let vb3 = b3[k];
+                c0[0] += va0 * vb0;
+                c0[1] += va0 * vb1;
+                c0[2] += va0 * vb2;
+                c0[3] += va0 * vb3;
+                c1[0] += va1 * vb0;
+                c1[1] += va1 * vb1;
+                c1[2] += va1 * vb2;
+                c1[3] += va1 * vb3;
+                c2[0] += va2 * vb0;
+                c2[1] += va2 * vb1;
+                c2[2] += va2 * vb2;
+                c2[3] += va2 * vb3;
+                c3[0] += va3 * vb0;
+                c3[1] += va3 * vb1;
+                c3[2] += va3 * vb2;
+                c3[3] += va3 * vb3;
+            }
+            out[i * b_rows + j..i * b_rows + j + 4].copy_from_slice(&c0);
+            out[(i + 1) * b_rows + j..(i + 1) * b_rows + j + 4].copy_from_slice(&c1);
+            out[(i + 2) * b_rows + j..(i + 2) * b_rows + j + 4].copy_from_slice(&c2);
+            out[(i + 3) * b_rows + j..(i + 3) * b_rows + j + 4].copy_from_slice(&c3);
+            j += 4;
+        }
+        while j < b_rows {
+            let bj = &b[j * cols..(j + 1) * cols];
+            out[i * b_rows + j] = dot4(a0, bj);
+            out[(i + 1) * b_rows + j] = dot4(a1, bj);
+            out[(i + 2) * b_rows + j] = dot4(a2, bj);
+            out[(i + 3) * b_rows + j] = dot4(a3, bj);
+            j += 1;
+        }
+        i += 4;
+    }
+    while i < a_rows {
+        let ai = &a[i * cols..(i + 1) * cols];
+        let mut j = 0;
+        while j + 4 <= b_rows {
+            let b0 = &b[j * cols..(j + 1) * cols];
+            let b1 = &b[(j + 1) * cols..(j + 2) * cols];
+            let b2 = &b[(j + 2) * cols..(j + 3) * cols];
+            let b3 = &b[(j + 3) * cols..(j + 4) * cols];
+            let mut c0 = 0.0;
+            let mut c1 = 0.0;
+            let mut c2 = 0.0;
+            let mut c3 = 0.0;
+            for k in 0..cols {
+                let va = ai[k];
+                c0 += va * b0[k];
+                c1 += va * b1[k];
+                c2 += va * b2[k];
+                c3 += va * b3[k];
+            }
+            out[i * b_rows + j] = c0;
+            out[i * b_rows + j + 1] = c1;
+            out[i * b_rows + j + 2] = c2;
+            out[i * b_rows + j + 3] = c3;
+            j += 4;
+        }
+        while j < b_rows {
+            let bj = &b[j * cols..(j + 1) * cols];
+            out[i * b_rows + j] = dot4(ai, bj);
+            j += 1;
+        }
+        i += 1;
+    }
+}
+
+/// 4x4 register-blocked `out += A^T * B` (`a_cols x b_cols`), L1-blocked over `rows`.
+fn gemm_at_b_4x4_add(
+    a: &[f64],
+    a_cols: usize,
+    b: &[f64],
+    b_cols: usize,
+    rows: usize,
+    out: &mut [f64],
+) {
+    let mut r0 = 0;
+    while r0 < rows {
+        let r1 = (r0 + NMF_ROW_STRIP).min(rows);
+        let mut i = 0;
+        while i + 4 <= a_cols {
+            let mut j = 0;
+            while j + 4 <= b_cols {
+                let mut c0 = [
+                    out[i * b_cols + j],
+                    out[i * b_cols + j + 1],
+                    out[i * b_cols + j + 2],
+                    out[i * b_cols + j + 3],
+                ];
+                let mut c1 = [
+                    out[(i + 1) * b_cols + j],
+                    out[(i + 1) * b_cols + j + 1],
+                    out[(i + 1) * b_cols + j + 2],
+                    out[(i + 1) * b_cols + j + 3],
+                ];
+                let mut c2 = [
+                    out[(i + 2) * b_cols + j],
+                    out[(i + 2) * b_cols + j + 1],
+                    out[(i + 2) * b_cols + j + 2],
+                    out[(i + 2) * b_cols + j + 3],
+                ];
+                let mut c3 = [
+                    out[(i + 3) * b_cols + j],
+                    out[(i + 3) * b_cols + j + 1],
+                    out[(i + 3) * b_cols + j + 2],
+                    out[(i + 3) * b_cols + j + 3],
+                ];
+                for r in r0..r1 {
+                    let a_off = r * a_cols + i;
+                    let b_off = r * b_cols + j;
+                    let va0 = a[a_off];
+                    let va1 = a[a_off + 1];
+                    let va2 = a[a_off + 2];
+                    let va3 = a[a_off + 3];
+                    let vb0 = b[b_off];
+                    let vb1 = b[b_off + 1];
+                    let vb2 = b[b_off + 2];
+                    let vb3 = b[b_off + 3];
+                    c0[0] += va0 * vb0;
+                    c0[1] += va0 * vb1;
+                    c0[2] += va0 * vb2;
+                    c0[3] += va0 * vb3;
+                    c1[0] += va1 * vb0;
+                    c1[1] += va1 * vb1;
+                    c1[2] += va1 * vb2;
+                    c1[3] += va1 * vb3;
+                    c2[0] += va2 * vb0;
+                    c2[1] += va2 * vb1;
+                    c2[2] += va2 * vb2;
+                    c2[3] += va2 * vb3;
+                    c3[0] += va3 * vb0;
+                    c3[1] += va3 * vb1;
+                    c3[2] += va3 * vb2;
+                    c3[3] += va3 * vb3;
+                }
+                out[i * b_cols + j..i * b_cols + j + 4].copy_from_slice(&c0);
+                out[(i + 1) * b_cols + j..(i + 1) * b_cols + j + 4].copy_from_slice(&c1);
+                out[(i + 2) * b_cols + j..(i + 2) * b_cols + j + 4].copy_from_slice(&c2);
+                out[(i + 3) * b_cols + j..(i + 3) * b_cols + j + 4].copy_from_slice(&c3);
+                j += 4;
+            }
+            while j < b_cols {
+                let mut s0 = out[i * b_cols + j];
+                let mut s1 = out[(i + 1) * b_cols + j];
+                let mut s2 = out[(i + 2) * b_cols + j];
+                let mut s3 = out[(i + 3) * b_cols + j];
+                for r in r0..r1 {
+                    let a_off = r * a_cols + i;
+                    let vb = b[r * b_cols + j];
+                    s0 += a[a_off] * vb;
+                    s1 += a[a_off + 1] * vb;
+                    s2 += a[a_off + 2] * vb;
+                    s3 += a[a_off + 3] * vb;
+                }
+                out[i * b_cols + j] = s0;
+                out[(i + 1) * b_cols + j] = s1;
+                out[(i + 2) * b_cols + j] = s2;
+                out[(i + 3) * b_cols + j] = s3;
+                j += 1;
+            }
+            i += 4;
+        }
+        while i < a_cols {
+            let mut j = 0;
+            while j + 4 <= b_cols {
+                let mut c0 = out[i * b_cols + j];
+                let mut c1 = out[i * b_cols + j + 1];
+                let mut c2 = out[i * b_cols + j + 2];
+                let mut c3 = out[i * b_cols + j + 3];
+                for r in r0..r1 {
+                    let va = a[r * a_cols + i];
+                    let b_off = r * b_cols + j;
+                    c0 += va * b[b_off];
+                    c1 += va * b[b_off + 1];
+                    c2 += va * b[b_off + 2];
+                    c3 += va * b[b_off + 3];
+                }
+                out[i * b_cols + j] = c0;
+                out[i * b_cols + j + 1] = c1;
+                out[i * b_cols + j + 2] = c2;
+                out[i * b_cols + j + 3] = c3;
+                j += 4;
+            }
+            while j < b_cols {
+                let mut s = out[i * b_cols + j];
+                for r in r0..r1 {
+                    s += a[r * a_cols + i] * b[r * b_cols + j];
+                }
+                out[i * b_cols + j] = s;
+                j += 1;
+            }
+            i += 1;
+        }
+        r0 = r1;
+    }
+}
+
+/// 4x4 register-blocked upper-triangle `out += A^T * A` (`cols x cols`), L1-blocked over `rows`.
+/// Caller mirrors upper to lower after all chunks are accumulated.
+fn gemm_at_a_upper_4x4_add(a: &[f64], cols: usize, rows: usize, out: &mut [f64]) {
+    let mut r0 = 0;
+    while r0 < rows {
+        let r1 = (r0 + NMF_ROW_STRIP).min(rows);
+        let mut i = 0;
+        while i + 4 <= cols {
+            // Diagonal 4x4 block (upper triangle)
+            let mut d00 = out[i * cols + i];
+            let mut d01 = out[i * cols + i + 1];
+            let mut d02 = out[i * cols + i + 2];
+            let mut d03 = out[i * cols + i + 3];
+            let mut d11 = out[(i + 1) * cols + i + 1];
+            let mut d12 = out[(i + 1) * cols + i + 2];
+            let mut d13 = out[(i + 1) * cols + i + 3];
+            let mut d22 = out[(i + 2) * cols + i + 2];
+            let mut d23 = out[(i + 2) * cols + i + 3];
+            let mut d33 = out[(i + 3) * cols + i + 3];
+            for r in r0..r1 {
+                let off = r * cols + i;
+                let v0 = a[off];
+                let v1 = a[off + 1];
+                let v2 = a[off + 2];
+                let v3 = a[off + 3];
+                d00 += v0 * v0;
+                d01 += v0 * v1;
+                d02 += v0 * v2;
+                d03 += v0 * v3;
+                d11 += v1 * v1;
+                d12 += v1 * v2;
+                d13 += v1 * v3;
+                d22 += v2 * v2;
+                d23 += v2 * v3;
+                d33 += v3 * v3;
+            }
+            out[i * cols + i] = d00;
+            out[i * cols + i + 1] = d01;
+            out[i * cols + i + 2] = d02;
+            out[i * cols + i + 3] = d03;
+            out[(i + 1) * cols + i + 1] = d11;
+            out[(i + 1) * cols + i + 2] = d12;
+            out[(i + 1) * cols + i + 3] = d13;
+            out[(i + 2) * cols + i + 2] = d22;
+            out[(i + 2) * cols + i + 3] = d23;
+            out[(i + 3) * cols + i + 3] = d33;
+
+            let mut j = i + 4;
+            while j + 4 <= cols {
+                let mut c0 = [
+                    out[i * cols + j],
+                    out[i * cols + j + 1],
+                    out[i * cols + j + 2],
+                    out[i * cols + j + 3],
+                ];
+                let mut c1 = [
+                    out[(i + 1) * cols + j],
+                    out[(i + 1) * cols + j + 1],
+                    out[(i + 1) * cols + j + 2],
+                    out[(i + 1) * cols + j + 3],
+                ];
+                let mut c2 = [
+                    out[(i + 2) * cols + j],
+                    out[(i + 2) * cols + j + 1],
+                    out[(i + 2) * cols + j + 2],
+                    out[(i + 2) * cols + j + 3],
+                ];
+                let mut c3 = [
+                    out[(i + 3) * cols + j],
+                    out[(i + 3) * cols + j + 1],
+                    out[(i + 3) * cols + j + 2],
+                    out[(i + 3) * cols + j + 3],
+                ];
+                for r in r0..r1 {
+                    let a_off = r * cols + i;
+                    let b_off = r * cols + j;
+                    let va0 = a[a_off];
+                    let va1 = a[a_off + 1];
+                    let va2 = a[a_off + 2];
+                    let va3 = a[a_off + 3];
+                    let vb0 = a[b_off];
+                    let vb1 = a[b_off + 1];
+                    let vb2 = a[b_off + 2];
+                    let vb3 = a[b_off + 3];
+                    c0[0] += va0 * vb0;
+                    c0[1] += va0 * vb1;
+                    c0[2] += va0 * vb2;
+                    c0[3] += va0 * vb3;
+                    c1[0] += va1 * vb0;
+                    c1[1] += va1 * vb1;
+                    c1[2] += va1 * vb2;
+                    c1[3] += va1 * vb3;
+                    c2[0] += va2 * vb0;
+                    c2[1] += va2 * vb1;
+                    c2[2] += va2 * vb2;
+                    c2[3] += va2 * vb3;
+                    c3[0] += va3 * vb0;
+                    c3[1] += va3 * vb1;
+                    c3[2] += va3 * vb2;
+                    c3[3] += va3 * vb3;
+                }
+                out[i * cols + j..i * cols + j + 4].copy_from_slice(&c0);
+                out[(i + 1) * cols + j..(i + 1) * cols + j + 4].copy_from_slice(&c1);
+                out[(i + 2) * cols + j..(i + 2) * cols + j + 4].copy_from_slice(&c2);
+                out[(i + 3) * cols + j..(i + 3) * cols + j + 4].copy_from_slice(&c3);
+                j += 4;
+            }
+            while j < cols {
+                let mut s0 = out[i * cols + j];
+                let mut s1 = out[(i + 1) * cols + j];
+                let mut s2 = out[(i + 2) * cols + j];
+                let mut s3 = out[(i + 3) * cols + j];
+                for r in r0..r1 {
+                    let a_off = r * cols + i;
+                    let vb = a[r * cols + j];
+                    s0 += a[a_off] * vb;
+                    s1 += a[a_off + 1] * vb;
+                    s2 += a[a_off + 2] * vb;
+                    s3 += a[a_off + 3] * vb;
+                }
+                out[i * cols + j] = s0;
+                out[(i + 1) * cols + j] = s1;
+                out[(i + 2) * cols + j] = s2;
+                out[(i + 3) * cols + j] = s3;
+                j += 1;
+            }
+            i += 4;
+        }
+        while i < cols {
+            for j in i..cols {
+                let mut s = out[i * cols + j];
+                for r in r0..r1 {
+                    s += a[r * cols + i] * a[r * cols + j];
+                }
+                out[i * cols + j] = s;
+            }
+            i += 1;
+        }
+        r0 = r1;
+    }
+}
+
 /// Compute `||X - W * H||_F` on CPU without allocating an `n x p` reconstruction matrix.
 fn frobenius_diff_wh_cpu(x: &Matrix, w: &Matrix, h: &Matrix, row_buf: &mut [f64]) -> f64 {
     let n = x.rows;
     let p = x.cols;
     let k = w.cols;
+    if n * p * k >= NMF_PAR_OPS_THRESHOLD && n >= 128 {
+        let sq: f64 = x
+            .data
+            .par_chunks(NMF_ROW_STRIP * p)
+            .zip(w.data.par_chunks(NMF_ROW_STRIP * k))
+            .map(|(x_chunk, w_chunk)| {
+                let mut local_buf = vec![0.0; p];
+                let mut local_sq = 0.0_f64;
+                let m = x_chunk.len() / p;
+                for r in 0..m {
+                    local_buf.fill(0.0);
+                    let w_row = &w_chunk[r * k..(r + 1) * k];
+                    for (c, &w_rc) in w_row.iter().enumerate() {
+                        if w_rc != 0.0 {
+                            let h_row = &h.data[c * p..(c + 1) * p];
+                            for j in 0..p {
+                                local_buf[j] += w_rc * h_row[j];
+                            }
+                        }
+                    }
+                    let x_row = &x_chunk[r * p..(r + 1) * p];
+                    for j in 0..p {
+                        let d = x_row[j] - local_buf[j];
+                        local_sq += d * d;
+                    }
+                }
+                local_sq
+            })
+            .sum();
+        return sq.sqrt();
+    }
     let mut sq = 0.0f64;
     for r in 0..n {
         row_buf.fill(0.0);
@@ -294,8 +790,9 @@ fn frobenius_diff_wh_cpu(x: &Matrix, w: &Matrix, h: &Matrix, row_buf: &mut [f64]
     sq.sqrt()
 }
 
-/// Zero-allocation CPU multiplicative update for `W` using contiguous dot products.
-/// `h_ht` has length `k * k`, `denom_row` has length `k`.
+/// Zero-allocation CPU multiplicative update for `W` using 4x4 register-blocked GEMM.
+/// `h_ht` has length `k * k`, `num_strip` and `denom_strip` have length `NMF_ROW_STRIP * k`.
+#[allow(clippy::too_many_arguments)]
 fn nmf_cpu_update_w(
     x: &Matrix,
     w: &mut Matrix,
@@ -303,42 +800,55 @@ fn nmf_cpu_update_w(
     l1_w: f64,
     l2_w: f64,
     h_ht: &mut [f64],
-    denom_row: &mut [f64],
+    num_strip: &mut [f64],
+    denom_strip: &mut [f64],
 ) {
     let n = x.rows;
     let p = x.cols;
     let k = w.cols;
 
     // h_ht = H * H^T (symmetric k x k)
-    for a in 0..k {
-        let h_a = &h.data[a * p..(a + 1) * p];
-        for b in a..k {
-            let h_b = &h.data[b * p..(b + 1) * p];
-            let v = dot4(h_a, h_b);
-            h_ht[a * k + b] = v;
-            h_ht[b * k + a] = v;
-        }
+    gemm_aat_sym_4x4(&h.data, k, p, h_ht);
+
+    if n * p * k >= NMF_PAR_OPS_THRESHOLD && n >= 128 {
+        let strip = NMF_ROW_STRIP;
+        w.data
+            .par_chunks_mut(strip * k)
+            .zip(x.data.par_chunks(strip * p))
+            .for_each(|(w_chunk, x_chunk)| {
+                let m = x_chunk.len() / p;
+                let mut local_num = vec![0.0; m * k];
+                let mut local_den = vec![0.0; m * k];
+                gemm_abt_4x4(x_chunk, m, p, &h.data, k, &mut local_num);
+                gemm_abt_4x4(w_chunk, m, k, h_ht, k, &mut local_den);
+                for idx in 0..(m * k) {
+                    let w_rc = w_chunk[idx];
+                    let d = local_den[idx] + l1_w + l2_w * w_rc + 1e-12;
+                    w_chunk[idx] = (w_rc * local_num[idx] / d).max(0.0);
+                }
+            });
+        return;
     }
 
-    // For each row r: denom[r, c] = dot(W[r], h_ht[c]), num[r, c] = dot(X[r], H[c])
-    for r in 0..n {
-        let x_row = &x.data[r * p..(r + 1) * p];
-        let w_row = &mut w.data[r * k..(r + 1) * k];
-        for c in 0..k {
-            let hh_row = &h_ht[c * k..(c + 1) * k];
-            denom_row[c] = dot4(w_row, hh_row);
+    let mut r0 = 0;
+    while r0 < n {
+        let m = (r0 + NMF_ROW_STRIP).min(n) - r0;
+        let x_strip = &x.data[r0 * p..(r0 + m) * p];
+        let w_strip = &mut w.data[r0 * k..(r0 + m) * k];
+        let num_slice = &mut num_strip[..m * k];
+        let den_slice = &mut denom_strip[..m * k];
+        gemm_abt_4x4(x_strip, m, p, &h.data, k, num_slice);
+        gemm_abt_4x4(w_strip, m, k, h_ht, k, den_slice);
+        for idx in 0..(m * k) {
+            let w_rc = w_strip[idx];
+            let d = den_slice[idx] + l1_w + l2_w * w_rc + 1e-12;
+            w_strip[idx] = (w_rc * num_slice[idx] / d).max(0.0);
         }
-        for c in 0..k {
-            let h_row = &h.data[c * p..(c + 1) * p];
-            let num = dot4(x_row, h_row);
-            let w_rc = w_row[c];
-            let d = denom_row[c] + l1_w + l2_w * w_rc + 1e-12;
-            w_row[c] = (w_rc * num / d).max(0.0);
-        }
+        r0 += m;
     }
 }
 
-/// Zero-allocation CPU multiplicative update for `H` using contiguous slices.
+/// Zero-allocation CPU multiplicative update for `H` using 4x4 register-blocked GEMM.
 /// `num_h` and `denom_h` have length `k * p`; `wt_w` has length `k * k`.
 #[allow(clippy::too_many_arguments)]
 fn nmf_cpu_update_h(
@@ -355,47 +865,46 @@ fn nmf_cpu_update_h(
     let p = x.cols;
     let k = w.cols;
 
-    num_h.fill(0.0);
-    wt_w.fill(0.0);
-
-    for r in 0..n {
-        let w_row = &w.data[r * k..(r + 1) * k];
-        let x_row = &x.data[r * p..(r + 1) * p];
-        for c in 0..k {
-            let w_rc = w_row[c];
-            if w_rc == 0.0 {
-                continue;
-            }
-            let num_row = &mut num_h[c * p..(c + 1) * p];
-            for j in 0..p {
-                num_row[j] += w_rc * x_row[j];
-            }
-            let wtw_row = &mut wt_w[c * k..(c + 1) * k];
-            for b in c..k {
-                wtw_row[b] += w_rc * w_row[b];
-            }
-        }
+    if n * p * k >= NMF_PAR_OPS_THRESHOLD && n >= 128 {
+        const CHUNK_ROWS: usize = 512;
+        let (par_num, par_wtw) = w
+            .data
+            .par_chunks(CHUNK_ROWS * k)
+            .zip(x.data.par_chunks(CHUNK_ROWS * p))
+            .fold(
+                || (vec![0.0; k * p], vec![0.0; k * k]),
+                |(mut ln, mut lw), (wc, xc)| {
+                    let m = wc.len() / k;
+                    gemm_at_b_4x4_add(wc, k, xc, p, m, &mut ln);
+                    gemm_at_a_upper_4x4_add(wc, k, m, &mut lw);
+                    (ln, lw)
+                },
+            )
+            .reduce(
+                || (vec![0.0; k * p], vec![0.0; k * k]),
+                |(mut n1, mut w1), (n2, w2)| {
+                    for idx in 0..(k * p) {
+                        n1[idx] += n2[idx];
+                    }
+                    for idx in 0..(k * k) {
+                        w1[idx] += w2[idx];
+                    }
+                    (n1, w1)
+                },
+            );
+        num_h.copy_from_slice(&par_num);
+        wt_w.copy_from_slice(&par_wtw);
+    } else {
+        num_h.fill(0.0);
+        wt_w.fill(0.0);
+        gemm_at_b_4x4_add(&w.data, k, &x.data, p, n, num_h);
+        gemm_at_a_upper_4x4_add(&w.data, k, n, wt_w);
     }
-    for a in 0..k {
-        for b in (a + 1)..k {
-            wt_w[b * k + a] = wt_w[a * k + b];
-        }
-    }
+    mirror_upper_to_lower(wt_w, k);
 
+    // wt_w is symmetric, so wt_w * H == wt_w^T * H
     denom_h.fill(0.0);
-    for a in 0..k {
-        let d_row = &mut denom_h[a * p..(a + 1) * p];
-        let wtw_row = &wt_w[a * k..(a + 1) * k];
-        for (b, &coeff) in wtw_row.iter().enumerate() {
-            if coeff == 0.0 {
-                continue;
-            }
-            let h_row = &h.data[b * p..(b + 1) * p];
-            for j in 0..p {
-                d_row[j] += coeff * h_row[j];
-            }
-        }
-    }
+    gemm_at_b_4x4_add(wt_w, k, &h.data, p, k, denom_h);
 
     for i in 0..h.data.len() {
         let h_i = h.data[i];
@@ -683,7 +1192,8 @@ impl NMF {
         let mut n_iter = 0usize;
         let final_err = if matches!(backend, Backend::Cpu) {
             let mut h_ht = vec![0.0; k * k];
-            let mut denom_row = vec![0.0; k];
+            let mut num_strip = vec![0.0; NMF_ROW_STRIP * k];
+            let mut denom_strip = vec![0.0; NMF_ROW_STRIP * k];
             let mut num_h = vec![0.0; k * p];
             let mut wt_w = vec![0.0; k * k];
             let mut denom_h = vec![0.0; k * p];
@@ -694,7 +1204,16 @@ impl NMF {
             let mut err = err_init;
 
             for it in 1..=self.max_iter {
-                nmf_cpu_update_w(x, &mut w, &h, l1_w, l2_w, &mut h_ht, &mut denom_row);
+                nmf_cpu_update_w(
+                    x,
+                    &mut w,
+                    &h,
+                    l1_w,
+                    l2_w,
+                    &mut h_ht,
+                    &mut num_strip,
+                    &mut denom_strip,
+                );
                 nmf_cpu_update_h(
                     x,
                     &w,
@@ -778,38 +1297,54 @@ impl NMF {
             let n = x.rows;
             let p = expected_p;
             let mut h_ht = vec![0.0; k * k];
-            for a in 0..k {
-                let h_a = &h.data[a * p..(a + 1) * p];
-                for b in a..k {
-                    let h_b = &h.data[b * p..(b + 1) * p];
-                    let v = dot4(h_a, h_b);
-                    h_ht[a * k + b] = v;
-                    h_ht[b * k + a] = v;
-                }
-            }
+            gemm_aat_sym_4x4(&h.data, k, p, &mut h_ht);
+
             let mut x_ht = vec![0.0; n * k];
-            for r in 0..n {
-                let x_row = &x.data[r * p..(r + 1) * p];
-                for c in 0..k {
-                    let h_row = &h.data[c * p..(c + 1) * p];
-                    x_ht[r * k + c] = dot4(x_row, h_row);
-                }
+            if n * p * k >= NMF_PAR_OPS_THRESHOLD && n >= 128 {
+                x_ht.par_chunks_mut(NMF_ROW_STRIP * k)
+                    .zip(x.data.par_chunks(NMF_ROW_STRIP * p))
+                    .for_each(|(out_chunk, x_chunk)| {
+                        let m = x_chunk.len() / p;
+                        gemm_abt_4x4(x_chunk, m, p, &h.data, k, out_chunk);
+                    });
+            } else {
+                gemm_abt_4x4(&x.data, n, p, &h.data, k, &mut x_ht);
             }
-            let mut denom_row = vec![0.0; k];
+
+            let mut denom_strip = vec![0.0; NMF_ROW_STRIP * k];
             let mut row_buf = vec![0.0; p];
             let mut prev_err = f64::INFINITY;
+            let use_par_update = n * k * k >= NMF_PAR_OPS_THRESHOLD && n >= 128;
+
             for it in 1..=self.max_iter {
-                for r in 0..n {
-                    let w_row = &mut w.data[r * k..(r + 1) * k];
-                    for c in 0..k {
-                        let hh_row = &h_ht[c * k..(c + 1) * k];
-                        denom_row[c] = dot4(w_row, hh_row);
-                    }
-                    let xht_row = &x_ht[r * k..(r + 1) * k];
-                    for c in 0..k {
-                        let w_rc = w_row[c];
-                        let d = denom_row[c] + l1_w + l2_w * w_rc + 1e-12;
-                        w_row[c] = (w_rc * xht_row[c] / d).max(0.0);
+                if use_par_update {
+                    w.data
+                        .par_chunks_mut(NMF_ROW_STRIP * k)
+                        .zip(x_ht.par_chunks(NMF_ROW_STRIP * k))
+                        .for_each(|(w_chunk, xht_chunk)| {
+                            let m = w_chunk.len() / k;
+                            let mut local_den = vec![0.0; m * k];
+                            gemm_abt_4x4(w_chunk, m, k, &h_ht, k, &mut local_den);
+                            for idx in 0..(m * k) {
+                                let w_rc = w_chunk[idx];
+                                let d = local_den[idx] + l1_w + l2_w * w_rc + 1e-12;
+                                w_chunk[idx] = (w_rc * xht_chunk[idx] / d).max(0.0);
+                            }
+                        });
+                } else {
+                    let mut r0 = 0;
+                    while r0 < n {
+                        let m = (r0 + NMF_ROW_STRIP).min(n) - r0;
+                        let w_strip = &mut w.data[r0 * k..(r0 + m) * k];
+                        let xht_strip = &x_ht[r0 * k..(r0 + m) * k];
+                        let den_slice = &mut denom_strip[..m * k];
+                        gemm_abt_4x4(w_strip, m, k, &h_ht, k, den_slice);
+                        for idx in 0..(m * k) {
+                            let w_rc = w_strip[idx];
+                            let d = den_slice[idx] + l1_w + l2_w * w_rc + 1e-12;
+                            w_strip[idx] = (w_rc * xht_strip[idx] / d).max(0.0);
+                        }
+                        r0 += m;
                     }
                 }
                 if it % 10 == 0 {
@@ -1018,6 +1553,177 @@ fn dot_slice(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
 }
 
+#[inline]
+fn cpu_axpy_slice(dst: &mut [f64], src: &[f64], scale: f64) {
+    let n = dst.len();
+    let chunks = n / 4;
+    for i in 0..chunks {
+        let base = i * 4;
+        dst[base] += scale * src[base];
+        dst[base + 1] += scale * src[base + 1];
+        dst[base + 2] += scale * src[base + 2];
+        dst[base + 3] += scale * src[base + 3];
+    }
+    for i in (chunks * 4)..n {
+        dst[i] += scale * src[i];
+    }
+}
+
+/// Zero-allocation CPU `out = A^T * v`.
+fn cpu_mat_t_vec(a: &Matrix, v: &[f64], out: &mut [f64]) {
+    let n = a.rows;
+    let p = a.cols;
+    if n * p >= NIPALS_PAR_ELEMS && n >= 256 {
+        const CHUNK: usize = 256;
+        let res = a
+            .data
+            .par_chunks(CHUNK * p)
+            .zip(v.par_chunks(CHUNK))
+            .fold(
+                || vec![0.0; p],
+                |mut loc, (ac, vc)| {
+                    for (r, &vr) in vc.iter().enumerate() {
+                        if vr != 0.0 {
+                            cpu_axpy_slice(&mut loc, &ac[r * p..(r + 1) * p], vr);
+                        }
+                    }
+                    loc
+                },
+            )
+            .reduce(
+                || vec![0.0; p],
+                |mut a_acc, b_acc| {
+                    for j in 0..p {
+                        a_acc[j] += b_acc[j];
+                    }
+                    a_acc
+                },
+            );
+        out.copy_from_slice(&res);
+    } else {
+        out.fill(0.0);
+        for (r, &vr) in v.iter().enumerate() {
+            if vr != 0.0 {
+                cpu_axpy_slice(out, &a.data[r * p..(r + 1) * p], vr);
+            }
+        }
+    }
+}
+
+/// Zero-allocation CPU `out = A * v`.
+fn cpu_mat_vec(a: &Matrix, v: &[f64], out: &mut [f64]) {
+    let n = a.rows;
+    let p = a.cols;
+    if n * p >= NIPALS_PAR_ELEMS && n >= 256 {
+        out.par_chunks_mut(256)
+            .zip(a.data.par_chunks(256 * p))
+            .for_each(|(oc, ac)| {
+                for (r, slot) in oc.iter_mut().enumerate() {
+                    *slot = dot4(&ac[r * p..(r + 1) * p], v);
+                }
+            });
+    } else {
+        for (r, slot) in out.iter_mut().enumerate() {
+            *slot = dot4(&a.data[r * p..(r + 1) * p], v);
+        }
+    }
+}
+
+/// Zero-allocation CPU `A -= scores * loadings^T`.
+fn cpu_rank1_deflate(a: &mut Matrix, scores: &[f64], loadings: &[f64]) {
+    let n = a.rows;
+    let p = a.cols;
+    if n * p >= NIPALS_PAR_ELEMS && n >= 256 {
+        a.data
+            .par_chunks_mut(256 * p)
+            .zip(scores.par_chunks(256))
+            .for_each(|(ac, sc)| {
+                for (r, &sr) in sc.iter().enumerate() {
+                    if sr != 0.0 {
+                        cpu_axpy_slice(&mut ac[r * p..(r + 1) * p], loadings, -sr);
+                    }
+                }
+            });
+    } else {
+        for (r, &sr) in scores.iter().enumerate() {
+            if sr != 0.0 {
+                cpu_axpy_slice(&mut a.data[r * p..(r + 1) * p], loadings, -sr);
+            }
+        }
+    }
+}
+
+/// Fused CPU `(X - mean) / std * rot` (`n x k`) without allocating scaled `X`.
+fn cpu_center_scale_matmul(
+    x: &Matrix,
+    mean: &[f64],
+    std: &[f64],
+    rot: &Matrix,
+) -> OchreResult<Matrix> {
+    let n = x.rows;
+    let p = x.cols;
+    let k = rot.cols;
+    let inv_std: Vec<f64> = std.iter().map(|&s| 1.0 / s).collect();
+    let mut out = Matrix::zeros(n, k);
+
+    let compute_strip = |x_chunk: &[f64], out_chunk: &mut [f64]| {
+        let m = x_chunk.len() / p;
+        for r in 0..m {
+            let xr = &x_chunk[r * p..(r + 1) * p];
+            let orow = &mut out_chunk[r * k..(r + 1) * k];
+            for j in 0..p {
+                let xs = (xr[j] - mean[j]) * inv_std[j];
+                let rot_row = &rot.data[j * k..(j + 1) * k];
+                for c in 0..k {
+                    orow[c] += xs * rot_row[c];
+                }
+            }
+        }
+    };
+
+    if n * p * k >= NMF_PAR_OPS_THRESHOLD && n >= 128 {
+        out.data
+            .par_chunks_mut(NMF_ROW_STRIP * k)
+            .zip(x.data.par_chunks(NMF_ROW_STRIP * p))
+            .for_each(|(oc, xc)| compute_strip(xc, oc));
+    } else {
+        compute_strip(&x.data, &mut out.data);
+    }
+    Ok(out)
+}
+
+/// Fused CPU `X * coef^T + intercept` (`n x q`) using 4x4 blocking without transposing `coef`.
+fn cpu_linear_predict_bias(x: &Matrix, coef: &Matrix, intercept: &[f64]) -> OchreResult<Matrix> {
+    let n = x.rows;
+    let p = x.cols;
+    let q = coef.rows;
+    let mut out = Matrix::zeros(n, q);
+    if n * p * q >= NMF_PAR_OPS_THRESHOLD && n >= 128 {
+        out.data
+            .par_chunks_mut(NMF_ROW_STRIP * q)
+            .zip(x.data.par_chunks(NMF_ROW_STRIP * p))
+            .for_each(|(oc, xc)| {
+                let m = xc.len() / p;
+                gemm_abt_4x4(xc, m, p, &coef.data, q, oc);
+                for r in 0..m {
+                    let row = &mut oc[r * q..(r + 1) * q];
+                    for (c, &b) in intercept.iter().enumerate() {
+                        row[c] += b;
+                    }
+                }
+            });
+    } else {
+        gemm_abt_4x4(&x.data, n, p, &coef.data, q, &mut out.data);
+        for r in 0..n {
+            let row = &mut out.data[r * q..(r + 1) * q];
+            for (c, &b) in intercept.iter().enumerate() {
+                row[c] += b;
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_nipals(
     backend: &Backend<'_>,
@@ -1032,9 +1738,11 @@ fn run_nipals(
     let n = x.rows;
     let p = x.cols;
     let q = y.cols;
+    let is_cpu = matches!(backend, Backend::Cpu);
 
     let (mut xk, x_mean, x_std) = center_and_scale_ddof1(backend, x, scale)?;
     let (mut yk, y_mean, y_std) = center_and_scale_ddof1(backend, y, scale)?;
+    let y_scaled = yk.clone();
 
     let mut x_weights = Matrix::zeros(p, n_components);
     let mut y_weights = Matrix::zeros(q, n_components);
@@ -1044,9 +1752,17 @@ fn run_nipals(
     let mut y_scores = Matrix::zeros(n, n_components);
     let mut n_iter = Vec::with_capacity(n_components);
 
+    let mut u = vec![0.0; n];
+    let mut w = vec![0.0; p];
+    let mut w_old = vec![0.0; p];
+    let mut c = vec![0.0; q];
+    let mut t = vec![0.0; n];
+    let mut p_vec = vec![0.0; p];
+    let mut q_vec = vec![0.0; q];
+
     for k in 0..n_components {
         // Initialize u as first non-zero column of Yk
-        let mut u = vec![0.0; n];
+        u.fill(0.0);
         for col in 0..q {
             let mut col_sq = 0.0;
             for r in 0..n {
@@ -1061,9 +1777,9 @@ fn run_nipals(
             }
         }
 
-        let mut w = vec![0.0; p];
-        let mut c = vec![0.0; q];
-        let mut t = vec![0.0; n];
+        w.fill(0.0);
+        c.fill(0.0);
+        t.fill(0.0);
         let mut iters_done = 0usize;
 
         // Precompute Gram matrices if Mode B (CCA)
@@ -1084,16 +1800,28 @@ fn run_nipals(
 
         for it in 1..=max_iter {
             iters_done = it;
-            let w_old = w.clone();
+            w_old.copy_from_slice(&w);
 
-            let u_mat = Matrix::from_vec(n, 1, u.clone())?;
-            let xk_t_u = backend.matmul_at_b(&xk, &u_mat)?;
-            if let Some(ref gram_x) = xk_gram {
-                let sol = solve_cholesky_multi(gram_x, &xk_t_u)?;
-                w = sol.data;
+            if is_cpu && !mode_b {
+                cpu_mat_t_vec(&xk, &u, &mut w);
+                let u_norm_sq = dot4(&u, &u).max(1e-15);
+                let inv_u = 1.0 / u_norm_sq;
+                for val in &mut w {
+                    *val *= inv_u;
+                }
             } else {
-                let u_norm_sq = dot_slice(&u, &u).max(1e-15);
-                w = xk_t_u.data.iter().map(|&v| v / u_norm_sq).collect();
+                let u_mat = Matrix::from_vec(n, 1, u.clone())?;
+                let xk_t_u = backend.matmul_at_b(&xk, &u_mat)?;
+                if let Some(ref gram_x) = xk_gram {
+                    let sol = solve_cholesky_multi(gram_x, &xk_t_u)?;
+                    w.copy_from_slice(&sol.data);
+                } else {
+                    let u_norm_sq = dot_slice(&u, &u).max(1e-15);
+                    let inv_u = 1.0 / u_norm_sq;
+                    for (dst, &v) in w.iter_mut().zip(xk_t_u.data.iter()) {
+                        *dst = v * inv_u;
+                    }
+                }
             }
             let w_norm = vec_norm2(&w);
             if w_norm > 1e-15 {
@@ -1110,33 +1838,61 @@ fn run_nipals(
                 }
             }
 
-            t = backend.matvec(&xk, &w)?;
+            if is_cpu {
+                cpu_mat_vec(&xk, &w, &mut t);
+            } else {
+                t = backend.matvec(&xk, &w)?;
+            }
 
-            let t_mat = Matrix::from_vec(n, 1, t.clone())?;
-            let yk_t_t = backend.matmul_at_b(&yk, &t_mat)?;
-            if let Some(ref gram_y) = yk_gram {
-                let sol = solve_cholesky_multi(gram_y, &yk_t_t)?;
-                c = sol.data;
-                let c_norm = vec_norm2(&c);
-                if c_norm > 1e-15 {
-                    let inv = 1.0 / c_norm;
-                    for val in &mut c {
-                        *val *= inv;
+            if is_cpu && !mode_b {
+                cpu_mat_t_vec(&yk, &t, &mut c);
+                let t_norm_sq = dot4(&t, &t).max(1e-15);
+                let inv_t = 1.0 / t_norm_sq;
+                for val in &mut c {
+                    *val *= inv_t;
+                }
+                let c_norm_sq = dot4(&c, &c);
+                if c_norm_sq > 1e-15 {
+                    cpu_mat_vec(&yk, &c, &mut u);
+                    let inv_c = 1.0 / c_norm_sq;
+                    for val in &mut u {
+                        *val *= inv_c;
                     }
                 } else {
-                    c[0] = 1.0;
-                }
-                u = backend.matvec(&yk, &c)?;
-            } else {
-                let t_norm_sq = dot_slice(&t, &t).max(1e-15);
-                c = yk_t_t.data.iter().map(|&v| v / t_norm_sq).collect();
-                let c_norm_sq = dot_slice(&c, &c);
-                if c_norm_sq > 1e-15 {
-                    let yk_c = backend.matvec(&yk, &c)?;
-                    let inv = 1.0 / c_norm_sq;
-                    u = yk_c.iter().map(|&v| v * inv).collect();
-                } else {
                     u.fill(0.0);
+                }
+            } else {
+                let t_mat = Matrix::from_vec(n, 1, t.clone())?;
+                let yk_t_t = backend.matmul_at_b(&yk, &t_mat)?;
+                if let Some(ref gram_y) = yk_gram {
+                    let sol = solve_cholesky_multi(gram_y, &yk_t_t)?;
+                    c.copy_from_slice(&sol.data);
+                    let c_norm = vec_norm2(&c);
+                    if c_norm > 1e-15 {
+                        let inv = 1.0 / c_norm;
+                        for val in &mut c {
+                            *val *= inv;
+                        }
+                    } else {
+                        c[0] = 1.0;
+                    }
+                    u = backend.matvec(&yk, &c)?;
+                } else {
+                    let t_norm_sq = dot_slice(&t, &t).max(1e-15);
+                    let inv_t = 1.0 / t_norm_sq;
+                    for (dst, &v) in c.iter_mut().zip(yk_t_t.data.iter()) {
+                        *dst = v * inv_t;
+                    }
+                    let c_norm_sq = dot_slice(&c, &c);
+                    if c_norm_sq > 1e-15 {
+                        let yk_c = backend.matvec(&yk, &c)?;
+                        let inv = 1.0 / c_norm_sq;
+                        for (dst, &v) in u.iter_mut().zip(yk_c.iter()) {
+                            *dst = v * inv;
+                        }
+                    } else {
+                        u.fill(0.0);
+                    }
                 }
             }
 
@@ -1152,46 +1908,65 @@ fn run_nipals(
         n_iter.push(iters_done);
 
         // Compute loadings and deflate
-        let t_mat = Matrix::from_vec(n, 1, t.clone())?;
-        let t_norm_sq = dot_slice(&t, &t).max(1e-15);
-        let p_vec: Vec<f64> = backend
-            .matmul_at_b(&xk, &t_mat)?
-            .data
-            .into_iter()
-            .map(|v| v / t_norm_sq)
-            .collect();
-
-        let q_vec: Vec<f64> = if mode_b {
-            let u_mat = Matrix::from_vec(n, 1, u.clone())?;
-            let u_norm_sq = dot_slice(&u, &u).max(1e-15);
-            backend
-                .matmul_at_b(&yk, &u_mat)?
-                .data
-                .into_iter()
-                .map(|v| v / u_norm_sq)
-                .collect()
-        } else {
-            backend
-                .matmul_at_b(&yk, &t_mat)?
-                .data
-                .into_iter()
-                .map(|v| v / t_norm_sq)
-                .collect()
-        };
-
-        // Deflate Xk -= t * p_vec^T
-        for r in 0..n {
-            let tr = t[r];
-            for col in 0..p {
-                xk[(r, col)] -= tr * p_vec[col];
+        if is_cpu {
+            let t_norm_sq = dot4(&t, &t).max(1e-15);
+            let inv_t = 1.0 / t_norm_sq;
+            cpu_mat_t_vec(&xk, &t, &mut p_vec);
+            for val in &mut p_vec {
+                *val *= inv_t;
             }
-        }
-        // Deflate Yk -= (u if mode_b else t) * q_vec^T
-        let y_deflate_score = if mode_b { &u } else { &t };
-        for r in 0..n {
-            let sr = y_deflate_score[r];
-            for col in 0..q {
-                yk[(r, col)] -= sr * q_vec[col];
+
+            if mode_b {
+                let u_norm_sq = dot4(&u, &u).max(1e-15);
+                let inv_u = 1.0 / u_norm_sq;
+                cpu_mat_t_vec(&yk, &u, &mut q_vec);
+                for val in &mut q_vec {
+                    *val *= inv_u;
+                }
+            } else {
+                cpu_mat_t_vec(&yk, &t, &mut q_vec);
+                for val in &mut q_vec {
+                    *val *= inv_t;
+                }
+            }
+
+            cpu_rank1_deflate(&mut xk, &t, &p_vec);
+            let y_deflate_score = if mode_b { &u } else { &t };
+            cpu_rank1_deflate(&mut yk, y_deflate_score, &q_vec);
+        } else {
+            let t_mat = Matrix::from_vec(n, 1, t.clone())?;
+            let t_norm_sq = dot_slice(&t, &t).max(1e-15);
+            let xk_t_t = backend.matmul_at_b(&xk, &t_mat)?;
+            for (dst, &v) in p_vec.iter_mut().zip(xk_t_t.data.iter()) {
+                *dst = v / t_norm_sq;
+            }
+
+            if mode_b {
+                let u_mat = Matrix::from_vec(n, 1, u.clone())?;
+                let u_norm_sq = dot_slice(&u, &u).max(1e-15);
+                let yk_t_u = backend.matmul_at_b(&yk, &u_mat)?;
+                for (dst, &v) in q_vec.iter_mut().zip(yk_t_u.data.iter()) {
+                    *dst = v / u_norm_sq;
+                }
+            } else {
+                let yk_t_t = backend.matmul_at_b(&yk, &t_mat)?;
+                for (dst, &v) in q_vec.iter_mut().zip(yk_t_t.data.iter()) {
+                    *dst = v / t_norm_sq;
+                }
+            }
+
+            for r in 0..n {
+                let tr = t[r];
+                for col in 0..p {
+                    xk[(r, col)] -= tr * p_vec[col];
+                }
+            }
+            let y_deflate_score = if mode_b { &u } else { &t };
+            for r in 0..n {
+                let sr = y_deflate_score[r];
+                for col in 0..q {
+                    yk[(r, col)] -= sr * q_vec[col];
+                }
             }
         }
 
@@ -1220,7 +1995,6 @@ fn run_nipals(
     let y_rotations = backend.matmul(&y_weights, &qt_c_inv)?;
 
     // Regression coefficients: B_scaled = x_rotations * B_y where B_y = (T^T T)^{-1} T^T Y_scaled
-    let (y_scaled, _, _) = center_and_scale_ddof1(backend, y, scale)?;
     let tt_t = backend.matmul_at_b(&x_scores, &x_scores)?;
     let tt_y = backend.matmul_at_b(&x_scores, &y_scaled)?;
     let b_y = solve_cholesky_multi(&tt_t, &tt_y)?;
@@ -1418,8 +2192,12 @@ impl PLSRegression {
         }
 
         let backend = effective_backend(&self.device, x.rows * expected_p);
-        let x_scaled = apply_center_scale(&backend, x, x_mean, x_std)?;
-        let x_scores = backend.matmul(&x_scaled, x_rot)?;
+        let x_scores = if matches!(backend, Backend::Cpu) {
+            cpu_center_scale_matmul(x, x_mean, x_std, x_rot)?
+        } else {
+            let x_scaled = apply_center_scale(&backend, x, x_mean, x_std)?;
+            backend.matmul(&x_scaled, x_rot)?
+        };
 
         let y_scores = if let Some(y_mat) = y {
             let y_rot = self.y_rotations_.as_ref().ok_or(OchreError::NotFitted)?;
@@ -1439,8 +2217,12 @@ impl PLSRegression {
                     expected: expected_q,
                 });
             }
-            let y_scaled = apply_center_scale(&backend, y_mat, y_mean, y_std)?;
-            Some(backend.matmul(&y_scaled, y_rot)?)
+            if matches!(backend, Backend::Cpu) {
+                Some(cpu_center_scale_matmul(y_mat, y_mean, y_std, y_rot)?)
+            } else {
+                let y_scaled = apply_center_scale(&backend, y_mat, y_mean, y_std)?;
+                Some(backend.matmul(&y_scaled, y_rot)?)
+            }
         } else {
             None
         };
@@ -1467,6 +2249,9 @@ impl PLSRegression {
             });
         }
         let backend = effective_backend(&self.device, x.rows * expected_p);
+        if matches!(backend, Backend::Cpu) {
+            return cpu_linear_predict_bias(x, coef, intercept);
+        }
         let coef_t = coef.transpose();
         let mut pred = backend.matmul(x, &coef_t)?;
         for r in 0..pred.rows {
@@ -1746,8 +2531,12 @@ impl CCA {
         }
 
         let backend = effective_backend(&self.device, x.rows * expected_p);
-        let x_scaled = apply_center_scale(&backend, x, x_mean, x_std)?;
-        let x_scores = backend.matmul(&x_scaled, x_rot)?;
+        let x_scores = if matches!(backend, Backend::Cpu) {
+            cpu_center_scale_matmul(x, x_mean, x_std, x_rot)?
+        } else {
+            let x_scaled = apply_center_scale(&backend, x, x_mean, x_std)?;
+            backend.matmul(&x_scaled, x_rot)?
+        };
 
         let y_scores = if let Some(y_mat) = y {
             let y_rot = self.y_rotations_.as_ref().ok_or(OchreError::NotFitted)?;
@@ -1767,8 +2556,12 @@ impl CCA {
                     expected: expected_q,
                 });
             }
-            let y_scaled = apply_center_scale(&backend, y_mat, y_mean, y_std)?;
-            Some(backend.matmul(&y_scaled, y_rot)?)
+            if matches!(backend, Backend::Cpu) {
+                Some(cpu_center_scale_matmul(y_mat, y_mean, y_std, y_rot)?)
+            } else {
+                let y_scaled = apply_center_scale(&backend, y_mat, y_mean, y_std)?;
+                Some(backend.matmul(&y_scaled, y_rot)?)
+            }
         } else {
             None
         };
@@ -1795,6 +2588,9 @@ impl CCA {
             });
         }
         let backend = effective_backend(&self.device, x.rows * expected_p);
+        if matches!(backend, Backend::Cpu) {
+            return cpu_linear_predict_bias(x, coef, intercept);
+        }
         let coef_t = coef.transpose();
         let mut pred = backend.matmul(x, &coef_t)?;
         for r in 0..pred.rows {
@@ -2517,5 +3313,113 @@ mod tests {
             iters.iter().all(|&it| it <= 20),
             "expected fast CCA convergence, got n_iter={iters:?}"
         );
+    }
+
+    #[test]
+    fn test_nmf_and_pls_blocked_and_parallel_parity() {
+        // Non-multiple-of-4 dimensions AND large enough to exercise Rayon path in NMF & PLS
+        let n = 600usize;
+        let p = 47usize;
+        let k = 11usize;
+        let mut state: u64 = 0x5555_AAAA_1234_9876;
+        let mut next_u01 = || -> f64 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+
+        let mut x_nmf_data = vec![0.0; n * p];
+        let mut w_true = vec![0.0; n * k];
+        let mut h_true = vec![0.0; k * p];
+        for v in &mut w_true {
+            *v = 0.1 + next_u01();
+        }
+        for v in &mut h_true {
+            *v = 0.1 + next_u01();
+        }
+        for r in 0..n {
+            for c in 0..p {
+                let mut sum = 0.0;
+                for j in 0..k {
+                    sum += w_true[r * k + j] * h_true[j * p + c];
+                }
+                x_nmf_data[r * p + c] = sum + 0.01 * next_u01();
+            }
+        }
+        let x_nmf = Matrix::from_vec(n, p, x_nmf_data).unwrap();
+        let mut nmf = NMF::new(
+            Some(k),
+            Some("nndsvda".to_string()),
+            100,
+            1e-4,
+            0.0,
+            0.0,
+            None,
+            Some(42),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        let w_fit = nmf.fit_transform(&x_nmf).unwrap();
+        assert_eq!(w_fit.rows, n);
+        assert_eq!(w_fit.cols, k);
+        let rel_err = nmf.reconstruction_err_.unwrap()
+            / x_nmf.data.iter().map(|&v| v * v).sum::<f64>().sqrt();
+        assert!(rel_err < 0.05, "rel_err={rel_err}");
+        let w_trans = nmf.transform(&x_nmf).unwrap();
+        assert_eq!(w_trans.rows, n);
+        assert_eq!(w_trans.cols, k);
+
+        // Multi-target PLSRegression with large N*p (exercises Rayon NIPALS, fused transform, fused predict)
+        let n_pls = 1200usize;
+        let p_pls = 65usize;
+        let q_pls = 5usize;
+        let mut x_pls_data = vec![0.0; n_pls * p_pls];
+        let mut y_pls_data = vec![0.0; n_pls * q_pls];
+        for r in 0..n_pls {
+            for c in 0..p_pls {
+                x_pls_data[r * p_pls + c] = next_u01() * 2.0 - 1.0;
+            }
+            for t in 0..q_pls {
+                y_pls_data[r * q_pls + t] = 2.0 * x_pls_data[r * p_pls + t]
+                    - 1.5 * x_pls_data[r * p_pls + t + 5]
+                    + 0.05 * (next_u01() - 0.5);
+            }
+        }
+        let x_pls = Matrix::from_vec(n_pls, p_pls, x_pls_data).unwrap();
+        let y_pls = Matrix::from_vec(n_pls, q_pls, y_pls_data).unwrap();
+        let mut pls = PLSRegression::new(10, true, 500, 1e-6, Some("cpu".to_string())).unwrap();
+        pls.fit(&x_pls, &y_pls).unwrap();
+        let r2 = pls.score(&x_pls, &y_pls).unwrap();
+        assert!(r2 > 0.98, "r2={r2}");
+        let (xs, ys) = pls.transform(&x_pls, Some(&y_pls)).unwrap();
+        assert_eq!(xs.rows, n_pls);
+        assert_eq!(xs.cols, 10);
+        assert_eq!(ys.unwrap().cols, 10);
+
+        // Verify fused CPU transform & predict match explicit center_scale + matmul to 1e-12
+        let x_scaled = apply_center_scale(
+            &Backend::Cpu,
+            &x_pls,
+            pls.x_mean_.as_ref().unwrap(),
+            pls.x_std_.as_ref().unwrap(),
+        )
+        .unwrap();
+        let xs_ref = Backend::Cpu
+            .matmul(&x_scaled, pls.x_rotations_.as_ref().unwrap())
+            .unwrap();
+        for (a, b) in xs.data.iter().zip(xs_ref.data.iter()) {
+            assert!((a - b).abs() < 1e-11, "xs mismatch: {a} vs {b}");
+        }
+        let preds = pls.predict(&x_pls).unwrap();
+        let coef_t = pls.coef_.as_ref().unwrap().transpose();
+        let mut preds_ref = Backend::Cpu.matmul(&x_pls, &coef_t).unwrap();
+        let intercept = pls.intercept_.as_ref().unwrap();
+        for r in 0..preds_ref.rows {
+            for (c, &b) in intercept.iter().enumerate() {
+                preds_ref[(r, c)] += b;
+            }
+        }
+        for (a, b) in preds.data.iter().zip(preds_ref.data.iter()) {
+            assert!((a - b).abs() < 1e-11, "pred mismatch: {a} vs {b}");
+        }
     }
 }

@@ -49,6 +49,164 @@ fn axpy_add_unrolled(dst: &mut [f64], src: &[f64], scale: f64) {
     }
 }
 
+const GLM_TILE_ROWS: usize = 64;
+const GLM_IRLS_CHUNK_ROWS: usize = 512;
+
+#[inline(always)]
+fn dot64(a: &[f64; GLM_TILE_ROWS], b: &[f64; GLM_TILE_ROWS]) -> f64 {
+    let mut acc = [0.0f64; 4];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        for lane in 0..4 {
+            acc[lane] += a[base + lane] * b[base + lane];
+        }
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
+}
+
+#[inline(always)]
+fn dot64_1x4(
+    a: &[f64; GLM_TILE_ROWS],
+    b0: &[f64; GLM_TILE_ROWS],
+    b1: &[f64; GLM_TILE_ROWS],
+    b2: &[f64; GLM_TILE_ROWS],
+    b3: &[f64; GLM_TILE_ROWS],
+) -> (f64, f64, f64, f64) {
+    let mut acc0 = [0.0f64; 4];
+    let mut acc1 = [0.0f64; 4];
+    let mut acc2 = [0.0f64; 4];
+    let mut acc3 = [0.0f64; 4];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        for lane in 0..4 {
+            let ai = a[base + lane];
+            acc0[lane] += ai * b0[base + lane];
+            acc1[lane] += ai * b1[base + lane];
+            acc2[lane] += ai * b2[base + lane];
+            acc3[lane] += ai * b3[base + lane];
+        }
+    }
+    (
+        (acc0[0] + acc0[1]) + (acc0[2] + acc0[3]),
+        (acc1[0] + acc1[1]) + (acc1[2] + acc1[3]),
+        (acc2[0] + acc2[1]) + (acc2[2] + acc2[3]),
+        (acc3[0] + acc3[1]) + (acc3[2] + acc3[3]),
+    )
+}
+
+#[inline(always)]
+fn dot64_2x4(
+    a0: &[f64; GLM_TILE_ROWS],
+    a1: &[f64; GLM_TILE_ROWS],
+    b0: &[f64; GLM_TILE_ROWS],
+    b1: &[f64; GLM_TILE_ROWS],
+    b2: &[f64; GLM_TILE_ROWS],
+    b3: &[f64; GLM_TILE_ROWS],
+) -> ([f64; 4], [f64; 4]) {
+    let mut acc00 = [0.0f64; 4];
+    let mut acc01 = [0.0f64; 4];
+    let mut acc02 = [0.0f64; 4];
+    let mut acc03 = [0.0f64; 4];
+    let mut acc10 = [0.0f64; 4];
+    let mut acc11 = [0.0f64; 4];
+    let mut acc12 = [0.0f64; 4];
+    let mut acc13 = [0.0f64; 4];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        for lane in 0..4 {
+            let v_a0 = a0[base + lane];
+            let v_a1 = a1[base + lane];
+            let v_b0 = b0[base + lane];
+            let v_b1 = b1[base + lane];
+            let v_b2 = b2[base + lane];
+            let v_b3 = b3[base + lane];
+            acc00[lane] += v_a0 * v_b0;
+            acc01[lane] += v_a0 * v_b1;
+            acc02[lane] += v_a0 * v_b2;
+            acc03[lane] += v_a0 * v_b3;
+            acc10[lane] += v_a1 * v_b0;
+            acc11[lane] += v_a1 * v_b1;
+            acc12[lane] += v_a1 * v_b2;
+            acc13[lane] += v_a1 * v_b3;
+        }
+    }
+    (
+        [
+            (acc00[0] + acc00[1]) + (acc00[2] + acc00[3]),
+            (acc01[0] + acc01[1]) + (acc01[2] + acc01[3]),
+            (acc02[0] + acc02[1]) + (acc02[2] + acc02[3]),
+            (acc03[0] + acc03[1]) + (acc03[2] + acc03[3]),
+        ],
+        [
+            (acc10[0] + acc10[1]) + (acc10[2] + acc10[3]),
+            (acc11[0] + acc11[1]) + (acc11[2] + acc11[3]),
+            (acc12[0] + acc12[1]) + (acc12[2] + acc12[3]),
+            (acc13[0] + acc13[1]) + (acc13[2] + acc13[3]),
+        ],
+    )
+}
+
+#[inline]
+fn accumulate_gram_upper_64(u_t: &[[f64; GLM_TILE_ROWS]], gram: &mut [f64], dim: usize) {
+    let mut j = 0;
+    while j + 2 <= dim {
+        let uj0 = &u_t[j];
+        let uj1 = &u_t[j + 1];
+        let off0 = j * dim;
+        let off1 = (j + 1) * dim;
+        gram[off0 + j] += dot64(uj0, uj0);
+        gram[off0 + j + 1] += dot64(uj0, uj1);
+        gram[off1 + j + 1] += dot64(uj1, uj1);
+
+        let mut k = j + 2;
+        while k + 4 <= dim {
+            let (r0, r1) = dot64_2x4(uj0, uj1, &u_t[k], &u_t[k + 1], &u_t[k + 2], &u_t[k + 3]);
+            gram[off0 + k] += r0[0];
+            gram[off0 + k + 1] += r0[1];
+            gram[off0 + k + 2] += r0[2];
+            gram[off0 + k + 3] += r0[3];
+            gram[off1 + k] += r1[0];
+            gram[off1 + k + 1] += r1[1];
+            gram[off1 + k + 2] += r1[2];
+            gram[off1 + k + 3] += r1[3];
+            k += 4;
+        }
+        while k < dim {
+            gram[off0 + k] += dot64(uj0, &u_t[k]);
+            gram[off1 + k] += dot64(uj1, &u_t[k]);
+            k += 1;
+        }
+        j += 2;
+    }
+    while j < dim {
+        let uj = &u_t[j];
+        let row_off = j * dim;
+        let mut k = j;
+        while k + 4 <= dim {
+            let (s0, s1, s2, s3) = dot64_1x4(uj, &u_t[k], &u_t[k + 1], &u_t[k + 2], &u_t[k + 3]);
+            gram[row_off + k] += s0;
+            gram[row_off + k + 1] += s1;
+            gram[row_off + k + 2] += s2;
+            gram[row_off + k + 3] += s3;
+            k += 4;
+        }
+        while k < dim {
+            gram[row_off + k] += dot64(uj, &u_t[k]);
+            k += 1;
+        }
+        j += 1;
+    }
+}
+
+#[inline]
+fn mirror_upper_to_lower_slice(mat: &mut [f64], dim: usize) {
+    for j in 0..dim {
+        for k in (j + 1)..dim {
+            mat[k * dim + j] = mat[j * dim + k];
+        }
+    }
+}
+
 fn median_in_place(buf: &mut [f64]) -> f64 {
     let n = buf.len();
     if n == 0 {
@@ -1049,18 +1207,23 @@ fn weighted_quantile(values: &[f64], weights_norm: &[f64], q: f64) -> f64 {
     pairs.last().map_or(0.0, |p| p.0)
 }
 
-fn weighted_std(values: &[f64], weights_norm: &[f64]) -> f64 {
-    let mean: f64 = values
-        .iter()
-        .zip(weights_norm.iter())
-        .map(|(&v, &w)| v * w)
-        .sum();
-    let var: f64 = values
-        .iter()
-        .zip(weights_norm.iter())
-        .map(|(&v, &w)| w * (v - mean).powi(2))
-        .sum();
-    var.sqrt()
+fn weighted_mean_and_std(values: &[f64], weights_norm: Option<&[f64]>, inv_n: f64) -> (f64, f64) {
+    match weights_norm {
+        Some(sw) => {
+            let mean: f64 = values.iter().zip(sw.iter()).map(|(&v, &w)| v * w).sum();
+            let var: f64 = values
+                .iter()
+                .zip(sw.iter())
+                .map(|(&v, &w)| w * (v - mean).powi(2))
+                .sum();
+            (mean, var.sqrt())
+        }
+        None => {
+            let mean = values.iter().sum::<f64>() * inv_n;
+            let var = values.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() * inv_n;
+            (mean, var.sqrt())
+        }
+    }
 }
 
 fn compute_weighted_gram_and_rhs(
@@ -1254,85 +1417,476 @@ impl QuantileRegressor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_quantile_tile_chunk(
+        x_data: &[f64],
+        y_data: &[f64],
+        sw_slice: Option<&[f64]>,
+        inv_n: f64,
+        w: &[f64],
+        b_intercept: f64,
+        x_shift: &[f64],
+        y_shift: f64,
+        eps: f64,
+        q_shift: f64,
+        fit_intercept: bool,
+        gram_data: &mut [f64],
+        rhs: &mut [f64],
+        sum_wt_z: &mut [f64],
+        u_t: &mut [[f64; GLM_TILE_ROWS]],
+    ) -> (f64, f64) {
+        let p = w.len();
+        let n_rows = y_data.len();
+        let mut sum_wt = 0.0_f64;
+        let mut sum_wt_y = 0.0_f64;
+        let mut sw_t = [0.0_f64; GLM_TILE_ROWS];
+        let mut sw_yt_t = [0.0_f64; GLM_TILE_ROWS];
+
+        let mut row_start = 0usize;
+        while row_start < n_rows {
+            let row_end = (row_start + GLM_TILE_ROWS).min(n_rows);
+            let b_len = row_end - row_start;
+            if b_len < GLM_TILE_ROWS {
+                for col in u_t.iter_mut() {
+                    col[b_len..GLM_TILE_ROWS].fill(0.0);
+                }
+                sw_t[b_len..GLM_TILE_ROWS].fill(0.0);
+                sw_yt_t[b_len..GLM_TILE_ROWS].fill(0.0);
+            }
+
+            for (b, i) in (row_start..row_end).enumerate() {
+                let row = &x_data[i * p..(i + 1) * p];
+                let r = y_data[i] - (dot_unrolled(row, w) + b_intercept);
+                let d = r.abs().max(eps);
+                let sw_base = sw_slice.map_or(inv_n, |s| s[i]);
+                let wt_i = sw_base / (2.0 * d);
+                let sw_i = wt_i.sqrt();
+                let yt_i = (y_data[i] - y_shift) + d * q_shift;
+
+                sum_wt += wt_i;
+                sw_t[b] = sw_i;
+                sw_yt_t[b] = sw_i * yt_i;
+
+                if fit_intercept {
+                    for j in 0..p {
+                        u_t[j][b] = sw_i * (row[j] - x_shift[j]);
+                    }
+                } else {
+                    for j in 0..p {
+                        u_t[j][b] = sw_i * row[j];
+                    }
+                }
+            }
+
+            accumulate_gram_upper_64(u_t, gram_data, p);
+            if fit_intercept {
+                sum_wt_y += dot64(&sw_t, &sw_yt_t);
+                for j in 0..p {
+                    sum_wt_z[j] += dot64(&u_t[j], &sw_t);
+                    rhs[j] += dot64(&u_t[j], &sw_yt_t);
+                }
+            } else {
+                for j in 0..p {
+                    rhs[j] += dot64(&u_t[j], &sw_yt_t);
+                }
+            }
+
+            row_start = row_end;
+        }
+
+        (sum_wt, sum_wt_y)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn quantile_fused_cpu_pass(
+        x: &Matrix,
+        y: &[f64],
+        sw_slice: Option<&[f64]>,
+        inv_n: f64,
+        w: &[f64],
+        b_intercept: f64,
+        x_shift: &[f64],
+        y_shift: f64,
+        eps: f64,
+        q_shift: f64,
+        fit_intercept: bool,
+        gram_data: &mut [f64],
+        rhs: &mut [f64],
+        sum_wt_z: &mut [f64],
+        u_t: &mut [[f64; GLM_TILE_ROWS]],
+        x_bar: &mut [f64],
+    ) -> f64 {
+        let n = x.rows;
+        let p = x.cols;
+        gram_data.fill(0.0);
+        rhs.fill(0.0);
+        sum_wt_z.fill(0.0);
+
+        let (sum_wt, sum_wt_y) = if p <= 256 {
+            if n >= 1024 && n * p >= 16_384 {
+                let chunk_rows = GLM_IRLS_CHUNK_ROWS;
+                let (g_par, r_par, z_par, sw_par, sy_par) = x
+                    .data
+                    .par_chunks(chunk_rows * p)
+                    .zip(y.par_chunks(chunk_rows))
+                    .enumerate()
+                    .fold(
+                        || {
+                            (
+                                vec![0.0; p * p],
+                                vec![0.0; p],
+                                vec![0.0; p],
+                                vec![[0.0f64; GLM_TILE_ROWS]; p],
+                                0.0_f64,
+                                0.0_f64,
+                            )
+                        },
+                        |(mut lg, mut lr, mut lz, mut lut, mut lsw, mut lsy), (c_idx, (xc, yc))| {
+                            let base = c_idx * chunk_rows;
+                            let sw_sub = sw_slice.map(|s| &s[base..base + yc.len()]);
+                            let (c_sw, c_sy) = Self::accumulate_quantile_tile_chunk(
+                                xc,
+                                yc,
+                                sw_sub,
+                                inv_n,
+                                w,
+                                b_intercept,
+                                x_shift,
+                                y_shift,
+                                eps,
+                                q_shift,
+                                fit_intercept,
+                                &mut lg,
+                                &mut lr,
+                                &mut lz,
+                                &mut lut,
+                            );
+                            lsw += c_sw;
+                            lsy += c_sy;
+                            (lg, lr, lz, lut, lsw, lsy)
+                        },
+                    )
+                    .map(|(g, r, z, _, sw, sy)| (g, r, z, sw, sy))
+                    .reduce(
+                        || {
+                            (
+                                vec![0.0; p * p],
+                                vec![0.0; p],
+                                vec![0.0; p],
+                                0.0_f64,
+                                0.0_f64,
+                            )
+                        },
+                        |(mut g1, mut r1, mut z1, sw1, sy1), (g2, r2, z2, sw2, sy2)| {
+                            for idx in 0..p * p {
+                                g1[idx] += g2[idx];
+                            }
+                            for j in 0..p {
+                                r1[j] += r2[j];
+                                z1[j] += z2[j];
+                            }
+                            (g1, r1, z1, sw1 + sw2, sy1 + sy2)
+                        },
+                    );
+                gram_data.copy_from_slice(&g_par);
+                rhs.copy_from_slice(&r_par);
+                sum_wt_z.copy_from_slice(&z_par);
+                (sw_par, sy_par)
+            } else {
+                Self::accumulate_quantile_tile_chunk(
+                    &x.data,
+                    y,
+                    sw_slice,
+                    inv_n,
+                    w,
+                    b_intercept,
+                    x_shift,
+                    y_shift,
+                    eps,
+                    q_shift,
+                    fit_intercept,
+                    gram_data,
+                    rhs,
+                    sum_wt_z,
+                    u_t,
+                )
+            }
+        } else if n >= 1024 {
+            let chunk_rows = GLM_IRLS_CHUNK_ROWS;
+            let (g_par, r_par, z_par, sw_par, sy_par) = x
+                .data
+                .par_chunks(chunk_rows * p)
+                .zip(y.par_chunks(chunk_rows))
+                .enumerate()
+                .fold(
+                    || {
+                        (
+                            vec![0.0; p * p],
+                            vec![0.0; p],
+                            vec![0.0; p],
+                            vec![0.0; p],
+                            0.0_f64,
+                            0.0_f64,
+                        )
+                    },
+                    |(mut lg, mut lr, mut lz, mut z_row, mut lsw, mut lsy), (c_idx, (xc, yc))| {
+                        let base = c_idx * chunk_rows;
+                        for i in 0..yc.len() {
+                            let row = &xc[i * p..(i + 1) * p];
+                            let r = yc[i] - (dot_unrolled(row, w) + b_intercept);
+                            let d = r.abs().max(eps);
+                            let wt_i = sw_slice.map_or(inv_n, |s| s[base + i]) / (2.0 * d);
+                            let yt_i = (yc[i] - y_shift) + d * q_shift;
+                            lsw += wt_i;
+                            if fit_intercept {
+                                lsy += wt_i * yt_i;
+                                for j in 0..p {
+                                    let zj = row[j] - x_shift[j];
+                                    z_row[j] = zj;
+                                    lz[j] += wt_i * zj;
+                                }
+                            } else {
+                                z_row.copy_from_slice(row);
+                            }
+                            let wy = wt_i * yt_i;
+                            for j in 0..p {
+                                let zj = z_row[j];
+                                let w_zj = wt_i * zj;
+                                lr[j] += wy * zj;
+                                let g_row = &mut lg[j * p..(j + 1) * p];
+                                for k in j..p {
+                                    g_row[k] += w_zj * z_row[k];
+                                }
+                            }
+                        }
+                        (lg, lr, lz, z_row, lsw, lsy)
+                    },
+                )
+                .map(|(g, r, z, _, sw, sy)| (g, r, z, sw, sy))
+                .reduce(
+                    || {
+                        (
+                            vec![0.0; p * p],
+                            vec![0.0; p],
+                            vec![0.0; p],
+                            0.0_f64,
+                            0.0_f64,
+                        )
+                    },
+                    |(mut g1, mut r1, mut z1, sw1, sy1), (g2, r2, z2, sw2, sy2)| {
+                        for idx in 0..p * p {
+                            g1[idx] += g2[idx];
+                        }
+                        for j in 0..p {
+                            r1[j] += r2[j];
+                            z1[j] += z2[j];
+                        }
+                        (g1, r1, z1, sw1 + sw2, sy1 + sy2)
+                    },
+                );
+            gram_data.copy_from_slice(&g_par);
+            rhs.copy_from_slice(&r_par);
+            sum_wt_z.copy_from_slice(&z_par);
+            (sw_par, sy_par)
+        } else {
+            let mut lsw = 0.0_f64;
+            let mut lsy = 0.0_f64;
+            let mut z_row = vec![0.0; p];
+            for i in 0..n {
+                let row = &x.data[i * p..(i + 1) * p];
+                let r = y[i] - (dot_unrolled(row, w) + b_intercept);
+                let d = r.abs().max(eps);
+                let wt_i = sw_slice.map_or(inv_n, |s| s[i]) / (2.0 * d);
+                let yt_i = (y[i] - y_shift) + d * q_shift;
+                lsw += wt_i;
+                if fit_intercept {
+                    lsy += wt_i * yt_i;
+                    for j in 0..p {
+                        let zj = row[j] - x_shift[j];
+                        z_row[j] = zj;
+                        sum_wt_z[j] += wt_i * zj;
+                    }
+                } else {
+                    z_row.copy_from_slice(row);
+                }
+                let wy = wt_i * yt_i;
+                for j in 0..p {
+                    let zj = z_row[j];
+                    let w_zj = wt_i * zj;
+                    rhs[j] += wy * zj;
+                    let g_row = &mut gram_data[j * p..(j + 1) * p];
+                    for k in j..p {
+                        g_row[k] += w_zj * z_row[k];
+                    }
+                }
+            }
+            (lsw, lsy)
+        };
+
+        let y_bar = if fit_intercept && sum_wt > 0.0 {
+            let inv_sum_wt = 1.0 / sum_wt;
+            let y_bar_shifted = sum_wt_y * inv_sum_wt;
+            // Reuse sum_wt_z as z_bar in-place
+            for j in 0..p {
+                let zb = sum_wt_z[j] * inv_sum_wt;
+                sum_wt_z[j] = zb;
+                x_bar[j] = x_shift[j] + zb;
+            }
+            for j in 0..p {
+                let sw_zb_j = sum_wt * sum_wt_z[j];
+                rhs[j] -= sw_zb_j * y_bar_shifted;
+                let g_row = &mut gram_data[j * p..(j + 1) * p];
+                for k in j..p {
+                    g_row[k] -= sw_zb_j * sum_wt_z[k];
+                }
+            }
+            y_shift + y_bar_shifted
+        } else {
+            x_bar.fill(0.0);
+            0.0
+        };
+
+        mirror_upper_to_lower_slice(gram_data, p);
+        y_bar
+    }
+
     pub fn fit(&mut self, x: &Matrix, y: &[f64], sample_weight: Option<&[f64]>) -> OchreResult<()> {
         validate_fit_inputs(x, y, sample_weight)?;
         let n = x.rows;
         let p = x.cols;
-        let sw_norm: Vec<f64> = match sample_weight {
-            Some(sw) => {
-                let s: f64 = sw.iter().sum();
-                sw.iter().map(|&v| v / s).collect()
-            }
-            None => vec![1.0 / (n as f64); n],
-        };
+        let inv_n = 1.0 / (n as f64);
+        let sw_norm_opt: Option<Vec<f64>> = sample_weight.map(|sw| {
+            let s: f64 = sw.iter().sum();
+            sw.iter().map(|&v| v / s).collect()
+        });
+        let sw_slice = sw_norm_opt.as_deref();
 
         let backend = effective_backend(&self.parsed_device, n, p);
+        let is_cpu = matches!(backend, Backend::Cpu);
+
         let mut w = vec![0.0; p];
         let mut b = if self.fit_intercept {
-            weighted_quantile(y, &sw_norm, self.quantile)
+            match sw_slice {
+                Some(sw) => weighted_quantile(y, sw, self.quantile),
+                None => {
+                    let mut vals = y.to_vec();
+                    let idx = ((self.quantile * (n as f64) - 1e-12).ceil() as usize)
+                        .saturating_sub(1)
+                        .min(n - 1);
+                    let (_, kth, _) = vals.select_nth_unstable_by(idx, |a, b| a.total_cmp(b));
+                    *kth
+                }
+            }
         } else {
             0.0
         };
 
-        let y_scale = weighted_std(y, &sw_norm).max(1.0);
+        let (y_mean, y_std_val) = weighted_mean_and_std(y, sw_slice, inv_n);
+        let y_scale = y_std_val.max(1.0);
         let mut eps = (1e-3 * y_scale).max(1e-6);
         let min_eps = 1e-8;
         let q_shift = 2.0 * self.quantile - 1.0;
 
-        let mut wt = vec![0.0; n];
-        let mut y_tilde = vec![0.0; n];
+        let x_shift: Vec<f64> = if is_cpu && self.fit_intercept {
+            if n >= FUSED_PAR_THRESHOLD {
+                let sums = x
+                    .data
+                    .par_chunks(FUSED_CHUNK_ROWS * p)
+                    .fold(
+                        || vec![0.0; p],
+                        |mut acc, xc| {
+                            for row in xc.chunks_exact(p) {
+                                axpy_add_unrolled(&mut acc, row, 1.0);
+                            }
+                            acc
+                        },
+                    )
+                    .reduce(
+                        || vec![0.0; p],
+                        |mut a, b_acc| {
+                            for j in 0..p {
+                                a[j] += b_acc[j];
+                            }
+                            a
+                        },
+                    );
+                sums.into_iter().map(|s| s * inv_n).collect()
+            } else {
+                let mut sums = vec![0.0; p];
+                for row in x.data.chunks_exact(p) {
+                    axpy_add_unrolled(&mut sums, row, 1.0);
+                }
+                for v in &mut sums {
+                    *v *= inv_n;
+                }
+                sums
+            }
+        } else {
+            Vec::new()
+        };
+        let y_shift = if self.fit_intercept { y_mean } else { 0.0 };
+
+        let mut wt = if is_cpu { Vec::new() } else { vec![0.0; n] };
+        let mut y_tilde = if is_cpu { Vec::new() } else { vec![0.0; n] };
+        let mut gram_data = if is_cpu { vec![0.0; p * p] } else { Vec::new() };
+        let mut rhs = if is_cpu { vec![0.0; p] } else { Vec::new() };
+        let mut sum_wt_z = if is_cpu { vec![0.0; p] } else { Vec::new() };
+        let mut x_bar = if is_cpu { vec![0.0; p] } else { Vec::new() };
+        let mut u_t = if is_cpu && p <= 256 {
+            vec![[0.0f64; GLM_TILE_ROWS]; p]
+        } else {
+            Vec::new()
+        };
+        let mut w_new = vec![0.0; p];
+        let mut gw = vec![0.0; p];
         let mut n_iter = 0usize;
 
         for iter in 0..self.max_iter {
             n_iter = iter + 1;
-            if matches!(backend, Backend::Cpu) {
-                if n >= FUSED_PAR_THRESHOLD {
-                    x.data
-                        .par_chunks(FUSED_CHUNK_ROWS * p)
-                        .zip(y.par_chunks(FUSED_CHUNK_ROWS))
-                        .zip(sw_norm.par_chunks(FUSED_CHUNK_ROWS))
-                        .zip(wt.par_chunks_mut(FUSED_CHUNK_ROWS))
-                        .zip(y_tilde.par_chunks_mut(FUSED_CHUNK_ROWS))
-                        .for_each(|((((xc, yc), swc), wtc), ytc)| {
-                            for i in 0..yc.len() {
-                                let row = &xc[i * p..(i + 1) * p];
-                                let r = yc[i] - (dot_unrolled(row, &w) + b);
-                                let d = r.abs().max(eps);
-                                wtc[i] = swc[i] / (2.0 * d);
-                                ytc[i] = yc[i] + d * q_shift;
-                            }
-                        });
-                } else {
-                    for i in 0..n {
-                        let row = &x.data[i * p..(i + 1) * p];
-                        let r = y[i] - (dot_unrolled(row, &w) + b);
-                        let d = r.abs().max(eps);
-                        wt[i] = sw_norm[i] / (2.0 * d);
-                        y_tilde[i] = y[i] + d * q_shift;
-                    }
-                }
+            let (mut gram, rhs_ref, x_bar_ref, y_bar) = if is_cpu {
+                let yb = Self::quantile_fused_cpu_pass(
+                    x,
+                    y,
+                    sw_slice,
+                    inv_n,
+                    &w,
+                    b,
+                    &x_shift,
+                    y_shift,
+                    eps,
+                    q_shift,
+                    self.fit_intercept,
+                    &mut gram_data,
+                    &mut rhs,
+                    &mut sum_wt_z,
+                    &mut u_t,
+                    &mut x_bar,
+                );
+                let g_mat = Matrix::from_vec(p, p, std::mem::take(&mut gram_data))?;
+                (g_mat, rhs.as_slice(), x_bar.as_slice(), yb)
             } else {
                 let preds = compute_linear_eta(&backend, x, &w, b)?;
                 for i in 0..n {
                     let r = y[i] - preds[i];
                     let d = r.abs().max(eps);
-                    wt[i] = sw_norm[i] / (2.0 * d);
+                    wt[i] = sw_slice.map_or(inv_n, |s| s[i]) / (2.0 * d);
                     y_tilde[i] = y[i] + d * q_shift;
                 }
-            }
+                let (g_mat, r_vec, xb_vec, yb) =
+                    compute_weighted_gram_and_rhs(&backend, x, &y_tilde, &wt, self.fit_intercept)?;
+                rhs = r_vec;
+                x_bar = xb_vec;
+                (g_mat, rhs.as_slice(), x_bar.as_slice(), yb)
+            };
 
-            let (mut gram, rhs, x_bar, y_bar) =
-                compute_weighted_gram_and_rhs(&backend, x, &y_tilde, &wt, self.fit_intercept)?;
-
-            let mut w_new = w.clone();
+            w_new.copy_from_slice(&w);
             if self.alpha == 0.0 && p <= 256 {
                 gram.add_ridge_diagonal(1e-12);
-                if let Ok(sol) = solve_cholesky(&gram, &rhs) {
-                    w_new = sol;
+                if let Ok(sol) = solve_cholesky(&gram, rhs_ref) {
+                    w_new.copy_from_slice(&sol);
                 }
             } else {
                 // Warm-started Coordinate Descent for L1-penalized weighted least squares
-                let mut gw = vec![0.0; p];
                 for (j, gw_j) in gw.iter_mut().enumerate() {
                     *gw_j = dot_unrolled(&gram.data[j * p..(j + 1) * p], &w_new);
                 }
@@ -1344,23 +1898,19 @@ impl QuantileRegressor {
                             if w_new[j] != 0.0 {
                                 let diff = -w_new[j];
                                 w_new[j] = 0.0;
-                                for (k, gw_k) in gw.iter_mut().enumerate() {
-                                    *gw_k += gram.data[j * p + k] * diff;
-                                }
+                                axpy_add_unrolled(&mut gw, &gram.data[j * p..(j + 1) * p], diff);
                             }
                             continue;
                         }
                         let w_old = w_new[j];
-                        let z = rhs[j] - gw[j] + g_jj * w_old;
+                        let z = rhs_ref[j] - gw[j] + g_jj * w_old;
                         let new_val =
                             apply_scalar_op(z, ElementwiseOp::SoftThreshold { lambda: self.alpha })
                                 / g_jj;
                         let diff = new_val - w_old;
                         if diff != 0.0 {
                             w_new[j] = new_val;
-                            for (k, gw_k) in gw.iter_mut().enumerate() {
-                                *gw_k += gram.data[j * p + k] * diff;
-                            }
+                            axpy_add_unrolled(&mut gw, &gram.data[j * p..(j + 1) * p], diff);
                             cd_delta = cd_delta.max(diff.abs());
                         }
                     }
@@ -1369,9 +1919,12 @@ impl QuantileRegressor {
                     }
                 }
             }
+            if is_cpu {
+                gram_data = gram.data;
+            }
 
             let b_new = if self.fit_intercept {
-                y_bar - dot_unrolled(&x_bar, &w_new)
+                y_bar - dot_unrolled(x_bar_ref, &w_new)
             } else {
                 0.0
             };
@@ -1381,12 +1934,12 @@ impl QuantileRegressor {
                 max_change = max_change.max((w_new[j] - w[j]).abs());
             }
 
-            w = w_new;
+            w.copy_from_slice(&w_new);
             b = b_new;
 
             if eps > min_eps {
-                if max_change < (eps * 0.25).max(self.tol) {
-                    eps = (eps * 0.25).max(min_eps);
+                if max_change < eps.max(self.tol) {
+                    eps = (eps * 0.1).max(min_eps);
                 }
             } else if max_change <= self.tol {
                 break;
@@ -1774,6 +2327,354 @@ impl TweediePowerKind {
             }
         }
     }
+
+    #[inline(always)]
+    fn loss_only(self, yi: f64, mui: f64, wi: f64) -> f64 {
+        match self {
+            Self::Normal => {
+                let d = mui - yi;
+                0.5 * wi * d * d
+            }
+            Self::Poisson => {
+                let term = if yi > 0.0 { yi * (yi / mui).ln() } else { 0.0 };
+                wi * (term - yi + mui)
+            }
+            Self::Gamma => wi * ((mui / yi).ln() + yi / mui - 1.0),
+            Self::General {
+                one_m_p, two_m_p, ..
+            } => {
+                let y_term = if yi > 0.0 {
+                    yi.powf(two_m_p) / (one_m_p * two_m_p)
+                } else {
+                    0.0
+                };
+                let mu_1mp = mui.powf(one_m_p);
+                let mu_2mp = mu_1mp * mui;
+                wi * (y_term - yi * mu_1mp / one_m_p + mu_2mp / two_m_p)
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn loss_grad_fisher(self, eff_link: GlmLink, yi: f64, mui: f64, wi: f64) -> (f64, f64, f64) {
+        match self {
+            Self::Normal => {
+                let d = mui - yi;
+                let loss = 0.5 * wi * d * d;
+                match eff_link {
+                    GlmLink::Identity => (loss, wi * d, wi),
+                    GlmLink::Log => (loss, wi * d * mui, wi * mui * mui),
+                }
+            }
+            Self::Poisson => {
+                let term = if yi > 0.0 { yi * (yi / mui).ln() } else { 0.0 };
+                let loss = wi * (term - yi + mui);
+                match eff_link {
+                    GlmLink::Identity => (loss, wi * (mui - yi) / mui, wi / mui),
+                    GlmLink::Log => (loss, wi * (mui - yi), wi * mui),
+                }
+            }
+            Self::Gamma => {
+                let loss = wi * ((mui / yi).ln() + yi / mui - 1.0);
+                let inv_mu = 1.0 / mui;
+                match eff_link {
+                    GlmLink::Identity => {
+                        let inv_mu2 = inv_mu * inv_mu;
+                        (loss, wi * (mui - yi) * inv_mu2, wi * inv_mu2)
+                    }
+                    GlmLink::Log => (loss, wi * (mui - yi) * inv_mu, wi),
+                }
+            }
+            Self::General {
+                one_m_p, two_m_p, ..
+            } => {
+                let y_term = if yi > 0.0 {
+                    yi.powf(two_m_p) / (one_m_p * two_m_p)
+                } else {
+                    0.0
+                };
+                let mu_1mp = mui.powf(one_m_p);
+                let mu_2mp = mu_1mp * mui;
+                let loss = wi * (y_term - yi * mu_1mp / one_m_p + mu_2mp / two_m_p);
+                match eff_link {
+                    GlmLink::Identity => {
+                        let mu_mp = mu_1mp / mui;
+                        (loss, wi * (mui - yi) * mu_mp, wi * mu_mp)
+                    }
+                    GlmLink::Log => (loss, wi * (mui - yi) * mu_1mp, wi * mu_2mp),
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_tweedie_irls_chunk(
+    x_data: &[f64],
+    y_data: &[f64],
+    sw_slice: Option<&[f64]>,
+    inv_n: f64,
+    w: &[f64],
+    b_intercept: f64,
+    fit_intercept: bool,
+    eff_link: GlmLink,
+    power_kind: TweediePowerKind,
+    check_pos_mu: bool,
+    grad: &mut [f64],
+    hess: &mut [f64],
+    u_t: &mut [[f64; GLM_TILE_ROWS]],
+) -> (f64, bool) {
+    let p = w.len();
+    let dim = p + usize::from(fit_intercept);
+    let n_rows = y_data.len();
+    let mut dl = 0.0_f64;
+
+    let mut row_start = 0usize;
+    while row_start < n_rows {
+        let row_end = (row_start + GLM_TILE_ROWS).min(n_rows);
+        let b_len = row_end - row_start;
+        if b_len < GLM_TILE_ROWS {
+            for col in u_t.iter_mut() {
+                col[b_len..GLM_TILE_ROWS].fill(0.0);
+            }
+        }
+
+        for (b, i) in (row_start..row_end).enumerate() {
+            let row = &x_data[i * p..(i + 1) * p];
+            let eta = dot_unrolled(row, w) + b_intercept;
+            let mui = match eff_link {
+                GlmLink::Identity => eta,
+                GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
+            };
+            if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
+                return (f64::INFINITY, true);
+            }
+            let wi = sw_slice.map_or(inv_n, |s| s[i]);
+            let (l_i, g_i, fisher_i) = power_kind.loss_grad_fisher(eff_link, y_data[i], mui, wi);
+            if !l_i.is_finite() || !g_i.is_finite() || !fisher_i.is_finite() {
+                return (f64::INFINITY, true);
+            }
+            dl += l_i;
+            axpy_add_unrolled(&mut grad[..p], row, g_i);
+            if fit_intercept {
+                grad[p] += g_i;
+            }
+            let sw_i = fisher_i.max(0.0).sqrt();
+            for j in 0..p {
+                u_t[j][b] = sw_i * row[j];
+            }
+            if fit_intercept {
+                u_t[p][b] = sw_i;
+            }
+        }
+
+        accumulate_gram_upper_64(u_t, hess, dim);
+        row_start = row_end;
+    }
+
+    (dl, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tweedie_irls_fused_cpu_pass(
+    x: &Matrix,
+    y: &[f64],
+    sw_slice: Option<&[f64]>,
+    inv_n: f64,
+    theta: &[f64],
+    fit_intercept: bool,
+    eff_link: GlmLink,
+    power_kind: TweediePowerKind,
+    check_pos_mu: bool,
+    grad: &mut [f64],
+    hess: &mut [f64],
+    u_t: &mut [[f64; GLM_TILE_ROWS]],
+) -> (f64, bool) {
+    let n = x.rows;
+    let p = x.cols;
+    let dim = p + usize::from(fit_intercept);
+    let w = &theta[..p];
+    let b_intercept = if fit_intercept { theta[p] } else { 0.0 };
+
+    if n >= 1024 && n * dim >= 16_384 {
+        let chunk_rows = GLM_IRLS_CHUNK_ROWS;
+        let (dl, g_par, h_par, invalid) = x
+            .data
+            .par_chunks(chunk_rows * p)
+            .zip(y.par_chunks(chunk_rows))
+            .enumerate()
+            .fold(
+                || {
+                    (
+                        0.0_f64,
+                        vec![0.0; dim],
+                        vec![0.0; dim * dim],
+                        vec![[0.0f64; GLM_TILE_ROWS]; dim],
+                        false,
+                    )
+                },
+                |(mut l_dl, mut l_g, mut l_h, mut l_ut, l_inv), (c_idx, (xc, yc))| {
+                    if l_inv {
+                        return (l_dl, l_g, l_h, l_ut, true);
+                    }
+                    let base = c_idx * chunk_rows;
+                    let sw_sub = sw_slice.map(|s| &s[base..base + yc.len()]);
+                    let (c_dl, c_inv) = accumulate_tweedie_irls_chunk(
+                        xc,
+                        yc,
+                        sw_sub,
+                        inv_n,
+                        w,
+                        b_intercept,
+                        fit_intercept,
+                        eff_link,
+                        power_kind,
+                        check_pos_mu,
+                        &mut l_g,
+                        &mut l_h,
+                        &mut l_ut,
+                    );
+                    if c_inv {
+                        return (0.0, l_g, l_h, l_ut, true);
+                    }
+                    l_dl += c_dl;
+                    (l_dl, l_g, l_h, l_ut, false)
+                },
+            )
+            .map(|(dl, g, h, _, inv)| (dl, g, h, inv))
+            .reduce(
+                || (0.0_f64, vec![0.0; dim], vec![0.0; dim * dim], false),
+                |(dl1, mut g1, mut h1, inv1), (dl2, g2, h2, inv2)| {
+                    if inv1 || inv2 {
+                        return (0.0, g1, h1, true);
+                    }
+                    for j in 0..dim {
+                        g1[j] += g2[j];
+                    }
+                    for idx in 0..dim * dim {
+                        h1[idx] += h2[idx];
+                    }
+                    (dl1 + dl2, g1, h1, false)
+                },
+            );
+        if invalid {
+            return (f64::INFINITY, true);
+        }
+        grad.copy_from_slice(&g_par);
+        hess.copy_from_slice(&h_par);
+        mirror_upper_to_lower_slice(hess, dim);
+        (dl, false)
+    } else {
+        grad.fill(0.0);
+        hess.fill(0.0);
+        let (dl, invalid) = accumulate_tweedie_irls_chunk(
+            &x.data,
+            y,
+            sw_slice,
+            inv_n,
+            w,
+            b_intercept,
+            fit_intercept,
+            eff_link,
+            power_kind,
+            check_pos_mu,
+            grad,
+            hess,
+            u_t,
+        );
+        if invalid {
+            return (f64::INFINITY, true);
+        }
+        mirror_upper_to_lower_slice(hess, dim);
+        (dl, false)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tweedie_loss_only_cpu(
+    x: &Matrix,
+    y: &[f64],
+    sw_slice: Option<&[f64]>,
+    inv_n: f64,
+    theta: &[f64],
+    fit_intercept: bool,
+    eff_link: GlmLink,
+    power_kind: TweediePowerKind,
+    check_pos_mu: bool,
+    alpha: f64,
+) -> f64 {
+    let n = x.rows;
+    let p = x.cols;
+    let w = &theta[..p];
+    let b = if fit_intercept { theta[p] } else { 0.0 };
+
+    let data_loss = if n >= FUSED_PAR_THRESHOLD {
+        let (dl, invalid) = x
+            .data
+            .par_chunks(FUSED_CHUNK_ROWS * p)
+            .zip(y.par_chunks(FUSED_CHUNK_ROWS))
+            .enumerate()
+            .fold(
+                || (0.0_f64, false),
+                |(mut dl, mut inv), (c_idx, (xc, yc))| {
+                    if inv {
+                        return (dl, true);
+                    }
+                    let base = c_idx * FUSED_CHUNK_ROWS;
+                    for i in 0..yc.len() {
+                        let row = &xc[i * p..(i + 1) * p];
+                        let eta = dot_unrolled(row, w) + b;
+                        let mui = match eff_link {
+                            GlmLink::Identity => eta,
+                            GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
+                        };
+                        if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
+                            inv = true;
+                            break;
+                        }
+                        let wi = sw_slice.map_or(inv_n, |s| s[base + i]);
+                        dl += power_kind.loss_only(yc[i], mui, wi);
+                    }
+                    (dl, inv)
+                },
+            )
+            .reduce(
+                || (0.0_f64, false),
+                |(dl1, inv1), (dl2, inv2)| {
+                    if inv1 || inv2 {
+                        (f64::INFINITY, true)
+                    } else {
+                        (dl1 + dl2, false)
+                    }
+                },
+            );
+        if invalid || !dl.is_finite() {
+            return f64::INFINITY;
+        }
+        dl
+    } else {
+        let mut dl = 0.0_f64;
+        for i in 0..n {
+            let row = &x.data[i * p..(i + 1) * p];
+            let eta = dot_unrolled(row, w) + b;
+            let mui = match eff_link {
+                GlmLink::Identity => eta,
+                GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
+            };
+            if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
+                return f64::INFINITY;
+            }
+            let wi = sw_slice.map_or(inv_n, |s| s[i]);
+            dl += power_kind.loss_only(y[i], mui, wi);
+        }
+        dl
+    };
+
+    let mut reg_loss = 0.0_f64;
+    for &wj in w {
+        reg_loss += wj * wj;
+    }
+    data_loss + 0.5 * alpha * reg_loss
 }
 
 #[derive(Debug, Clone)]
@@ -1872,137 +2773,242 @@ impl TweedieRegressor {
         let is_cpu = matches!(backend, Backend::Cpu);
         let check_pos_mu = eff_link == GlmLink::Identity && power > 0.0;
 
-        let (theta, n_iter) = run_lbfgs(
-            init_theta,
-            self.max_iter,
-            self.tol,
-            |_| {},
-            |t, grad_out| {
-                let w = &t[..p];
-                let b = if fit_intercept { t[p] } else { 0.0 };
+        let mut irls_iters = 0usize;
+        let mut irls_converged = false;
+        let use_irls = p <= 256 && (is_cpu || n.saturating_mul(p) < 524_288);
 
-                let (data_loss, grad_b) = if is_cpu {
-                    if n >= FUSED_PAR_THRESHOLD {
-                        let (dl, gb, gw, invalid) = x
-                            .data
-                            .par_chunks(FUSED_CHUNK_ROWS * p)
-                            .zip(y.par_chunks(FUSED_CHUNK_ROWS))
-                            .enumerate()
-                            .fold(
-                                || (0.0_f64, 0.0_f64, vec![0.0_f64; p], false),
-                                |(mut dl, mut gb, mut gw, mut inv), (c_idx, (xc, yc))| {
-                                    if inv {
-                                        return (dl, gb, gw, true);
-                                    }
-                                    let base = c_idx * FUSED_CHUNK_ROWS;
-                                    for i in 0..yc.len() {
-                                        let row = &xc[i * p..(i + 1) * p];
-                                        let eta = dot_unrolled(row, w) + b;
-                                        let mui = match eff_link {
-                                            GlmLink::Identity => eta,
-                                            GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
-                                        };
-                                        if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
-                                            inv = true;
-                                            break;
+        if use_irls {
+            let irls_max_iters = self.max_iter.min(25);
+            let mut grad = vec![0.0; dim];
+            let mut neg_grad = vec![0.0; dim];
+            let mut hess_data = vec![0.0; dim * dim];
+            let mut cand_theta = vec![0.0; dim];
+            let mut u_t = if n >= 1024 && n * dim >= 16_384 {
+                Vec::new()
+            } else {
+                vec![[0.0f64; GLM_TILE_ROWS]; dim]
+            };
+
+            for _ in 0..irls_max_iters {
+                let (data_loss, invalid) = tweedie_irls_fused_cpu_pass(
+                    x,
+                    y,
+                    sw_slice,
+                    inv_n,
+                    &init_theta,
+                    fit_intercept,
+                    eff_link,
+                    power_kind,
+                    check_pos_mu,
+                    &mut grad,
+                    &mut hess_data,
+                    &mut u_t,
+                );
+                if invalid || !data_loss.is_finite() {
+                    break;
+                }
+
+                let mut reg_loss = 0.0;
+                for j in 0..p {
+                    let wj = init_theta[j];
+                    reg_loss += wj * wj;
+                    grad[j] += alpha * wj;
+                    hess_data[j * dim + j] += alpha;
+                }
+                let loss = data_loss + 0.5 * alpha * reg_loss;
+
+                let g_inf = grad.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                if g_inf <= self.tol {
+                    irls_converged = true;
+                    break;
+                }
+
+                for d in 0..dim {
+                    neg_grad[d] = -grad[d];
+                }
+                let hess_mat = Matrix::from_vec(dim, dim, std::mem::take(&mut hess_data))?;
+                let delta_res = solve_cholesky(&hess_mat, &neg_grad);
+                hess_data = hess_mat.data;
+                let Ok(delta) = delta_res else {
+                    break;
+                };
+                if !delta.iter().all(|v| v.is_finite()) {
+                    break;
+                }
+                let dg = dot_unrolled(&grad, &delta);
+                if !dg.is_finite() || dg >= 0.0 {
+                    break;
+                }
+
+                let mut step = 1.0_f64;
+                let c1 = 1e-4_f64;
+                let mut accepted = false;
+                for _ in 0..20 {
+                    for d in 0..dim {
+                        cand_theta[d] = init_theta[d] + step * delta[d];
+                    }
+                    let cand_loss = tweedie_loss_only_cpu(
+                        x,
+                        y,
+                        sw_slice,
+                        inv_n,
+                        &cand_theta,
+                        fit_intercept,
+                        eff_link,
+                        power_kind,
+                        check_pos_mu,
+                        alpha,
+                    );
+                    if cand_loss.is_finite() && cand_loss <= loss + c1 * step * dg {
+                        init_theta.copy_from_slice(&cand_theta);
+                        accepted = true;
+                        break;
+                    }
+                    step *= 0.5;
+                }
+                if !accepted {
+                    break;
+                }
+                irls_iters += 1;
+            }
+        }
+
+        let (theta, n_iter) = if irls_converged || irls_iters >= self.max_iter {
+            (init_theta, irls_iters)
+        } else {
+            let (lbfgs_theta, lbfgs_iters) = run_lbfgs(
+                init_theta,
+                self.max_iter.saturating_sub(irls_iters),
+                self.tol,
+                |_| {},
+                |t, grad_out| {
+                    let w = &t[..p];
+                    let b = if fit_intercept { t[p] } else { 0.0 };
+
+                    let (data_loss, grad_b) = if is_cpu {
+                        if n >= FUSED_PAR_THRESHOLD {
+                            let (dl, gb, gw, invalid) = x
+                                .data
+                                .par_chunks(FUSED_CHUNK_ROWS * p)
+                                .zip(y.par_chunks(FUSED_CHUNK_ROWS))
+                                .enumerate()
+                                .fold(
+                                    || (0.0_f64, 0.0_f64, vec![0.0_f64; p], false),
+                                    |(mut dl, mut gb, mut gw, mut inv), (c_idx, (xc, yc))| {
+                                        if inv {
+                                            return (dl, gb, gw, true);
                                         }
-                                        let wi = sw_slice.map_or(inv_n, |s| s[base + i]);
-                                        let (l_i, g) =
-                                            power_kind.loss_and_grad(eff_link, yc[i], mui, wi);
-                                        dl += l_i;
-                                        gb += g;
-                                        axpy_add_unrolled(&mut gw, row, g);
-                                    }
-                                    (dl, gb, gw, inv)
-                                },
-                            )
-                            .reduce(
-                                || (0.0_f64, 0.0_f64, vec![0.0_f64; p], false),
-                                |(dl1, gb1, mut gw1, inv1), (dl2, gb2, gw2, inv2)| {
-                                    if inv1 || inv2 {
-                                        return (0.0, 0.0, gw1, true);
-                                    }
-                                    for j in 0..p {
-                                        gw1[j] += gw2[j];
-                                    }
-                                    (dl1 + dl2, gb1 + gb2, gw1, false)
-                                },
-                            );
-                        if invalid {
-                            return Ok(f64::INFINITY);
+                                        let base = c_idx * FUSED_CHUNK_ROWS;
+                                        for i in 0..yc.len() {
+                                            let row = &xc[i * p..(i + 1) * p];
+                                            let eta = dot_unrolled(row, w) + b;
+                                            let mui = match eff_link {
+                                                GlmLink::Identity => eta,
+                                                GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
+                                            };
+                                            if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
+                                                inv = true;
+                                                break;
+                                            }
+                                            let wi = sw_slice.map_or(inv_n, |s| s[base + i]);
+                                            let (l_i, g) =
+                                                power_kind.loss_and_grad(eff_link, yc[i], mui, wi);
+                                            dl += l_i;
+                                            gb += g;
+                                            axpy_add_unrolled(&mut gw, row, g);
+                                        }
+                                        (dl, gb, gw, inv)
+                                    },
+                                )
+                                .reduce(
+                                    || (0.0_f64, 0.0_f64, vec![0.0_f64; p], false),
+                                    |(dl1, gb1, mut gw1, inv1), (dl2, gb2, gw2, inv2)| {
+                                        if inv1 || inv2 {
+                                            return (0.0, 0.0, gw1, true);
+                                        }
+                                        for j in 0..p {
+                                            gw1[j] += gw2[j];
+                                        }
+                                        (dl1 + dl2, gb1 + gb2, gw1, false)
+                                    },
+                                );
+                            if invalid {
+                                return Ok(f64::INFINITY);
+                            }
+                            grad_out[..p].copy_from_slice(&gw);
+                            (dl, gb)
+                        } else {
+                            grad_out[..p].fill(0.0);
+                            let mut dl = 0.0;
+                            let mut gb = 0.0;
+                            for i in 0..n {
+                                let row = &x.data[i * p..(i + 1) * p];
+                                let eta = dot_unrolled(row, w) + b;
+                                let mui = match eff_link {
+                                    GlmLink::Identity => eta,
+                                    GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
+                                };
+                                if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
+                                    return Ok(f64::INFINITY);
+                                }
+                                let wi = sw_slice.map_or(inv_n, |s| s[i]);
+                                let (l_i, g) = power_kind.loss_and_grad(eff_link, y[i], mui, wi);
+                                dl += l_i;
+                                gb += g;
+                                axpy_add_unrolled(&mut grad_out[..p], row, g);
+                            }
+                            (dl, gb)
                         }
-                        grad_out[..p].copy_from_slice(&gw);
-                        (dl, gb)
                     } else {
-                        grad_out[..p].fill(0.0);
+                        let eta = compute_linear_eta(&backend, x, w, b)?;
+                        let mu: Vec<f64> = match eff_link {
+                            GlmLink::Identity => eta,
+                            GlmLink::Log => {
+                                if n >= SMALL_VEC_GPU_THRESHOLD {
+                                    let clamped: Vec<f64> =
+                                        eta.iter().map(|&v| v.clamp(-50.0, 50.0)).collect();
+                                    let eta_mat = Matrix::from_vec(n, 1, clamped)?;
+                                    backend.elementwise_op(&eta_mat, ElementwiseOp::Exp)?.data
+                                } else {
+                                    eta.iter().map(|&v| v.clamp(-50.0, 50.0).exp()).collect()
+                                }
+                            }
+                        };
+
                         let mut dl = 0.0;
+                        let mut grad_eta = vec![0.0; n];
                         let mut gb = 0.0;
                         for i in 0..n {
-                            let row = &x.data[i * p..(i + 1) * p];
-                            let eta = dot_unrolled(row, w) + b;
-                            let mui = match eff_link {
-                                GlmLink::Identity => eta,
-                                GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
-                            };
+                            let mui = mu[i];
                             if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
                                 return Ok(f64::INFINITY);
                             }
                             let wi = sw_slice.map_or(inv_n, |s| s[i]);
                             let (l_i, g) = power_kind.loss_and_grad(eff_link, y[i], mui, wi);
                             dl += l_i;
+                            grad_eta[i] = g;
                             gb += g;
-                            axpy_add_unrolled(&mut grad_out[..p], row, g);
                         }
+                        let grad_w = compute_xt_r(&backend, x, &grad_eta)?;
+                        grad_out[..p].copy_from_slice(&grad_w);
                         (dl, gb)
-                    }
-                } else {
-                    let eta = compute_linear_eta(&backend, x, w, b)?;
-                    let mu: Vec<f64> = match eff_link {
-                        GlmLink::Identity => eta,
-                        GlmLink::Log => {
-                            if n >= SMALL_VEC_GPU_THRESHOLD {
-                                let clamped: Vec<f64> =
-                                    eta.iter().map(|&v| v.clamp(-50.0, 50.0)).collect();
-                                let eta_mat = Matrix::from_vec(n, 1, clamped)?;
-                                backend.elementwise_op(&eta_mat, ElementwiseOp::Exp)?.data
-                            } else {
-                                eta.iter().map(|&v| v.clamp(-50.0, 50.0).exp()).collect()
-                            }
-                        }
                     };
 
-                    let mut dl = 0.0;
-                    let mut grad_eta = vec![0.0; n];
-                    let mut gb = 0.0;
-                    for i in 0..n {
-                        let mui = mu[i];
-                        if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
-                            return Ok(f64::INFINITY);
-                        }
-                        let wi = sw_slice.map_or(inv_n, |s| s[i]);
-                        let (l_i, g) = power_kind.loss_and_grad(eff_link, y[i], mui, wi);
-                        dl += l_i;
-                        grad_eta[i] = g;
-                        gb += g;
+                    let mut reg_loss = 0.0;
+                    for j in 0..p {
+                        let wj = w[j];
+                        reg_loss += wj * wj;
+                        grad_out[j] += alpha * wj;
                     }
-                    let grad_w = compute_xt_r(&backend, x, &grad_eta)?;
-                    grad_out[..p].copy_from_slice(&grad_w);
-                    (dl, gb)
-                };
+                    if fit_intercept {
+                        grad_out[p] = grad_b;
+                    }
 
-                let mut reg_loss = 0.0;
-                for j in 0..p {
-                    let wj = w[j];
-                    reg_loss += wj * wj;
-                    grad_out[j] += alpha * wj;
-                }
-                if fit_intercept {
-                    grad_out[p] = grad_b;
-                }
-
-                Ok(data_loss + 0.5 * alpha * reg_loss)
-            },
-        )?;
+                    Ok(data_loss + 0.5 * alpha * reg_loss)
+                },
+            )?;
+            (lbfgs_theta, irls_iters + lbfgs_iters)
+        };
 
         self.coef_ = Some(theta[..p].to_vec());
         self.intercept_ = if self.fit_intercept { theta[p] } else { 0.0 };
@@ -2647,5 +3653,88 @@ mod tests {
             QuantileRegressor::new(0.5, 0.0, true, 100, 1e-5, Some("cpu".to_string())).unwrap();
         quant.fit(&x, &y_pos, None).unwrap();
         assert!(quant.score(&x, &y_pos, None).unwrap() > 0.90);
+    }
+
+    #[test]
+    fn test_tweedie_newton_irls_and_quantile_edge_cases() {
+        let n = 1500;
+        let p = 6;
+        let mut x_data = Vec::with_capacity(n * p);
+        let mut y_lin = Vec::with_capacity(n);
+        let mut y_pos = Vec::with_capacity(n);
+        let mut sw = Vec::with_capacity(n);
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_f64 = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
+        };
+        for i in 0..n {
+            let mut eta = 0.0;
+            for j in 0..p {
+                let v = next_f64();
+                x_data.push(v + 50.0); // non-zero mean to test shifted Gram centering
+                eta += 0.25 * ((j + 1) as f64) * v;
+            }
+            y_lin.push(1.5 + eta);
+            y_pos.push((0.8 + eta).exp());
+            sw.push(0.5 + ((i % 5) as f64) * 0.25);
+        }
+        let x = Matrix::from_vec(n, p, x_data).unwrap();
+
+        // Poisson with sample_weight + fit_intercept=false (zero true intercept)
+        let x_centered =
+            Matrix::from_vec(n, p, x.data.iter().map(|&v| v - 50.0).collect()).unwrap();
+        let y_no_int_pos: Vec<f64> = y_pos.iter().map(|&v| v * (-0.8_f64).exp()).collect();
+        let mut pois_no_int =
+            PoissonRegressor::new(1e-4, false, 100, 1e-6, Some("cpu".to_string())).unwrap();
+        pois_no_int
+            .fit(&x_centered, &y_no_int_pos, Some(&sw))
+            .unwrap();
+        assert!(
+            pois_no_int.inner.n_iter_ <= 15,
+            "n_iter={}",
+            pois_no_int.inner.n_iter_
+        );
+        assert!(
+            pois_no_int
+                .score(&x_centered, &y_no_int_pos, Some(&sw))
+                .unwrap()
+                > 0.99
+        );
+
+        // Tweedie Normal with identity link + intercept + sample_weight
+        let mut norm_id = TweedieRegressor::new(
+            0.0,
+            1e-4,
+            true,
+            "identity".to_string(),
+            100,
+            1e-6,
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        norm_id.fit(&x, &y_lin, Some(&sw)).unwrap();
+        assert!(norm_id.n_iter_ <= 10, "n_iter={}", norm_id.n_iter_);
+        assert!(norm_id.score(&x, &y_lin, Some(&sw)).unwrap() > 0.99);
+
+        // Gamma with log link
+        let mut gamma =
+            GammaRegressor::new(1e-4, true, 100, 1e-6, Some("cpu".to_string())).unwrap();
+        gamma.fit(&x, &y_pos, Some(&sw)).unwrap();
+        assert!(gamma.inner.n_iter_ <= 15, "n_iter={}", gamma.inner.n_iter_);
+        assert!(gamma.score(&x, &y_pos, Some(&sw)).unwrap() > 0.99);
+
+        // Quantile with alpha > 0 (CD) + non-zero feature offset (tests anchor-shifted fused pass)
+        let mut quant_l1 =
+            QuantileRegressor::new(0.25, 0.01, true, 200, 1e-6, Some("cpu".to_string())).unwrap();
+        quant_l1.fit(&x, &y_lin, Some(&sw)).unwrap();
+        assert!(quant_l1.score(&x, &y_lin, Some(&sw)).unwrap() > 0.90);
+
+        // Quantile with fit_intercept=false
+        let y_no_int: Vec<f64> = y_lin.iter().map(|&v| v - 1.5).collect();
+        let mut quant_no_int =
+            QuantileRegressor::new(0.5, 0.0, false, 200, 1e-6, Some("cpu".to_string())).unwrap();
+        quant_no_int.fit(&x_centered, &y_no_int, None).unwrap();
+        assert!(quant_no_int.score(&x_centered, &y_no_int, None).unwrap() > 0.95);
     }
 }
