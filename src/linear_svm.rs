@@ -10,7 +10,7 @@ use crate::dit_io::{
     write_opt_usize, write_str, write_usize,
 };
 use crate::error::{OchreError, OchreResult};
-use crate::linear_regression::{dot_unrolled, predict_linear_1d, predict_linear_multi};
+use crate::linear_regression::dot_unrolled;
 use crate::logistic_regression::{
     build_effective_weights, extract_sorted_classes, map_labels_to_indices, validate_sample_weights,
 };
@@ -30,7 +30,435 @@ pub const TAG_LINEAR_SVR: u8 = 55;
 
 const LBFGS_HISTORY: usize = 10;
 const LARGE_MATRIX_THRESHOLD: usize = 262_144;
-const SMALL_MATRIX_GPU_THRESHOLD: usize = 131_072;
+const PREDICT_GPU_THRESHOLD: usize = 2_000_000;
+const PARALLEL_ROW_THRESHOLD: usize = 512;
+const PREDICT_CHUNK_ROWS: usize = 64;
+
+#[inline(always)]
+fn dot4_4rows(a0: &[f64], a1: &[f64], a2: &[f64], a3: &[f64], b: &[f64]) -> (f64, f64, f64, f64) {
+    let mut s0 = [0.0f64; 4];
+    let mut s1 = [0.0f64; 4];
+    let mut s2 = [0.0f64; 4];
+    let mut s3 = [0.0f64; 4];
+    let (b_chunks, b_rem) = b.as_chunks::<4>();
+    let (a0_chunks, a0_rem) = a0.as_chunks::<4>();
+    let (a1_chunks, a1_rem) = a1.as_chunks::<4>();
+    let (a2_chunks, a2_rem) = a2.as_chunks::<4>();
+    let (a3_chunks, a3_rem) = a3.as_chunks::<4>();
+    for ((((&bc, &c0), &c1), &c2), &c3) in b_chunks
+        .iter()
+        .zip(a0_chunks.iter())
+        .zip(a1_chunks.iter())
+        .zip(a2_chunks.iter())
+        .zip(a3_chunks.iter())
+    {
+        for l in 0..4 {
+            let bv = bc[l];
+            s0[l] += c0[l] * bv;
+            s1[l] += c1[l] * bv;
+            s2[l] += c2[l] * bv;
+            s3[l] += c3[l] * bv;
+        }
+    }
+    let mut r0 = (s0[0] + s0[1]) + (s0[2] + s0[3]);
+    let mut r1 = (s1[0] + s1[1]) + (s1[2] + s1[3]);
+    let mut r2 = (s2[0] + s2[1]) + (s2[2] + s2[3]);
+    let mut r3 = (s3[0] + s3[1]) + (s3[2] + s3[3]);
+    for j in 0..b_rem.len() {
+        let bv = b_rem[j];
+        r0 += a0_rem[j] * bv;
+        r1 += a1_rem[j] * bv;
+        r2 += a2_rem[j] * bv;
+        r3 += a3_rem[j] * bv;
+    }
+    (r0, r1, r2, r3)
+}
+
+fn pack_coef_4(coef_data: &[f64], k: usize, p: usize) -> Vec<f64> {
+    let n_blocks = k / 4;
+    let mut packed = vec![0.0; n_blocks * p * 4];
+    for blk in 0..n_blocks {
+        let c_base = blk * 4;
+        let c0 = &coef_data[c_base * p..(c_base + 1) * p];
+        let c1 = &coef_data[(c_base + 1) * p..(c_base + 2) * p];
+        let c2 = &coef_data[(c_base + 2) * p..(c_base + 3) * p];
+        let c3 = &coef_data[(c_base + 3) * p..(c_base + 4) * p];
+        let dst = &mut packed[blk * p * 4..(blk + 1) * p * 4];
+        for f in 0..p {
+            let off = f * 4;
+            dst[off] = c0[f];
+            dst[off + 1] = c1[f];
+            dst[off + 2] = c2[f];
+            dst[off + 3] = c3[f];
+        }
+    }
+    packed
+}
+
+fn cpu_linear_1d_chunk(x_chunk: &[f64], p: usize, w: &[f64], b: f64, out_chunk: &mut [f64]) {
+    let n_rows = out_chunk.len();
+    let mut r = 0usize;
+    while r + 4 <= n_rows {
+        let (d0, d1, d2, d3) = dot4_4rows(
+            &x_chunk[r * p..(r + 1) * p],
+            &x_chunk[(r + 1) * p..(r + 2) * p],
+            &x_chunk[(r + 2) * p..(r + 3) * p],
+            &x_chunk[(r + 3) * p..(r + 4) * p],
+            w,
+        );
+        out_chunk[r] = d0 + b;
+        out_chunk[r + 1] = d1 + b;
+        out_chunk[r + 2] = d2 + b;
+        out_chunk[r + 3] = d3 + b;
+        r += 4;
+    }
+    while r < n_rows {
+        out_chunk[r] = dot_unrolled(&x_chunk[r * p..(r + 1) * p], w) + b;
+        r += 1;
+    }
+}
+
+fn cpu_linear_1d(x: &Matrix, w: &[f64], b: f64) -> Vec<f64> {
+    let n = x.rows;
+    let p = x.cols;
+    let mut out = vec![0.0; n];
+    if n >= PARALLEL_ROW_THRESHOLD {
+        out.par_chunks_mut(PREDICT_CHUNK_ROWS)
+            .zip(x.data.par_chunks(PREDICT_CHUNK_ROWS * p))
+            .for_each(|(out_chunk, x_chunk)| {
+                cpu_linear_1d_chunk(x_chunk, p, w, b, out_chunk);
+            });
+    } else {
+        cpu_linear_1d_chunk(&x.data, p, w, b, &mut out);
+    }
+    out
+}
+
+fn cpu_svc_predict_binary_chunk(
+    x_chunk: &[f64],
+    p: usize,
+    w: &[f64],
+    b: f64,
+    c0: f64,
+    c1: f64,
+    out_chunk: &mut [f64],
+) {
+    let n_rows = out_chunk.len();
+    let mut r = 0usize;
+    while r + 4 <= n_rows {
+        let (d0, d1, d2, d3) = dot4_4rows(
+            &x_chunk[r * p..(r + 1) * p],
+            &x_chunk[(r + 1) * p..(r + 2) * p],
+            &x_chunk[(r + 2) * p..(r + 3) * p],
+            &x_chunk[(r + 3) * p..(r + 4) * p],
+            w,
+        );
+        out_chunk[r] = if d0 + b > 0.0 { c1 } else { c0 };
+        out_chunk[r + 1] = if d1 + b > 0.0 { c1 } else { c0 };
+        out_chunk[r + 2] = if d2 + b > 0.0 { c1 } else { c0 };
+        out_chunk[r + 3] = if d3 + b > 0.0 { c1 } else { c0 };
+        r += 4;
+    }
+    while r < n_rows {
+        let s = dot_unrolled(&x_chunk[r * p..(r + 1) * p], w) + b;
+        out_chunk[r] = if s > 0.0 { c1 } else { c0 };
+        r += 1;
+    }
+}
+
+fn cpu_svc_predict_binary(x: &Matrix, w: &[f64], b: f64, c0: f64, c1: f64) -> Vec<f64> {
+    let n = x.rows;
+    let p = x.cols;
+    let mut out = vec![0.0; n];
+    if n >= PARALLEL_ROW_THRESHOLD {
+        out.par_chunks_mut(PREDICT_CHUNK_ROWS)
+            .zip(x.data.par_chunks(PREDICT_CHUNK_ROWS * p))
+            .for_each(|(out_chunk, x_chunk)| {
+                cpu_svc_predict_binary_chunk(x_chunk, p, w, b, c0, c1, out_chunk);
+            });
+    } else {
+        cpu_svc_predict_binary_chunk(&x.data, p, w, b, c0, c1, &mut out);
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_linear_multi_chunk(
+    x_chunk: &[f64],
+    n_rows: usize,
+    p: usize,
+    coef_packed: &[f64],
+    coef_data: &[f64],
+    intercept: &[f64],
+    k: usize,
+    out_chunk: &mut [f64],
+) {
+    let n_blocks = k / 4;
+    let k_rem_start = n_blocks * 4;
+    let mut r = 0usize;
+
+    while r + 4 <= n_rows {
+        let x0 = &x_chunk[r * p..(r + 1) * p];
+        let x1 = &x_chunk[(r + 1) * p..(r + 2) * p];
+        let x2 = &x_chunk[(r + 2) * p..(r + 3) * p];
+        let x3 = &x_chunk[(r + 3) * p..(r + 4) * p];
+        let o0_off = r * k;
+        let o1_off = (r + 1) * k;
+        let o2_off = (r + 2) * k;
+        let o3_off = (r + 3) * k;
+
+        for blk in 0..n_blocks {
+            let c = blk * 4;
+            let c_blk = &coef_packed[blk * p * 4..(blk + 1) * p * 4];
+            let mut acc0 = [0.0f64; 4];
+            let mut acc1 = [0.0f64; 4];
+            let mut acc2 = [0.0f64; 4];
+            let mut acc3 = [0.0f64; 4];
+            for (f, cv) in c_blk.as_chunks::<4>().0.iter().enumerate() {
+                let xv0 = x0[f];
+                let xv1 = x1[f];
+                let xv2 = x2[f];
+                let xv3 = x3[f];
+                for lane in 0..4 {
+                    let cval = cv[lane];
+                    acc0[lane] += xv0 * cval;
+                    acc1[lane] += xv1 * cval;
+                    acc2[lane] += xv2 * cval;
+                    acc3[lane] += xv3 * cval;
+                }
+            }
+            let b = &intercept[c..c + 4];
+            for lane in 0..4 {
+                acc0[lane] += b[lane];
+                acc1[lane] += b[lane];
+                acc2[lane] += b[lane];
+                acc3[lane] += b[lane];
+            }
+            out_chunk[o0_off + c..o0_off + c + 4].copy_from_slice(&acc0);
+            out_chunk[o1_off + c..o1_off + c + 4].copy_from_slice(&acc1);
+            out_chunk[o2_off + c..o2_off + c + 4].copy_from_slice(&acc2);
+            out_chunk[o3_off + c..o3_off + c + 4].copy_from_slice(&acc3);
+        }
+
+        for c in k_rem_start..k {
+            let (d0, d1, d2, d3) = dot4_4rows(x0, x1, x2, x3, &coef_data[c * p..(c + 1) * p]);
+            let bc = intercept[c];
+            out_chunk[o0_off + c] = d0 + bc;
+            out_chunk[o1_off + c] = d1 + bc;
+            out_chunk[o2_off + c] = d2 + bc;
+            out_chunk[o3_off + c] = d3 + bc;
+        }
+        r += 4;
+    }
+
+    while r < n_rows {
+        let x_row = &x_chunk[r * p..(r + 1) * p];
+        let dst = &mut out_chunk[r * k..(r + 1) * k];
+        for c in 0..k {
+            dst[c] = dot_unrolled(x_row, &coef_data[c * p..(c + 1) * p]) + intercept[c];
+        }
+        r += 1;
+    }
+}
+
+fn cpu_linear_multi(x: &Matrix, coef: &Matrix, intercept: &[f64]) -> OchreResult<Matrix> {
+    let n = x.rows;
+    let p = x.cols;
+    let k = coef.rows;
+    let coef_data = &coef.data;
+    let coef_packed = pack_coef_4(coef_data, k, p);
+    let mut out = vec![0.0; n * k];
+    if n >= PARALLEL_ROW_THRESHOLD {
+        out.par_chunks_mut(PREDICT_CHUNK_ROWS * k)
+            .zip(x.data.par_chunks(PREDICT_CHUNK_ROWS * p))
+            .for_each(|(out_chunk, x_chunk)| {
+                let n_rows = out_chunk.len() / k;
+                cpu_linear_multi_chunk(
+                    x_chunk,
+                    n_rows,
+                    p,
+                    &coef_packed,
+                    coef_data,
+                    intercept,
+                    k,
+                    out_chunk,
+                );
+            });
+    } else {
+        cpu_linear_multi_chunk(
+            &x.data,
+            n,
+            p,
+            &coef_packed,
+            coef_data,
+            intercept,
+            k,
+            &mut out,
+        );
+    }
+    Matrix::from_vec(n, k, out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_svc_predict_multi_chunk(
+    x_chunk: &[f64],
+    p: usize,
+    coef_packed: &[f64],
+    coef_data: &[f64],
+    intercept: &[f64],
+    classes: &[f64],
+    k: usize,
+    preds_chunk: &mut [f64],
+) {
+    let n_rows = preds_chunk.len();
+    let n_blocks = k / 4;
+    let k_rem_start = n_blocks * 4;
+    let mut r = 0usize;
+
+    while r + 4 <= n_rows {
+        let x0 = &x_chunk[r * p..(r + 1) * p];
+        let x1 = &x_chunk[(r + 1) * p..(r + 2) * p];
+        let x2 = &x_chunk[(r + 2) * p..(r + 3) * p];
+        let x3 = &x_chunk[(r + 3) * p..(r + 4) * p];
+
+        let mut best_c = [0usize; 4];
+        let mut best_v = [f64::NEG_INFINITY; 4];
+
+        for blk in 0..n_blocks {
+            let c = blk * 4;
+            let c_blk = &coef_packed[blk * p * 4..(blk + 1) * p * 4];
+            let mut acc0 = [0.0f64; 4];
+            let mut acc1 = [0.0f64; 4];
+            let mut acc2 = [0.0f64; 4];
+            let mut acc3 = [0.0f64; 4];
+            for (f, cv) in c_blk.as_chunks::<4>().0.iter().enumerate() {
+                let xv0 = x0[f];
+                let xv1 = x1[f];
+                let xv2 = x2[f];
+                let xv3 = x3[f];
+                for lane in 0..4 {
+                    let cval = cv[lane];
+                    acc0[lane] += xv0 * cval;
+                    acc1[lane] += xv1 * cval;
+                    acc2[lane] += xv2 * cval;
+                    acc3[lane] += xv3 * cval;
+                }
+            }
+            let b = &intercept[c..c + 4];
+            for lane in 0..4 {
+                let v0 = acc0[lane] + b[lane];
+                if v0 > best_v[0] {
+                    best_v[0] = v0;
+                    best_c[0] = c + lane;
+                }
+                let v1 = acc1[lane] + b[lane];
+                if v1 > best_v[1] {
+                    best_v[1] = v1;
+                    best_c[1] = c + lane;
+                }
+                let v2 = acc2[lane] + b[lane];
+                if v2 > best_v[2] {
+                    best_v[2] = v2;
+                    best_c[2] = c + lane;
+                }
+                let v3 = acc3[lane] + b[lane];
+                if v3 > best_v[3] {
+                    best_v[3] = v3;
+                    best_c[3] = c + lane;
+                }
+            }
+        }
+
+        for c in k_rem_start..k {
+            let (d0, d1, d2, d3) = dot4_4rows(x0, x1, x2, x3, &coef_data[c * p..(c + 1) * p]);
+            let bc = intercept[c];
+            let v0 = d0 + bc;
+            if v0 > best_v[0] {
+                best_v[0] = v0;
+                best_c[0] = c;
+            }
+            let v1 = d1 + bc;
+            if v1 > best_v[1] {
+                best_v[1] = v1;
+                best_c[1] = c;
+            }
+            let v2 = d2 + bc;
+            if v2 > best_v[2] {
+                best_v[2] = v2;
+                best_c[2] = c;
+            }
+            let v3 = d3 + bc;
+            if v3 > best_v[3] {
+                best_v[3] = v3;
+                best_c[3] = c;
+            }
+        }
+
+        preds_chunk[r] = classes[best_c[0]];
+        preds_chunk[r + 1] = classes[best_c[1]];
+        preds_chunk[r + 2] = classes[best_c[2]];
+        preds_chunk[r + 3] = classes[best_c[3]];
+        r += 4;
+    }
+
+    while r < n_rows {
+        let x_row = &x_chunk[r * p..(r + 1) * p];
+        let mut best_c = 0usize;
+        let mut best_v = dot_unrolled(x_row, &coef_data[..p]) + intercept[0];
+        for c in 1..k {
+            let v = dot_unrolled(x_row, &coef_data[c * p..(c + 1) * p]) + intercept[c];
+            if v > best_v {
+                best_v = v;
+                best_c = c;
+            }
+        }
+        preds_chunk[r] = classes[best_c];
+        r += 1;
+    }
+}
+
+fn cpu_svc_predict_multi(
+    x: &Matrix,
+    coef: &Matrix,
+    intercept: &[f64],
+    classes: &[f64],
+) -> Vec<f64> {
+    let n = x.rows;
+    let p = x.cols;
+    let k = classes.len();
+    let coef_data = &coef.data;
+    let coef_packed = pack_coef_4(coef_data, k, p);
+    let mut preds = vec![0.0; n];
+    if n >= PARALLEL_ROW_THRESHOLD {
+        preds
+            .par_chunks_mut(PREDICT_CHUNK_ROWS)
+            .zip(x.data.par_chunks(PREDICT_CHUNK_ROWS * p))
+            .for_each(|(preds_chunk, x_chunk)| {
+                cpu_svc_predict_multi_chunk(
+                    x_chunk,
+                    p,
+                    &coef_packed,
+                    coef_data,
+                    intercept,
+                    classes,
+                    k,
+                    preds_chunk,
+                );
+            });
+    } else {
+        cpu_svc_predict_multi_chunk(
+            &x.data,
+            p,
+            &coef_packed,
+            coef_data,
+            intercept,
+            classes,
+            k,
+            &mut preds,
+        );
+    }
+    preds
+}
 
 #[inline(always)]
 fn axpy_add_unrolled(dst: &mut [f64], src: &[f64], scale: f64) {
@@ -1108,15 +1536,72 @@ impl LinearSVC {
                 expected: n_features,
             });
         }
-        if coef.rows == 1 {
-            let scores = predict_linear_1d(x, &coef.data, intercept[0])?;
-            Matrix::from_vec(x.rows, 1, scores)
+        let elems = x.rows.saturating_mul(x.cols);
+        let backend = if elems < PREDICT_GPU_THRESHOLD {
+            Backend::Cpu
         } else {
-            predict_linear_multi(x, coef, intercept)
+            get_backend(&self.device)
+        };
+        if matches!(backend, Backend::Cpu) {
+            if coef.rows == 1 {
+                let scores = cpu_linear_1d(x, &coef.data, intercept[0]);
+                Matrix::from_vec(x.rows, 1, scores)
+            } else {
+                cpu_linear_multi(x, coef, intercept)
+            }
+        } else if coef.rows == 1 {
+            let mut out = backend.matvec(x, &coef.data)?;
+            let b0 = intercept[0];
+            if b0 != 0.0 {
+                for v in &mut out {
+                    *v += b0;
+                }
+            }
+            Matrix::from_vec(x.rows, 1, out)
+        } else {
+            let coef_t = coef.transpose();
+            let mut scores = backend.matmul(x, &coef_t)?;
+            let k = coef.rows;
+            for r in 0..scores.rows {
+                let row = &mut scores.data[r * k..(r + 1) * k];
+                for (dst, &b) in row.iter_mut().zip(intercept.iter()) {
+                    *dst += b;
+                }
+            }
+            Ok(scores)
         }
     }
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
+        let coef = self.coef_.as_ref().ok_or(OchreError::NotFitted)?;
+        let intercept = self.intercept_.as_ref().ok_or(OchreError::NotFitted)?;
+        let n_features = self.n_features_in_.ok_or(OchreError::NotFitted)?;
+        validate_finite_matrix(x)?;
+        if x.cols != n_features {
+            return Err(OchreError::FeatureCountMismatch {
+                features: x.cols,
+                expected: n_features,
+            });
+        }
+        let elems = x.rows.saturating_mul(x.cols);
+        let backend = if elems < PREDICT_GPU_THRESHOLD {
+            Backend::Cpu
+        } else {
+            get_backend(&self.device)
+        };
+        if matches!(backend, Backend::Cpu) {
+            if self.classes_.len() == 2 {
+                return Ok(cpu_svc_predict_binary(
+                    x,
+                    &coef.data,
+                    intercept[0],
+                    self.classes_[0],
+                    self.classes_[1],
+                ));
+            }
+            return Ok(cpu_svc_predict_multi(x, coef, intercept, &self.classes_));
+        }
+
         let scores = self.decision_function(x)?;
         let n = scores.rows;
         let k = scores.cols;
@@ -1373,13 +1858,13 @@ impl LinearSVR {
             });
         }
         let elems = x.rows.saturating_mul(x.cols);
-        let backend = if elems < SMALL_MATRIX_GPU_THRESHOLD {
+        let backend = if elems < PREDICT_GPU_THRESHOLD {
             Backend::Cpu
         } else {
             get_backend(&self.device)
         };
         if matches!(backend, Backend::Cpu) {
-            predict_linear_1d(x, coef, intercept)
+            Ok(cpu_linear_1d(x, coef, intercept))
         } else {
             let mut out = backend.matvec(x, coef)?;
             if intercept != 0.0 {
@@ -1916,5 +2401,91 @@ mod tests {
             let loaded = LinearSVR::from_bytes(&bytes, Some("cpu")).unwrap();
             assert!((loaded.score(&x, &y).unwrap() - r2).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn test_linear_svm_parallel_blocked_predict_parity() {
+        let n = 651;
+        let p = 13;
+        let mut x_data = vec![0.0; n * p];
+        let mut y_cls = vec![0.0; n];
+        let mut y_reg = vec![0.0; n];
+        for i in 0..n {
+            let cls = i % 5; // 5 classes => 1 full 4-class block + 1 tail class
+            y_cls[i] = cls as f64;
+            y_reg[i] = (cls as f64) * 2.0 + 1.0;
+            for j in 0..p {
+                let signal = if j == cls || j == cls + 5 { 6.0 } else { 0.0 };
+                x_data[i * p + j] = signal + (((i * 7 + j * 11) % 19) as f64) * 0.05;
+            }
+        }
+        let x = Matrix::from_vec(n, p, x_data).unwrap();
+
+        let mut svc = LinearSVC::new(
+            1.0,
+            "squared_hinge".to_string(),
+            "l2".to_string(),
+            true,
+            1e-4,
+            true,
+            1.0,
+            None,
+            None,
+            1000,
+            Some(42),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        svc.fit(&x, &y_cls).unwrap();
+        let df = svc.decision_function(&x).unwrap();
+        let preds = svc.predict(&x).unwrap();
+        assert_eq!(df.rows, n);
+        assert_eq!(df.cols, 5);
+        assert_eq!(preds.len(), n);
+        let coef = svc.coef_.as_ref().unwrap();
+        let intercept = svc.intercept_.as_ref().unwrap();
+        for r in [0, 3, 4, 511, 512, 650] {
+            let mut best_c = 0;
+            let mut best_v = f64::NEG_INFINITY;
+            for c in 0..5 {
+                let mut ref_v = intercept[c];
+                for j in 0..p {
+                    ref_v += x[(r, j)] * coef[(c, j)];
+                }
+                assert!((df[(r, c)] - ref_v).abs() < 1e-10);
+                if ref_v > best_v {
+                    best_v = ref_v;
+                    best_c = c;
+                }
+            }
+            assert_eq!(preds[r], svc.classes_[best_c]);
+        }
+        assert!(svc.score(&x, &y_cls).unwrap() > 0.99);
+
+        let mut svr = LinearSVR::new(
+            0.01,
+            1e-4,
+            10.0,
+            "squared_epsilon_insensitive".to_string(),
+            true,
+            1.0,
+            false,
+            1000,
+            Some(42),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        svr.fit(&x, &y_reg).unwrap();
+        let svr_preds = svr.predict(&x).unwrap();
+        let svr_coef = svr.coef_.as_ref().unwrap();
+        let svr_b = svr.intercept_.unwrap();
+        for r in [0, 3, 4, 511, 512, 650] {
+            let mut ref_v = svr_b;
+            for j in 0..p {
+                ref_v += x[(r, j)] * svr_coef[j];
+            }
+            assert!((svr_preds[r] - ref_v).abs() < 1e-10);
+        }
+        assert!(svr.score(&x, &y_reg).unwrap() > 0.99);
     }
 }

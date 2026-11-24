@@ -25,6 +25,75 @@ pub const TAG_GAUSSIAN_MIXTURE: u8 = 64;
 
 const MAX_DIST_ELEMENTS: usize = 4_000_000;
 const KMEANS_INIT_MAX_ITER: usize = 10;
+const GMM_GPU_THRESHOLD: usize = 2_000_000;
+const PARALLEL_ROW_THRESHOLD: usize = 512;
+const GMM_CHUNK_ROWS: usize = 64;
+
+#[inline]
+fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
+    if elems < GMM_GPU_THRESHOLD {
+        Backend::Cpu
+    } else {
+        get_backend(dev)
+    }
+}
+
+#[inline(always)]
+fn dot4_4rows(a0: &[f64], a1: &[f64], a2: &[f64], a3: &[f64], b: &[f64]) -> (f64, f64, f64, f64) {
+    let mut s0 = [0.0f64; 4];
+    let mut s1 = [0.0f64; 4];
+    let mut s2 = [0.0f64; 4];
+    let mut s3 = [0.0f64; 4];
+    let (b_chunks, b_rem) = b.as_chunks::<4>();
+    let (a0_chunks, a0_rem) = a0.as_chunks::<4>();
+    let (a1_chunks, a1_rem) = a1.as_chunks::<4>();
+    let (a2_chunks, a2_rem) = a2.as_chunks::<4>();
+    let (a3_chunks, a3_rem) = a3.as_chunks::<4>();
+    for ((((&bc, &c0), &c1), &c2), &c3) in b_chunks
+        .iter()
+        .zip(a0_chunks.iter())
+        .zip(a1_chunks.iter())
+        .zip(a2_chunks.iter())
+        .zip(a3_chunks.iter())
+    {
+        for l in 0..4 {
+            let bv = bc[l];
+            s0[l] += c0[l] * bv;
+            s1[l] += c1[l] * bv;
+            s2[l] += c2[l] * bv;
+            s3[l] += c3[l] * bv;
+        }
+    }
+    let mut r0 = (s0[0] + s0[1]) + (s0[2] + s0[3]);
+    let mut r1 = (s1[0] + s1[1]) + (s1[2] + s1[3]);
+    let mut r2 = (s2[0] + s2[1]) + (s2[2] + s2[3]);
+    let mut r3 = (s3[0] + s3[1]) + (s3[2] + s3[3]);
+    for j in 0..b_rem.len() {
+        let bv = b_rem[j];
+        r0 += a0_rem[j] * bv;
+        r1 += a1_rem[j] * bv;
+        r2 += a2_rem[j] * bv;
+        r3 += a3_rem[j] * bv;
+    }
+    (r0, r1, r2, r3)
+}
+
+#[inline(always)]
+fn dot_slice(a: &[f64], b: &[f64]) -> f64 {
+    let mut s = [0.0f64; 4];
+    let (ac, ar) = a.as_chunks::<4>();
+    let (bc, br) = b.as_chunks::<4>();
+    for (&xa, &xb) in ac.iter().zip(bc.iter()) {
+        for l in 0..4 {
+            s[l] += xa[l] * xb[l];
+        }
+    }
+    let mut r = (s[0] + s[1]) + (s[2] + s[3]);
+    for (&xa, &xb) in ar.iter().zip(br.iter()) {
+        r += xa * xb;
+    }
+    r
+}
 
 /// Deterministic SplitMix64 + Xorshift64 PRNG (zero external crate dependencies).
 struct DeterministicRng {
@@ -287,12 +356,12 @@ fn init_centers_kmeans_pp(
     Matrix::from_vec(n_clusters, p, centers_data)
 }
 
-fn init_responsibilities_kmeans(
+fn init_kmeans_labels(
     backend: &Backend<'_>,
     x: &Matrix,
     n_components: usize,
     rng: &mut DeterministicRng,
-) -> OchreResult<Matrix> {
+) -> OchreResult<Vec<usize>> {
     let n = x.rows;
     let p = x.cols;
     let mut centers = init_centers_kmeans_pp(backend, x, n_components, rng)?;
@@ -328,11 +397,970 @@ fn init_responsibilities_kmeans(
         labels = new_labels;
     }
 
-    let mut resp = vec![0.0; n * n_components];
+    Ok(labels)
+}
+
+fn estimate_gaussian_parameters_from_labels(
+    x: &Matrix,
+    labels: &[usize],
+    k: usize,
+    covariance_type: &str,
+    reg_covar: f64,
+    precomputed_xtx: Option<&[f64]>,
+) -> OchreResult<GaussianParamsEstimate> {
+    let n = x.rows;
+    let p = x.cols;
+    let mut nk = vec![0.0; k];
+    let mut xk = vec![0.0; k * p];
     for (i, &c) in labels.iter().enumerate() {
-        resp[i * n_components + c] = 1.0;
+        nk[c] += 1.0;
+        let x_row = &x.data[i * p..(i + 1) * p];
+        let xk_c = &mut xk[c * p..(c + 1) * p];
+        for j in 0..p {
+            xk_c[j] += x_row[j];
+        }
     }
-    Matrix::from_vec(n, n_components, resp)
+
+    let eps_pad = 10.0 * f64::EPSILON;
+    let r_sum = nk.clone();
+    let mut nk_sum = 0.0;
+    for val in &mut nk {
+        *val += eps_pad;
+        nk_sum += *val;
+    }
+    let weights: Vec<f64> = nk.iter().map(|&v| v / nk_sum).collect();
+    let mut means_data = vec![0.0; k * p];
+    for c in 0..k {
+        let inv = 1.0 / nk[c];
+        for j in 0..p {
+            means_data[c * p + j] = xk[c * p + j] * inv;
+        }
+    }
+    let means = Matrix::from_vec(k, p, means_data)?;
+
+    let (covariances, precisions_cholesky) = match covariance_type {
+        "full" => {
+            let mut covs = vec![0.0; k * p * p];
+            let mut prec_chols = vec![0.0; k * p * p];
+            for (i, &c) in labels.iter().enumerate() {
+                let x_row = &x.data[i * p..(i + 1) * p];
+                let m_c = &means.data[c * p..(c + 1) * p];
+                let cov_c = &mut covs[c * p * p..(c + 1) * p * p];
+                for a in 0..p {
+                    let da = x_row[a] - m_c[a];
+                    for b in a..p {
+                        cov_c[a * p + b] += da * (x_row[b] - m_c[b]);
+                    }
+                }
+            }
+            for c in 0..k {
+                let cov_c = &mut covs[c * p * p..(c + 1) * p * p];
+                let inv_nk = 1.0 / nk[c];
+                for a in 0..p {
+                    for b in a..p {
+                        let val = cov_c[a * p + b] * inv_nk + if a == b { reg_covar } else { 0.0 };
+                        cov_c[a * p + b] = val;
+                        cov_c[b * p + a] = val;
+                    }
+                }
+                let u = compute_prec_chol_from_cov(cov_c, p)?;
+                prec_chols[c * p * p..(c + 1) * p * p].copy_from_slice(&u);
+            }
+            (covs, prec_chols)
+        }
+        "tied" => {
+            let mut cov = if let Some(xtx) = precomputed_xtx {
+                let mut c_mat = xtx.to_vec();
+                for c in 0..k {
+                    let rc = r_sum[c];
+                    let m_c = &means.data[c * p..(c + 1) * p];
+                    let xk_c = &xk[c * p..(c + 1) * p];
+                    for a in 0..p {
+                        for b in a..p {
+                            c_mat[a * p + b] +=
+                                -xk_c[a] * m_c[b] - xk_c[b] * m_c[a] + rc * m_c[a] * m_c[b];
+                        }
+                    }
+                }
+                c_mat
+            } else {
+                let mut c_mat = vec![0.0; p * p];
+                for (i, &c) in labels.iter().enumerate() {
+                    let x_row = &x.data[i * p..(i + 1) * p];
+                    let m_c = &means.data[c * p..(c + 1) * p];
+                    for a in 0..p {
+                        let da = x_row[a] - m_c[a];
+                        for b in a..p {
+                            c_mat[a * p + b] += da * (x_row[b] - m_c[b]);
+                        }
+                    }
+                }
+                c_mat
+            };
+            let inv_nk_sum = 1.0 / nk_sum;
+            for a in 0..p {
+                for b in a..p {
+                    let mut val = cov[a * p + b] * inv_nk_sum;
+                    if a == b {
+                        val = val.max(0.0) + reg_covar;
+                    }
+                    cov[a * p + b] = val;
+                    cov[b * p + a] = val;
+                }
+            }
+            let prec_chol = compute_prec_chol_from_cov(&cov, p)?;
+            (cov, prec_chol)
+        }
+        "diag" => {
+            let mut covs = vec![0.0; k * p];
+            let mut prec_chols = vec![0.0; k * p];
+            for (i, &c) in labels.iter().enumerate() {
+                let x_row = &x.data[i * p..(i + 1) * p];
+                let m_c = &means.data[c * p..(c + 1) * p];
+                let cov_c = &mut covs[c * p..(c + 1) * p];
+                for j in 0..p {
+                    let d = x_row[j] - m_c[j];
+                    cov_c[j] += d * d;
+                }
+            }
+            for c in 0..k {
+                let cov_c = &mut covs[c * p..(c + 1) * p];
+                let inv_nk = 1.0 / nk[c];
+                for j in 0..p {
+                    let v = cov_c[j] * inv_nk + reg_covar;
+                    cov_c[j] = v;
+                    if !v.is_finite() || v <= 0.0 {
+                        return Err(OchreError::SingularMatrix(
+                            "Diagonal covariance is non-positive; try increasing reg_covar"
+                                .to_string(),
+                        ));
+                    }
+                    prec_chols[c * p + j] = 1.0 / v.sqrt();
+                }
+            }
+            (covs, prec_chols)
+        }
+        "spherical" => {
+            let mut covs = vec![0.0; k];
+            let mut prec_chols = vec![0.0; k];
+            let inv_p = 1.0 / (p as f64);
+            for (i, &c) in labels.iter().enumerate() {
+                let x_row = &x.data[i * p..(i + 1) * p];
+                let m_c = &means.data[c * p..(c + 1) * p];
+                let mut sq = 0.0;
+                for j in 0..p {
+                    let d = x_row[j] - m_c[j];
+                    sq += d * d;
+                }
+                covs[c] += sq;
+            }
+            for c in 0..k {
+                let v = covs[c] * (1.0 / nk[c]) * inv_p + reg_covar;
+                if !v.is_finite() || v <= 0.0 {
+                    return Err(OchreError::SingularMatrix(
+                        "Spherical covariance is non-positive; try increasing reg_covar"
+                            .to_string(),
+                    ));
+                }
+                covs[c] = v;
+                prec_chols[c] = 1.0 / v.sqrt();
+            }
+            (covs, prec_chols)
+        }
+        _ => {
+            return Err(OchreError::InvalidParameter(format!(
+                "Unsupported covariance_type '{}'",
+                covariance_type
+            )));
+        }
+    };
+
+    let _ = n;
+    Ok((weights, means, covariances, precisions_cholesky))
+}
+
+enum GmmEvalData {
+    Full {
+        u_t_all: Vec<f64>,
+        mu_u_all: Vec<f64>,
+        offsets: Vec<f64>,
+    },
+    Tied {
+        u_t: Vec<f64>,
+        mu_u_all: Vec<f64>,
+        offsets: Vec<f64>,
+    },
+    Diag {
+        m_scaled: Vec<f64>,
+        offsets: Vec<f64>,
+    },
+    Spherical {
+        prec_sq: Vec<f64>,
+        offsets: Vec<f64>,
+    },
+}
+
+fn prepare_gmm_eval_data(
+    weights: Option<&[f64]>,
+    means: &Matrix,
+    precisions_cholesky: &[f64],
+    covariance_type: &str,
+) -> OchreResult<GmmEvalData> {
+    let k = means.rows;
+    let p = means.cols;
+    let const_term = (p as f64) * (2.0 * PI).ln();
+    let log_w: Vec<f64> = match weights {
+        Some(ws) => ws
+            .iter()
+            .map(|&w| if w > 0.0 { w.ln() } else { f64::NEG_INFINITY })
+            .collect(),
+        None => vec![0.0; k],
+    };
+
+    match covariance_type {
+        "full" => {
+            let mut u_t_all = vec![0.0; k * p * p];
+            let mut mu_u_all = vec![0.0; k * p];
+            let mut offsets = vec![0.0; k];
+            for c in 0..k {
+                let u_c = &precisions_cholesky[c * p * p..(c + 1) * p * p];
+                let u_t = &mut u_t_all[c * p * p..(c + 1) * p * p];
+                let mut log_det = 0.0;
+                for j in 0..p {
+                    log_det += u_c[j * p + j].ln();
+                    for r in 0..=j {
+                        u_t[j * p + r] = u_c[r * p + j];
+                    }
+                }
+                let mu_c = &means.data[c * p..(c + 1) * p];
+                let mu_u = &mut mu_u_all[c * p..(c + 1) * p];
+                for j in 0..p {
+                    mu_u[j] = dot_slice(&mu_c[..=j], &u_t[j * p..j * p + j + 1]);
+                }
+                offsets[c] = -0.5 * const_term + log_det + log_w[c];
+            }
+            Ok(GmmEvalData::Full {
+                u_t_all,
+                mu_u_all,
+                offsets,
+            })
+        }
+        "tied" => {
+            let mut u_t = vec![0.0; p * p];
+            let mut log_det = 0.0;
+            for j in 0..p {
+                log_det += precisions_cholesky[j * p + j].ln();
+                for r in 0..=j {
+                    u_t[j * p + r] = precisions_cholesky[r * p + j];
+                }
+            }
+            let mut mu_u_all = vec![0.0; k * p];
+            for c in 0..k {
+                let mu_c = &means.data[c * p..(c + 1) * p];
+                let mu_u = &mut mu_u_all[c * p..(c + 1) * p];
+                for j in 0..p {
+                    mu_u[j] = dot_slice(&mu_c[..=j], &u_t[j * p..j * p + j + 1]);
+                }
+            }
+            let base = -0.5 * const_term + log_det;
+            let offsets: Vec<f64> = log_w.iter().map(|&lw| base + lw).collect();
+            Ok(GmmEvalData::Tied {
+                u_t,
+                mu_u_all,
+                offsets,
+            })
+        }
+        "diag" => {
+            let mut m_scaled = vec![0.0; k * p];
+            let mut offsets = vec![0.0; k];
+            for c in 0..k {
+                let pc = &precisions_cholesky[c * p..(c + 1) * p];
+                let mu_c = &means.data[c * p..(c + 1) * p];
+                let ms_c = &mut m_scaled[c * p..(c + 1) * p];
+                let mut log_det = 0.0;
+                for j in 0..p {
+                    log_det += pc[j].ln();
+                    ms_c[j] = mu_c[j] * pc[j];
+                }
+                offsets[c] = -0.5 * const_term + log_det + log_w[c];
+            }
+            Ok(GmmEvalData::Diag { m_scaled, offsets })
+        }
+        "spherical" => {
+            let mut prec_sq = Vec::with_capacity(k);
+            let mut offsets = Vec::with_capacity(k);
+            for (c, &pc) in precisions_cholesky.iter().enumerate().take(k) {
+                prec_sq.push(pc * pc);
+                let log_det = (p as f64) * pc.ln();
+                offsets.push(-0.5 * const_term + log_det + log_w[c]);
+            }
+            Ok(GmmEvalData::Spherical { prec_sq, offsets })
+        }
+        _ => Err(OchreError::InvalidParameter(format!(
+            "Unsupported covariance_type '{}'",
+            covariance_type
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_log_prob_chunk(
+    eval: &GmmEvalData,
+    x_chunk: &[f64],
+    m: usize,
+    p: usize,
+    k: usize,
+    means_data: &[f64],
+    prec_chols: &[f64],
+    out_lp: &mut [f64],
+    xu_scratch: &mut Vec<f64>,
+) {
+    match eval {
+        GmmEvalData::Full {
+            u_t_all,
+            mu_u_all,
+            offsets,
+        } => {
+            let mut r = 0usize;
+            while r + 4 <= m {
+                let x0 = &x_chunk[r * p..(r + 1) * p];
+                let x1 = &x_chunk[(r + 1) * p..(r + 2) * p];
+                let x2 = &x_chunk[(r + 2) * p..(r + 3) * p];
+                let x3 = &x_chunk[(r + 3) * p..(r + 4) * p];
+                for c in 0..k {
+                    let u_t = &u_t_all[c * p * p..(c + 1) * p * p];
+                    let mu_u = &mu_u_all[c * p..(c + 1) * p];
+                    let mut m0 = 0.0;
+                    let mut m1 = 0.0;
+                    let mut m2 = 0.0;
+                    let mut m3 = 0.0;
+                    for j in 0..p {
+                        let u_col = &u_t[j * p..j * p + j + 1];
+                        let (d0, d1, d2, d3) =
+                            dot4_4rows(&x0[..=j], &x1[..=j], &x2[..=j], &x3[..=j], u_col);
+                        let mj = mu_u[j];
+                        let e0 = d0 - mj;
+                        let e1 = d1 - mj;
+                        let e2 = d2 - mj;
+                        let e3 = d3 - mj;
+                        m0 += e0 * e0;
+                        m1 += e1 * e1;
+                        m2 += e2 * e2;
+                        m3 += e3 * e3;
+                    }
+                    let off = offsets[c];
+                    out_lp[r * k + c] = off - 0.5 * m0;
+                    out_lp[(r + 1) * k + c] = off - 0.5 * m1;
+                    out_lp[(r + 2) * k + c] = off - 0.5 * m2;
+                    out_lp[(r + 3) * k + c] = off - 0.5 * m3;
+                }
+                r += 4;
+            }
+            while r < m {
+                let x_row = &x_chunk[r * p..(r + 1) * p];
+                for c in 0..k {
+                    let u_t = &u_t_all[c * p * p..(c + 1) * p * p];
+                    let mu_u = &mu_u_all[c * p..(c + 1) * p];
+                    let mut maha_sq = 0.0;
+                    for j in 0..p {
+                        let d = dot_slice(&x_row[..=j], &u_t[j * p..j * p + j + 1]) - mu_u[j];
+                        maha_sq += d * d;
+                    }
+                    out_lp[r * k + c] = offsets[c] - 0.5 * maha_sq;
+                }
+                r += 1;
+            }
+        }
+        GmmEvalData::Tied {
+            u_t,
+            mu_u_all,
+            offsets,
+        } => {
+            xu_scratch.resize(4 * p, 0.0);
+            let mut r = 0usize;
+            while r + 4 <= m {
+                let x0 = &x_chunk[r * p..(r + 1) * p];
+                let x1 = &x_chunk[(r + 1) * p..(r + 2) * p];
+                let x2 = &x_chunk[(r + 2) * p..(r + 3) * p];
+                let x3 = &x_chunk[(r + 3) * p..(r + 4) * p];
+                let (xu01, xu23) = xu_scratch.split_at_mut(2 * p);
+                let (xu0, xu1) = xu01.split_at_mut(p);
+                let (xu2, xu3) = xu23.split_at_mut(p);
+                for j in 0..p {
+                    let u_col = &u_t[j * p..j * p + j + 1];
+                    let (d0, d1, d2, d3) =
+                        dot4_4rows(&x0[..=j], &x1[..=j], &x2[..=j], &x3[..=j], u_col);
+                    xu0[j] = d0;
+                    xu1[j] = d1;
+                    xu2[j] = d2;
+                    xu3[j] = d3;
+                }
+                for c in 0..k {
+                    let mu_u = &mu_u_all[c * p..(c + 1) * p];
+                    let mut m0 = 0.0;
+                    let mut m1 = 0.0;
+                    let mut m2 = 0.0;
+                    let mut m3 = 0.0;
+                    for j in 0..p {
+                        let mj = mu_u[j];
+                        let e0 = xu0[j] - mj;
+                        let e1 = xu1[j] - mj;
+                        let e2 = xu2[j] - mj;
+                        let e3 = xu3[j] - mj;
+                        m0 += e0 * e0;
+                        m1 += e1 * e1;
+                        m2 += e2 * e2;
+                        m3 += e3 * e3;
+                    }
+                    let off = offsets[c];
+                    out_lp[r * k + c] = off - 0.5 * m0;
+                    out_lp[(r + 1) * k + c] = off - 0.5 * m1;
+                    out_lp[(r + 2) * k + c] = off - 0.5 * m2;
+                    out_lp[(r + 3) * k + c] = off - 0.5 * m3;
+                }
+                r += 4;
+            }
+            while r < m {
+                let x_row = &x_chunk[r * p..(r + 1) * p];
+                let xu = &mut xu_scratch[..p];
+                for j in 0..p {
+                    xu[j] = dot_slice(&x_row[..=j], &u_t[j * p..j * p + j + 1]);
+                }
+                for c in 0..k {
+                    let mu_u = &mu_u_all[c * p..(c + 1) * p];
+                    let mut maha_sq = 0.0;
+                    for j in 0..p {
+                        let d = xu[j] - mu_u[j];
+                        maha_sq += d * d;
+                    }
+                    out_lp[r * k + c] = offsets[c] - 0.5 * maha_sq;
+                }
+                r += 1;
+            }
+        }
+        GmmEvalData::Diag { m_scaled, offsets } => {
+            let mut r = 0usize;
+            while r + 4 <= m {
+                let x0 = &x_chunk[r * p..(r + 1) * p];
+                let x1 = &x_chunk[(r + 1) * p..(r + 2) * p];
+                let x2 = &x_chunk[(r + 2) * p..(r + 3) * p];
+                let x3 = &x_chunk[(r + 3) * p..(r + 4) * p];
+                for c in 0..k {
+                    let pc = &prec_chols[c * p..(c + 1) * p];
+                    let ms = &m_scaled[c * p..(c + 1) * p];
+                    let mut s0 = [0.0f64; 4];
+                    let mut s1 = [0.0f64; 4];
+                    let mut s2 = [0.0f64; 4];
+                    let mut s3 = [0.0f64; 4];
+                    let (pc_c, pc_r) = pc.as_chunks::<4>();
+                    let (ms_c, ms_r) = ms.as_chunks::<4>();
+                    let (x0_c, x0_r) = x0.as_chunks::<4>();
+                    let (x1_c, x1_r) = x1.as_chunks::<4>();
+                    let (x2_c, x2_r) = x2.as_chunks::<4>();
+                    let (x3_c, x3_r) = x3.as_chunks::<4>();
+                    for (((((&p_v, &m_v), &c0), &c1), &c2), &c3) in pc_c
+                        .iter()
+                        .zip(ms_c.iter())
+                        .zip(x0_c.iter())
+                        .zip(x1_c.iter())
+                        .zip(x2_c.iter())
+                        .zip(x3_c.iter())
+                    {
+                        for l in 0..4 {
+                            let d0 = c0[l] * p_v[l] - m_v[l];
+                            let d1 = c1[l] * p_v[l] - m_v[l];
+                            let d2 = c2[l] * p_v[l] - m_v[l];
+                            let d3 = c3[l] * p_v[l] - m_v[l];
+                            s0[l] += d0 * d0;
+                            s1[l] += d1 * d1;
+                            s2[l] += d2 * d2;
+                            s3[l] += d3 * d3;
+                        }
+                    }
+                    let mut m0 = (s0[0] + s0[1]) + (s0[2] + s0[3]);
+                    let mut m1 = (s1[0] + s1[1]) + (s1[2] + s1[3]);
+                    let mut m2 = (s2[0] + s2[1]) + (s2[2] + s2[3]);
+                    let mut m3 = (s3[0] + s3[1]) + (s3[2] + s3[3]);
+                    for j in 0..pc_r.len() {
+                        let d0 = x0_r[j] * pc_r[j] - ms_r[j];
+                        let d1 = x1_r[j] * pc_r[j] - ms_r[j];
+                        let d2 = x2_r[j] * pc_r[j] - ms_r[j];
+                        let d3 = x3_r[j] * pc_r[j] - ms_r[j];
+                        m0 += d0 * d0;
+                        m1 += d1 * d1;
+                        m2 += d2 * d2;
+                        m3 += d3 * d3;
+                    }
+                    let off = offsets[c];
+                    out_lp[r * k + c] = off - 0.5 * m0;
+                    out_lp[(r + 1) * k + c] = off - 0.5 * m1;
+                    out_lp[(r + 2) * k + c] = off - 0.5 * m2;
+                    out_lp[(r + 3) * k + c] = off - 0.5 * m3;
+                }
+                r += 4;
+            }
+            while r < m {
+                let x_row = &x_chunk[r * p..(r + 1) * p];
+                for c in 0..k {
+                    let pc = &prec_chols[c * p..(c + 1) * p];
+                    let ms = &m_scaled[c * p..(c + 1) * p];
+                    let mut maha_sq = 0.0;
+                    for j in 0..p {
+                        let d = x_row[j] * pc[j] - ms[j];
+                        maha_sq += d * d;
+                    }
+                    out_lp[r * k + c] = offsets[c] - 0.5 * maha_sq;
+                }
+                r += 1;
+            }
+        }
+        GmmEvalData::Spherical { prec_sq, offsets } => {
+            let mut r = 0usize;
+            while r + 4 <= m {
+                let x0 = &x_chunk[r * p..(r + 1) * p];
+                let x1 = &x_chunk[(r + 1) * p..(r + 2) * p];
+                let x2 = &x_chunk[(r + 2) * p..(r + 3) * p];
+                let x3 = &x_chunk[(r + 3) * p..(r + 4) * p];
+                for c in 0..k {
+                    let mu = &means_data[c * p..(c + 1) * p];
+                    let mut s0 = [0.0f64; 4];
+                    let mut s1 = [0.0f64; 4];
+                    let mut s2 = [0.0f64; 4];
+                    let mut s3 = [0.0f64; 4];
+                    let (mu_c, mu_r) = mu.as_chunks::<4>();
+                    let (x0_c, x0_r) = x0.as_chunks::<4>();
+                    let (x1_c, x1_r) = x1.as_chunks::<4>();
+                    let (x2_c, x2_r) = x2.as_chunks::<4>();
+                    let (x3_c, x3_r) = x3.as_chunks::<4>();
+                    for ((((&m_v, &c0), &c1), &c2), &c3) in mu_c
+                        .iter()
+                        .zip(x0_c.iter())
+                        .zip(x1_c.iter())
+                        .zip(x2_c.iter())
+                        .zip(x3_c.iter())
+                    {
+                        for l in 0..4 {
+                            let d0 = c0[l] - m_v[l];
+                            let d1 = c1[l] - m_v[l];
+                            let d2 = c2[l] - m_v[l];
+                            let d3 = c3[l] - m_v[l];
+                            s0[l] += d0 * d0;
+                            s1[l] += d1 * d1;
+                            s2[l] += d2 * d2;
+                            s3[l] += d3 * d3;
+                        }
+                    }
+                    let mut m0 = (s0[0] + s0[1]) + (s0[2] + s0[3]);
+                    let mut m1 = (s1[0] + s1[1]) + (s1[2] + s1[3]);
+                    let mut m2 = (s2[0] + s2[1]) + (s2[2] + s2[3]);
+                    let mut m3 = (s3[0] + s3[1]) + (s3[2] + s3[3]);
+                    for j in 0..mu_r.len() {
+                        let d0 = x0_r[j] - mu_r[j];
+                        let d1 = x1_r[j] - mu_r[j];
+                        let d2 = x2_r[j] - mu_r[j];
+                        let d3 = x3_r[j] - mu_r[j];
+                        m0 += d0 * d0;
+                        m1 += d1 * d1;
+                        m2 += d2 * d2;
+                        m3 += d3 * d3;
+                    }
+                    let half_psq = 0.5 * prec_sq[c];
+                    let off = offsets[c];
+                    out_lp[r * k + c] = off - half_psq * m0;
+                    out_lp[(r + 1) * k + c] = off - half_psq * m1;
+                    out_lp[(r + 2) * k + c] = off - half_psq * m2;
+                    out_lp[(r + 3) * k + c] = off - half_psq * m3;
+                }
+                r += 4;
+            }
+            while r < m {
+                let x_row = &x_chunk[r * p..(r + 1) * p];
+                for c in 0..k {
+                    let mu = &means_data[c * p..(c + 1) * p];
+                    let mut d2 = 0.0;
+                    for j in 0..p {
+                        let d = x_row[j] - mu[j];
+                        d2 += d * d;
+                    }
+                    out_lp[r * k + c] = offsets[c] - 0.5 * prec_sq[c] * d2;
+                }
+                r += 1;
+            }
+        }
+    }
+}
+
+fn compute_xtx_upper_cpu(x: &Matrix) -> Vec<f64> {
+    let n = x.rows;
+    let p = x.cols;
+    let accum_chunk = |x_chunk: &[f64], acc: &mut [f64]| {
+        let m = x_chunk.len() / p;
+        for i in 0..m {
+            let x_row = &x_chunk[i * p..(i + 1) * p];
+            for a in 0..p {
+                let xa = x_row[a];
+                let dst = &mut acc[a * p..a * p + p];
+                for b in a..p {
+                    dst[b] += xa * x_row[b];
+                }
+            }
+        }
+    };
+    if n >= PARALLEL_ROW_THRESHOLD {
+        x.data
+            .par_chunks(GMM_CHUNK_ROWS * p)
+            .fold(
+                || vec![0.0; p * p],
+                |mut acc, x_chunk| {
+                    accum_chunk(x_chunk, &mut acc);
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0.0; p * p],
+                |mut a, b| {
+                    for i in 0..a.len() {
+                        a[i] += b[i];
+                    }
+                    a
+                },
+            )
+    } else {
+        let mut acc = vec![0.0; p * p];
+        accum_chunk(&x.data, &mut acc);
+        acc
+    }
+}
+
+struct EmThreadAcc {
+    resp_buf: Vec<f64>,
+    xu_scratch: Vec<f64>,
+    log_prob_sum: f64,
+    nk: Vec<f64>,
+    xk: Vec<f64>,
+    sk: Vec<f64>,
+}
+
+impl EmThreadAcc {
+    fn new(k: usize, p: usize, sk_len: usize) -> Self {
+        Self {
+            resp_buf: vec![0.0; GMM_CHUNK_ROWS * k],
+            xu_scratch: Vec::with_capacity(4 * p),
+            log_prob_sum: 0.0,
+            nk: vec![0.0; k],
+            xk: vec![0.0; k * p],
+            sk: vec![0.0; sk_len],
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fused_em_step_cpu(
+    x: &Matrix,
+    weights: &[f64],
+    means: &Matrix,
+    prec_chols: &[f64],
+    covariance_type: &str,
+    reg_covar: f64,
+    precomputed_xtx: Option<&[f64]>,
+) -> OchreResult<(f64, GaussianParamsEstimate)> {
+    let n = x.rows;
+    let p = x.cols;
+    let k = weights.len();
+    let eval = prepare_gmm_eval_data(Some(weights), means, prec_chols, covariance_type)?;
+    let sk_len = match covariance_type {
+        "full" => k * p * p,
+        "tied" => 0,
+        "diag" => k * p,
+        "spherical" => k,
+        _ => {
+            return Err(OchreError::InvalidParameter(format!(
+                "Unsupported covariance_type '{}'",
+                covariance_type
+            )));
+        }
+    };
+    let means_data = &means.data;
+
+    let process_chunk = |acc: &mut EmThreadAcc, x_chunk: &[f64]| {
+        let m = x_chunk.len() / p;
+        acc.resp_buf.resize(m * k, 0.0);
+        eval_log_prob_chunk(
+            &eval,
+            x_chunk,
+            m,
+            p,
+            k,
+            means_data,
+            prec_chols,
+            &mut acc.resp_buf,
+            &mut acc.xu_scratch,
+        );
+
+        // In-place softmax + log_prob_sum so resp stays in L1/L2 cache
+        for i in 0..m {
+            let row = &mut acc.resp_buf[i * k..(i + 1) * k];
+            let mut max_v = f64::NEG_INFINITY;
+            for &v in row.iter() {
+                if v > max_v {
+                    max_v = v;
+                }
+            }
+            if max_v == f64::NEG_INFINITY {
+                acc.log_prob_sum += f64::NEG_INFINITY;
+                row.fill(0.0);
+            } else {
+                let mut sum_exp = 0.0;
+                for v in row.iter_mut() {
+                    let e = (*v - max_v).exp();
+                    *v = e;
+                    sum_exp += e;
+                }
+                acc.log_prob_sum += max_v + sum_exp.ln();
+                let inv_sum = 1.0 / sum_exp;
+                for v in row.iter_mut() {
+                    *v *= inv_sum;
+                }
+            }
+        }
+
+        // Accumulate nk and xk from cache-hot resp_buf
+        for i in 0..m {
+            let r_row = &acc.resp_buf[i * k..(i + 1) * k];
+            let x_row = &x_chunk[i * p..(i + 1) * p];
+            for (c, &r) in r_row.iter().enumerate().take(k) {
+                acc.nk[c] += r;
+                if r > 0.0 {
+                    let xk_c = &mut acc.xk[c * p..(c + 1) * p];
+                    for j in 0..p {
+                        xk_c[j] += r * x_row[j];
+                    }
+                }
+            }
+        }
+
+        // Accumulate sk from cache-hot resp_buf
+        match covariance_type {
+            "full" => {
+                for c in 0..k {
+                    let sk_c = &mut acc.sk[c * p * p..(c + 1) * p * p];
+                    for i in 0..m {
+                        let r = acc.resp_buf[i * k + c];
+                        if r <= 0.0 {
+                            continue;
+                        }
+                        let x_row = &x_chunk[i * p..(i + 1) * p];
+                        for a in 0..p {
+                            let da = r * x_row[a];
+                            let dst = &mut sk_c[a * p..(a + 1) * p];
+                            for b in a..p {
+                                dst[b] += da * x_row[b];
+                            }
+                        }
+                    }
+                }
+            }
+            "diag" => {
+                for i in 0..m {
+                    let r_row = &acc.resp_buf[i * k..(i + 1) * k];
+                    let x_row = &x_chunk[i * p..(i + 1) * p];
+                    for (c, &r) in r_row.iter().enumerate().take(k) {
+                        if r <= 0.0 {
+                            continue;
+                        }
+                        let sk_c = &mut acc.sk[c * p..(c + 1) * p];
+                        for j in 0..p {
+                            let xj = x_row[j];
+                            sk_c[j] += r * xj * xj;
+                        }
+                    }
+                }
+            }
+            "spherical" => {
+                for i in 0..m {
+                    let x_row = &x_chunk[i * p..(i + 1) * p];
+                    let norm2 = dot_slice(x_row, x_row);
+                    let r_row = &acc.resp_buf[i * k..(i + 1) * k];
+                    for (c, &r) in r_row.iter().enumerate().take(k) {
+                        acc.sk[c] += r * norm2;
+                    }
+                }
+            }
+            _ => {}
+        }
+    };
+
+    let merged = if n >= PARALLEL_ROW_THRESHOLD || n * k * p >= 4096 {
+        x.data
+            .par_chunks(GMM_CHUNK_ROWS * p)
+            .fold(
+                || EmThreadAcc::new(k, p, sk_len),
+                |mut acc, x_chunk| {
+                    process_chunk(&mut acc, x_chunk);
+                    acc
+                },
+            )
+            .reduce(
+                || EmThreadAcc::new(k, p, sk_len),
+                |mut a, b| {
+                    a.log_prob_sum += b.log_prob_sum;
+                    for c in 0..k {
+                        a.nk[c] += b.nk[c];
+                    }
+                    for i in 0..a.xk.len() {
+                        a.xk[i] += b.xk[i];
+                    }
+                    for i in 0..a.sk.len() {
+                        a.sk[i] += b.sk[i];
+                    }
+                    a
+                },
+            )
+    } else {
+        let mut acc = EmThreadAcc::new(k, p, sk_len);
+        for x_chunk in x.data.chunks(GMM_CHUNK_ROWS * p) {
+            process_chunk(&mut acc, x_chunk);
+        }
+        acc
+    };
+
+    let lower_bound = merged.log_prob_sum / (n as f64);
+    let r_sum = merged.nk;
+    let eps_pad = 10.0 * f64::EPSILON;
+    let mut nk = Vec::with_capacity(k);
+    let mut nk_sum = 0.0;
+    for &rs in &r_sum {
+        let v = rs + eps_pad;
+        nk.push(v);
+        nk_sum += v;
+    }
+    let new_weights: Vec<f64> = nk.iter().map(|&v| v / nk_sum).collect();
+
+    let mut means_data_new = vec![0.0; k * p];
+    for c in 0..k {
+        let inv = 1.0 / nk[c];
+        for j in 0..p {
+            means_data_new[c * p + j] = merged.xk[c * p + j] * inv;
+        }
+    }
+    let new_means = Matrix::from_vec(k, p, means_data_new)?;
+
+    let (covariances, precisions_cholesky) = match covariance_type {
+        "full" => {
+            let mut covs = merged.sk;
+            let mut prec_chols = vec![0.0; k * p * p];
+            for c in 0..k {
+                let inv_nk = 1.0 / nk[c];
+                let rc = r_sum[c];
+                let m_c = &new_means.data[c * p..(c + 1) * p];
+                let xk_c = &merged.xk[c * p..(c + 1) * p];
+                let cov_c = &mut covs[c * p * p..(c + 1) * p * p];
+                for a in 0..p {
+                    for b in a..p {
+                        let raw = cov_c[a * p + b] - xk_c[a] * m_c[b] - xk_c[b] * m_c[a]
+                            + rc * m_c[a] * m_c[b];
+                        let mut val = raw * inv_nk;
+                        if a == b {
+                            val = val.max(0.0) + reg_covar;
+                        }
+                        cov_c[a * p + b] = val;
+                        cov_c[b * p + a] = val;
+                    }
+                }
+                let u = compute_prec_chol_from_cov(cov_c, p)?;
+                prec_chols[c * p * p..(c + 1) * p * p].copy_from_slice(&u);
+            }
+            (covs, prec_chols)
+        }
+        "tied" => {
+            let mut cov = match precomputed_xtx {
+                Some(xtx) => xtx.to_vec(),
+                None => compute_xtx_upper_cpu(x),
+            };
+            for (c, &rc) in r_sum.iter().enumerate().take(k) {
+                let m_c = &new_means.data[c * p..(c + 1) * p];
+                let xk_c = &merged.xk[c * p..(c + 1) * p];
+                for a in 0..p {
+                    for b in a..p {
+                        cov[a * p + b] +=
+                            -xk_c[a] * m_c[b] - xk_c[b] * m_c[a] + rc * m_c[a] * m_c[b];
+                    }
+                }
+            }
+            let inv_nk_sum = 1.0 / nk_sum;
+            for a in 0..p {
+                for b in a..p {
+                    let mut val = cov[a * p + b] * inv_nk_sum;
+                    if a == b {
+                        val = val.max(0.0) + reg_covar;
+                    }
+                    cov[a * p + b] = val;
+                    cov[b * p + a] = val;
+                }
+            }
+            let prec_chol = compute_prec_chol_from_cov(&cov, p)?;
+            (cov, prec_chol)
+        }
+        "diag" => {
+            let mut covs = merged.sk;
+            let mut prec_chols = vec![0.0; k * p];
+            for c in 0..k {
+                let inv_nk = 1.0 / nk[c];
+                let rc = r_sum[c];
+                let m_c = &new_means.data[c * p..(c + 1) * p];
+                let xk_c = &merged.xk[c * p..(c + 1) * p];
+                let cov_c = &mut covs[c * p..(c + 1) * p];
+                for j in 0..p {
+                    let raw = cov_c[j] - 2.0 * xk_c[j] * m_c[j] + rc * m_c[j] * m_c[j];
+                    let v = (raw * inv_nk).max(0.0) + reg_covar;
+                    cov_c[j] = v;
+                    if !v.is_finite() || v <= 0.0 {
+                        return Err(OchreError::SingularMatrix(
+                            "Diagonal covariance is non-positive; try increasing reg_covar"
+                                .to_string(),
+                        ));
+                    }
+                    prec_chols[c * p + j] = 1.0 / v.sqrt();
+                }
+            }
+            (covs, prec_chols)
+        }
+        "spherical" => {
+            let mut covs = vec![0.0; k];
+            let mut prec_chols = vec![0.0; k];
+            let inv_p = 1.0 / (p as f64);
+            for c in 0..k {
+                let inv_nk = 1.0 / nk[c];
+                let rc = r_sum[c];
+                let m_c = &new_means.data[c * p..(c + 1) * p];
+                let xk_c = &merged.xk[c * p..(c + 1) * p];
+                let dot_xk_m = dot_slice(xk_c, m_c);
+                let dot_m_m = dot_slice(m_c, m_c);
+                let sum_sq = (merged.sk[c] - 2.0 * dot_xk_m + rc * dot_m_m).max(0.0);
+                let v = sum_sq * inv_nk * inv_p + reg_covar;
+                if !v.is_finite() || v <= 0.0 {
+                    return Err(OchreError::SingularMatrix(
+                        "Spherical covariance is non-positive; try increasing reg_covar"
+                            .to_string(),
+                    ));
+                }
+                covs[c] = v;
+                prec_chols[c] = 1.0 / v.sqrt();
+            }
+            (covs, prec_chols)
+        }
+        _ => {
+            return Err(OchreError::InvalidParameter(format!(
+                "Unsupported covariance_type '{}'",
+                covariance_type
+            )));
+        }
+    };
+
+    Ok((
+        lower_bound,
+        (new_weights, new_means, covariances, precisions_cholesky),
+    ))
 }
 
 fn init_responsibilities_random(
@@ -671,13 +1699,63 @@ fn estimate_weighted_log_prob(
     precisions_cholesky: &[f64],
     covariance_type: &str,
 ) -> OchreResult<Matrix> {
+    let n = x.rows;
+    let p = x.cols;
+    let k = weights.len();
+    if matches!(backend, Backend::Cpu) {
+        let eval =
+            prepare_gmm_eval_data(Some(weights), means, precisions_cholesky, covariance_type)?;
+        let mut wlp = vec![0.0; n * k];
+        let means_data = &means.data;
+        if n >= PARALLEL_ROW_THRESHOLD {
+            wlp.par_chunks_mut(GMM_CHUNK_ROWS * k)
+                .zip(x.data.par_chunks(GMM_CHUNK_ROWS * p))
+                .for_each_init(
+                    || Vec::with_capacity(4 * p),
+                    |xu_scratch, (out_chunk, x_chunk)| {
+                        let m = out_chunk.len() / k;
+                        eval_log_prob_chunk(
+                            &eval,
+                            x_chunk,
+                            m,
+                            p,
+                            k,
+                            means_data,
+                            precisions_cholesky,
+                            out_chunk,
+                            xu_scratch,
+                        );
+                    },
+                );
+        } else {
+            let mut xu_scratch = Vec::with_capacity(4 * p);
+            for (out_chunk, x_chunk) in wlp
+                .chunks_mut(GMM_CHUNK_ROWS * k)
+                .zip(x.data.chunks(GMM_CHUNK_ROWS * p))
+            {
+                let m = out_chunk.len() / k;
+                eval_log_prob_chunk(
+                    &eval,
+                    x_chunk,
+                    m,
+                    p,
+                    k,
+                    means_data,
+                    precisions_cholesky,
+                    out_chunk,
+                    &mut xu_scratch,
+                );
+            }
+        }
+        return Matrix::from_vec(n, k, wlp);
+    }
+
     let mut lp =
         estimate_log_gaussian_prob(backend, x, means, precisions_cholesky, covariance_type)?;
     let log_w: Vec<f64> = weights
         .iter()
         .map(|&w| if w > 0.0 { w.ln() } else { f64::NEG_INFINITY })
         .collect();
-    let k = weights.len();
     for row in lp.data.chunks_mut(k) {
         for c in 0..k {
             row[c] += log_w[c];
@@ -696,7 +1774,7 @@ fn e_step(
 ) -> OchreResult<(Vec<f64>, Matrix)> {
     let n = x.rows;
     let k = weights.len();
-    let wlp = estimate_weighted_log_prob(
+    let mut wlp = estimate_weighted_log_prob(
         backend,
         x,
         weights,
@@ -706,12 +1784,9 @@ fn e_step(
     )?;
 
     let mut log_prob_norm = vec![0.0; n];
-    let mut log_resp = vec![0.0; n * k];
-
-    for i in 0..n {
-        let row = &wlp.data[i * k..(i + 1) * k];
+    let compute_lse = |(lpn, row): (&mut f64, &mut [f64])| {
         let mut max_v = f64::NEG_INFINITY;
-        for &v in row {
+        for &v in row.iter() {
             if v > max_v {
                 max_v = v;
             }
@@ -720,19 +1795,29 @@ fn e_step(
             f64::NEG_INFINITY
         } else {
             let mut sum_exp = 0.0;
-            for &v in row {
+            for &v in row.iter() {
                 sum_exp += (v - max_v).exp();
             }
             max_v + sum_exp.ln()
         };
-        log_prob_norm[i] = lse;
-        let out_row = &mut log_resp[i * k..(i + 1) * k];
-        for c in 0..k {
-            out_row[c] = row[c] - lse;
+        *lpn = lse;
+        for v in row.iter_mut() {
+            *v -= lse;
         }
+    };
+    if n >= PARALLEL_ROW_THRESHOLD {
+        log_prob_norm
+            .par_iter_mut()
+            .zip(wlp.data.par_chunks_exact_mut(k))
+            .for_each(compute_lse);
+    } else {
+        log_prob_norm
+            .iter_mut()
+            .zip(wlp.data.chunks_exact_mut(k))
+            .for_each(compute_lse);
     }
 
-    Ok((log_prob_norm, Matrix::from_vec(n, k, log_resp)?))
+    Ok((log_prob_norm, wlp))
 }
 
 #[derive(Debug, Clone)]
@@ -819,10 +1904,38 @@ impl GaussianMixture {
             )));
         }
 
-        let backend = get_backend(&self.device_type);
         let n = x.rows;
         let p = x.cols;
         let k = self.n_components;
+        let backend = effective_backend(&self.device_type, n * p);
+
+        // Center X once when reasonably sized so sufficient-statistics M-step never loses precision on large offsets.
+        let (x_shift, x_centered_opt) = if n * p <= 10_000_000 {
+            let mut col_sum = vec![0.0; p];
+            for row in x.data.chunks_exact(p) {
+                for j in 0..p {
+                    col_sum[j] += row[j];
+                }
+            }
+            let inv_n = 1.0 / (n as f64);
+            let shift: Vec<f64> = col_sum.iter().map(|&s| s * inv_n).collect();
+            let mut shifted = vec![0.0; n * p];
+            for (dst, src) in shifted.chunks_exact_mut(p).zip(x.data.chunks_exact(p)) {
+                for j in 0..p {
+                    dst[j] = src[j] - shift[j];
+                }
+            }
+            (Some(shift), Some(Matrix::from_vec(n, p, shifted)?))
+        } else {
+            (None, None)
+        };
+        let x_work = x_centered_opt.as_ref().unwrap_or(x);
+
+        let precomputed_xtx = if matches!(backend, Backend::Cpu) && self.covariance_type == "tied" {
+            Some(compute_xtx_upper_cpu(x_work))
+        } else {
+            None
+        };
 
         let mut best_lower_bound = f64::NEG_INFINITY;
         type BestGmmParams = (Vec<f64>, Matrix, Vec<f64>, Vec<f64>, bool, usize);
@@ -834,46 +1947,65 @@ impl GaussianMixture {
                 .map(|s| s.wrapping_add((init_idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)));
             let mut rng = DeterministicRng::new(seed);
 
-            let init_resp = if self.init_params == "kmeans" {
-                init_responsibilities_kmeans(&backend, x, k, &mut rng)?
-            } else {
-                init_responsibilities_random(n, k, &mut rng)?
-            };
-
             let (mut weights, mut means, mut covariances, mut prec_chols) =
-                estimate_gaussian_parameters(
-                    &backend,
-                    x,
-                    &init_resp,
-                    &self.covariance_type,
-                    self.reg_covar,
-                )?;
+                if self.init_params == "kmeans" {
+                    let labels = init_kmeans_labels(&backend, x_work, k, &mut rng)?;
+                    estimate_gaussian_parameters_from_labels(
+                        x_work,
+                        &labels,
+                        k,
+                        &self.covariance_type,
+                        self.reg_covar,
+                        precomputed_xtx.as_deref(),
+                    )?
+                } else {
+                    let init_resp = init_responsibilities_random(n, k, &mut rng)?;
+                    estimate_gaussian_parameters(
+                        &backend,
+                        x_work,
+                        &init_resp,
+                        &self.covariance_type,
+                        self.reg_covar,
+                    )?
+                };
 
             let mut prev_lower_bound = f64::NEG_INFINITY;
             let mut converged = false;
             let mut n_iter = 0;
 
             for iter in 1..=self.max_iter {
-                let (log_prob_norm, log_resp) = e_step(
-                    &backend,
-                    x,
-                    &weights,
-                    &means,
-                    &prec_chols,
-                    &self.covariance_type,
-                )?;
-                let lower_bound = log_prob_norm.iter().sum::<f64>() / (n as f64);
-
-                let resp_data: Vec<f64> = log_resp.data.iter().map(|&v| v.exp()).collect();
-                let resp = Matrix::from_vec(n, k, resp_data)?;
-
-                let (w_new, m_new, c_new, pc_new) = estimate_gaussian_parameters(
-                    &backend,
-                    x,
-                    &resp,
-                    &self.covariance_type,
-                    self.reg_covar,
-                )?;
+                let (lower_bound, (w_new, m_new, c_new, pc_new)) =
+                    if matches!(backend, Backend::Cpu) {
+                        fused_em_step_cpu(
+                            x_work,
+                            &weights,
+                            &means,
+                            &prec_chols,
+                            &self.covariance_type,
+                            self.reg_covar,
+                            precomputed_xtx.as_deref(),
+                        )?
+                    } else {
+                        let (log_prob_norm, log_resp) = e_step(
+                            &backend,
+                            x_work,
+                            &weights,
+                            &means,
+                            &prec_chols,
+                            &self.covariance_type,
+                        )?;
+                        let lb = log_prob_norm.iter().sum::<f64>() / (n as f64);
+                        let resp_data: Vec<f64> = log_resp.data.iter().map(|&v| v.exp()).collect();
+                        let resp = Matrix::from_vec(n, k, resp_data)?;
+                        let params = estimate_gaussian_parameters(
+                            &backend,
+                            x_work,
+                            &resp,
+                            &self.covariance_type,
+                            self.reg_covar,
+                        )?;
+                        (lb, params)
+                    };
                 weights = w_new;
                 means = m_new;
                 covariances = c_new;
@@ -895,7 +2027,15 @@ impl GaussianMixture {
             }
         }
 
-        if let Some((weights, means, covariances, prec_chols, converged, n_iter)) = best_params {
+        if let Some((weights, mut means, covariances, prec_chols, converged, n_iter)) = best_params
+        {
+            if let Some(ref shift) = x_shift {
+                for row in means.data.chunks_exact_mut(p) {
+                    for j in 0..p {
+                        row[j] += shift[j];
+                    }
+                }
+            }
             self.weights_ = Some(weights);
             self.means_ = Some(means);
             self.covariances_ = Some(covariances);
@@ -928,8 +2068,8 @@ impl GaussianMixture {
         validate_x(x)?;
         validate_fitted_cols(self.n_features_in_, x.cols)?;
         let (weights, means, prec_chols) = self.get_fitted()?;
-        let backend = get_backend(&self.device_type);
-        let (_, log_resp) = e_step(
+        let backend = effective_backend(&self.device_type, x.rows * x.cols);
+        let (_, mut log_resp) = e_step(
             &backend,
             x,
             weights,
@@ -937,15 +2077,76 @@ impl GaussianMixture {
             prec_chols,
             &self.covariance_type,
         )?;
-        let data: Vec<f64> = log_resp.data.into_iter().map(|v| v.exp()).collect();
-        Matrix::from_vec(x.rows, self.n_components, data)
+        for v in &mut log_resp.data {
+            *v = v.exp();
+        }
+        Ok(log_resp)
     }
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<usize>> {
         validate_x(x)?;
         validate_fitted_cols(self.n_features_in_, x.cols)?;
         let (weights, means, prec_chols) = self.get_fitted()?;
-        let backend = get_backend(&self.device_type);
+        let backend = effective_backend(&self.device_type, x.rows * x.cols);
+        let k = self.n_components;
+        let p = x.cols;
+        let n = x.rows;
+        if matches!(backend, Backend::Cpu) {
+            let eval =
+                prepare_gmm_eval_data(Some(weights), means, prec_chols, &self.covariance_type)?;
+            let means_data = &means.data;
+            let mut labels = vec![0usize; n];
+            let predict_chunk = |(wlp_buf, xu_scratch): &mut (Vec<f64>, Vec<f64>),
+                                 lbl_chunk: &mut [usize],
+                                 x_chunk: &[f64]| {
+                let m = lbl_chunk.len();
+                wlp_buf.resize(m * k, 0.0);
+                eval_log_prob_chunk(
+                    &eval, x_chunk, m, p, k, means_data, prec_chols, wlp_buf, xu_scratch,
+                );
+                for (i, dst) in lbl_chunk.iter_mut().enumerate() {
+                    let row = &wlp_buf[i * k..(i + 1) * k];
+                    let mut best_c = 0;
+                    let mut best_v = f64::NEG_INFINITY;
+                    for (c, &v) in row.iter().enumerate() {
+                        if v > best_v {
+                            best_v = v;
+                            best_c = c;
+                        }
+                    }
+                    *dst = best_c;
+                }
+            };
+            if n >= PARALLEL_ROW_THRESHOLD {
+                labels
+                    .par_chunks_mut(GMM_CHUNK_ROWS)
+                    .zip(x.data.par_chunks(GMM_CHUNK_ROWS * p))
+                    .for_each_init(
+                        || {
+                            (
+                                Vec::with_capacity(GMM_CHUNK_ROWS * k),
+                                Vec::with_capacity(4 * p),
+                            )
+                        },
+                        |scratch, (lbl_chunk, x_chunk)| {
+                            predict_chunk(scratch, lbl_chunk, x_chunk);
+                        },
+                    );
+            } else {
+                let mut scratch = (
+                    Vec::with_capacity(GMM_CHUNK_ROWS * k),
+                    Vec::with_capacity(4 * p),
+                );
+                for (lbl_chunk, x_chunk) in labels
+                    .chunks_mut(GMM_CHUNK_ROWS)
+                    .zip(x.data.chunks(GMM_CHUNK_ROWS * p))
+                {
+                    predict_chunk(&mut scratch, lbl_chunk, x_chunk);
+                }
+            }
+            return Ok(labels);
+        }
+
         let wlp = estimate_weighted_log_prob(
             &backend,
             x,
@@ -954,7 +2155,6 @@ impl GaussianMixture {
             prec_chols,
             &self.covariance_type,
         )?;
-        let k = self.n_components;
         let mut labels = Vec::with_capacity(x.rows);
         for row in wlp.data.chunks(k) {
             let mut best_c = 0;
@@ -974,7 +2174,7 @@ impl GaussianMixture {
         validate_x(x)?;
         validate_fitted_cols(self.n_features_in_, x.cols)?;
         let (weights, means, prec_chols) = self.get_fitted()?;
-        let backend = get_backend(&self.device_type);
+        let backend = effective_backend(&self.device_type, x.rows * x.cols);
         let (log_prob_norm, _) = e_step(
             &backend,
             x,
@@ -1537,5 +2737,48 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_gmm_large_parallel_fused_em_all_cov_types() {
+        let n = 651;
+        let p = 7;
+        let k = 3;
+        let mut data = vec![0.0; n * p];
+        for i in 0..n {
+            let cls = i % k;
+            let base = (cls as f64) * 8.0 + 1000.0;
+            for j in 0..p {
+                data[i * p + j] = base + (((i * 13 + j * 5) % 17) as f64) * 0.1;
+            }
+        }
+        let x = Matrix::from_vec(n, p, data).unwrap();
+        for cov_type in ["full", "tied", "diag", "spherical"] {
+            let mut gmm = GaussianMixture::new(
+                k,
+                cov_type.to_string(),
+                1e-4,
+                1e-5,
+                50,
+                1,
+                "kmeans".to_string(),
+                Some(42),
+                Some("cpu".to_string()),
+            )
+            .unwrap();
+            let labels = gmm.fit_predict(&x).unwrap();
+            assert_eq!(labels.len(), n);
+            let probs = gmm.predict_proba(&x).unwrap();
+            assert_eq!(probs.rows, n);
+            assert_eq!(probs.cols, k);
+            for r in 0..n {
+                let mut sum = 0.0;
+                for c in 0..k {
+                    sum += probs[(r, c)];
+                }
+                assert!((sum - 1.0).abs() < 1e-9);
+            }
+            assert!(gmm.score(&x).unwrap().is_finite());
+        }
     }
 }

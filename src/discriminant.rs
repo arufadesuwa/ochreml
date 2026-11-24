@@ -23,11 +23,13 @@ use rayon::prelude::*;
 pub const TAG_LDA: u8 = 45;
 pub const TAG_QDA: u8 = 46;
 
-const PARALLEL_ROW_THRESHOLD: usize = 4096;
+const PARALLEL_ROW_THRESHOLD: usize = 512;
+const LDA_TILE: usize = 64;
+const QDA_CHUNK_ROWS: usize = 64;
 
 #[inline]
 fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
-    if elems < 131_072 {
+    if elems < 524_288 {
         Backend::Cpu
     } else {
         get_backend(dev)
@@ -54,6 +56,300 @@ fn dot4(a: &[f64], b: &[f64]) -> f64 {
         sum += a[i] * b[i];
     }
     sum
+}
+
+#[inline(always)]
+fn dot4_4rows(a0: &[f64], a1: &[f64], a2: &[f64], a3: &[f64], b: &[f64]) -> (f64, f64, f64, f64) {
+    let mut s0 = [0.0f64; 4];
+    let mut s1 = [0.0f64; 4];
+    let mut s2 = [0.0f64; 4];
+    let mut s3 = [0.0f64; 4];
+    let (b_chunks, b_rem) = b.as_chunks::<4>();
+    let (a0_chunks, a0_rem) = a0.as_chunks::<4>();
+    let (a1_chunks, a1_rem) = a1.as_chunks::<4>();
+    let (a2_chunks, a2_rem) = a2.as_chunks::<4>();
+    let (a3_chunks, a3_rem) = a3.as_chunks::<4>();
+    for ((((&bc, &c0), &c1), &c2), &c3) in b_chunks
+        .iter()
+        .zip(a0_chunks.iter())
+        .zip(a1_chunks.iter())
+        .zip(a2_chunks.iter())
+        .zip(a3_chunks.iter())
+    {
+        for l in 0..4 {
+            let bv = bc[l];
+            s0[l] += c0[l] * bv;
+            s1[l] += c1[l] * bv;
+            s2[l] += c2[l] * bv;
+            s3[l] += c3[l] * bv;
+        }
+    }
+    let mut r0 = (s0[0] + s0[1]) + (s0[2] + s0[3]);
+    let mut r1 = (s1[0] + s1[1]) + (s1[2] + s1[3]);
+    let mut r2 = (s2[0] + s2[1]) + (s2[2] + s2[3]);
+    let mut r3 = (s3[0] + s3[1]) + (s3[2] + s3[3]);
+    for j in 0..b_rem.len() {
+        let bv = b_rem[j];
+        r0 += a0_rem[j] * bv;
+        r1 += a1_rem[j] * bv;
+        r2 += a2_rem[j] * bv;
+        r3 += a3_rem[j] * bv;
+    }
+    (r0, r1, r2, r3)
+}
+
+#[inline(always)]
+fn dot64_tile(a: &[f64; LDA_TILE], b: &[f64; LDA_TILE]) -> f64 {
+    let mut acc = [0.0f64; 4];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        for lane in 0..4 {
+            acc[lane] += a[base + lane] * b[base + lane];
+        }
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
+}
+
+#[inline(always)]
+fn dot64_tile_1x4(
+    a: &[f64; LDA_TILE],
+    b0: &[f64; LDA_TILE],
+    b1: &[f64; LDA_TILE],
+    b2: &[f64; LDA_TILE],
+    b3: &[f64; LDA_TILE],
+) -> (f64, f64, f64, f64) {
+    let mut acc0 = [0.0f64; 4];
+    let mut acc1 = [0.0f64; 4];
+    let mut acc2 = [0.0f64; 4];
+    let mut acc3 = [0.0f64; 4];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        for lane in 0..4 {
+            let ai = a[base + lane];
+            acc0[lane] += ai * b0[base + lane];
+            acc1[lane] += ai * b1[base + lane];
+            acc2[lane] += ai * b2[base + lane];
+            acc3[lane] += ai * b3[base + lane];
+        }
+    }
+    (
+        (acc0[0] + acc0[1]) + (acc0[2] + acc0[3]),
+        (acc1[0] + acc1[1]) + (acc1[2] + acc1[3]),
+        (acc2[0] + acc2[1]) + (acc2[2] + acc2[3]),
+        (acc3[0] + acc3[1]) + (acc3[2] + acc3[3]),
+    )
+}
+
+type Tile2x4Result = ((f64, f64, f64, f64), (f64, f64, f64, f64));
+
+#[inline(always)]
+fn dot64_tile_2x4(
+    a0: &[f64; LDA_TILE],
+    a1: &[f64; LDA_TILE],
+    b0: &[f64; LDA_TILE],
+    b1: &[f64; LDA_TILE],
+    b2: &[f64; LDA_TILE],
+    b3: &[f64; LDA_TILE],
+) -> Tile2x4Result {
+    let mut acc00 = [0.0f64; 4];
+    let mut acc01 = [0.0f64; 4];
+    let mut acc02 = [0.0f64; 4];
+    let mut acc03 = [0.0f64; 4];
+    let mut acc10 = [0.0f64; 4];
+    let mut acc11 = [0.0f64; 4];
+    let mut acc12 = [0.0f64; 4];
+    let mut acc13 = [0.0f64; 4];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        for lane in 0..4 {
+            let v_a0 = a0[base + lane];
+            let v_a1 = a1[base + lane];
+            let v_b0 = b0[base + lane];
+            let v_b1 = b1[base + lane];
+            let v_b2 = b2[base + lane];
+            let v_b3 = b3[base + lane];
+            acc00[lane] += v_a0 * v_b0;
+            acc01[lane] += v_a0 * v_b1;
+            acc02[lane] += v_a0 * v_b2;
+            acc03[lane] += v_a0 * v_b3;
+            acc10[lane] += v_a1 * v_b0;
+            acc11[lane] += v_a1 * v_b1;
+            acc12[lane] += v_a1 * v_b2;
+            acc13[lane] += v_a1 * v_b3;
+        }
+    }
+    (
+        (
+            (acc00[0] + acc00[1]) + (acc00[2] + acc00[3]),
+            (acc01[0] + acc01[1]) + (acc01[2] + acc01[3]),
+            (acc02[0] + acc02[1]) + (acc02[2] + acc02[3]),
+            (acc03[0] + acc03[1]) + (acc03[2] + acc03[3]),
+        ),
+        (
+            (acc10[0] + acc10[1]) + (acc10[2] + acc10[3]),
+            (acc11[0] + acc11[1]) + (acc11[2] + acc11[3]),
+            (acc12[0] + acc12[1]) + (acc12[2] + acc12[3]),
+            (acc13[0] + acc13[1]) + (acc13[2] + acc13[3]),
+        ),
+    )
+}
+
+fn accumulate_centered_gram_chunk(
+    x_chunk: &[f64],
+    y_chunk: &[usize],
+    means_data: &[f64],
+    p: usize,
+    x_t: &mut [[f64; LDA_TILE]],
+    gram: &mut [f64],
+) {
+    let n_chunk = y_chunk.len();
+    let mut r_block = 0usize;
+    while r_block < n_chunk {
+        let block_end = (r_block + LDA_TILE).min(n_chunk);
+        let b_len = block_end - r_block;
+        if b_len < LDA_TILE {
+            for col in x_t.iter_mut() {
+                col[b_len..LDA_TILE].fill(0.0);
+            }
+        }
+
+        let mut b = 0usize;
+        while b + 4 <= b_len {
+            let r0 = r_block + b;
+            let row0 = &x_chunk[r0 * p..(r0 + 1) * p];
+            let row1 = &x_chunk[(r0 + 1) * p..(r0 + 2) * p];
+            let row2 = &x_chunk[(r0 + 2) * p..(r0 + 3) * p];
+            let row3 = &x_chunk[(r0 + 3) * p..(r0 + 4) * p];
+            let c0 = y_chunk[r0];
+            let c1 = y_chunk[r0 + 1];
+            let c2 = y_chunk[r0 + 2];
+            let c3 = y_chunk[r0 + 3];
+            let m0 = &means_data[c0 * p..(c0 + 1) * p];
+            let m1 = &means_data[c1 * p..(c1 + 1) * p];
+            let m2 = &means_data[c2 * p..(c2 + 1) * p];
+            let m3 = &means_data[c3 * p..(c3 + 1) * p];
+            for (j, col) in x_t.iter_mut().enumerate().take(p) {
+                col[b] = row0[j] - m0[j];
+                col[b + 1] = row1[j] - m1[j];
+                col[b + 2] = row2[j] - m2[j];
+                col[b + 3] = row3[j] - m3[j];
+            }
+            b += 4;
+        }
+        while b < b_len {
+            let r0 = r_block + b;
+            let row = &x_chunk[r0 * p..(r0 + 1) * p];
+            let c0 = y_chunk[r0];
+            let m0 = &means_data[c0 * p..(c0 + 1) * p];
+            for (j, col) in x_t.iter_mut().enumerate().take(p) {
+                col[b] = row[j] - m0[j];
+            }
+            b += 1;
+        }
+
+        let mut j = 0usize;
+        while j + 2 <= p {
+            let lj0 = &x_t[j];
+            let lj1 = &x_t[j + 1];
+            let off0 = j * p;
+            let off1 = (j + 1) * p;
+            gram[off0 + j] += dot64_tile(lj0, lj0);
+            gram[off0 + j + 1] += dot64_tile(lj0, lj1);
+            gram[off1 + j + 1] += dot64_tile(lj1, lj1);
+
+            let mut k = j + 2;
+            while k + 4 <= p {
+                let ((s00, s01, s02, s03), (s10, s11, s12, s13)) =
+                    dot64_tile_2x4(lj0, lj1, &x_t[k], &x_t[k + 1], &x_t[k + 2], &x_t[k + 3]);
+                gram[off0 + k] += s00;
+                gram[off0 + k + 1] += s01;
+                gram[off0 + k + 2] += s02;
+                gram[off0 + k + 3] += s03;
+                gram[off1 + k] += s10;
+                gram[off1 + k + 1] += s11;
+                gram[off1 + k + 2] += s12;
+                gram[off1 + k + 3] += s13;
+                k += 4;
+            }
+            while k < p {
+                gram[off0 + k] += dot64_tile(lj0, &x_t[k]);
+                gram[off1 + k] += dot64_tile(lj1, &x_t[k]);
+                k += 1;
+            }
+            j += 2;
+        }
+        while j < p {
+            let lj = &x_t[j];
+            let off = j * p;
+            let mut k = j;
+            while k + 4 <= p {
+                let (s0, s1, s2, s3) =
+                    dot64_tile_1x4(lj, &x_t[k], &x_t[k + 1], &x_t[k + 2], &x_t[k + 3]);
+                gram[off + k] += s0;
+                gram[off + k + 1] += s1;
+                gram[off + k + 2] += s2;
+                gram[off + k + 3] += s3;
+                k += 4;
+            }
+            while k < p {
+                gram[off + k] += dot64_tile(lj, &x_t[k]);
+                k += 1;
+            }
+            j += 1;
+        }
+
+        r_block = block_end;
+    }
+}
+
+fn compute_centered_gram_cpu(x: &Matrix, y_idx: &[usize], means: &Matrix) -> OchreResult<Matrix> {
+    let n = x.rows;
+    let p = x.cols;
+    let means_data = &means.data;
+    let gram_data = if n >= PARALLEL_ROW_THRESHOLD {
+        const CHUNK_ROWS: usize = 1024;
+        x.data
+            .par_chunks(CHUNK_ROWS * p)
+            .zip(y_idx.par_chunks(CHUNK_ROWS))
+            .fold(
+                || (vec![0.0; p * p], vec![[0.0f64; LDA_TILE]; p]),
+                |(mut local_gram, mut x_t), (x_chunk, y_chunk)| {
+                    accumulate_centered_gram_chunk(
+                        x_chunk,
+                        y_chunk,
+                        means_data,
+                        p,
+                        &mut x_t,
+                        &mut local_gram,
+                    );
+                    (local_gram, x_t)
+                },
+            )
+            .map(|(local_gram, _)| local_gram)
+            .reduce(
+                || vec![0.0; p * p],
+                |mut a, b| {
+                    for i in 0..a.len() {
+                        a[i] += b[i];
+                    }
+                    a
+                },
+            )
+    } else {
+        let mut gram = vec![0.0; p * p];
+        let mut x_t = vec![[0.0f64; LDA_TILE]; p];
+        accumulate_centered_gram_chunk(&x.data, y_idx, means_data, p, &mut x_t, &mut gram);
+        gram
+    };
+
+    let mut gram_mat = Matrix::from_vec(p, p, gram_data)?;
+    for r in 0..p {
+        for c in (r + 1)..p {
+            let v = gram_mat.data[r * p + c];
+            gram_mat.data[c * p + r] = v;
+        }
+    }
+    Ok(gram_mat)
 }
 
 fn validate_matrix_finite(x: &Matrix) -> OchreResult<()> {
@@ -682,36 +978,37 @@ impl LinearDiscriminantAnalysis {
         n_features: usize,
         n_classes: usize,
     ) -> OchreResult<(Matrix, Option<Matrix>, Option<Vec<f64>>)> {
-        let mut xc_data = vec![0.0; n_samples * n_features];
-        let mut col_sq = vec![0.0; n_features];
-        for (i, &cls) in y_idx.iter().enumerate() {
-            let x_row = &x.data[(i * n_features)..((i + 1) * n_features)];
-            let m_row = &means.data[(cls * n_features)..((cls + 1) * n_features)];
-            let out_row = &mut xc_data[(i * n_features)..((i + 1) * n_features)];
-            for j in 0..n_features {
-                let d = x_row[j] - m_row[j];
-                out_row[j] = d;
-                col_sq[j] += d * d;
+        let mut gram = if matches!(backend, Backend::Cpu) {
+            compute_centered_gram_cpu(x, y_idx, means)?
+        } else {
+            let mut xc_data = vec![0.0; n_samples * n_features];
+            for (i, &cls) in y_idx.iter().enumerate() {
+                let x_row = &x.data[(i * n_features)..((i + 1) * n_features)];
+                let m_row = &means.data[(cls * n_features)..((cls + 1) * n_features)];
+                let out_row = &mut xc_data[(i * n_features)..((i + 1) * n_features)];
+                for j in 0..n_features {
+                    out_row[j] = x_row[j] - m_row[j];
+                }
             }
-        }
+            let xc = Matrix::from_vec(n_samples, n_features, xc_data)?;
+            let dummy_y = vec![0.0; n_samples];
+            let (gram_gpu, _) = backend.compute_normal_equation(&xc, &dummy_y, false)?;
+            gram_gpu
+        };
 
         let inv_n = 1.0 / (n_samples as f64);
-        let stds: Vec<f64> = col_sq
-            .iter()
-            .map(|&s| {
-                let v = (s * inv_n).sqrt();
-                if v == 0.0 { 1.0 } else { v }
-            })
-            .collect();
-
-        let xc = Matrix::from_vec(n_samples, n_features, xc_data)?;
-        let dummy_y = vec![0.0; n_samples];
-        let (mut gram, _) = backend.compute_normal_equation(&xc, &dummy_y, false)?;
-
-        let fac = 1.0 / (n_samples as f64);
+        let mut inv_stds = Vec::with_capacity(n_features);
         for r in 0..n_features {
-            for c in 0..n_features {
-                gram.data[r * n_features + c] *= fac / (stds[r] * stds[c]);
+            let v = (gram.data[r * n_features + r] * inv_n).max(0.0).sqrt();
+            let std_r = if v == 0.0 { 1.0 } else { v };
+            inv_stds.push(1.0 / std_r);
+        }
+
+        for (r, &inv_std_r) in inv_stds.iter().enumerate().take(n_features) {
+            let row_scale = inv_n * inv_std_r;
+            let row = &mut gram.data[r * n_features..(r + 1) * n_features];
+            for (dst, &inv_std_c) in row.iter_mut().zip(inv_stds.iter()) {
+                *dst *= row_scale * inv_std_c;
             }
         }
 
@@ -732,16 +1029,18 @@ impl LinearDiscriminantAnalysis {
         // scalings_w has shape (n_features, rank)
         let mut scalings_w_data = vec![0.0; n_features * rank];
         for r in 0..n_features {
+            let inv_std_r = inv_stds[r];
             for k in 0..rank {
                 scalings_w_data[r * rank + k] =
-                    eig_w.eigenvectors.data[r * n_features + k] / (stds[r] * s_vals[k]);
+                    (eig_w.eigenvectors.data[r * n_features + k] * inv_std_r) / s_vals[k];
             }
         }
         let scalings_w = Matrix::from_vec(n_features, rank, scalings_w_data)?;
 
-        // Project weighted centered class means onto whitened space:
+        // Project centered class means onto whitened space once and reuse for coef_full:
         // X_b = diag(sqrt(n_samples * priors)) * means_centered * scalings_w  (n_classes x rank)
-        let mut xb_raw = backend.matmul(means_centered, &scalings_w)?;
+        let proj = backend.matmul(means_centered, &scalings_w)?;
+        let mut xb_raw = proj.clone();
         for (k, &pk) in priors.iter().enumerate() {
             let w = (n_samples as f64 * pk).sqrt();
             for j in 0..rank {
@@ -775,7 +1074,6 @@ impl LinearDiscriminantAnalysis {
             .collect();
 
         // coef_full = means_centered * scalings_w * scalings_w^T (n_classes x n_features)
-        let proj = backend.matmul(means_centered, &scalings_w)?;
         let scalings_w_t = scalings_w.transpose();
         let coef_full = backend.matmul(&proj, &scalings_w_t)?;
 
@@ -1432,28 +1730,29 @@ impl QuadraticDiscriminantAnalysis {
         let backend = effective_backend(&self.device, n_samples * p);
 
         if matches!(backend, Backend::Cpu) {
-            // Precompute per-class transposed rotations, projected means, inv_s2, and constants
+            // Precompute per-class pre-scaled transposed rotations (rot_t[c, j] *= inv_s[c]),
+            // pre-scaled projected means (pm[c] *= inv_s[c]), and class constants.
             let mut rot_ts = Vec::with_capacity(n_classes);
             let mut proj_means = Vec::with_capacity(n_classes);
-            let mut inv_s2s = Vec::with_capacity(n_classes);
             let mut class_consts = Vec::with_capacity(n_classes);
 
             for k in 0..n_classes {
                 let m_row = &means.data[(k * p)..((k + 1) * p)];
                 let rot = &rotations[k];
-                let mut rot_t = vec![0.0; p * p];
-                for c in 0..p {
-                    for r in 0..p {
-                        rot_t[c * p + r] = rot.data[r * p + c];
-                    }
-                }
-                let mut pm = Vec::with_capacity(p);
-                for c in 0..p {
-                    pm.push(dot4(m_row, &rot_t[c * p..(c + 1) * p]));
-                }
                 let s2 = &scalings[k];
-                let inv_s2: Vec<f64> = s2.iter().map(|&v| 1.0 / v).collect();
-                let logdet: f64 = s2.iter().map(|&v| v.ln()).sum();
+                let mut rot_t = vec![0.0; p * p];
+                let mut pm = Vec::with_capacity(p);
+                let mut logdet = 0.0;
+                for c in 0..p {
+                    let s2c = s2[c];
+                    logdet += s2c.ln();
+                    let inv_s = if s2c > 0.0 { 1.0 / s2c.sqrt() } else { 0.0 };
+                    let dst = &mut rot_t[c * p..(c + 1) * p];
+                    for (r, dst_val) in dst.iter_mut().enumerate().take(p) {
+                        *dst_val = rot.data[r * p + c] * inv_s;
+                    }
+                    pm.push(dot4(m_row, dst));
+                }
                 let log_prior = if priors[k] > 0.0 {
                     priors[k].ln()
                 } else {
@@ -1461,36 +1760,72 @@ impl QuadraticDiscriminantAnalysis {
                 };
                 rot_ts.push(rot_t);
                 proj_means.push(pm);
-                inv_s2s.push(inv_s2);
                 class_consts.push(-0.5 * logdet + log_prior);
             }
 
             let mut scores = vec![0.0; n_samples * n_classes];
             let x_data = &x.data;
-            let compute_row = |(r, dst): (usize, &mut [f64])| {
-                let x_row = &x_data[(r * p)..((r + 1) * p)];
-                for k in 0..n_classes {
-                    let rot_t = &rot_ts[k];
-                    let pm = &proj_means[k];
-                    let inv_s2 = &inv_s2s[k];
-                    let mut norm2 = 0.0;
-                    for c in 0..p {
-                        let proj_c = dot4(x_row, &rot_t[c * p..(c + 1) * p]) - pm[c];
-                        norm2 += proj_c * proj_c * inv_s2[c];
+            let compute_chunk = |(chunk_idx, out_chunk): (usize, &mut [f64])| {
+                let start_r = chunk_idx * QDA_CHUNK_ROWS;
+                let chunk_rows = out_chunk.len() / n_classes;
+                let x_chunk = &x_data[start_r * p..(start_r + chunk_rows) * p];
+                let mut r = 0usize;
+                while r + 4 <= chunk_rows {
+                    let x0 = &x_chunk[r * p..(r + 1) * p];
+                    let x1 = &x_chunk[(r + 1) * p..(r + 2) * p];
+                    let x2 = &x_chunk[(r + 2) * p..(r + 3) * p];
+                    let x3 = &x_chunk[(r + 3) * p..(r + 4) * p];
+                    for k in 0..n_classes {
+                        let rot_t = &rot_ts[k];
+                        let pm = &proj_means[k];
+                        let mut n0 = 0.0;
+                        let mut n1 = 0.0;
+                        let mut n2 = 0.0;
+                        let mut n3 = 0.0;
+                        for c in 0..p {
+                            let rt_row = &rot_t[c * p..(c + 1) * p];
+                            let (d0, d1, d2, d3) = dot4_4rows(x0, x1, x2, x3, rt_row);
+                            let pm_c = pm[c];
+                            let p0 = d0 - pm_c;
+                            let p1 = d1 - pm_c;
+                            let p2 = d2 - pm_c;
+                            let p3 = d3 - pm_c;
+                            n0 += p0 * p0;
+                            n1 += p1 * p1;
+                            n2 += p2 * p2;
+                            n3 += p3 * p3;
+                        }
+                        let cc = class_consts[k];
+                        out_chunk[r * n_classes + k] = cc - 0.5 * n0;
+                        out_chunk[(r + 1) * n_classes + k] = cc - 0.5 * n1;
+                        out_chunk[(r + 2) * n_classes + k] = cc - 0.5 * n2;
+                        out_chunk[(r + 3) * n_classes + k] = cc - 0.5 * n3;
                     }
-                    dst[k] = class_consts[k] - 0.5 * norm2;
+                    r += 4;
+                }
+                while r < chunk_rows {
+                    let x_row = &x_chunk[r * p..(r + 1) * p];
+                    let dst = &mut out_chunk[r * n_classes..(r + 1) * n_classes];
+                    for k in 0..n_classes {
+                        let rot_t = &rot_ts[k];
+                        let pm = &proj_means[k];
+                        let mut norm2 = 0.0;
+                        for c in 0..p {
+                            let proj_c = dot4(x_row, &rot_t[c * p..(c + 1) * p]) - pm[c];
+                            norm2 += proj_c * proj_c;
+                        }
+                        dst[k] = class_consts[k] - 0.5 * norm2;
+                    }
+                    r += 1;
                 }
             };
             if n_samples >= PARALLEL_ROW_THRESHOLD {
                 scores
-                    .par_chunks_exact_mut(n_classes)
+                    .par_chunks_mut(QDA_CHUNK_ROWS * n_classes)
                     .enumerate()
-                    .for_each(compute_row);
+                    .for_each(compute_chunk);
             } else {
-                scores
-                    .chunks_exact_mut(n_classes)
-                    .enumerate()
-                    .for_each(compute_row);
+                compute_chunk((0, &mut scores));
             }
             return Matrix::from_vec(n_samples, n_classes, scores);
         }
@@ -2163,5 +2498,50 @@ mod tests {
         let bytes = qda.to_bytes();
         let loaded = QuadraticDiscriminantAnalysis::from_bytes(&bytes, Some("cpu")).unwrap();
         assert_eq!(loaded.predict(&x).unwrap(), y);
+    }
+
+    #[test]
+    fn test_lda_qda_large_parallel_parity() {
+        // Exercise parallel threshold (>= 512) and fused solve_svd / blocked QDA predict with non-multiple-of-4 cols
+        let n = 650;
+        let p = 13;
+        let mut x_data = vec![0.0; n * p];
+        let mut y = vec![0.0; n];
+        for i in 0..n {
+            let cls = i % 3;
+            y[i] = cls as f64;
+            let shift = (cls as f64) * 4.0;
+            for j in 0..p {
+                x_data[i * p + j] = shift + (((i * 7 + j * 13) % 29) as f64) * 0.05;
+            }
+        }
+        let x = Matrix::from_vec(n, p, x_data).unwrap();
+
+        let mut lda = LinearDiscriminantAnalysis::new(
+            "svd".to_string(),
+            None,
+            false,
+            None,
+            None,
+            1e-4,
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        lda.fit(&x, &y).unwrap();
+        assert!(lda.score(&x, &y).unwrap() > 0.99);
+        let x_t = lda.transform(&x).unwrap();
+        assert_eq!(x_t.rows, n);
+        assert_eq!(x_t.cols, 2);
+
+        let mut qda =
+            QuadraticDiscriminantAnalysis::new(None, 0.05, 1e-4, false, Some("cpu".to_string()))
+                .unwrap();
+        qda.fit(&x, &y).unwrap();
+        assert!(qda.score(&x, &y).unwrap() > 0.99);
+        let probs = qda.predict_proba(&x).unwrap();
+        for r in 0..n {
+            let s = probs[(r, 0)] + probs[(r, 1)] + probs[(r, 2)];
+            assert!((s - 1.0).abs() < 1e-10);
+        }
     }
 }

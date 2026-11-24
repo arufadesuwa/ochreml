@@ -23,7 +23,9 @@ use rayon::prelude::*;
 pub const TAG_PCA: u8 = 43;
 pub const TAG_TRUNCATED_SVD: u8 = 44;
 
-const PARALLEL_ROW_THRESHOLD: usize = 4096;
+const PARALLEL_ROW_THRESHOLD: usize = 512;
+const TRANSFORM_GPU_THRESHOLD: usize = 2_000_000;
+const PROJECT_CHUNK_ROWS: usize = 64;
 
 #[inline]
 fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
@@ -32,6 +34,236 @@ fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
     } else {
         get_backend(dev)
     }
+}
+
+#[inline]
+fn effective_transform_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
+    if elems < TRANSFORM_GPU_THRESHOLD {
+        Backend::Cpu
+    } else {
+        get_backend(dev)
+    }
+}
+
+#[inline(always)]
+fn dot4_4rows(a0: &[f64], a1: &[f64], a2: &[f64], a3: &[f64], b: &[f64]) -> (f64, f64, f64, f64) {
+    let mut s0 = [0.0f64; 4];
+    let mut s1 = [0.0f64; 4];
+    let mut s2 = [0.0f64; 4];
+    let mut s3 = [0.0f64; 4];
+    let (b_chunks, b_rem) = b.as_chunks::<4>();
+    let (a0_chunks, a0_rem) = a0.as_chunks::<4>();
+    let (a1_chunks, a1_rem) = a1.as_chunks::<4>();
+    let (a2_chunks, a2_rem) = a2.as_chunks::<4>();
+    let (a3_chunks, a3_rem) = a3.as_chunks::<4>();
+    for ((((&bc, &c0), &c1), &c2), &c3) in b_chunks
+        .iter()
+        .zip(a0_chunks.iter())
+        .zip(a1_chunks.iter())
+        .zip(a2_chunks.iter())
+        .zip(a3_chunks.iter())
+    {
+        for l in 0..4 {
+            let bv = bc[l];
+            s0[l] += c0[l] * bv;
+            s1[l] += c1[l] * bv;
+            s2[l] += c2[l] * bv;
+            s3[l] += c3[l] * bv;
+        }
+    }
+    let mut r0 = (s0[0] + s0[1]) + (s0[2] + s0[3]);
+    let mut r1 = (s1[0] + s1[1]) + (s1[2] + s1[3]);
+    let mut r2 = (s2[0] + s2[1]) + (s2[2] + s2[3]);
+    let mut r3 = (s3[0] + s3[1]) + (s3[2] + s3[3]);
+    for j in 0..b_rem.len() {
+        let bv = b_rem[j];
+        r0 += a0_rem[j] * bv;
+        r1 += a1_rem[j] * bv;
+        r2 += a2_rem[j] * bv;
+        r3 += a3_rem[j] * bv;
+    }
+    (r0, r1, r2, r3)
+}
+
+/// Pack groups of 4 component rows `(k x p)` into contiguous `(p x 4)` strips for SIMD FMA.
+fn pack_components_4(comp_data: &[f64], k: usize, p: usize) -> Vec<f64> {
+    let n_blocks = k / 4;
+    let mut packed = vec![0.0; n_blocks * p * 4];
+    for blk in 0..n_blocks {
+        let c_base = blk * 4;
+        let c0 = &comp_data[c_base * p..(c_base + 1) * p];
+        let c1 = &comp_data[(c_base + 1) * p..(c_base + 2) * p];
+        let c2 = &comp_data[(c_base + 2) * p..(c_base + 3) * p];
+        let c3 = &comp_data[(c_base + 3) * p..(c_base + 4) * p];
+        let dst = &mut packed[blk * p * 4..(blk + 1) * p * 4];
+        for f in 0..p {
+            let off = f * 4;
+            dst[off] = c0[f];
+            dst[off + 1] = c1[f];
+            dst[off + 2] = c2[f];
+            dst[off + 3] = c3[f];
+        }
+    }
+    packed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_4x4_chunk(
+    x_chunk: &[f64],
+    n_rows: usize,
+    p: usize,
+    comp_packed: &[f64],
+    comp_data: &[f64],
+    k: usize,
+    offset: Option<&[f64]>,
+    scales: Option<&[f64]>,
+    out_chunk: &mut [f64],
+) {
+    let n_blocks = k / 4;
+    let k_rem_start = n_blocks * 4;
+    let mut r = 0usize;
+
+    while r + 4 <= n_rows {
+        let x0 = &x_chunk[r * p..(r + 1) * p];
+        let x1 = &x_chunk[(r + 1) * p..(r + 2) * p];
+        let x2 = &x_chunk[(r + 2) * p..(r + 3) * p];
+        let x3 = &x_chunk[(r + 3) * p..(r + 4) * p];
+        let o0_off = r * k;
+        let o1_off = (r + 1) * k;
+        let o2_off = (r + 2) * k;
+        let o3_off = (r + 3) * k;
+
+        for blk in 0..n_blocks {
+            let c = blk * 4;
+            let c_blk = &comp_packed[blk * p * 4..(blk + 1) * p * 4];
+            let mut acc0 = [0.0f64; 4];
+            let mut acc1 = [0.0f64; 4];
+            let mut acc2 = [0.0f64; 4];
+            let mut acc3 = [0.0f64; 4];
+            for (f, cv) in c_blk.as_chunks::<4>().0.iter().enumerate() {
+                let xv0 = x0[f];
+                let xv1 = x1[f];
+                let xv2 = x2[f];
+                let xv3 = x3[f];
+                for lane in 0..4 {
+                    let cval = cv[lane];
+                    acc0[lane] += xv0 * cval;
+                    acc1[lane] += xv1 * cval;
+                    acc2[lane] += xv2 * cval;
+                    acc3[lane] += xv3 * cval;
+                }
+            }
+            if let Some(off) = offset {
+                let o = &off[c..c + 4];
+                for lane in 0..4 {
+                    acc0[lane] -= o[lane];
+                    acc1[lane] -= o[lane];
+                    acc2[lane] -= o[lane];
+                    acc3[lane] -= o[lane];
+                }
+            }
+            if let Some(sc) = scales {
+                let s = &sc[c..c + 4];
+                for lane in 0..4 {
+                    acc0[lane] *= s[lane];
+                    acc1[lane] *= s[lane];
+                    acc2[lane] *= s[lane];
+                    acc3[lane] *= s[lane];
+                }
+            }
+            out_chunk[o0_off + c..o0_off + c + 4].copy_from_slice(&acc0);
+            out_chunk[o1_off + c..o1_off + c + 4].copy_from_slice(&acc1);
+            out_chunk[o2_off + c..o2_off + c + 4].copy_from_slice(&acc2);
+            out_chunk[o3_off + c..o3_off + c + 4].copy_from_slice(&acc3);
+        }
+
+        for j in k_rem_start..k {
+            let comp_row = &comp_data[j * p..(j + 1) * p];
+            let (mut d0, mut d1, mut d2, mut d3) = dot4_4rows(x0, x1, x2, x3, comp_row);
+            if let Some(off) = offset {
+                let o = off[j];
+                d0 -= o;
+                d1 -= o;
+                d2 -= o;
+                d3 -= o;
+            }
+            if let Some(sc) = scales {
+                let s = sc[j];
+                d0 *= s;
+                d1 *= s;
+                d2 *= s;
+                d3 *= s;
+            }
+            out_chunk[o0_off + j] = d0;
+            out_chunk[o1_off + j] = d1;
+            out_chunk[o2_off + j] = d2;
+            out_chunk[o3_off + j] = d3;
+        }
+        r += 4;
+    }
+
+    while r < n_rows {
+        let x_row = &x_chunk[r * p..(r + 1) * p];
+        let dst = &mut out_chunk[r * k..(r + 1) * k];
+        for j in 0..k {
+            let mut val = dot_unrolled(x_row, &comp_data[j * p..(j + 1) * p]);
+            if let Some(off) = offset {
+                val -= off[j];
+            }
+            if let Some(sc) = scales {
+                val *= sc[j];
+            }
+            dst[j] = val;
+        }
+        r += 1;
+    }
+}
+
+fn project_cpu_matrix(
+    x: &Matrix,
+    components: &Matrix,
+    offset: Option<&[f64]>,
+    scales: Option<&[f64]>,
+) -> OchreResult<Matrix> {
+    let n = x.rows;
+    let p = x.cols;
+    let k = components.rows;
+    let comp_data = &components.data;
+    let comp_packed = pack_components_4(comp_data, k, p);
+    let mut out_data = vec![0.0; n * k];
+
+    if n >= PARALLEL_ROW_THRESHOLD {
+        out_data
+            .par_chunks_mut(PROJECT_CHUNK_ROWS * k)
+            .zip(x.data.par_chunks(PROJECT_CHUNK_ROWS * p))
+            .for_each(|(out_chunk, x_chunk)| {
+                let n_rows = out_chunk.len() / k;
+                project_4x4_chunk(
+                    x_chunk,
+                    n_rows,
+                    p,
+                    &comp_packed,
+                    comp_data,
+                    k,
+                    offset,
+                    scales,
+                    out_chunk,
+                );
+            });
+    } else {
+        project_4x4_chunk(
+            &x.data,
+            n,
+            p,
+            &comp_packed,
+            comp_data,
+            k,
+            offset,
+            scales,
+            &mut out_data,
+        );
+    }
+    Matrix::from_vec(n, k, out_data)
 }
 
 // Deterministic SplitMix64 PRNG with Box-Muller Gaussian sampling for randomized SVD
@@ -282,7 +514,7 @@ impl PCA {
         }
 
         let backend = effective_backend(&self.device, n * p);
-        let (singular_values_all, v_right, mean) = if n >= p || n > 4096 {
+        let (mut singular_values_all, v_right, mean) = if n >= p || n > 4096 {
             backend.gram_svd(x, true)?
         } else {
             let stats = backend.col_reduce_stats(x, None)?;
@@ -294,13 +526,13 @@ impl PCA {
         };
 
         let dof = if n > 1 { (n - 1) as f64 } else { 1.0 };
-        let exp_var_all: Vec<f64> = singular_values_all
+        let mut exp_var_all: Vec<f64> = singular_values_all
             .iter()
             .take(max_components)
             .map(|&s| (s * s) / dof)
             .collect();
         let total_var: f64 = exp_var_all.iter().sum();
-        let exp_var_ratio_all: Vec<f64> = exp_var_all
+        let mut exp_var_ratio_all: Vec<f64> = exp_var_all
             .iter()
             .map(|&v| if total_var > 0.0 { v / total_var } else { 0.0 })
             .collect();
@@ -331,10 +563,13 @@ impl PCA {
 
         let components = extract_components_from_v_cols(&v_right, k)?;
 
+        exp_var_all.truncate(k);
+        exp_var_ratio_all.truncate(k);
+        singular_values_all.truncate(k);
         self.components_ = Some(components);
-        self.explained_variance_ = Some(exp_var_all[..k].to_vec());
-        self.explained_variance_ratio_ = Some(exp_var_ratio_all[..k].to_vec());
-        self.singular_values_ = Some(singular_values_all[..k].to_vec());
+        self.explained_variance_ = Some(exp_var_all);
+        self.explained_variance_ratio_ = Some(exp_var_ratio_all);
+        self.singular_values_ = Some(singular_values_all);
         self.mean_ = Some(mean);
         self.n_components_ = Some(k);
         self.n_features_in_ = Some(p);
@@ -383,53 +618,9 @@ impl PCA {
             None
         };
 
-        let backend = effective_backend(&self.device, n * p);
+        let backend = effective_transform_backend(&self.device, n * p);
         if matches!(backend, Backend::Cpu) {
-            let mut out_data = vec![0.0; n * k];
-            let x_data = &x.data;
-            let comp_data = &components.data;
-
-            if let Some(ref scales) = inv_stds {
-                let compute_row = |(r, dst): (usize, &mut [f64])| {
-                    let x_row = &x_data[r * p..(r + 1) * p];
-                    for j in 0..k {
-                        let comp_row = &comp_data[j * p..(j + 1) * p];
-                        dst[j] = (dot_unrolled(x_row, comp_row) - proj_mean[j]) * scales[j];
-                    }
-                };
-                if n >= PARALLEL_ROW_THRESHOLD {
-                    out_data
-                        .par_chunks_exact_mut(k)
-                        .enumerate()
-                        .for_each(compute_row);
-                } else {
-                    out_data
-                        .chunks_exact_mut(k)
-                        .enumerate()
-                        .for_each(compute_row);
-                }
-            } else {
-                let compute_row = |(r, dst): (usize, &mut [f64])| {
-                    let x_row = &x_data[r * p..(r + 1) * p];
-                    for j in 0..k {
-                        let comp_row = &comp_data[j * p..(j + 1) * p];
-                        dst[j] = dot_unrolled(x_row, comp_row) - proj_mean[j];
-                    }
-                };
-                if n >= PARALLEL_ROW_THRESHOLD {
-                    out_data
-                        .par_chunks_exact_mut(k)
-                        .enumerate()
-                        .for_each(compute_row);
-                } else {
-                    out_data
-                        .chunks_exact_mut(k)
-                        .enumerate()
-                        .for_each(compute_row);
-                }
-            }
-
-            return Matrix::from_vec(n, k, out_data);
+            return project_cpu_matrix(x, components, Some(&proj_mean), inv_stds.as_deref());
         }
 
         // Large GPU path: compute X @ components^T directly and subtract proj_mean in-place
@@ -902,13 +1093,15 @@ impl TruncatedSVD {
         let (singular_values, components) =
             if self.algorithm == "arpack" || self.algorithm == "exact" || p <= 512 {
                 if n >= p || p <= 512 {
-                    let (s_vals, v_cols, _) = backend.gram_svd(x, false)?;
+                    let (mut s_vals, v_cols, _) = backend.gram_svd(x, false)?;
                     let comps = extract_components_from_v_cols(&v_cols, k)?;
-                    (s_vals[..k].to_vec(), comps)
+                    s_vals.truncate(k);
+                    (s_vals, comps)
                 } else if n <= 4096 {
-                    let (s_vals, v_cols) = dual_gram_svd(&backend, x, k)?;
+                    let (mut s_vals, v_cols) = dual_gram_svd(&backend, x, k)?;
                     let comps = extract_components_from_v_cols(&v_cols, k)?;
-                    (s_vals[..k].to_vec(), comps)
+                    s_vals.truncate(k);
+                    (s_vals, comps)
                 } else {
                     self.randomized_svd(&backend, x, k)?
                 }
@@ -917,12 +1110,88 @@ impl TruncatedSVD {
             };
 
         // Explained variance (ddof=0) matching sklearn.decomposition.TruncatedSVD
-        let comp_t = components.transpose();
-        let x_transformed = backend.matmul(x, &comp_t)?;
-        let trans_stats = backend.col_reduce_stats(&x_transformed, None)?;
         let full_stats = backend.col_reduce_stats(x, None)?;
         let total_var: f64 = full_stats.var.iter().sum();
-        let exp_var = trans_stats.var;
+        let exp_var = if matches!(
+            effective_transform_backend(&self.device, n * p),
+            Backend::Cpu
+        ) {
+            let comp_data = &components.data;
+            let comp_packed = pack_components_4(comp_data, k, p);
+            let mut anchor_t = vec![0.0; k];
+            let first_row = &x.data[..p];
+            for j in 0..k {
+                anchor_t[j] = dot_unrolled(first_row, &comp_data[j * p..(j + 1) * p]);
+            }
+            let accumulate_chunk =
+                |x_chunk: &[f64], buf: &mut Vec<f64>, sum_t: &mut [f64], sum_sq_t: &mut [f64]| {
+                    let m = x_chunk.len() / p;
+                    buf.resize(m * k, 0.0);
+                    project_4x4_chunk(
+                        x_chunk,
+                        m,
+                        p,
+                        &comp_packed,
+                        comp_data,
+                        k,
+                        Some(&anchor_t),
+                        None,
+                        buf,
+                    );
+                    for row in buf.chunks_exact(k) {
+                        for j in 0..k {
+                            let d = row[j];
+                            sum_t[j] += d;
+                            sum_sq_t[j] += d * d;
+                        }
+                    }
+                };
+            let (sum_t, sum_sq_t) = if n >= PARALLEL_ROW_THRESHOLD {
+                x.data
+                    .par_chunks(PROJECT_CHUNK_ROWS * p)
+                    .fold(
+                        || {
+                            (
+                                Vec::with_capacity(PROJECT_CHUNK_ROWS * k),
+                                vec![0.0; k],
+                                vec![0.0; k],
+                            )
+                        },
+                        |(mut buf, mut st, mut ssq), x_chunk| {
+                            accumulate_chunk(x_chunk, &mut buf, &mut st, &mut ssq);
+                            (buf, st, ssq)
+                        },
+                    )
+                    .map(|(_, st, ssq)| (st, ssq))
+                    .reduce(
+                        || (vec![0.0; k], vec![0.0; k]),
+                        |(mut a_s, mut a_sq), (b_s, b_sq)| {
+                            for j in 0..k {
+                                a_s[j] += b_s[j];
+                                a_sq[j] += b_sq[j];
+                            }
+                            (a_s, a_sq)
+                        },
+                    )
+            } else {
+                let mut buf = Vec::with_capacity(n * k);
+                let mut st = vec![0.0; k];
+                let mut ssq = vec![0.0; k];
+                accumulate_chunk(&x.data, &mut buf, &mut st, &mut ssq);
+                (st, ssq)
+            };
+            let inv_n = 1.0 / (n as f64);
+            (0..k)
+                .map(|j| {
+                    let mean_t = sum_t[j] * inv_n;
+                    (sum_sq_t[j] * inv_n - mean_t * mean_t).max(0.0)
+                })
+                .collect()
+        } else {
+            let comp_t = components.transpose();
+            let x_transformed = backend.matmul(x, &comp_t)?;
+            backend.col_reduce_stats(&x_transformed, None)?.var
+        };
         let exp_var_ratio: Vec<f64> = exp_var
             .iter()
             .map(|&v| if total_var > 0.0 { v / total_var } else { 0.0 })
@@ -947,36 +1216,9 @@ impl TruncatedSVD {
             });
         }
         let components = self.components_.as_ref().ok_or(OchreError::NotFitted)?;
-        let backend = effective_backend(&self.device, x.rows * expected);
+        let backend = effective_transform_backend(&self.device, x.rows * expected);
         if matches!(backend, Backend::Cpu) {
-            let n = x.rows;
-            let p = expected;
-            let k = components.rows;
-            let mut out_data = vec![0.0; n * k];
-            let x_data = &x.data;
-            let comp_data = &components.data;
-            let compute_chunk = |(chunk_idx, out_chunk): (usize, &mut [f64])| {
-                let start_r = chunk_idx * 512;
-                let n_chunk = out_chunk.len() / k;
-                for i in 0..n_chunk {
-                    let r = start_r + i;
-                    let x_row = &x_data[r * p..(r + 1) * p];
-                    let dst = &mut out_chunk[i * k..(i + 1) * k];
-                    for j in 0..k {
-                        let comp_row = &comp_data[j * p..(j + 1) * p];
-                        dst[j] = dot_unrolled(x_row, comp_row);
-                    }
-                }
-            };
-            if n >= 2048 {
-                out_data
-                    .par_chunks_mut(512 * k)
-                    .enumerate()
-                    .for_each(compute_chunk);
-            } else {
-                compute_chunk((0, &mut out_data));
-            }
-            return Matrix::from_vec(n, k, out_data);
+            return project_cpu_matrix(x, components, None, None);
         }
         let comp_t = components.transpose();
         backend.matmul(x, &comp_t)
@@ -1152,4 +1394,75 @@ pub fn register_py_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPCA>()?;
     m.add_class::<PyTruncatedSVD>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pca_and_truncated_svd_parallel_4x4_parity() {
+        let n = 651;
+        let p = 13;
+        let k = 6; // tests 1 full 4-component block + 2 remainder components, and 4-row blocks + 3 tail rows
+        let mut data = vec![0.0; n * p];
+        for i in 0..n {
+            for j in 0..p {
+                data[i * p + j] = ((i * 11 + j * 17) % 53) as f64 * 0.1 + (j as f64) * 0.5;
+            }
+        }
+        let x = Matrix::from_vec(n, p, data).unwrap();
+
+        for whiten in [false, true] {
+            let mut pca = PCA::new(Some(k), None, whiten, Some("cpu".to_string())).unwrap();
+            let z = pca.fit_transform(&x).unwrap();
+            assert_eq!(z.rows, n);
+            assert_eq!(z.cols, k);
+            let comps = pca.components_.as_ref().unwrap();
+            let mean = pca.mean_.as_ref().unwrap();
+            let exp_var = pca.explained_variance_.as_ref().unwrap();
+            for r in [0, 3, 4, 511, 512, 650] {
+                for c in 0..k {
+                    let mut ref_val = 0.0;
+                    for j in 0..p {
+                        ref_val += (x[(r, j)] - mean[j]) * comps[(c, j)];
+                    }
+                    if whiten {
+                        ref_val /= exp_var[c].sqrt();
+                    }
+                    assert!(
+                        (z[(r, c)] - ref_val).abs() < 1e-10,
+                        "PCA mismatch at ({r}, {c}): {} vs {ref_val}",
+                        z[(r, c)]
+                    );
+                }
+            }
+        }
+
+        let mut svd = TruncatedSVD::new(
+            k,
+            5,
+            Some(42),
+            "randomized".to_string(),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        let z_svd = svd.fit_transform(&x).unwrap();
+        assert_eq!(z_svd.rows, n);
+        assert_eq!(z_svd.cols, k);
+        let comps = svd.components_.as_ref().unwrap();
+        for r in [0, 3, 4, 511, 512, 650] {
+            for c in 0..k {
+                let mut ref_val = 0.0;
+                for j in 0..p {
+                    ref_val += x[(r, j)] * comps[(c, j)];
+                }
+                assert!(
+                    (z_svd[(r, c)] - ref_val).abs() < 1e-10,
+                    "SVD mismatch at ({r}, {c}): {} vs {ref_val}",
+                    z_svd[(r, c)]
+                );
+            }
+        }
+    }
 }
