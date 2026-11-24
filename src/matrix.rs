@@ -182,15 +182,25 @@ impl Matrix {
                 len: vec.len(),
             });
         }
-
-        let mut res = vec![0.0; self.rows];
-        for r in 0..self.rows {
-            let mut sum = 0.0;
-            for c in 0..self.cols {
-                sum += self[(r, c)] * vec[c];
-            }
-            res[r] = sum;
+        if self.rows == 0 {
+            return Ok(Vec::new());
         }
+        if self.cols == 0 {
+            return Ok(vec![0.0; self.rows]);
+        }
+
+        let cols = self.cols;
+        let res = if self.rows >= 128 && self.rows.saturating_mul(cols) >= 16_384 {
+            self.data
+                .par_chunks(cols)
+                .map(|row| dot_slice_unrolled(row, vec))
+                .collect()
+        } else {
+            self.data
+                .chunks_exact(cols)
+                .map(|row| dot_slice_unrolled(row, vec))
+                .collect()
+        };
         Ok(res)
     }
 
@@ -651,6 +661,611 @@ pub fn compute_normal_equation_multi_range(
     Ok((xt_x, xt_y))
 }
 
+#[inline(always)]
+pub(crate) fn dot_slice_unrolled(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    let a = &a[..n];
+    let b = &b[..n];
+    let chunks = n / 4;
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    let mut idx = 0;
+    for _ in 0..chunks {
+        s0 += a[idx] * b[idx];
+        s1 += a[idx + 1] * b[idx + 1];
+        s2 += a[idx + 2] * b[idx + 2];
+        s3 += a[idx + 3] * b[idx + 3];
+        idx += 4;
+    }
+    let mut sum = (s0 + s1) + (s2 + s3);
+    while idx < n {
+        sum += a[idx] * b[idx];
+        idx += 1;
+    }
+    sum
+}
+
+/// 4x4 register-blocked right-looking Cholesky factorization into preallocated `l` (`n x n`).
+/// Reads only the lower triangle (`j <= i`) of `a`, adds `lambda` to the diagonal, and writes
+/// lower-triangular `L` such that `L * L^T = A + lambda * I` (upper triangle of `l` is zeroed).
+pub(crate) fn cholesky_lower_with_diag_shift_into(
+    a: &Matrix,
+    lambda: f64,
+    diag_tol: f64,
+    l: &mut Matrix,
+    panel_buf: &mut Vec<f64>,
+) -> bool {
+    let n = a.rows;
+    if n == 0 {
+        return true;
+    }
+    debug_assert_eq!(a.cols, n);
+    debug_assert_eq!(l.rows, n);
+    debug_assert_eq!(l.cols, n);
+
+    if panel_buf.len() < 4 * n {
+        panel_buf.resize(4 * n, 0.0);
+    }
+
+    for i in 0..n {
+        let row_off = i * n;
+        let src_row = &a.data[row_off..row_off + n];
+        let dst_row = &mut l.data[row_off..row_off + n];
+        dst_row[..=i].copy_from_slice(&src_row[..=i]);
+        dst_row[i] += lambda;
+        dst_row[i + 1..].fill(0.0);
+    }
+
+    let mut k = 0;
+    while k + 4 <= n {
+        let k0 = k;
+        let k1 = k + 1;
+        let k2 = k + 2;
+        let k3 = k + 3;
+        let r0 = k0 * n;
+        let r1 = k1 * n;
+        let r2 = k2 * n;
+        let r3 = k3 * n;
+
+        let d0 = l.data[r0 + k0];
+        if !d0.is_finite() || d0 <= diag_tol {
+            return false;
+        }
+        let l00 = d0.sqrt();
+        let inv0 = 1.0 / l00;
+        l.data[r0 + k0] = l00;
+
+        let l10 = l.data[r1 + k0] * inv0;
+        let l20 = l.data[r2 + k0] * inv0;
+        let l30 = l.data[r3 + k0] * inv0;
+        l.data[r1 + k0] = l10;
+        l.data[r2 + k0] = l20;
+        l.data[r3 + k0] = l30;
+
+        let d1 = l.data[r1 + k1] - l10 * l10;
+        if !d1.is_finite() || d1 <= diag_tol {
+            return false;
+        }
+        let l11 = d1.sqrt();
+        let inv1 = 1.0 / l11;
+        l.data[r1 + k1] = l11;
+
+        let l21 = (l.data[r2 + k1] - l20 * l10) * inv1;
+        let l31 = (l.data[r3 + k1] - l30 * l10) * inv1;
+        l.data[r2 + k1] = l21;
+        l.data[r3 + k1] = l31;
+
+        let d2 = l.data[r2 + k2] - l20 * l20 - l21 * l21;
+        if !d2.is_finite() || d2 <= diag_tol {
+            return false;
+        }
+        let l22 = d2.sqrt();
+        let inv2 = 1.0 / l22;
+        l.data[r2 + k2] = l22;
+
+        let l32 = (l.data[r3 + k2] - l30 * l20 - l31 * l21) * inv2;
+        l.data[r3 + k2] = l32;
+
+        let d3 = l.data[r3 + k3] - l30 * l30 - l31 * l31 - l32 * l32;
+        if !d3.is_finite() || d3 <= diag_tol {
+            return false;
+        }
+        let l33 = d3.sqrt();
+        let inv3 = 1.0 / l33;
+        l.data[r3 + k3] = l33;
+
+        let rem_start = k + 4;
+        let rem = n - rem_start;
+        if rem > 0 {
+            let (p0, rest) = panel_buf[..4 * rem].split_at_mut(rem);
+            let (p1, rest) = rest.split_at_mut(rem);
+            let (p2, p3) = rest.split_at_mut(rem);
+
+            for idx in 0..rem {
+                let row_off = (rem_start + idx) * n + k;
+                let a0 = l.data[row_off];
+                let a1 = l.data[row_off + 1];
+                let a2 = l.data[row_off + 2];
+                let a3 = l.data[row_off + 3];
+
+                let x0 = a0 * inv0;
+                let x1 = (a1 - l10 * x0) * inv1;
+                let x2 = (a2 - l20 * x0 - l21 * x1) * inv2;
+                let x3 = (a3 - l30 * x0 - l31 * x1 - l32 * x2) * inv3;
+
+                l.data[row_off] = x0;
+                l.data[row_off + 1] = x1;
+                l.data[row_off + 2] = x2;
+                l.data[row_off + 3] = x3;
+
+                p0[idx] = x0;
+                p1[idx] = x1;
+                p2[idx] = x2;
+                p3[idx] = x3;
+            }
+
+            let trailing = &mut l.data[rem_start * n..];
+            let update_chunk = |(chunk_idx, rows_slice): (usize, &mut [f64])| {
+                let base_idx = chunk_idx * 4;
+                let n_rows_chunk = rows_slice.len() / n;
+                if n_rows_chunk == 4 {
+                    let (row0, rest) = rows_slice.split_at_mut(n);
+                    let (row1, rest) = rest.split_at_mut(n);
+                    let (row2, row3) = rest.split_at_mut(n);
+
+                    let x00 = p0[base_idx];
+                    let x01 = p1[base_idx];
+                    let x02 = p2[base_idx];
+                    let x03 = p3[base_idx];
+                    let x10 = p0[base_idx + 1];
+                    let x11 = p1[base_idx + 1];
+                    let x12 = p2[base_idx + 1];
+                    let x13 = p3[base_idx + 1];
+                    let x20 = p0[base_idx + 2];
+                    let x21 = p1[base_idx + 2];
+                    let x22 = p2[base_idx + 2];
+                    let x23 = p3[base_idx + 2];
+                    let x30 = p0[base_idx + 3];
+                    let x31 = p1[base_idx + 3];
+                    let x32 = p2[base_idx + 3];
+                    let x33 = p3[base_idx + 3];
+
+                    let r0_rect = &mut row0[rem_start..rem_start + base_idx];
+                    let r1_rect = &mut row1[rem_start..rem_start + base_idx];
+                    let r2_rect = &mut row2[rem_start..rem_start + base_idx];
+                    let r3_rect = &mut row3[rem_start..rem_start + base_idx];
+                    let p0_rect = &p0[..base_idx];
+                    let p1_rect = &p1[..base_idx];
+                    let p2_rect = &p2[..base_idx];
+                    let p3_rect = &p3[..base_idx];
+
+                    for j in 0..base_idx {
+                        let c0 = p0_rect[j];
+                        let c1 = p1_rect[j];
+                        let c2 = p2_rect[j];
+                        let c3 = p3_rect[j];
+                        r0_rect[j] -= x00 * c0 + x01 * c1 + x02 * c2 + x03 * c3;
+                        r1_rect[j] -= x10 * c0 + x11 * c1 + x12 * c2 + x13 * c3;
+                        r2_rect[j] -= x20 * c0 + x21 * c1 + x22 * c2 + x23 * c3;
+                        r3_rect[j] -= x30 * c0 + x31 * c1 + x32 * c2 + x33 * c3;
+                    }
+
+                    let d_off = rem_start + base_idx;
+                    row0[d_off] -= x00 * x00 + x01 * x01 + x02 * x02 + x03 * x03;
+                    row1[d_off] -= x10 * x00 + x11 * x01 + x12 * x02 + x13 * x03;
+                    row1[d_off + 1] -= x10 * x10 + x11 * x11 + x12 * x12 + x13 * x13;
+                    row2[d_off] -= x20 * x00 + x21 * x01 + x22 * x02 + x23 * x03;
+                    row2[d_off + 1] -= x20 * x10 + x21 * x11 + x22 * x12 + x23 * x13;
+                    row2[d_off + 2] -= x20 * x20 + x21 * x21 + x22 * x22 + x23 * x23;
+                    row3[d_off] -= x30 * x00 + x31 * x01 + x32 * x02 + x33 * x03;
+                    row3[d_off + 1] -= x30 * x10 + x31 * x11 + x32 * x12 + x33 * x13;
+                    row3[d_off + 2] -= x30 * x20 + x31 * x21 + x32 * x22 + x33 * x23;
+                    row3[d_off + 3] -= x30 * x30 + x31 * x31 + x32 * x32 + x33 * x33;
+                } else {
+                    for r_local in 0..n_rows_chunk {
+                        let idx = base_idx + r_local;
+                        let xr0 = p0[idx];
+                        let xr1 = p1[idx];
+                        let xr2 = p2[idx];
+                        let xr3 = p3[idx];
+                        let row = &mut rows_slice
+                            [r_local * n + rem_start..r_local * n + rem_start + idx + 1];
+                        for j in 0..=idx {
+                            row[j] -= xr0 * p0[j] + xr1 * p1[j] + xr2 * p2[j] + xr3 * p3[j];
+                        }
+                    }
+                }
+            };
+
+            if n >= 192 && rem >= 96 {
+                trailing
+                    .par_chunks_mut(4 * n)
+                    .enumerate()
+                    .for_each(update_chunk);
+            } else {
+                trailing
+                    .chunks_mut(4 * n)
+                    .enumerate()
+                    .for_each(update_chunk);
+            }
+        }
+        k += 4;
+    }
+
+    for i in k..n {
+        let r_i = i * n;
+        for j in k..=i {
+            let mut sum = 0.0;
+            for m in k..j {
+                sum += l.data[r_i + m] * l.data[j * n + m];
+            }
+            if i == j {
+                let diag = l.data[r_i + i] - sum;
+                if !diag.is_finite() || diag <= diag_tol {
+                    return false;
+                }
+                l.data[r_i + i] = diag.sqrt();
+            } else {
+                let ljj = l.data[j * n + j];
+                if !ljj.is_finite() || ljj.abs() <= diag_tol {
+                    return false;
+                }
+                l.data[r_i + j] = (l.data[r_i + j] - sum) / ljj;
+            }
+        }
+    }
+
+    true
+}
+
+/// 4-row register-blocked forward substitution: solve `L * z = b`.
+#[inline]
+pub(crate) fn solve_lower_triangular_4row_into(l: &Matrix, b: &[f64], z: &mut [f64]) {
+    let n = l.rows;
+    let mut i = 0;
+    while i + 4 <= n {
+        let l0 = &l.data[i * n..(i + 1) * n];
+        let l1 = &l.data[(i + 1) * n..(i + 2) * n];
+        let l2 = &l.data[(i + 2) * n..(i + 3) * n];
+        let l3 = &l.data[(i + 3) * n..(i + 4) * n];
+        let mut s0 = 0.0;
+        let mut s1 = 0.0;
+        let mut s2 = 0.0;
+        let mut s3 = 0.0;
+        let z_prefix = &z[..i];
+        let l0_p = &l0[..i];
+        let l1_p = &l1[..i];
+        let l2_p = &l2[..i];
+        let l3_p = &l3[..i];
+        for k in 0..i {
+            let zk = z_prefix[k];
+            s0 += l0_p[k] * zk;
+            s1 += l1_p[k] * zk;
+            s2 += l2_p[k] * zk;
+            s3 += l3_p[k] * zk;
+        }
+        let z0 = (b[i] - s0) / l0[i];
+        let z1 = (b[i + 1] - s1 - l1[i] * z0) / l1[i + 1];
+        let z2 = (b[i + 2] - s2 - l2[i] * z0 - l2[i + 1] * z1) / l2[i + 2];
+        let z3 = (b[i + 3] - s3 - l3[i] * z0 - l3[i + 1] * z1 - l3[i + 2] * z2) / l3[i + 3];
+        z[i] = z0;
+        z[i + 1] = z1;
+        z[i + 2] = z2;
+        z[i + 3] = z3;
+        i += 4;
+    }
+    while i < n {
+        let row_off = i * n;
+        let sum = dot_slice_unrolled(&l.data[row_off..row_off + i], &z[..i]);
+        z[i] = (b[i] - sum) / l.data[row_off + i];
+        i += 1;
+    }
+}
+
+/// 4-row register-blocked backward substitution: solve `L^T * x = z` (row-major scatter-subtract).
+#[inline]
+pub(crate) fn solve_upper_triangular_t_4row_into(l: &Matrix, z: &[f64], x: &mut [f64]) {
+    let n = l.rows;
+    x[..n].copy_from_slice(&z[..n]);
+    let mut rem = n;
+    while rem >= 4 {
+        let i = rem - 4;
+        let l0 = &l.data[i * n..(i + 1) * n];
+        let l1 = &l.data[(i + 1) * n..(i + 2) * n];
+        let l2 = &l.data[(i + 2) * n..(i + 3) * n];
+        let l3 = &l.data[(i + 3) * n..(i + 4) * n];
+
+        let x3 = x[i + 3] / l3[i + 3];
+        let x2 = (x[i + 2] - l3[i + 2] * x3) / l2[i + 2];
+        let x1 = (x[i + 1] - l3[i + 1] * x3 - l2[i + 1] * x2) / l1[i + 1];
+        let x0 = (x[i] - l3[i] * x3 - l2[i] * x2 - l1[i] * x1) / l0[i];
+        x[i] = x0;
+        x[i + 1] = x1;
+        x[i + 2] = x2;
+        x[i + 3] = x3;
+
+        let x_prefix = &mut x[..i];
+        let l0_p = &l0[..i];
+        let l1_p = &l1[..i];
+        let l2_p = &l2[..i];
+        let l3_p = &l3[..i];
+        for k in 0..i {
+            x_prefix[k] -= l0_p[k] * x0 + l1_p[k] * x1 + l2_p[k] * x2 + l3_p[k] * x3;
+        }
+        rem = i;
+    }
+    while rem > 0 {
+        let i = rem - 1;
+        let row_off = i * n;
+        let xi = x[i] / l.data[row_off + i];
+        x[i] = xi;
+        let row_i = &l.data[row_off..row_off + i];
+        let x_prefix = &mut x[..i];
+        for k in 0..i {
+            x_prefix[k] -= row_i[k] * xi;
+        }
+        rem = i;
+    }
+}
+
+/// 4-row x 4-column register-blocked forward triangular solve `L * V = B` in-place on `v_block`
+/// (`n x 4` row-major), returning `[||V[:, 0]||^2, ..., ||V[:, 3]||^2]`.
+#[inline]
+pub(crate) fn solve_lower_triangular_4col_4row_into(
+    l: &Matrix,
+    v_block: &mut [f64],
+    n: usize,
+) -> [f64; 4] {
+    let mut norm_sq = [0.0f64; 4];
+    let mut i = 0;
+    while i + 4 <= n {
+        let l0 = &l.data[i * n..(i + 1) * n];
+        let l1 = &l.data[(i + 1) * n..(i + 2) * n];
+        let l2 = &l.data[(i + 2) * n..(i + 3) * n];
+        let l3 = &l.data[(i + 3) * n..(i + 4) * n];
+
+        let mut s0 = [0.0f64; 4];
+        let mut s1 = [0.0f64; 4];
+        let mut s2 = [0.0f64; 4];
+        let mut s3 = [0.0f64; 4];
+
+        for j in 0..i {
+            let vj = &v_block[j * 4..j * 4 + 4];
+            let v0 = vj[0];
+            let v1 = vj[1];
+            let v2 = vj[2];
+            let v3 = vj[3];
+            let a0 = l0[j];
+            let a1 = l1[j];
+            let a2 = l2[j];
+            let a3 = l3[j];
+            s0[0] += a0 * v0;
+            s0[1] += a0 * v1;
+            s0[2] += a0 * v2;
+            s0[3] += a0 * v3;
+            s1[0] += a1 * v0;
+            s1[1] += a1 * v1;
+            s1[2] += a1 * v2;
+            s1[3] += a1 * v3;
+            s2[0] += a2 * v0;
+            s2[1] += a2 * v1;
+            s2[2] += a2 * v2;
+            s2[3] += a2 * v3;
+            s3[0] += a3 * v0;
+            s3[1] += a3 * v1;
+            s3[2] += a3 * v2;
+            s3[3] += a3 * v3;
+        }
+
+        let inv0 = 1.0 / l0[i];
+        let inv1 = 1.0 / l1[i + 1];
+        let inv2 = 1.0 / l2[i + 2];
+        let inv3 = 1.0 / l3[i + 3];
+        let l10 = l1[i];
+        let l20 = l2[i];
+        let l21 = l2[i + 1];
+        let l30 = l3[i];
+        let l31 = l3[i + 1];
+        let l32 = l3[i + 2];
+
+        let vr = &mut v_block[i * 4..(i + 4) * 4];
+        for c in 0..4 {
+            let x0 = (vr[c] - s0[c]) * inv0;
+            let x1 = (vr[4 + c] - s1[c] - l10 * x0) * inv1;
+            let x2 = (vr[8 + c] - s2[c] - l20 * x0 - l21 * x1) * inv2;
+            let x3 = (vr[12 + c] - s3[c] - l30 * x0 - l31 * x1 - l32 * x2) * inv3;
+            vr[c] = x0;
+            vr[4 + c] = x1;
+            vr[8 + c] = x2;
+            vr[12 + c] = x3;
+            norm_sq[c] += x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3;
+        }
+        i += 4;
+    }
+
+    while i < n {
+        let row_off = i * n;
+        let l_row = &l.data[row_off..row_off + i];
+        let mut s = [0.0f64; 4];
+        for (j, &lij) in l_row.iter().enumerate() {
+            let vj = &v_block[j * 4..j * 4 + 4];
+            s[0] += lij * vj[0];
+            s[1] += lij * vj[1];
+            s[2] += lij * vj[2];
+            s[3] += lij * vj[3];
+        }
+        let inv_diag = 1.0 / l.data[row_off + i];
+        let vi = &mut v_block[i * 4..i * 4 + 4];
+        for c in 0..4 {
+            let x = (vi[c] - s[c]) * inv_diag;
+            vi[c] = x;
+            norm_sq[c] += x * x;
+        }
+        i += 1;
+    }
+    norm_sq
+}
+
+/// 4-row x 4-column register-blocked backward triangular solve `L^T * X = Z` in-place on `v_block` (`n x 4` row-major).
+#[inline]
+fn solve_upper_triangular_t_4col_4row_inplace(l: &Matrix, v_block: &mut [f64], n: usize) {
+    let mut rem = n;
+    while rem >= 4 {
+        let i = rem - 4;
+        let l0 = &l.data[i * n..(i + 1) * n];
+        let l1 = &l.data[(i + 1) * n..(i + 2) * n];
+        let l2 = &l.data[(i + 2) * n..(i + 3) * n];
+        let l3 = &l.data[(i + 3) * n..(i + 4) * n];
+
+        let inv0 = 1.0 / l0[i];
+        let inv1 = 1.0 / l1[i + 1];
+        let inv2 = 1.0 / l2[i + 2];
+        let inv3 = 1.0 / l3[i + 3];
+        let l10 = l1[i];
+        let l20 = l2[i];
+        let l21 = l2[i + 1];
+        let l30 = l3[i];
+        let l31 = l3[i + 1];
+        let l32 = l3[i + 2];
+
+        let mut x0 = [0.0f64; 4];
+        let mut x1 = [0.0f64; 4];
+        let mut x2 = [0.0f64; 4];
+        let mut x3 = [0.0f64; 4];
+        {
+            let vr = &mut v_block[i * 4..(i + 4) * 4];
+            for c in 0..4 {
+                let v3 = vr[12 + c] * inv3;
+                let v2 = (vr[8 + c] - l32 * v3) * inv2;
+                let v1 = (vr[4 + c] - l31 * v3 - l21 * v2) * inv1;
+                let v0 = (vr[c] - l30 * v3 - l20 * v2 - l10 * v1) * inv0;
+                vr[c] = v0;
+                vr[4 + c] = v1;
+                vr[8 + c] = v2;
+                vr[12 + c] = v3;
+                x0[c] = v0;
+                x1[c] = v1;
+                x2[c] = v2;
+                x3[c] = v3;
+            }
+        }
+
+        let l0_p = &l0[..i];
+        let l1_p = &l1[..i];
+        let l2_p = &l2[..i];
+        let l3_p = &l3[..i];
+        let vp = &mut v_block[..i * 4];
+        for k in 0..i {
+            let a0 = l0_p[k];
+            let a1 = l1_p[k];
+            let a2 = l2_p[k];
+            let a3 = l3_p[k];
+            let vk = &mut vp[k * 4..k * 4 + 4];
+            vk[0] -= a0 * x0[0] + a1 * x1[0] + a2 * x2[0] + a3 * x3[0];
+            vk[1] -= a0 * x0[1] + a1 * x1[1] + a2 * x2[1] + a3 * x3[1];
+            vk[2] -= a0 * x0[2] + a1 * x1[2] + a2 * x2[2] + a3 * x3[2];
+            vk[3] -= a0 * x0[3] + a1 * x1[3] + a2 * x2[3] + a3 * x3[3];
+        }
+        rem = i;
+    }
+    while rem > 0 {
+        let i = rem - 1;
+        let row_off = i * n;
+        let inv_diag = 1.0 / l.data[row_off + i];
+        let mut xi = [0.0f64; 4];
+        {
+            let vi = &mut v_block[i * 4..i * 4 + 4];
+            for c in 0..4 {
+                let val = vi[c] * inv_diag;
+                vi[c] = val;
+                xi[c] = val;
+            }
+        }
+        let row_i = &l.data[row_off..row_off + i];
+        let vp = &mut v_block[..i * 4];
+        for (k, &lik) in row_i.iter().enumerate() {
+            let vk = &mut vp[k * 4..k * 4 + 4];
+            vk[0] -= lik * xi[0];
+            vk[1] -= lik * xi[1];
+            vk[2] -= lik * xi[2];
+            vk[3] -= lik * xi[3];
+        }
+        rem = i;
+    }
+}
+
+/// Solve `(L * L^T) * Theta = B` using 4-column blocked forward/backward triangular solves.
+pub(crate) fn solve_cholesky_multi_from_l(l: &Matrix, b: &Matrix) -> Matrix {
+    let n = l.rows;
+    let k_targets = b.cols;
+    let mut theta = Matrix::zeros(n, k_targets);
+    if n == 0 || k_targets == 0 {
+        return theta;
+    }
+
+    if k_targets == 1 {
+        let mut z = vec![0.0; n];
+        solve_lower_triangular_4row_into(l, &b.data, &mut z);
+        solve_upper_triangular_t_4row_into(l, &z, &mut theta.data);
+        return theta;
+    }
+
+    let n_blocks = k_targets.div_ceil(4);
+    let solve_block = |blk: usize, v_block: &mut [f64]| {
+        let t_start = blk * 4;
+        let bs = (k_targets - t_start).min(4);
+        if bs == 4 {
+            for r in 0..n {
+                let src = &b.data[r * k_targets + t_start..r * k_targets + t_start + 4];
+                v_block[r * 4..r * 4 + 4].copy_from_slice(src);
+            }
+        } else {
+            for r in 0..n {
+                let src = &b.data[r * k_targets + t_start..r * k_targets + t_start + bs];
+                let dst = &mut v_block[r * 4..r * 4 + 4];
+                dst[..bs].copy_from_slice(src);
+                dst[bs..].fill(0.0);
+            }
+        }
+        solve_lower_triangular_4col_4row_into(l, v_block, n);
+        solve_upper_triangular_t_4col_4row_inplace(l, v_block, n);
+    };
+
+    if n_blocks >= 2 && n >= 128 {
+        let solved_blocks: Vec<(usize, Vec<f64>)> = (0..n_blocks)
+            .into_par_iter()
+            .map(|blk| {
+                let mut v_block = vec![0.0; n * 4];
+                solve_block(blk, &mut v_block);
+                (blk, v_block)
+            })
+            .collect();
+        for (blk, v_block) in solved_blocks {
+            let t_start = blk * 4;
+            let bs = (k_targets - t_start).min(4);
+            for r in 0..n {
+                let dst = &mut theta.data[r * k_targets + t_start..r * k_targets + t_start + bs];
+                dst.copy_from_slice(&v_block[r * 4..r * 4 + bs]);
+            }
+        }
+    } else {
+        let mut v_block = vec![0.0; n * 4];
+        for blk in 0..n_blocks {
+            solve_block(blk, &mut v_block);
+            let t_start = blk * 4;
+            let bs = (k_targets - t_start).min(4);
+            for r in 0..n {
+                let dst = &mut theta.data[r * k_targets + t_start..r * k_targets + t_start + bs];
+                dst.copy_from_slice(&v_block[r * 4..r * 4 + bs]);
+            }
+        }
+    }
+
+    theta
+}
+
 // Solve symmetric positive semi-definite linear system (A * theta = b) using Cholesky Decomposition (L * L^T)
 pub fn solve_cholesky(a: &Matrix, b: &[f64]) -> OchreResult<Vec<f64>> {
     if a.rows != a.cols {
@@ -664,59 +1279,14 @@ pub fn solve_cholesky(a: &Matrix, b: &[f64]) -> OchreResult<Vec<f64>> {
         return Ok(Vec::new());
     }
 
-    // Try Cholesky decomposition directly or with subtle Ridge regularizer if ill-conditioned
+    let mut l = Matrix::zeros(n, n);
+    let mut panel_buf = Vec::new();
     for &lambda in &[0.0, 1e-12, 1e-9, 1e-6, 1e-3] {
-        let mut l = Matrix::zeros(n, n);
-        let mut success = true;
-
-        for i in 0..n {
-            for j in 0..=i {
-                let mut sum = 0.0;
-                for k in 0..j {
-                    sum += l[(i, k)] * l[(j, k)];
-                }
-                if i == j {
-                    let diag = a[(i, i)] + lambda - sum;
-                    if diag <= 1e-14 {
-                        success = false;
-                        break;
-                    }
-                    l[(i, i)] = diag.sqrt();
-                } else {
-                    let lj_j = l[(j, j)];
-                    if lj_j.abs() <= 1e-14 {
-                        success = false;
-                        break;
-                    }
-                    l[(i, j)] = (a[(i, j)] - sum) / lj_j;
-                }
-            }
-            if !success {
-                break;
-            }
-        }
-
-        if success {
-            // Forward substitution: L * z = b
+        if cholesky_lower_with_diag_shift_into(a, lambda, 1e-14, &mut l, &mut panel_buf) {
             let mut z = vec![0.0; n];
-            for i in 0..n {
-                let mut sum = 0.0;
-                for k in 0..i {
-                    sum += l[(i, k)] * z[k];
-                }
-                z[i] = (b[i] - sum) / l[(i, i)];
-            }
-
-            // Backward substitution: L^T * theta = z
+            solve_lower_triangular_4row_into(&l, b, &mut z);
             let mut theta = vec![0.0; n];
-            for i in (0..n).rev() {
-                let mut sum = 0.0;
-                for k in (i + 1)..n {
-                    sum += l[(k, i)] * theta[k];
-                }
-                theta[i] = (z[i] - sum) / l[(i, i)];
-            }
-
+            solve_upper_triangular_t_4row_into(&l, &z, &mut theta);
             return Ok(theta);
         }
     }
@@ -740,62 +1310,11 @@ pub fn solve_cholesky_multi(a: &Matrix, b: &Matrix) -> OchreResult<Matrix> {
         return Ok(Matrix::zeros(n, k_targets));
     }
 
+    let mut l = Matrix::zeros(n, n);
+    let mut panel_buf = Vec::new();
     for &lambda in &[0.0, 1e-12, 1e-9, 1e-6, 1e-3] {
-        let mut l = Matrix::zeros(n, n);
-        let mut success = true;
-
-        for i in 0..n {
-            for j in 0..=i {
-                let mut sum = 0.0;
-                for k in 0..j {
-                    sum += l[(i, k)] * l[(j, k)];
-                }
-                if i == j {
-                    let diag = a[(i, i)] + lambda - sum;
-                    if diag <= 1e-14 {
-                        success = false;
-                        break;
-                    }
-                    l[(i, i)] = diag.sqrt();
-                } else {
-                    let lj_j = l[(j, j)];
-                    if lj_j.abs() <= 1e-14 {
-                        success = false;
-                        break;
-                    }
-                    l[(i, j)] = (a[(i, j)] - sum) / lj_j;
-                }
-            }
-            if !success {
-                break;
-            }
-        }
-
-        if success {
-            let mut theta = Matrix::zeros(n, k_targets);
-            let mut z = vec![0.0; n];
-
-            for t in 0..k_targets {
-                // Forward substitution: L * z = B[:, t]
-                for i in 0..n {
-                    let mut sum = 0.0;
-                    for k in 0..i {
-                        sum += l[(i, k)] * z[k];
-                    }
-                    z[i] = (b[(i, t)] - sum) / l[(i, i)];
-                }
-
-                // Backward substitution: L^T * theta[:, t] = z
-                for i in (0..n).rev() {
-                    let mut sum = 0.0;
-                    for k in (i + 1)..n {
-                        sum += l[(k, i)] * theta[(k, t)];
-                    }
-                    theta[(i, t)] = (z[i] - sum) / l[(i, i)];
-                }
-            }
-
-            return Ok(theta);
+        if cholesky_lower_with_diag_shift_into(a, lambda, 1e-14, &mut l, &mut panel_buf) {
+            return Ok(solve_cholesky_multi_from_l(&l, b));
         }
     }
 
@@ -1102,5 +1621,61 @@ mod tests {
         let (xt_x_tpu, xt_y_tpu) = compute_normal_equation_mats(&x, &y, true, &tpu).unwrap();
         assert_eq!(xt_x_tpu, xt_x_cpu);
         assert_eq!(xt_y_tpu, xt_y_cpu);
+    }
+
+    #[test]
+    fn test_blocked4_cholesky_and_multi_280() {
+        let n = 280usize;
+        let p = 16usize;
+        let mut x = Matrix::zeros(n, p);
+        for i in 0..n {
+            for j in 0..p {
+                x[(i, j)] = (((i * 7 + j * 13) % 97) as f64) * 0.03 - 1.2;
+            }
+        }
+        // Build SPD matrix A = K_rbf + 0.1 * I
+        let mut a = Matrix::zeros(n, n);
+        for i in 0..n {
+            a[(i, i)] = 1.1;
+            for j in 0..i {
+                let mut d2 = 0.0;
+                for c in 0..p {
+                    let d = x[(i, c)] - x[(j, c)];
+                    d2 += d * d;
+                }
+                let val = (-0.2 * d2).exp();
+                a[(i, j)] = val;
+                a[(j, i)] = val;
+            }
+        }
+
+        // Single RHS solve_cholesky
+        let b1: Vec<f64> = (0..n).map(|i| ((i as f64) * 0.17).sin()).collect();
+        let sol1 = solve_cholesky(&a, &b1).unwrap();
+        let ax1 = a.matvec(&sol1).unwrap();
+        let max_err1 = ax1
+            .iter()
+            .zip(b1.iter())
+            .map(|(u, v)| (u - v).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_err1 < 1e-10, "max_err1 = {max_err1}");
+
+        // Multi-target solve_cholesky_multi with 7 columns (exercises 4-col + 3-col remainder)
+        let k_cols = 7usize;
+        let mut b_multi = Matrix::zeros(n, k_cols);
+        for i in 0..n {
+            for t in 0..k_cols {
+                b_multi[(i, t)] = (((i + 1) * (t + 3)) as f64 * 0.11).cos();
+            }
+        }
+        let theta = solve_cholesky_multi(&a, &b_multi).unwrap();
+        let a_theta = a.matmul(&theta).unwrap();
+        let max_err_m = a_theta
+            .data
+            .iter()
+            .zip(b_multi.data.iter())
+            .map(|(u, v)| (u - v).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_err_m < 1e-10, "max_err_m = {max_err_m}");
     }
 }

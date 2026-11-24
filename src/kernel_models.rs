@@ -32,10 +32,20 @@ pub const TAG_KERNEL_PCA: u8 = 80;
 const LARGE_ELEMENTWISE_THRESHOLD: usize = 16_384;
 const LARGE_MATMUL_THRESHOLD: usize = 4_096;
 const GPU_MIN_ELEMS: usize = 131_072;
+const KRR_GPU_MIN_ELEMS: usize = 524_288;
 
 #[inline]
 fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
     if elems < GPU_MIN_ELEMS {
+        Backend::Cpu
+    } else {
+        get_backend(dev)
+    }
+}
+
+#[inline]
+fn effective_backend_krr<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
+    if elems < KRR_GPU_MIN_ELEMS {
         Backend::Cpu
     } else {
         get_backend(dev)
@@ -259,6 +269,426 @@ fn compute_dot_gram(backend: &Backend<'_>, a: &Matrix, b: &Matrix) -> OchreResul
     }
 }
 
+#[inline(always)]
+fn row_sq_norm_unrolled(row: &[f64]) -> f64 {
+    let cols = row.len();
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    let mut c = 0;
+    while c + 4 <= cols {
+        let v0 = row[c];
+        let v1 = row[c + 1];
+        let v2 = row[c + 2];
+        let v3 = row[c + 3];
+        s0 += v0 * v0;
+        s1 += v1 * v1;
+        s2 += v2 * v2;
+        s3 += v3 * v3;
+        c += 4;
+    }
+    let mut sum = (s0 + s1) + (s2 + s3);
+    while c < cols {
+        sum += row[c] * row[c];
+        c += 1;
+    }
+    sum
+}
+
+#[inline(always)]
+fn direct_l2_sq_1x1(a: &[f64], b: &[f64]) -> f64 {
+    let mut sum = 0.0;
+    for c in 0..a.len() {
+        let d = a[c] - b[c];
+        sum += d * d;
+    }
+    sum
+}
+
+#[inline(always)]
+fn dot_1x1(a: &[f64], b: &[f64]) -> f64 {
+    let cols = a.len();
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    let mut c = 0;
+    while c + 4 <= cols {
+        s0 += a[c] * b[c];
+        s1 += a[c + 1] * b[c + 1];
+        s2 += a[c + 2] * b[c + 2];
+        s3 += a[c + 3] * b[c + 3];
+        c += 4;
+    }
+    let mut sum = (s0 + s1) + (s2 + s3);
+    while c < cols {
+        sum += a[c] * b[c];
+        c += 1;
+    }
+    sum
+}
+
+#[inline(always)]
+fn direct_l2_sq_4x4(a: [&[f64]; 4], b: [&[f64]; 4]) -> [[f64; 4]; 4] {
+    let mut d = [[0.0f64; 4]; 4];
+    for c in 0..a[0].len() {
+        let av0 = a[0][c];
+        let av1 = a[1][c];
+        let av2 = a[2][c];
+        let av3 = a[3][c];
+        let bv0 = b[0][c];
+        let bv1 = b[1][c];
+        let bv2 = b[2][c];
+        let bv3 = b[3][c];
+
+        let t00 = av0 - bv0;
+        let t01 = av0 - bv1;
+        let t02 = av0 - bv2;
+        let t03 = av0 - bv3;
+        d[0][0] += t00 * t00;
+        d[0][1] += t01 * t01;
+        d[0][2] += t02 * t02;
+        d[0][3] += t03 * t03;
+
+        let t10 = av1 - bv0;
+        let t11 = av1 - bv1;
+        let t12 = av1 - bv2;
+        let t13 = av1 - bv3;
+        d[1][0] += t10 * t10;
+        d[1][1] += t11 * t11;
+        d[1][2] += t12 * t12;
+        d[1][3] += t13 * t13;
+
+        let t20 = av2 - bv0;
+        let t21 = av2 - bv1;
+        let t22 = av2 - bv2;
+        let t23 = av2 - bv3;
+        d[2][0] += t20 * t20;
+        d[2][1] += t21 * t21;
+        d[2][2] += t22 * t22;
+        d[2][3] += t23 * t23;
+
+        let t30 = av3 - bv0;
+        let t31 = av3 - bv1;
+        let t32 = av3 - bv2;
+        let t33 = av3 - bv3;
+        d[3][0] += t30 * t30;
+        d[3][1] += t31 * t31;
+        d[3][2] += t32 * t32;
+        d[3][3] += t33 * t33;
+    }
+    d
+}
+
+#[inline(always)]
+fn dot_4x4(a: [&[f64]; 4], b: [&[f64]; 4]) -> [[f64; 4]; 4] {
+    let mut s = [[0.0f64; 4]; 4];
+    for c in 0..a[0].len() {
+        let av0 = a[0][c];
+        let av1 = a[1][c];
+        let av2 = a[2][c];
+        let av3 = a[3][c];
+        let bv0 = b[0][c];
+        let bv1 = b[1][c];
+        let bv2 = b[2][c];
+        let bv3 = b[3][c];
+
+        s[0][0] += av0 * bv0;
+        s[0][1] += av0 * bv1;
+        s[0][2] += av0 * bv2;
+        s[0][3] += av0 * bv3;
+
+        s[1][0] += av1 * bv0;
+        s[1][1] += av1 * bv1;
+        s[1][2] += av1 * bv2;
+        s[1][3] += av1 * bv3;
+
+        s[2][0] += av2 * bv0;
+        s[2][1] += av2 * bv1;
+        s[2][2] += av2 * bv2;
+        s[2][3] += av2 * bv3;
+
+        s[3][0] += av3 * bv0;
+        s[3][1] += av3 * bv1;
+        s[3][2] += av3 * bv2;
+        s[3][3] += av3 * bv3;
+    }
+    s
+}
+
+/// Fused symmetric RBF kernel on CPU (`n <= 2048`): computes only the lower triangle (`j <= i`)
+/// in 4x4 register blocks, fuses `exp(-gamma * d2)` in registers, and mirrors to the upper triangle.
+fn fused_rbf_symmetric_cpu(x: &Matrix, gamma: f64) -> Matrix {
+    let n = x.rows;
+    let cols = x.cols;
+    let mut k = Matrix::zeros(n, n);
+    let neg_gamma = -gamma;
+    let use_direct = cols <= 16;
+    let norms = if use_direct {
+        Vec::new()
+    } else if n >= 128 {
+        x.data.par_chunks(cols).map(row_sq_norm_unrolled).collect()
+    } else {
+        x.data
+            .chunks_exact(cols)
+            .map(row_sq_norm_unrolled)
+            .collect()
+    };
+
+    let fill_chunk = |(chunk_idx, rows_slice): (usize, &mut [f64])| {
+        let i_base = chunk_idx * 4;
+        let n_rows = rows_slice.len() / n;
+        if n_rows == 4 {
+            let (row0, rest) = rows_slice.split_at_mut(n);
+            let (row1, rest) = rest.split_at_mut(n);
+            let (row2, row3) = rest.split_at_mut(n);
+
+            let x0 = &x.data[i_base * cols..(i_base + 1) * cols];
+            let x1 = &x.data[(i_base + 1) * cols..(i_base + 2) * cols];
+            let x2 = &x.data[(i_base + 2) * cols..(i_base + 3) * cols];
+            let x3 = &x.data[(i_base + 3) * cols..(i_base + 4) * cols];
+
+            let mut j = 0;
+            if use_direct {
+                while j + 4 <= i_base {
+                    let y0 = &x.data[j * cols..(j + 1) * cols];
+                    let y1 = &x.data[(j + 1) * cols..(j + 2) * cols];
+                    let y2 = &x.data[(j + 2) * cols..(j + 3) * cols];
+                    let y3 = &x.data[(j + 3) * cols..(j + 4) * cols];
+                    let d = direct_l2_sq_4x4([x0, x1, x2, x3], [y0, y1, y2, y3]);
+                    for c in 0..4 {
+                        row0[j + c] = (neg_gamma * d[0][c]).exp();
+                        row1[j + c] = (neg_gamma * d[1][c]).exp();
+                        row2[j + c] = (neg_gamma * d[2][c]).exp();
+                        row3[j + c] = (neg_gamma * d[3][c]).exp();
+                    }
+                    j += 4;
+                }
+            } else {
+                let ni0 = norms[i_base];
+                let ni1 = norms[i_base + 1];
+                let ni2 = norms[i_base + 2];
+                let ni3 = norms[i_base + 3];
+                while j + 4 <= i_base {
+                    let y0 = &x.data[j * cols..(j + 1) * cols];
+                    let y1 = &x.data[(j + 1) * cols..(j + 2) * cols];
+                    let y2 = &x.data[(j + 2) * cols..(j + 3) * cols];
+                    let y3 = &x.data[(j + 3) * cols..(j + 4) * cols];
+                    let dots = dot_4x4([x0, x1, x2, x3], [y0, y1, y2, y3]);
+                    let nj0 = norms[j];
+                    let nj1 = norms[j + 1];
+                    let nj2 = norms[j + 2];
+                    let nj3 = norms[j + 3];
+                    let nj = [nj0, nj1, nj2, nj3];
+                    for c in 0..4 {
+                        let n_j = nj[c];
+                        row0[j + c] = (neg_gamma * (ni0 + n_j - 2.0 * dots[0][c]).max(0.0)).exp();
+                        row1[j + c] = (neg_gamma * (ni1 + n_j - 2.0 * dots[1][c]).max(0.0)).exp();
+                        row2[j + c] = (neg_gamma * (ni2 + n_j - 2.0 * dots[2][c]).max(0.0)).exp();
+                        row3[j + c] = (neg_gamma * (ni3 + n_j - 2.0 * dots[3][c]).max(0.0)).exp();
+                    }
+                    j += 4;
+                }
+            }
+
+            // Diagonal 4x4 block (lower triangle)
+            let pair_rbf = |r_a: &[f64], r_b: &[f64], na: f64, nb: f64| -> f64 {
+                let d2 = if use_direct {
+                    direct_l2_sq_1x1(r_a, r_b)
+                } else {
+                    (na + nb - 2.0 * dot_1x1(r_a, r_b)).max(0.0)
+                };
+                (neg_gamma * d2).exp()
+            };
+            let na0 = if use_direct { 0.0 } else { norms[i_base] };
+            let na1 = if use_direct { 0.0 } else { norms[i_base + 1] };
+            let na2 = if use_direct { 0.0 } else { norms[i_base + 2] };
+            let na3 = if use_direct { 0.0 } else { norms[i_base + 3] };
+
+            row0[i_base] = 1.0;
+            row1[i_base] = pair_rbf(x1, x0, na1, na0);
+            row1[i_base + 1] = 1.0;
+            row2[i_base] = pair_rbf(x2, x0, na2, na0);
+            row2[i_base + 1] = pair_rbf(x2, x1, na2, na1);
+            row2[i_base + 2] = 1.0;
+            row3[i_base] = pair_rbf(x3, x0, na3, na0);
+            row3[i_base + 1] = pair_rbf(x3, x1, na3, na1);
+            row3[i_base + 2] = pair_rbf(x3, x2, na3, na2);
+            row3[i_base + 3] = 1.0;
+        } else {
+            for r_local in 0..n_rows {
+                let i = i_base + r_local;
+                let xi = &x.data[i * cols..(i + 1) * cols];
+                let dst = &mut rows_slice[r_local * n..(r_local + 1) * n];
+                if use_direct {
+                    for (j, dst_j) in dst.iter_mut().enumerate().take(i) {
+                        let xj = &x.data[j * cols..(j + 1) * cols];
+                        *dst_j = (neg_gamma * direct_l2_sq_1x1(xi, xj)).exp();
+                    }
+                } else {
+                    let ni = norms[i];
+                    for (j, dst_j) in dst.iter_mut().enumerate().take(i) {
+                        let xj = &x.data[j * cols..(j + 1) * cols];
+                        let d2 = (ni + norms[j] - 2.0 * dot_1x1(xi, xj)).max(0.0);
+                        *dst_j = (neg_gamma * d2).exp();
+                    }
+                }
+                dst[i] = 1.0;
+            }
+        }
+    };
+
+    if n >= 64 {
+        k.data
+            .par_chunks_mut(4 * n)
+            .enumerate()
+            .for_each(fill_chunk);
+    } else {
+        k.data.chunks_mut(4 * n).enumerate().for_each(fill_chunk);
+    }
+
+    for i in 0..n {
+        let row_i_off = i * n;
+        for j in 0..i {
+            k.data[j * n + i] = k.data[row_i_off + j];
+        }
+    }
+    k
+}
+
+/// Fused non-symmetric RBF kernel on CPU: computes `exp(-gamma * ||a_i - b_j||^2)` in 4x4 register blocks
+/// without allocating intermediate `d2` or `b_t` matrices.
+fn fused_rbf_cross_cpu(a: &Matrix, b: &Matrix, gamma: f64) -> Matrix {
+    let na = a.rows;
+    let nb = b.rows;
+    let cols = a.cols;
+    let mut k = Matrix::zeros(na, nb);
+    let neg_gamma = -gamma;
+    let use_direct = cols <= 16;
+    let (a_norms, b_norms) = if use_direct {
+        (Vec::new(), Vec::new())
+    } else {
+        let an = if na >= 128 {
+            a.data.par_chunks(cols).map(row_sq_norm_unrolled).collect()
+        } else {
+            a.data
+                .chunks_exact(cols)
+                .map(row_sq_norm_unrolled)
+                .collect()
+        };
+        let bn = if nb >= 128 {
+            b.data.par_chunks(cols).map(row_sq_norm_unrolled).collect()
+        } else {
+            b.data
+                .chunks_exact(cols)
+                .map(row_sq_norm_unrolled)
+                .collect()
+        };
+        (an, bn)
+    };
+
+    let fill_chunk = |(chunk_idx, rows_slice): (usize, &mut [f64])| {
+        let i_base = chunk_idx * 4;
+        let n_rows = rows_slice.len() / nb;
+        if n_rows == 4 {
+            let (row0, rest) = rows_slice.split_at_mut(nb);
+            let (row1, rest) = rest.split_at_mut(nb);
+            let (row2, row3) = rest.split_at_mut(nb);
+
+            let x0 = &a.data[i_base * cols..(i_base + 1) * cols];
+            let x1 = &a.data[(i_base + 1) * cols..(i_base + 2) * cols];
+            let x2 = &a.data[(i_base + 2) * cols..(i_base + 3) * cols];
+            let x3 = &a.data[(i_base + 3) * cols..(i_base + 4) * cols];
+
+            let mut j = 0;
+            if use_direct {
+                while j + 4 <= nb {
+                    let y0 = &b.data[j * cols..(j + 1) * cols];
+                    let y1 = &b.data[(j + 1) * cols..(j + 2) * cols];
+                    let y2 = &b.data[(j + 2) * cols..(j + 3) * cols];
+                    let y3 = &b.data[(j + 3) * cols..(j + 4) * cols];
+                    let d = direct_l2_sq_4x4([x0, x1, x2, x3], [y0, y1, y2, y3]);
+                    for c in 0..4 {
+                        row0[j + c] = (neg_gamma * d[0][c]).exp();
+                        row1[j + c] = (neg_gamma * d[1][c]).exp();
+                        row2[j + c] = (neg_gamma * d[2][c]).exp();
+                        row3[j + c] = (neg_gamma * d[3][c]).exp();
+                    }
+                    j += 4;
+                }
+                while j < nb {
+                    let yj = &b.data[j * cols..(j + 1) * cols];
+                    row0[j] = (neg_gamma * direct_l2_sq_1x1(x0, yj)).exp();
+                    row1[j] = (neg_gamma * direct_l2_sq_1x1(x1, yj)).exp();
+                    row2[j] = (neg_gamma * direct_l2_sq_1x1(x2, yj)).exp();
+                    row3[j] = (neg_gamma * direct_l2_sq_1x1(x3, yj)).exp();
+                    j += 1;
+                }
+            } else {
+                let ni0 = a_norms[i_base];
+                let ni1 = a_norms[i_base + 1];
+                let ni2 = a_norms[i_base + 2];
+                let ni3 = a_norms[i_base + 3];
+                while j + 4 <= nb {
+                    let y0 = &b.data[j * cols..(j + 1) * cols];
+                    let y1 = &b.data[(j + 1) * cols..(j + 2) * cols];
+                    let y2 = &b.data[(j + 2) * cols..(j + 3) * cols];
+                    let y3 = &b.data[(j + 3) * cols..(j + 4) * cols];
+                    let dots = dot_4x4([x0, x1, x2, x3], [y0, y1, y2, y3]);
+                    let nj = [b_norms[j], b_norms[j + 1], b_norms[j + 2], b_norms[j + 3]];
+                    for c in 0..4 {
+                        let n_j = nj[c];
+                        row0[j + c] = (neg_gamma * (ni0 + n_j - 2.0 * dots[0][c]).max(0.0)).exp();
+                        row1[j + c] = (neg_gamma * (ni1 + n_j - 2.0 * dots[1][c]).max(0.0)).exp();
+                        row2[j + c] = (neg_gamma * (ni2 + n_j - 2.0 * dots[2][c]).max(0.0)).exp();
+                        row3[j + c] = (neg_gamma * (ni3 + n_j - 2.0 * dots[3][c]).max(0.0)).exp();
+                    }
+                    j += 4;
+                }
+                while j < nb {
+                    let yj = &b.data[j * cols..(j + 1) * cols];
+                    let n_j = b_norms[j];
+                    row0[j] = (neg_gamma * (ni0 + n_j - 2.0 * dot_1x1(x0, yj)).max(0.0)).exp();
+                    row1[j] = (neg_gamma * (ni1 + n_j - 2.0 * dot_1x1(x1, yj)).max(0.0)).exp();
+                    row2[j] = (neg_gamma * (ni2 + n_j - 2.0 * dot_1x1(x2, yj)).max(0.0)).exp();
+                    row3[j] = (neg_gamma * (ni3 + n_j - 2.0 * dot_1x1(x3, yj)).max(0.0)).exp();
+                    j += 1;
+                }
+            }
+        } else {
+            for r_local in 0..n_rows {
+                let i = i_base + r_local;
+                let xi = &a.data[i * cols..(i + 1) * cols];
+                let dst = &mut rows_slice[r_local * nb..(r_local + 1) * nb];
+                if use_direct {
+                    for (j, dst_j) in dst.iter_mut().enumerate().take(nb) {
+                        let yj = &b.data[j * cols..(j + 1) * cols];
+                        *dst_j = (neg_gamma * direct_l2_sq_1x1(xi, yj)).exp();
+                    }
+                } else {
+                    let ni = a_norms[i];
+                    for (j, dst_j) in dst.iter_mut().enumerate().take(nb) {
+                        let yj = &b.data[j * cols..(j + 1) * cols];
+                        let d2 = (ni + b_norms[j] - 2.0 * dot_1x1(xi, yj)).max(0.0);
+                        *dst_j = (neg_gamma * d2).exp();
+                    }
+                }
+            }
+        }
+    };
+
+    if na * nb >= 16_384 && na >= 16 {
+        k.data
+            .par_chunks_mut(4 * nb)
+            .enumerate()
+            .for_each(fill_chunk);
+    } else {
+        k.data.chunks_mut(4 * nb).enumerate().for_each(fill_chunk);
+    }
+    k
+}
+
 fn compute_kernel_matrix(
     backend: &Backend<'_>,
     a: &Matrix,
@@ -277,6 +707,12 @@ fn compute_kernel_matrix(
                     features: a.cols,
                     expected: b.cols,
                 });
+            }
+            if matches!(backend, Backend::Cpu) {
+                if std::ptr::eq(a, b) && a.rows <= 2048 {
+                    return Ok(fused_rbf_symmetric_cpu(a, gamma));
+                }
+                return Ok(fused_rbf_cross_cpu(a, b, gamma));
             }
             let mut d2 = backend.pairwise_l2_sq(a, b)?;
             let len = d2.data.len();
@@ -480,7 +916,7 @@ impl KernelRidge {
         };
 
         let dev = self.device_type()?;
-        let backend = effective_backend(&dev, n.saturating_mul(n).max(x.data.len()));
+        let backend = effective_backend_krr(&dev, n.saturating_mul(n).max(x.data.len()));
         let gamma_val = resolve_gamma(&backend, x, k_kind, "auto", self.gamma)?;
         let mut k_mat =
             compute_kernel_matrix(&backend, x, x, k_kind, gamma_val, self.degree, self.coef0)?;
@@ -532,7 +968,7 @@ impl KernelRidge {
         validate_finite_matrix(x)?;
         let k_kind = KernelKind::parse(&self.kernel)?;
         let dev = self.device_type()?;
-        let backend = effective_backend(
+        let backend = effective_backend_krr(
             &dev,
             x.rows
                 .saturating_mul(self.n_samples_fit_.max(dual_coef.cols)),
@@ -745,7 +1181,7 @@ impl KernelPCA {
 
         let n = x.rows;
         let dev = self.device_type()?;
-        let backend = effective_backend(&dev, n.saturating_mul(n).max(x.data.len()));
+        let backend = effective_backend_krr(&dev, n.saturating_mul(n).max(x.data.len()));
         let gamma_val = resolve_gamma(&backend, x, k_kind, "auto", self.gamma)?;
         let k_mat =
             compute_kernel_matrix(&backend, x, x, k_kind, gamma_val, self.degree, self.coef0)?;
@@ -3483,5 +3919,41 @@ mod tests {
         ocsvm.fit(&x).unwrap();
         let preds = ocsvm.predict(&x).unwrap();
         assert_eq!(preds.len(), 4);
+    }
+
+    #[test]
+    fn test_fused_rbf_kernel_and_krr_280_parity() {
+        for cols in [8usize, 24usize] {
+            let n = 280usize;
+            let mut x_data = vec![0.0; n * cols];
+            let mut y_data = vec![0.0; n];
+            for i in 0..n {
+                let mut target = 0.0;
+                for c in 0..cols {
+                    let v = (((i * 11 + c * 5) % 43) as f64) * 0.08 - 1.5;
+                    x_data[i * cols + c] = v;
+                    target += (v * 0.7).sin();
+                }
+                y_data[i] = target;
+            }
+            let x = Matrix::from_vec(n, cols, x_data).unwrap();
+            let y = Matrix::from_vec(n, 1, y_data).unwrap();
+
+            // Verify fused symmetric RBF matches pairwise_l2_sq + exp(-gamma * d2)
+            let gamma = 0.15;
+            let k_fused = fused_rbf_symmetric_cpu(&x, gamma);
+            let d2_ref = Backend::Cpu.pairwise_l2_sq(&x, &x).unwrap();
+            for idx in 0..k_fused.data.len() {
+                let expected = (-gamma * d2_ref.data[idx].max(0.0)).exp();
+                assert!((k_fused.data[idx] - expected).abs() < 1e-12);
+            }
+
+            // Verify KernelRidge fit & predict with auto device (stays on CPU < 524_288)
+            let mut krr =
+                KernelRidge::new(0.1, "rbf".to_string(), Some(gamma), 3, 1.0, None).unwrap();
+            krr.fit(&x, &y, None).unwrap();
+            let r2 = krr.score(&x, &y, None).unwrap();
+            assert!(r2 > 0.95, "KRR 280x{cols} R2 = {r2}");
+        }
     }
 }

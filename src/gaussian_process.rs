@@ -11,7 +11,11 @@ use crate::dit_io::{
     write_opt_usize, write_str, write_usize,
 };
 use crate::error::{OchreError, OchreResult};
-use crate::matrix::{Matrix, r2_score};
+use crate::matrix::{
+    Matrix, cholesky_lower_with_diag_shift_into, dot_slice_unrolled, r2_score,
+    solve_lower_triangular_4col_4row_into, solve_lower_triangular_4row_into,
+    solve_upper_triangular_t_4row_into,
+};
 use crate::preprocessing::py_helpers::{
     buffer_to_f64_1d, buffer_to_pooled_matrix, f64_slice_to_pybytes,
 };
@@ -28,7 +32,7 @@ pub const TAG_GP_CLASSIFIER: u8 = 84;
 
 const LOG_BOUND_MIN: f64 = -11.512925464970229; // ln(1e-5)
 const LOG_BOUND_MAX: f64 = 11.512925464970229; // ln(1e5)
-const GPU_MIN_ELEMS: usize = 131_072;
+const GPU_MIN_ELEMS: usize = 524_288;
 
 #[inline]
 fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
@@ -256,105 +260,6 @@ fn compute_kernel_matrix(
     Ok(k)
 }
 
-/// Build kernel matrix K from precomputed squared Euclidean distance matrix D2.
-fn compute_kernel_from_d2(
-    backend: &Backend<'_>,
-    d2: &Matrix,
-    params: &KernelParams,
-    is_self: bool,
-) -> OchreResult<Matrix> {
-    let rows = d2.rows;
-    let cols = d2.cols;
-    if params.kind == KernelKind::White {
-        let mut k = Matrix::zeros(rows, cols);
-        if is_self {
-            for i in 0..rows.min(cols) {
-                k.set(i, i, params.noise_level);
-            }
-        }
-        return Ok(k);
-    }
-
-    let mut k = d2.clone();
-    let ls = params.length_scale;
-    let ls_sq = ls * ls;
-    let c = params.constant_value;
-
-    match params.kind {
-        KernelKind::Rbf | KernelKind::RbfWhite => {
-            let inv_two_ls_sq = -0.5 / ls_sq;
-            if k.data.len() >= 16_384 {
-                k.data.par_iter_mut().for_each(|d| {
-                    *d = d.max(0.0) * inv_two_ls_sq;
-                });
-                backend.elementwise_op_inplace(&mut k, ElementwiseOp::Exp)?;
-                if (c - 1.0).abs() > 0.0 {
-                    backend.elementwise_op_inplace(
-                        &mut k,
-                        ElementwiseOp::Affine {
-                            scale: c,
-                            shift: 0.0,
-                        },
-                    )?;
-                }
-            } else {
-                for d in &mut k.data {
-                    *d = c * (d.max(0.0) * inv_two_ls_sq).exp();
-                }
-            }
-            if is_self && params.kind == KernelKind::RbfWhite {
-                for i in 0..rows.min(cols) {
-                    let cur = k.get(i, i);
-                    k.set(i, i, cur + params.noise_level);
-                }
-            }
-        }
-        KernelKind::Matern => {
-            let nu = params.nu;
-            if (nu - 0.5).abs() <= 1e-12 {
-                k.data.par_iter_mut().for_each(|d| {
-                    let r = d.max(0.0).sqrt() / ls;
-                    *d = c * (-r).exp();
-                });
-            } else if (nu - 1.5).abs() <= 1e-12 {
-                let s3 = 3.0_f64.sqrt() / ls;
-                k.data.par_iter_mut().for_each(|d| {
-                    let r = d.max(0.0).sqrt() * s3;
-                    *d = c * (1.0 + r) * (-r).exp();
-                });
-            } else {
-                let s5 = 5.0_f64.sqrt() / ls;
-                k.data.par_iter_mut().for_each(|d| {
-                    let r = d.max(0.0).sqrt() * s5;
-                    *d = c * (1.0 + r + (r * r) / 3.0) * (-r).exp();
-                });
-            }
-        }
-        KernelKind::RationalQuadratic => {
-            let alpha = params.rq_alpha;
-            let denom = 2.0 * alpha * ls_sq;
-            k.data.par_iter_mut().for_each(|d| {
-                let base = 1.0 + d.max(0.0) / denom;
-                *d = c * base.powf(-alpha);
-            });
-        }
-        KernelKind::White => unreachable!(),
-    }
-
-    if is_self {
-        for i in 0..rows.min(cols) {
-            let diag = match params.kind {
-                KernelKind::White => params.noise_level,
-                KernelKind::RbfWhite => params.constant_value + params.noise_level,
-                _ => params.constant_value,
-            };
-            k.set(i, i, diag);
-        }
-    }
-
-    Ok(k)
-}
-
 #[inline]
 fn kernel_diag_value(params: &KernelParams) -> f64 {
     match params.kind {
@@ -364,137 +269,367 @@ fn kernel_diag_value(params: &KernelParams) -> f64 {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn dot_unrolled(a: &[f64], b: &[f64]) -> f64 {
-    let n = a.len().min(b.len());
-    let chunks = n / 4;
-    let mut s0 = 0.0;
-    let mut s1 = 0.0;
-    let mut s2 = 0.0;
-    let mut s3 = 0.0;
-    let mut idx = 0;
-    for _ in 0..chunks {
-        s0 += a[idx] * b[idx];
-        s1 += a[idx + 1] * b[idx + 1];
-        s2 += a[idx + 2] * b[idx + 2];
-        s3 += a[idx + 3] * b[idx + 3];
-        idx += 4;
-    }
-    let mut sum = (s0 + s1) + (s2 + s3);
-    while idx < n {
-        sum += a[idx] * b[idx];
-        idx += 1;
-    }
-    sum
+    dot_slice_unrolled(a, b)
 }
 
-/// Lower-triangular Cholesky factorization: A = L * L^T.
-fn cholesky_lower(a: &Matrix) -> OchreResult<Matrix> {
-    if a.rows != a.cols {
-        return Err(OchreError::NonSquareMatrix);
+/// Lower-triangular Cholesky factorization into preallocated `l` and `panel_buf`.
+#[inline]
+fn cholesky_lower_into(a: &Matrix, l: &mut Matrix, panel_buf: &mut Vec<f64>) -> OchreResult<()> {
+    if !cholesky_lower_with_diag_shift_into(a, 0.0, 1e-15, l, panel_buf) {
+        return Err(OchreError::SingularMatrix(
+            "Kernel matrix is not positive definite; consider increasing alpha or noise_level"
+                .to_string(),
+        ));
     }
-    let n = a.rows;
-    let mut l = Matrix::zeros(n, n);
-    for i in 0..n {
-        let row_i_off = i * n;
-        for j in 0..=i {
-            let sum = dot_unrolled(&l.data[row_i_off..row_i_off + j], &l.data[j * n..j * n + j]);
-            if i == j {
-                let diag = a.data[row_i_off + i] - sum;
-                if !diag.is_finite() || diag <= 1e-15 {
-                    return Err(OchreError::SingularMatrix(
-                        "Kernel matrix is not positive definite; consider increasing alpha or noise_level".to_string(),
-                    ));
-                }
-                l.data[row_i_off + i] = diag.sqrt();
-            } else {
-                let ljj = l.data[j * n + j];
-                if ljj.abs() <= 1e-15 {
-                    return Err(OchreError::SingularMatrix(
-                        "Zero diagonal encountered during Cholesky factorization".to_string(),
-                    ));
-                }
-                l.data[row_i_off + j] = (a.data[row_i_off + j] - sum) / ljj;
-            }
-        }
-    }
-    Ok(l)
+    Ok(())
 }
 
 /// Forward substitution into preallocated buffer: solve L * z = b where L is lower triangular (n x n).
 #[inline]
 fn solve_lower_triangular_into(l: &Matrix, b: &[f64], z: &mut [f64]) {
+    solve_lower_triangular_4row_into(l, b, z);
+}
+
+/// Solve (L * L^T) * x = b using preallocated buffers `z` and `x`.
+#[inline]
+fn solve_cholesky_from_l_into(l: &Matrix, b: &[f64], z: &mut [f64], x: &mut [f64]) {
+    solve_lower_triangular_4row_into(l, b, z);
+    solve_upper_triangular_t_4row_into(l, z, x);
+}
+
+/// Compute `(L^{-1})^T` into preallocated `m_t` (`n * n`), zeroing `m_t[i, 0..i]`.
+/// Each row `i` of `M^T` depends only on `L` and itself, so rows run in parallel when `n >= 128`.
+fn invert_lower_triangular_t_into(l: &Matrix, m_t: &mut [f64]) {
     let n = l.rows;
-    for i in 0..n {
-        let row_off = i * n;
-        let sum = dot_unrolled(&l.data[row_off..row_off + i], &z[..i]);
-        z[i] = (b[i] - sum) / l.data[row_off + i];
-    }
-}
-
-/// Forward substitution: solve L * z = b where L is lower triangular (n x n).
-fn solve_lower_triangular(l: &Matrix, b: &[f64]) -> Vec<f64> {
-    let mut z = vec![0.0; l.rows];
-    solve_lower_triangular_into(l, b, &mut z);
-    z
-}
-
-/// Backward substitution: solve L^T * x = z where L is lower triangular (n x n).
-/// Uses contiguous row-major scatter-subtract for cache locality and 4x unrolling.
-fn solve_upper_triangular_t(l: &Matrix, z: &[f64]) -> Vec<f64> {
-    let n = l.rows;
-    let mut x = z[..n].to_vec();
-    for i in (0..n).rev() {
-        let row_off = i * n;
-        let xi = x[i] / l.data[row_off + i];
-        x[i] = xi;
-        let row_i = &l.data[row_off..row_off + i];
-        let mut k = 0;
-        let chunks = i / 4;
-        for _ in 0..chunks {
-            x[k] -= row_i[k] * xi;
-            x[k + 1] -= row_i[k + 1] * xi;
-            x[k + 2] -= row_i[k + 2] * xi;
-            x[k + 3] -= row_i[k + 3] * xi;
-            k += 4;
-        }
-        while k < i {
-            x[k] -= row_i[k] * xi;
-            k += 1;
-        }
-    }
-    x
-}
-
-/// Solve (L * L^T) * x = b given lower-triangular Cholesky factor L.
-fn solve_cholesky_from_l(l: &Matrix, b: &[f64]) -> Vec<f64> {
-    let z = solve_lower_triangular(l, b);
-    solve_upper_triangular_t(l, &z)
-}
-
-/// Compute (L^{-1})^T where L is lower triangular (n x n).
-/// Entry (i, k) stores (L^{-1})_{k, i} for k >= i, so columns of L^{-1} are stored contiguously as rows.
-fn invert_lower_triangular_t(l: &Matrix) -> Vec<f64> {
-    let n = l.rows;
-    let mut m_t = vec![0.0; n * n];
-    for i in 0..n {
-        let mi_off = i * n;
-        m_t[mi_off + i] = 1.0 / l.data[i * n + i];
+    let fill_row = |(i, mi_row): (usize, &mut [f64])| {
+        mi_row[..i].fill(0.0);
+        mi_row[i] = 1.0 / l.data[i * n + i];
         for k in (i + 1)..n {
             let lk_off = k * n;
-            let sum = dot_unrolled(
-                &l.data[lk_off + i..lk_off + k],
-                &m_t[mi_off + i..mi_off + k],
-            );
-            m_t[mi_off + k] = -sum / l.data[lk_off + k];
+            let sum = dot_slice_unrolled(&l.data[lk_off + i..lk_off + k], &mi_row[i..k]);
+            mi_row[k] = -sum / l.data[lk_off + k];
+        }
+    };
+    if n >= 128 {
+        m_t.par_chunks_mut(n).enumerate().for_each(fill_row);
+    } else {
+        m_t.chunks_exact_mut(n).enumerate().for_each(fill_row);
+    }
+}
+
+/// Zero-allocation CPU matrix-vector multiply `out = mat * v`.
+#[inline]
+fn matvec_into(mat: &Matrix, v: &[f64], out: &mut [f64]) {
+    let cols = mat.cols;
+    if mat.rows >= 128 && mat.rows.saturating_mul(cols) >= 16_384 {
+        out.par_iter_mut()
+            .zip(mat.data.par_chunks(cols))
+            .for_each(|(dst, row)| {
+                *dst = dot_slice_unrolled(row, v);
+            });
+    } else {
+        for (dst, row) in out.iter_mut().zip(mat.data.chunks_exact(cols)) {
+            *dst = dot_slice_unrolled(row, v);
         }
     }
-    m_t
+}
+
+/// Precompute Euclidean distance matrix `D = sqrt(max(D2, 0))` once for Matern optimization.
+fn compute_d_sqrt(d2: &Matrix) -> Matrix {
+    let mut out = Matrix::zeros(d2.rows, d2.cols);
+    if d2.data.len() >= 16_384 {
+        out.data
+            .par_iter_mut()
+            .zip(d2.data.par_iter())
+            .for_each(|(dst, &d)| {
+                *dst = d.max(0.0).sqrt();
+            });
+    } else {
+        for (dst, &d) in out.data.iter_mut().zip(d2.data.iter()) {
+            *dst = d.max(0.0).sqrt();
+        }
+    }
+    out
+}
+
+/// Fill ONLY the lower triangle (`j <= i`) of `k_out` from `d2` (or `d_sqrt` for Matern)
+/// with `diag = kernel_diag_value(params) + alpha_reg`.
+fn fill_kernel_lower_into(
+    d2: Option<&Matrix>,
+    d_sqrt: Option<&Matrix>,
+    n: usize,
+    params: &KernelParams,
+    alpha_reg: f64,
+    k_out: &mut Matrix,
+) {
+    let diag_val = kernel_diag_value(params) + alpha_reg;
+    if params.kind == KernelKind::White {
+        for i in 0..n {
+            let row = &mut k_out.data[i * n..i * n + n];
+            row[..i].fill(0.0);
+            row[i] = diag_val;
+        }
+        return;
+    }
+
+    let c = params.constant_value;
+    let ls = params.length_scale;
+    let ls_sq = ls * ls;
+
+    match params.kind {
+        KernelKind::Rbf | KernelKind::RbfWhite => {
+            if let Some(d2_mat) = d2 {
+                let inv_two_ls_sq = -0.5 / ls_sq;
+                let fill_row = |(i, k_row): (usize, &mut [f64])| {
+                    let d_row = &d2_mat.data[i * n..i * n + i];
+                    for j in 0..i {
+                        k_row[j] = c * (d_row[j].max(0.0) * inv_two_ls_sq).exp();
+                    }
+                    k_row[i] = diag_val;
+                };
+                if n >= 128 {
+                    k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
+                } else {
+                    k_out
+                        .data
+                        .chunks_exact_mut(n)
+                        .enumerate()
+                        .for_each(fill_row);
+                }
+            }
+        }
+        KernelKind::Matern => {
+            let nu = params.nu;
+            if let Some(ds_mat) = d_sqrt {
+                if (nu - 0.5).abs() <= 1e-12 {
+                    let inv_ls = 1.0 / ls;
+                    let fill_row = |(i, k_row): (usize, &mut [f64])| {
+                        let d_row = &ds_mat.data[i * n..i * n + i];
+                        for j in 0..i {
+                            k_row[j] = c * (-(d_row[j] * inv_ls)).exp();
+                        }
+                        k_row[i] = diag_val;
+                    };
+                    if n >= 128 {
+                        k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
+                    } else {
+                        k_out
+                            .data
+                            .chunks_exact_mut(n)
+                            .enumerate()
+                            .for_each(fill_row);
+                    }
+                } else if (nu - 1.5).abs() <= 1e-12 {
+                    let s3 = 3.0_f64.sqrt() / ls;
+                    let fill_row = |(i, k_row): (usize, &mut [f64])| {
+                        let d_row = &ds_mat.data[i * n..i * n + i];
+                        for j in 0..i {
+                            let r = d_row[j] * s3;
+                            k_row[j] = c * (1.0 + r) * (-r).exp();
+                        }
+                        k_row[i] = diag_val;
+                    };
+                    if n >= 128 {
+                        k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
+                    } else {
+                        k_out
+                            .data
+                            .chunks_exact_mut(n)
+                            .enumerate()
+                            .for_each(fill_row);
+                    }
+                } else {
+                    let s5 = 5.0_f64.sqrt() / ls;
+                    let fill_row = |(i, k_row): (usize, &mut [f64])| {
+                        let d_row = &ds_mat.data[i * n..i * n + i];
+                        for j in 0..i {
+                            let r = d_row[j] * s5;
+                            k_row[j] = c * (1.0 + r + (r * r) * (1.0 / 3.0)) * (-r).exp();
+                        }
+                        k_row[i] = diag_val;
+                    };
+                    if n >= 128 {
+                        k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
+                    } else {
+                        k_out
+                            .data
+                            .chunks_exact_mut(n)
+                            .enumerate()
+                            .for_each(fill_row);
+                    }
+                }
+            } else if let Some(d2_mat) = d2 {
+                if (nu - 0.5).abs() <= 1e-12 {
+                    let inv_ls = 1.0 / ls;
+                    let fill_row = |(i, k_row): (usize, &mut [f64])| {
+                        let d_row = &d2_mat.data[i * n..i * n + i];
+                        for j in 0..i {
+                            k_row[j] = c * (-(d_row[j].max(0.0).sqrt() * inv_ls)).exp();
+                        }
+                        k_row[i] = diag_val;
+                    };
+                    if n >= 128 {
+                        k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
+                    } else {
+                        k_out
+                            .data
+                            .chunks_exact_mut(n)
+                            .enumerate()
+                            .for_each(fill_row);
+                    }
+                } else if (nu - 1.5).abs() <= 1e-12 {
+                    let s3 = 3.0_f64.sqrt() / ls;
+                    let fill_row = |(i, k_row): (usize, &mut [f64])| {
+                        let d_row = &d2_mat.data[i * n..i * n + i];
+                        for j in 0..i {
+                            let r = d_row[j].max(0.0).sqrt() * s3;
+                            k_row[j] = c * (1.0 + r) * (-r).exp();
+                        }
+                        k_row[i] = diag_val;
+                    };
+                    if n >= 128 {
+                        k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
+                    } else {
+                        k_out
+                            .data
+                            .chunks_exact_mut(n)
+                            .enumerate()
+                            .for_each(fill_row);
+                    }
+                } else {
+                    let s5 = 5.0_f64.sqrt() / ls;
+                    let fill_row = |(i, k_row): (usize, &mut [f64])| {
+                        let d_row = &d2_mat.data[i * n..i * n + i];
+                        for j in 0..i {
+                            let r = d_row[j].max(0.0).sqrt() * s5;
+                            k_row[j] = c * (1.0 + r + (r * r) * (1.0 / 3.0)) * (-r).exp();
+                        }
+                        k_row[i] = diag_val;
+                    };
+                    if n >= 128 {
+                        k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
+                    } else {
+                        k_out
+                            .data
+                            .chunks_exact_mut(n)
+                            .enumerate()
+                            .for_each(fill_row);
+                    }
+                }
+            }
+        }
+        KernelKind::RationalQuadratic => {
+            if let Some(d2_mat) = d2 {
+                let alpha = params.rq_alpha;
+                let denom = 2.0 * alpha * ls_sq;
+                let fill_row = |(i, k_row): (usize, &mut [f64])| {
+                    let d_row = &d2_mat.data[i * n..i * n + i];
+                    for j in 0..i {
+                        k_row[j] = c * (1.0 + d_row[j].max(0.0) / denom).powf(-alpha);
+                    }
+                    k_row[i] = diag_val;
+                };
+                if n >= 128 {
+                    k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
+                } else {
+                    k_out
+                        .data
+                        .chunks_exact_mut(n)
+                        .enumerate()
+                        .for_each(fill_row);
+                }
+            }
+        }
+        KernelKind::White => unreachable!(),
+    }
 }
 
 #[inline]
-fn dot(a: &[f64], b: &[f64]) -> f64 {
-    dot_unrolled(a, b)
+fn mirror_lower_to_upper(mat: &mut Matrix) {
+    let n = mat.rows;
+    for i in 0..n {
+        let row_off = i * n;
+        for j in 0..i {
+            mat.data[j * n + i] = mat.data[row_off + j];
+        }
+    }
+}
+
+/// Compute `4 x 4` dot products `(M^T * M)[i_base..i_base+4, j_base..j_base+4]` where `j_base <= i_base`
+/// and `m_t[r, k] == 0` for `k < r`, starting summation at `k = i_base`.
+#[inline(always)]
+fn dot_4x4_m_t(m_t: &[f64], n: usize, i_base: usize, j_base: usize) -> [[f64; 4]; 4] {
+    let m0 = &m_t[i_base * n..(i_base + 1) * n];
+    let m1 = &m_t[(i_base + 1) * n..(i_base + 2) * n];
+    let m2 = &m_t[(i_base + 2) * n..(i_base + 3) * n];
+    let m3 = &m_t[(i_base + 3) * n..(i_base + 4) * n];
+    let n0 = &m_t[j_base * n..(j_base + 1) * n];
+    let n1 = &m_t[(j_base + 1) * n..(j_base + 2) * n];
+    let n2 = &m_t[(j_base + 2) * n..(j_base + 3) * n];
+    let n3 = &m_t[(j_base + 3) * n..(j_base + 4) * n];
+
+    let mut acc = [[0.0f64; 4]; 4];
+    for k in i_base..n {
+        let a0 = m0[k];
+        let a1 = m1[k];
+        let a2 = m2[k];
+        let a3 = m3[k];
+        let b0 = n0[k];
+        let b1 = n1[k];
+        let b2 = n2[k];
+        let b3 = n3[k];
+
+        acc[0][0] += a0 * b0;
+        acc[0][1] += a0 * b1;
+        acc[0][2] += a0 * b2;
+        acc[0][3] += a0 * b3;
+
+        acc[1][0] += a1 * b0;
+        acc[1][1] += a1 * b1;
+        acc[1][2] += a1 * b2;
+        acc[1][3] += a1 * b3;
+
+        acc[2][0] += a2 * b0;
+        acc[2][1] += a2 * b1;
+        acc[2][2] += a2 * b2;
+        acc[2][3] += a2 * b3;
+
+        acc[3][0] += a3 * b0;
+        acc[3][1] += a3 * b1;
+        acc[3][2] += a3 * b2;
+        acc[3][3] += a3 * b3;
+    }
+    acc
+}
+
+/// Compute `dK_{ij} / d(log length_scale)` multiplier `ratio` such that `dK_{ij}/d(log ls) = K_{ij} * ratio`.
+#[inline(always)]
+fn dlog_ls_factor(
+    kind: KernelKind,
+    nu: f64,
+    ls: f64,
+    inv_ls_sq: f64,
+    d2_val: f64,
+    d_sqrt_val: f64,
+) -> f64 {
+    match kind {
+        KernelKind::Rbf | KernelKind::RbfWhite => d2_val * inv_ls_sq,
+        KernelKind::Matern => {
+            if (nu - 0.5).abs() <= 1e-12 {
+                d_sqrt_val / ls
+            } else if (nu - 1.5).abs() <= 1e-12 {
+                let r = 3.0_f64.sqrt() * d_sqrt_val / ls;
+                (r * r) / (1.0 + r)
+            } else {
+                let r = 5.0_f64.sqrt() * d_sqrt_val / ls;
+                let r2 = r * r;
+                (r2 * (1.0 + r)) / (3.0 + 3.0 * r + r2)
+            }
+        }
+        _ => 0.0,
+    }
 }
 
 #[inline]
@@ -939,7 +1074,7 @@ fn optimize_lml_lbfgs<F>(
     n_restarts: usize,
     random_state: Option<u64>,
     mut eval_lml_grad: F,
-) -> KernelParams
+) -> Option<KernelParams>
 where
     F: FnMut(&KernelParams) -> Option<(f64, Vec<f64>)>,
 {
@@ -952,7 +1087,7 @@ where
         let cand = apply_log_vec(&base, pt);
         eval_lml_grad(&cand).map(|(lml, g)| (-lml, g.into_iter().map(|v| -v).collect()))
     });
-    if -opt_neg_lml > best_lml {
+    if opt_neg_lml < 1e29 && -opt_neg_lml > best_lml {
         best_lml = -opt_neg_lml;
         best_theta = opt_theta;
     }
@@ -968,14 +1103,40 @@ where
                 let cand = apply_log_vec(&base, pt);
                 eval_lml_grad(&cand).map(|(lml, g)| (-lml, g.into_iter().map(|v| -v).collect()))
             });
-            if -cand_neg_lml > best_lml {
+            if cand_neg_lml < 1e29 && -cand_neg_lml > best_lml {
                 best_lml = -cand_neg_lml;
                 best_theta = cand_theta;
             }
         }
     }
 
-    apply_log_vec(&base, &best_theta)
+    if best_lml.is_finite() {
+        Some(apply_log_vec(&base, &best_theta))
+    } else {
+        None
+    }
+}
+
+struct GprScratch {
+    k: Matrix,
+    l: Matrix,
+    m_t: Vec<f64>,
+    panel_buf: Vec<f64>,
+    z: Vec<f64>,
+    alpha: Vec<f64>,
+}
+
+impl GprScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            k: Matrix::zeros(n, n),
+            l: Matrix::zeros(n, n),
+            m_t: vec![0.0; n * n],
+            panel_buf: vec![0.0; 4 * n],
+            z: vec![0.0; n],
+            alpha: vec![0.0; n],
+        }
+    }
 }
 
 // ============================================================================
@@ -1094,118 +1255,182 @@ impl GaussianProcessRegressor {
         })
     }
 
+    fn eval_gpr_fit_from_d2_into(
+        d2: Option<&Matrix>,
+        d_sqrt: Option<&Matrix>,
+        n: usize,
+        y_norm: &[f64],
+        alpha_reg: f64,
+        params: &KernelParams,
+        scratch: &mut GprScratch,
+    ) -> OchreResult<f64> {
+        fill_kernel_lower_into(d2, d_sqrt, n, params, alpha_reg, &mut scratch.k);
+        cholesky_lower_into(&scratch.k, &mut scratch.l, &mut scratch.panel_buf)?;
+        solve_cholesky_from_l_into(&scratch.l, y_norm, &mut scratch.z, &mut scratch.alpha);
+
+        let mut log_det_half = 0.0;
+        for i in 0..n {
+            log_det_half += scratch.l.data[i * n + i].ln();
+        }
+        let lml = -0.5 * dot_slice_unrolled(y_norm, &scratch.alpha)
+            - log_det_half
+            - 0.5 * (n as f64) * (2.0 * PI).ln();
+
+        Ok(lml)
+    }
+
+    #[allow(dead_code)]
     fn eval_gpr_fit_from_d2(
-        backend: &Backend<'_>,
+        _backend: &Backend<'_>,
         d2: Option<&Matrix>,
         n: usize,
         y_norm: &[f64],
         alpha_reg: f64,
         params: &KernelParams,
     ) -> OchreResult<(Matrix, Vec<f64>, f64)> {
-        let mut k = match d2 {
-            Some(d) => compute_kernel_from_d2(backend, d, params, true)?,
-            None => {
-                let mut m = Matrix::zeros(n, n);
-                for i in 0..n {
-                    m.set(i, i, params.noise_level);
-                }
-                m
-            }
-        };
-        for i in 0..n {
-            let cur = k.get(i, i);
-            k.set(i, i, cur + alpha_reg);
-        }
-        let l = cholesky_lower(&k)?;
-        let alpha_vec = solve_cholesky_from_l(&l, y_norm);
-
-        let mut log_det_half = 0.0;
-        for i in 0..n {
-            log_det_half += l.data[i * n + i].ln();
-        }
+        let mut scratch = GprScratch::new(n);
         let lml =
-            -0.5 * dot(y_norm, &alpha_vec) - log_det_half - 0.5 * (n as f64) * (2.0 * PI).ln();
-
-        Ok((l, alpha_vec, lml))
+            Self::eval_gpr_fit_from_d2_into(d2, None, n, y_norm, alpha_reg, params, &mut scratch)?;
+        Ok((scratch.l, scratch.alpha, lml))
     }
 
-    /// Evaluate GPR LML and analytical gradient wrt log-hyperparameters for `Rbf` and `RbfWhite`.
+    /// Evaluate GPR LML and analytical gradient wrt log-hyperparameters for `Rbf`, `RbfWhite`, and `Matern`.
     /// Gradient formula: d(LML)/d(theta_m) = 0.5 * tr((alpha * alpha^T - K^{-1}) * dK/d(theta_m)).
-    fn eval_gpr_lml_and_grad(
+    /// Reuses preallocated `GprScratch` buffers (zero `n x n` allocations).
+    fn eval_gpr_lml_and_grad_into(
         d2: &Matrix,
+        d_sqrt: Option<&Matrix>,
         y_norm: &[f64],
         alpha_reg: f64,
         params: &KernelParams,
+        scratch: &mut GprScratch,
     ) -> OchreResult<(f64, Vec<f64>)> {
         let n = d2.rows;
         let ls = params.length_scale;
-        let ls_sq = ls * ls;
-        let inv_ls_sq = 1.0 / ls_sq;
-        let inv_two_ls_sq = -0.5 * inv_ls_sq;
+        let inv_ls_sq = 1.0 / (ls * ls);
         let c = params.constant_value;
         let is_rbf_white = params.kind == KernelKind::RbfWhite;
-        let extra_diag = if is_rbf_white {
-            params.noise_level + alpha_reg
-        } else {
-            alpha_reg
-        };
+        let kind = params.kind;
+        let nu = params.nu;
+        let noise_level = params.noise_level;
 
-        // Build K0 (RBF part) and K = K0 + extra_diag * I
-        let mut k0 = Matrix::zeros(n, n);
-        let mut k = Matrix::zeros(n, n);
-        for i in 0..n {
-            let row = i * n;
-            k0.data[row + i] = c;
-            k.data[row + i] = c + extra_diag;
-            for j in 0..i {
-                let d_ij = d2.data[row + j].max(0.0);
-                let val = c * (d_ij * inv_two_ls_sq).exp();
-                k0.data[row + j] = val;
-                k0.data[j * n + i] = val;
-                k.data[row + j] = val;
-                k.data[j * n + i] = val;
-            }
-        }
-
-        let l = cholesky_lower(&k)?;
-        let alpha_vec = solve_cholesky_from_l(&l, y_norm);
+        fill_kernel_lower_into(Some(d2), d_sqrt, n, params, alpha_reg, &mut scratch.k);
+        cholesky_lower_into(&scratch.k, &mut scratch.l, &mut scratch.panel_buf)?;
+        solve_cholesky_from_l_into(&scratch.l, y_norm, &mut scratch.z, &mut scratch.alpha);
 
         let mut log_det_half = 0.0;
         for i in 0..n {
-            log_det_half += l.data[i * n + i].ln();
+            log_det_half += scratch.l.data[i * n + i].ln();
         }
-        let lml =
-            -0.5 * dot(y_norm, &alpha_vec) - log_det_half - 0.5 * (n as f64) * (2.0 * PI).ln();
+        let lml = -0.5 * dot_slice_unrolled(y_norm, &scratch.alpha)
+            - log_det_half
+            - 0.5 * (n as f64) * (2.0 * PI).ln();
 
-        // Compute M^T = (L^{-1})^T so K^{-1}_{ij} = dot(m_t[i, i..n], m_t[j, i..n]) for i >= j
-        let m_t = invert_lower_triangular_t(&l);
+        // Compute M^T = (L^{-1})^T into scratch.m_t so K^{-1}_{ij} = dot(m_t[i, i..n], m_t[j, i..n]) for i >= j
+        invert_lower_triangular_t_into(&scratch.l, &mut scratch.m_t);
 
-        let mut g_log_c = 0.0;
-        let mut g_log_ls = 0.0;
-        let mut g_log_noise = 0.0;
+        let k_ref = &scratch.k.data;
+        let m_t_ref = &scratch.m_t;
+        let alpha_ref = &scratch.alpha;
+        let d2_ref = &d2.data;
+        let ds_ref = d_sqrt.map(|m| m.data.as_slice());
 
-        for i in 0..n {
-            let row = i * n;
-            let ai = alpha_vec[i];
-            let mi = &m_t[row + i..row + n];
-            let k_inv_ii = dot_unrolled(mi, mi);
-            let w_ii = ai * ai - k_inv_ii;
-            g_log_c += 0.5 * w_ii * c;
-            if is_rbf_white {
-                g_log_noise += 0.5 * w_ii * params.noise_level;
+        let accum_block_row = |i_block: usize| -> (f64, f64, f64) {
+            let i_base = i_block * 4;
+            let mut gc = 0.0;
+            let mut gl = 0.0;
+            let mut gn = 0.0;
+
+            if i_base + 4 <= n {
+                // Strictly below diagonal 4x4 blocks: j_base < i_base
+                let mut j_base = 0;
+                while j_base < i_base {
+                    let k_inv_blk = dot_4x4_m_t(m_t_ref, n, i_base, j_base);
+                    for (dr, k_inv_row) in k_inv_blk.iter().enumerate() {
+                        let i = i_base + dr;
+                        let row = i * n;
+                        let ai = alpha_ref[i];
+                        for (dc, &k_inv_ij) in k_inv_row.iter().enumerate() {
+                            let j = j_base + dc;
+                            let w_ij = ai * alpha_ref[j] - k_inv_ij;
+                            let wk = w_ij * k_ref[row + j];
+                            gc += wk;
+                            let d2_val = d2_ref[row + j].max(0.0);
+                            let ds_val = match ds_ref {
+                                Some(ds) => ds[row + j],
+                                None => d2_val.sqrt(),
+                            };
+                            gl += wk * dlog_ls_factor(kind, nu, ls, inv_ls_sq, d2_val, ds_val);
+                        }
+                    }
+                    j_base += 4;
+                }
+
+                // Diagonal 4x4 block: j_base == i_base
+                let k_inv_diag = dot_4x4_m_t(m_t_ref, n, i_base, i_base);
+                for (dr, k_inv_row) in k_inv_diag.iter().enumerate() {
+                    let i = i_base + dr;
+                    let row = i * n;
+                    let ai = alpha_ref[i];
+                    let w_ii = ai * ai - k_inv_row[dr];
+                    gc += 0.5 * w_ii * c;
+                    if is_rbf_white {
+                        gn += 0.5 * w_ii * noise_level;
+                    }
+                    for (dc, &k_inv_ij) in k_inv_row.iter().enumerate().take(dr) {
+                        let j = i_base + dc;
+                        let w_ij = ai * alpha_ref[j] - k_inv_ij;
+                        let wk = w_ij * k_ref[row + j];
+                        gc += wk;
+                        let d2_val = d2_ref[row + j].max(0.0);
+                        let ds_val = match ds_ref {
+                            Some(ds) => ds[row + j],
+                            None => d2_val.sqrt(),
+                        };
+                        gl += wk * dlog_ls_factor(kind, nu, ls, inv_ls_sq, d2_val, ds_val);
+                    }
+                }
+            } else {
+                // Remainder rows at bottom (0..=3 rows)
+                for i in i_base..n {
+                    let row = i * n;
+                    let ai = alpha_ref[i];
+                    let mi = &m_t_ref[row + i..row + n];
+                    let k_inv_ii = dot_slice_unrolled(mi, mi);
+                    let w_ii = ai * ai - k_inv_ii;
+                    gc += 0.5 * w_ii * c;
+                    if is_rbf_white {
+                        gn += 0.5 * w_ii * noise_level;
+                    }
+                    for j in 0..i {
+                        let mj = &m_t_ref[j * n + i..j * n + n];
+                        let k_inv_ij = dot_slice_unrolled(mi, mj);
+                        let w_ij = ai * alpha_ref[j] - k_inv_ij;
+                        let wk = w_ij * k_ref[row + j];
+                        gc += wk;
+                        let d2_val = d2_ref[row + j].max(0.0);
+                        let ds_val = match ds_ref {
+                            Some(ds) => ds[row + j],
+                            None => d2_val.sqrt(),
+                        };
+                        gl += wk * dlog_ls_factor(kind, nu, ls, inv_ls_sq, d2_val, ds_val);
+                    }
+                }
             }
+            (gc, gl, gn)
+        };
 
-            for j in 0..i {
-                let mj = &m_t[j * n + i..j * n + n];
-                let k_inv_ij = dot_unrolled(mi, mj);
-                let w_ij = ai * alpha_vec[j] - k_inv_ij;
-                let k0_ij = k0.data[row + j];
-                // Factor 2 for symmetric off-diagonal * 0.5 in LML grad = 1.0
-                let wk = w_ij * k0_ij;
-                g_log_c += wk;
-                g_log_ls += wk * (d2.data[row + j].max(0.0) * inv_ls_sq);
-            }
-        }
+        let n_blocks = n.div_ceil(4);
+        let (g_log_c, g_log_ls, g_log_noise) = if n >= 128 {
+            (0..n_blocks)
+                .into_par_iter()
+                .map(accum_block_row)
+                .reduce(|| (0.0, 0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+        } else {
+            (0..n_blocks)
+                .map(accum_block_row)
+                .fold((0.0, 0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+        };
 
         let grad = if is_rbf_white {
             vec![g_log_c, g_log_ls, g_log_noise]
@@ -1213,6 +1438,17 @@ impl GaussianProcessRegressor {
             vec![g_log_c, g_log_ls]
         };
         Ok((lml, grad))
+    }
+
+    #[allow(dead_code)]
+    fn eval_gpr_lml_and_grad(
+        d2: &Matrix,
+        y_norm: &[f64],
+        alpha_reg: f64,
+        params: &KernelParams,
+    ) -> OchreResult<(f64, Vec<f64>)> {
+        let mut scratch = GprScratch::new(d2.rows);
+        Self::eval_gpr_lml_and_grad_into(d2, None, y_norm, alpha_reg, params, &mut scratch)
     }
 
     pub fn fit(&mut self, x: &Matrix, y: &[f64]) -> OchreResult<()> {
@@ -1244,30 +1480,53 @@ impl GaussianProcessRegressor {
         } else {
             Some(backend.pairwise_l2_sq(x, x)?)
         };
+        let d_sqrt = if base_params.kind == KernelKind::Matern {
+            d2.as_ref().map(compute_d_sqrt)
+        } else {
+            None
+        };
+
+        let mut scratch = GprScratch::new(n);
 
         let best_params = if self.optimize_hyperparams || self.n_restarts_optimizer > 0 {
-            match (base_params.kind, d2.as_ref()) {
-                (KernelKind::Rbf | KernelKind::RbfWhite, Some(d2_mat)) => optimize_lml_lbfgs(
-                    base_params,
-                    self.n_restarts_optimizer,
-                    self.random_state,
-                    |cand| Self::eval_gpr_lml_and_grad(d2_mat, &y_norm, self.alpha, cand).ok(),
-                ),
-                _ => optimize_lml(
+            let lbfgs_opt = match (base_params.kind, d2.as_ref()) {
+                (KernelKind::Rbf | KernelKind::RbfWhite | KernelKind::Matern, Some(d2_mat)) => {
+                    optimize_lml_lbfgs(
+                        base_params,
+                        self.n_restarts_optimizer,
+                        self.random_state,
+                        |cand| {
+                            Self::eval_gpr_lml_and_grad_into(
+                                d2_mat,
+                                d_sqrt.as_ref(),
+                                &y_norm,
+                                self.alpha,
+                                cand,
+                                &mut scratch,
+                            )
+                            .ok()
+                        },
+                    )
+                }
+                _ => None,
+            };
+            match lbfgs_opt {
+                Some(p) => p,
+                None => optimize_lml(
                     base_params,
                     self.n_restarts_optimizer,
                     self.random_state,
                     |cand| {
-                        Self::eval_gpr_fit_from_d2(
-                            &backend,
+                        Self::eval_gpr_fit_from_d2_into(
                             d2.as_ref(),
+                            d_sqrt.as_ref(),
                             n,
                             &y_norm,
                             self.alpha,
                             cand,
+                            &mut scratch,
                         )
                         .ok()
-                        .map(|r| r.2)
                     },
                 ),
             }
@@ -1275,20 +1534,21 @@ impl GaussianProcessRegressor {
             base_params
         };
 
-        let (l, alpha_vec, lml) = Self::eval_gpr_fit_from_d2(
-            &backend,
+        let lml = Self::eval_gpr_fit_from_d2_into(
             d2.as_ref(),
+            d_sqrt.as_ref(),
             n,
             &y_norm,
             self.alpha,
             &best_params,
+            &mut scratch,
         )?;
 
         self.x_train_ = Some(x.clone());
         self.y_train_mean_ = y_mean;
         self.y_train_std_ = y_std;
-        self.l_ = Some(l);
-        self.alpha_ = Some(alpha_vec);
+        self.l_ = Some(scratch.l);
+        self.alpha_ = Some(scratch.alpha);
         self.log_marginal_likelihood_value_ = Some(lml);
         self.length_scale_ = best_params.length_scale;
         self.constant_value_ = best_params.constant_value;
@@ -1376,21 +1636,49 @@ impl GaussianProcessRegressor {
             return Ok((y_mean, Some(y_std), None));
         }
 
-        // Solve L * V = K_trans^T => V has shape (n_train, n_test), stored column-by-column
-        let v_cols: Vec<Vec<f64>> = (0..n_test)
-            .into_par_iter()
-            .map(|i| {
-                let row = &k_trans.data[i * n_train..(i + 1) * n_train];
-                solve_lower_triangular(l, row)
-            })
-            .collect();
-
-        // return_cov == true
+        // Solve L * V = K_trans^T => V has shape (n_train, n_test) using 4-column blocked forward solve
         let mut y_cov = compute_kernel_matrix(&backend, x, x, &params, true)?;
         let mut v_mat = Matrix::zeros(n_train, n_test);
-        for (j, col) in v_cols.iter().enumerate() {
-            for (i, &val) in col.iter().enumerate().take(n_train) {
-                v_mat.set(i, j, val);
+        let n_blocks = n_test.div_ceil(4);
+        let solve_4col = |blk: usize, v_block: &mut [f64]| {
+            let j_start = blk * 4;
+            let bs = (n_test - j_start).min(4);
+            for r in 0..n_train {
+                let dst = &mut v_block[r * 4..r * 4 + 4];
+                for (c, d) in dst.iter_mut().enumerate().take(bs) {
+                    *d = k_trans.data[(j_start + c) * n_train + r];
+                }
+                dst[bs..].fill(0.0);
+            }
+            solve_lower_triangular_4col_4row_into(l, v_block, n_train);
+        };
+        if n_test > 64 {
+            let solved_blocks: Vec<(usize, Vec<f64>)> = (0..n_blocks)
+                .into_par_iter()
+                .map(|blk| {
+                    let mut v_block = vec![0.0; n_train * 4];
+                    solve_4col(blk, &mut v_block);
+                    (blk, v_block)
+                })
+                .collect();
+            for (blk, v_block) in solved_blocks {
+                let j_start = blk * 4;
+                let bs = (n_test - j_start).min(4);
+                for r in 0..n_train {
+                    let dst = &mut v_mat.data[r * n_test + j_start..r * n_test + j_start + bs];
+                    dst.copy_from_slice(&v_block[r * 4..r * 4 + bs]);
+                }
+            }
+        } else {
+            let mut v_block = vec![0.0; n_train * 4];
+            for blk in 0..n_blocks {
+                solve_4col(blk, &mut v_block);
+                let j_start = blk * 4;
+                let bs = (n_test - j_start).min(4);
+                for r in 0..n_train {
+                    let dst = &mut v_mat.data[r * n_test + j_start..r * n_test + j_start + bs];
+                    dst.copy_from_slice(&v_block[r * 4..r * 4 + bs]);
+                }
             }
         }
         let vt_v = backend.matmul_at_b(&v_mat, &v_mat)?;
@@ -1740,6 +2028,85 @@ pymethods_with_dit!(PyGaussianProcessRegressor, GaussianProcessRegressor, {
 // GaussianProcessClassifier (Binary Laplace + One-vs-Rest Multiclass)
 // ============================================================================
 
+struct GpcScratch {
+    k: Matrix,
+    b_mat: Matrix,
+    l: Matrix,
+    m_t: Vec<f64>,
+    r_mat: Matrix,
+    panel_buf: Vec<f64>,
+    f: Vec<f64>,
+    pi: Vec<f64>,
+    w: Vec<f64>,
+    w_sqrt: Vec<f64>,
+    a: Vec<f64>,
+    b_vec: Vec<f64>,
+    kb: Vec<f64>,
+    rhs: Vec<f64>,
+    z: Vec<f64>,
+    solved: Vec<f64>,
+    f_new: Vec<f64>,
+    s2: Vec<f64>,
+    k_s2: Vec<f64>,
+    r_k_s2: Vec<f64>,
+    u: Vec<f64>,
+}
+
+impl GpcScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            k: Matrix::zeros(n, n),
+            b_mat: Matrix::zeros(n, n),
+            l: Matrix::zeros(n, n),
+            m_t: vec![0.0; n * n],
+            r_mat: Matrix::zeros(n, n),
+            panel_buf: vec![0.0; 4 * n],
+            f: vec![0.0; n],
+            pi: vec![0.5; n],
+            w: vec![0.25; n],
+            w_sqrt: vec![0.5; n],
+            a: vec![0.0; n],
+            b_vec: vec![0.0; n],
+            kb: vec![0.0; n],
+            rhs: vec![0.0; n],
+            z: vec![0.0; n],
+            solved: vec![0.0; n],
+            f_new: vec![0.0; n],
+            s2: vec![0.0; n],
+            k_s2: vec![0.0; n],
+            r_k_s2: vec![0.0; n],
+            u: vec![0.0; n],
+        }
+    }
+
+    #[inline]
+    fn fill_b_mat_lower(&mut self, n: usize) {
+        let k_data = &self.k.data;
+        let w_sqrt = &self.w_sqrt;
+        let fill_row = |(i, b_row): (usize, &mut [f64])| {
+            let wsi = w_sqrt[i];
+            let k_row = &k_data[i * n..i * n + i + 1];
+            for j in 0..i {
+                b_row[j] = wsi * k_row[j] * w_sqrt[j];
+            }
+            b_row[i] = 1.0 + wsi * k_row[i] * wsi;
+        };
+        if n >= 128 {
+            self.b_mat
+                .data
+                .par_chunks_mut(n)
+                .enumerate()
+                .for_each(fill_row);
+        } else {
+            self.b_mat
+                .data
+                .chunks_exact_mut(n)
+                .enumerate()
+                .for_each(fill_row);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct BinaryLaplaceGP {
     y_train_minus_pi: Vec<f64>,
@@ -1750,76 +2117,65 @@ struct BinaryLaplaceGP {
 }
 
 impl BinaryLaplaceGP {
-    fn fit_single_from_d2(
-        backend: &Backend<'_>,
+    fn fit_single_lml_from_d2_into(
         d2: Option<&Matrix>,
+        d_sqrt: Option<&Matrix>,
         n: usize,
         y_bin: &[f64],
         params: &KernelParams,
         max_iter_predict: usize,
-    ) -> OchreResult<Self> {
-        let k = match d2 {
-            Some(d) => compute_kernel_from_d2(backend, d, params, true)?,
-            None => {
-                let mut m = Matrix::zeros(n, n);
-                for i in 0..n {
-                    m.set(i, i, params.noise_level);
-                }
-                m
-            }
-        };
-        let mut f = vec![0.0; n];
+        scratch: &mut GpcScratch,
+    ) -> OchreResult<f64> {
+        fill_kernel_lower_into(d2, d_sqrt, n, params, 0.0, &mut scratch.k);
+        mirror_lower_to_upper(&mut scratch.k);
 
-        let mut pi = vec![0.5; n];
-        let mut w = vec![0.25; n];
-        let mut w_sqrt = vec![0.5; n];
-        let mut a = vec![0.0; n];
-        let mut b_mat = Matrix::zeros(n, n);
-        let mut b_vec = vec![0.0; n];
-        let mut rhs = vec![0.0; n];
+        scratch.f.fill(0.0);
+        scratch.a.fill(0.0);
 
         for _iter in 0..max_iter_predict {
             for i in 0..n {
-                let p = sigmoid(f[i]);
-                pi[i] = p;
+                let p = sigmoid(scratch.f[i]);
+                scratch.pi[i] = p;
                 let wi = (p * (1.0 - p)).max(1e-12);
-                w[i] = wi;
-                w_sqrt[i] = wi.sqrt();
+                scratch.w[i] = wi;
+                scratch.w_sqrt[i] = wi.sqrt();
             }
 
-            // B = I + W^{1/2} K W^{1/2}
+            scratch.fill_b_mat_lower(n);
+            cholesky_lower_into(&scratch.b_mat, &mut scratch.l, &mut scratch.panel_buf)?;
+
+            for (i, ((&yi, &pi), (&wi, &fi))) in y_bin
+                .iter()
+                .zip(scratch.pi.iter())
+                .zip(scratch.w.iter().zip(scratch.f.iter()))
+                .enumerate()
+            {
+                scratch.b_vec[i] = wi * fi + (yi - pi);
+            }
+
+            matvec_into(&scratch.k, &scratch.b_vec, &mut scratch.kb);
             for i in 0..n {
-                let wsi = w_sqrt[i];
-                let row_off = i * n;
-                for (j, &wsj) in w_sqrt.iter().enumerate().take(n) {
-                    let val = wsi * k.data[row_off + j] * wsj;
-                    b_mat.data[row_off + j] = if i == j { 1.0 + val } else { val };
+                scratch.rhs[i] = scratch.w_sqrt[i] * scratch.kb[i];
+            }
+            solve_cholesky_from_l_into(
+                &scratch.l,
+                &scratch.rhs,
+                &mut scratch.z,
+                &mut scratch.solved,
+            );
+            for i in 0..n {
+                scratch.a[i] = scratch.b_vec[i] - scratch.w_sqrt[i] * scratch.solved[i];
+            }
+
+            matvec_into(&scratch.k, &scratch.a, &mut scratch.f_new);
+            let mut max_diff = 0.0_f64;
+            for i in 0..n {
+                let d = (scratch.f[i] - scratch.f_new[i]).abs();
+                if d > max_diff {
+                    max_diff = d;
                 }
             }
-            let l_iter = cholesky_lower(&b_mat)?;
-
-            // b_vec = W * f + (y_bin - pi)
-            for i in 0..n {
-                b_vec[i] = w[i] * f[i] + (y_bin[i] - pi[i]);
-            }
-
-            // kb = K * b_vec
-            let kb = backend.matvec(&k, &b_vec)?;
-            for i in 0..n {
-                rhs[i] = w_sqrt[i] * kb[i];
-            }
-            let solved = solve_cholesky_from_l(&l_iter, &rhs);
-            for i in 0..n {
-                a[i] = b_vec[i] - w_sqrt[i] * solved[i];
-            }
-
-            let f_new = backend.matvec(&k, &a)?;
-            let max_diff = f
-                .iter()
-                .zip(f_new.iter())
-                .map(|(&old, &new)| (old - new).abs())
-                .fold(0.0_f64, f64::max);
-            f = f_new;
+            std::mem::swap(&mut scratch.f, &mut scratch.f_new);
             if max_diff < 1e-8 {
                 break;
             }
@@ -1827,231 +2183,269 @@ impl BinaryLaplaceGP {
 
         // Recompute pi, w_sqrt, L at converged f
         for i in 0..n {
-            let p = sigmoid(f[i]);
-            pi[i] = p;
-            w_sqrt[i] = (p * (1.0 - p)).max(1e-12).sqrt();
+            let p = sigmoid(scratch.f[i]);
+            scratch.pi[i] = p;
+            let wi = (p * (1.0 - p)).max(1e-12);
+            scratch.w[i] = wi;
+            scratch.w_sqrt[i] = wi.sqrt();
         }
-        for i in 0..n {
-            let wsi = w_sqrt[i];
-            let row_off = i * n;
-            for (j, &wsj) in w_sqrt.iter().enumerate().take(n) {
-                let val = wsi * k.data[row_off + j] * wsj;
-                b_mat.data[row_off + j] = if i == j { 1.0 + val } else { val };
-            }
-        }
-        let l = cholesky_lower(&b_mat)?;
+        scratch.fill_b_mat_lower(n);
+        cholesky_lower_into(&scratch.b_mat, &mut scratch.l, &mut scratch.panel_buf)?;
 
         let mut log_lik = 0.0;
-        for i in 0..n {
-            let fi = f[i];
+        for (&yi, &fi) in y_bin.iter().zip(scratch.f.iter()) {
             let log_1_plus_exp = fi.max(0.0) + (-fi.abs()).exp().ln_1p();
-            log_lik += y_bin[i] * fi - log_1_plus_exp;
+            log_lik += yi * fi - log_1_plus_exp;
         }
         let mut log_det_b_half = 0.0;
         for i in 0..n {
-            log_det_b_half += l.data[i * n + i].ln();
+            log_det_b_half += scratch.l.data[i * n + i].ln();
         }
-        let lml = -0.5 * dot(&a, &f) + log_lik - log_det_b_half;
+        let lml = -0.5 * dot_slice_unrolled(&scratch.a, &scratch.f) + log_lik - log_det_b_half;
+        Ok(lml)
+    }
+
+    fn fit_single_from_d2_into(
+        d2: Option<&Matrix>,
+        d_sqrt: Option<&Matrix>,
+        n: usize,
+        y_bin: &[f64],
+        params: &KernelParams,
+        max_iter_predict: usize,
+        scratch: &mut GpcScratch,
+    ) -> OchreResult<Self> {
+        let lml = Self::fit_single_lml_from_d2_into(
+            d2,
+            d_sqrt,
+            n,
+            y_bin,
+            params,
+            max_iter_predict,
+            scratch,
+        )?;
         let y_train_minus_pi: Vec<f64> = y_bin
             .iter()
-            .zip(pi.iter())
+            .zip(scratch.pi.iter())
             .map(|(&yi, &pii)| yi - pii)
             .collect();
 
         Ok(Self {
             y_train_minus_pi,
-            w_sqrt,
-            l,
+            w_sqrt: scratch.w_sqrt.clone(),
+            l: scratch.l.clone(),
             lml,
             params: *params,
         })
     }
 
-    /// Evaluate Laplace LML and analytical gradient wrt log-hyperparameters (Rasmussen & Williams Alg 5.1)
-    /// for `Rbf` and `RbfWhite` kernels.
-    fn fit_single_lml_and_grad(
-        backend: &Backend<'_>,
-        d2: &Matrix,
+    #[allow(dead_code)]
+    fn fit_single_from_d2(
+        _backend: &Backend<'_>,
+        d2: Option<&Matrix>,
+        n: usize,
         y_bin: &[f64],
         params: &KernelParams,
         max_iter_predict: usize,
+    ) -> OchreResult<Self> {
+        let mut scratch = GpcScratch::new(n);
+        Self::fit_single_from_d2_into(d2, None, n, y_bin, params, max_iter_predict, &mut scratch)
+    }
+
+    /// Evaluate Laplace LML and analytical gradient wrt log-hyperparameters (Rasmussen & Williams Alg 5.1)
+    /// for `Rbf`, `RbfWhite`, and `Matern` kernels, reusing preallocated `GpcScratch` buffers.
+    fn fit_single_lml_and_grad_into(
+        d2: &Matrix,
+        d_sqrt: Option<&Matrix>,
+        y_bin: &[f64],
+        params: &KernelParams,
+        max_iter_predict: usize,
+        scratch: &mut GpcScratch,
     ) -> OchreResult<(f64, Vec<f64>)> {
         let n = d2.rows;
         let ls = params.length_scale;
-        let ls_sq = ls * ls;
-        let inv_ls_sq = 1.0 / ls_sq;
-        let inv_two_ls_sq = -0.5 * inv_ls_sq;
+        let inv_ls_sq = 1.0 / (ls * ls);
         let c = params.constant_value;
         let is_rbf_white = params.kind == KernelKind::RbfWhite;
+        let kind = params.kind;
+        let nu = params.nu;
+        let noise_level = params.noise_level;
 
-        let mut k0 = Matrix::zeros(n, n);
-        let mut k = Matrix::zeros(n, n);
-        let extra_diag = if is_rbf_white {
-            params.noise_level
-        } else {
-            0.0
-        };
-        for i in 0..n {
-            let row = i * n;
-            k0.data[row + i] = c;
-            k.data[row + i] = c + extra_diag;
-            for j in 0..i {
-                let val = c * (d2.data[row + j].max(0.0) * inv_two_ls_sq).exp();
-                k0.data[row + j] = val;
-                k0.data[j * n + i] = val;
-                k.data[row + j] = val;
-                k.data[j * n + i] = val;
-            }
-        }
+        let lml = Self::fit_single_lml_from_d2_into(
+            Some(d2),
+            d_sqrt,
+            n,
+            y_bin,
+            params,
+            max_iter_predict,
+            scratch,
+        )?;
 
-        let mut f = vec![0.0; n];
-        let mut pi = vec![0.5; n];
-        let mut w = vec![0.25; n];
-        let mut w_sqrt = vec![0.5; n];
-        let mut a = vec![0.0; n];
-        let mut b_mat = Matrix::zeros(n, n);
-        let mut b_vec = vec![0.0; n];
-        let mut rhs = vec![0.0; n];
-
-        for _iter in 0..max_iter_predict {
-            for i in 0..n {
-                let p = sigmoid(f[i]);
-                pi[i] = p;
-                let wi = (p * (1.0 - p)).max(1e-12);
-                w[i] = wi;
-                w_sqrt[i] = wi.sqrt();
-            }
-            for i in 0..n {
-                let wsi = w_sqrt[i];
-                let row_off = i * n;
-                for (j, &wsj) in w_sqrt.iter().enumerate().take(n) {
-                    let val = wsi * k.data[row_off + j] * wsj;
-                    b_mat.data[row_off + j] = if i == j { 1.0 + val } else { val };
+        // R = W^{1/2} * B^{-1} * W^{1/2} via M^T = (L^{-1})^T using 4x4 register blocking
+        invert_lower_triangular_t_into(&scratch.l, &mut scratch.m_t);
+        {
+            let m_t_ref = &scratch.m_t;
+            let w_sqrt_ref = &scratch.w_sqrt;
+            let fill_r_chunk = |(chunk_idx, rows_slice): (usize, &mut [f64])| {
+                let i_base = chunk_idx * 4;
+                let n_rows_chunk = rows_slice.len() / n;
+                if n_rows_chunk == 4 {
+                    let mut j_base = 0;
+                    while j_base < i_base {
+                        let block = dot_4x4_m_t(m_t_ref, n, i_base, j_base);
+                        for dr in 0..4 {
+                            let wsi = w_sqrt_ref[i_base + dr];
+                            let dst = &mut rows_slice[dr * n + j_base..dr * n + j_base + 4];
+                            for dc in 0..4 {
+                                dst[dc] = wsi * w_sqrt_ref[j_base + dc] * block[dr][dc];
+                            }
+                        }
+                        j_base += 4;
+                    }
+                    let diag_blk = dot_4x4_m_t(m_t_ref, n, i_base, i_base);
+                    for dr in 0..4 {
+                        let wsi = w_sqrt_ref[i_base + dr];
+                        let dst = &mut rows_slice[dr * n + i_base..dr * n + i_base + dr + 1];
+                        for dc in 0..=dr {
+                            dst[dc] = wsi * w_sqrt_ref[i_base + dc] * diag_blk[dr][dc];
+                        }
+                    }
+                } else {
+                    for r_local in 0..n_rows_chunk {
+                        let i = i_base + r_local;
+                        let wsi = w_sqrt_ref[i];
+                        let mi = &m_t_ref[i * n + i..i * n + n];
+                        let dst = &mut rows_slice[r_local * n..r_local * n + i + 1];
+                        for j in 0..=i {
+                            let mj = &m_t_ref[j * n + i..j * n + n];
+                            dst[j] = wsi * w_sqrt_ref[j] * dot_slice_unrolled(mi, mj);
+                        }
+                    }
                 }
+            };
+            if n >= 128 {
+                scratch
+                    .r_mat
+                    .data
+                    .par_chunks_mut(4 * n)
+                    .enumerate()
+                    .for_each(fill_r_chunk);
+            } else {
+                scratch
+                    .r_mat
+                    .data
+                    .chunks_mut(4 * n)
+                    .enumerate()
+                    .for_each(fill_r_chunk);
             }
-            let l_iter = cholesky_lower(&b_mat)?;
-            for i in 0..n {
-                b_vec[i] = w[i] * f[i] + (y_bin[i] - pi[i]);
-            }
-            let kb = backend.matvec(&k, &b_vec)?;
-            for i in 0..n {
-                rhs[i] = w_sqrt[i] * kb[i];
-            }
-            let solved = solve_cholesky_from_l(&l_iter, &rhs);
-            for i in 0..n {
-                a[i] = b_vec[i] - w_sqrt[i] * solved[i];
-            }
-            let f_new = backend.matvec(&k, &a)?;
-            let max_diff = f
-                .iter()
-                .zip(f_new.iter())
-                .map(|(&old, &new)| (old - new).abs())
-                .fold(0.0_f64, f64::max);
-            f = f_new;
-            if max_diff < 1e-8 {
-                break;
-            }
-        }
-
-        for i in 0..n {
-            let p = sigmoid(f[i]);
-            pi[i] = p;
-            let wi = (p * (1.0 - p)).max(1e-12);
-            w[i] = wi;
-            w_sqrt[i] = wi.sqrt();
-        }
-        for i in 0..n {
-            let wsi = w_sqrt[i];
-            let row_off = i * n;
-            for (j, &wsj) in w_sqrt.iter().enumerate().take(n) {
-                let val = wsi * k.data[row_off + j] * wsj;
-                b_mat.data[row_off + j] = if i == j { 1.0 + val } else { val };
-            }
-        }
-        let l = cholesky_lower(&b_mat)?;
-
-        let mut log_lik = 0.0;
-        for i in 0..n {
-            let fi = f[i];
-            let log_1_plus_exp = fi.max(0.0) + (-fi.abs()).exp().ln_1p();
-            log_lik += y_bin[i] * fi - log_1_plus_exp;
-        }
-        let mut log_det_b_half = 0.0;
-        for i in 0..n {
-            log_det_b_half += l.data[i * n + i].ln();
-        }
-        let lml = -0.5 * dot(&a, &f) + log_lik - log_det_b_half;
-
-        // R = W^{1/2} * B^{-1} * W^{1/2} via M^T = (L^{-1})^T
-        let m_t = invert_lower_triangular_t(&l);
-        let mut r_mat = Matrix::zeros(n, n);
-        for i in 0..n {
-            let row = i * n;
-            let mi = &m_t[row + i..row + n];
-            let wsi = w_sqrt[i];
-            r_mat.data[row + i] = wsi * wsi * dot_unrolled(mi, mi);
-            for j in 0..i {
-                let mj = &m_t[j * n + i..j * n + n];
-                let val = wsi * w_sqrt[j] * dot_unrolled(mi, mj);
-                r_mat.data[row + j] = val;
-                r_mat.data[j * n + i] = val;
-            }
+            mirror_lower_to_upper(&mut scratch.r_mat);
         }
 
         // s2[i] = -0.5 * (K_{ii} - ||L^{-1} W^{1/2} K_{:,i}||^2) * d^3 log p(y_i | f_i) / df_i^3
-        // where d^3 log p / df_i^3 = -pi_i * (1 - pi_i) * (1 - 2 * pi_i)
-        let mut s2 = vec![0.0; n];
-        let mut wk_col = vec![0.0; n];
-        let mut c_col = vec![0.0; n];
-        for i in 0..n {
-            let k_row = &k.data[i * n..(i + 1) * n];
-            for j in 0..n {
-                wk_col[j] = w_sqrt[j] * k_row[j];
+        // Solve L * C = W^{1/2} * K in 4-column blocked passes.
+        {
+            let l_ref = &scratch.l;
+            let k_ref = &scratch.k.data;
+            let w_sqrt_ref = &scratch.w_sqrt;
+            let pi_ref = &scratch.pi;
+            let compute_s2_chunk = |v_block: &mut [f64], (blk, s2_chunk): (usize, &mut [f64])| {
+                let i_start = blk * 4;
+                let bs = s2_chunk.len();
+                if bs == 4 {
+                    let k0 = &k_ref[i_start * n..(i_start + 1) * n];
+                    let k1 = &k_ref[(i_start + 1) * n..(i_start + 2) * n];
+                    let k2 = &k_ref[(i_start + 2) * n..(i_start + 3) * n];
+                    let k3 = &k_ref[(i_start + 3) * n..(i_start + 4) * n];
+                    for j in 0..n {
+                        let ws = w_sqrt_ref[j];
+                        let dst = &mut v_block[j * 4..j * 4 + 4];
+                        dst[0] = ws * k0[j];
+                        dst[1] = ws * k1[j];
+                        dst[2] = ws * k2[j];
+                        dst[3] = ws * k3[j];
+                    }
+                } else {
+                    for j in 0..n {
+                        let ws = w_sqrt_ref[j];
+                        let dst = &mut v_block[j * 4..j * 4 + 4];
+                        for (c, d) in dst.iter_mut().enumerate().take(bs) {
+                            *d = ws * k_ref[(i_start + c) * n + j];
+                        }
+                        dst[bs..].fill(0.0);
+                    }
+                }
+                let norm_sq = solve_lower_triangular_4col_4row_into(l_ref, v_block, n);
+                for (c, s2_out) in s2_chunk.iter_mut().enumerate() {
+                    let i = i_start + c;
+                    let post_var_i = k_ref[i * n + i] - norm_sq[c];
+                    let p = pi_ref[i];
+                    let dw_df = p * (1.0 - p) * (1.0 - 2.0 * p);
+                    *s2_out = -0.5 * post_var_i * dw_df;
+                }
+            };
+            if n >= 128 {
+                scratch.s2.par_chunks_mut(4).enumerate().for_each_init(
+                    || vec![0.0; n * 4],
+                    |v_block, (blk, chunk)| compute_s2_chunk(v_block, (blk, chunk)),
+                );
+            } else {
+                let mut v_block = vec![0.0; n * 4];
+                for (blk, chunk) in scratch.s2.chunks_mut(4).enumerate() {
+                    compute_s2_chunk(&mut v_block, (blk, chunk));
+                }
             }
-            solve_lower_triangular_into(&l, &wk_col, &mut c_col);
-            let post_var_i = k.data[i * n + i] - dot_unrolled(&c_col, &c_col);
-            let p = pi[i];
-            let dw_df = p * (1.0 - p) * (1.0 - 2.0 * p);
-            s2[i] = -0.5 * post_var_i * dw_df;
         }
 
-        // Precompute u = (I - R K) s2 so s2^T (I - K R) b_m = u^T b_m, where b_m = dK_m * a
-        // Since R and K are symmetric: (s2^T (I - K R))^T = s2 - R (K s2)
-        let k_s2 = backend.matvec(&k, &s2)?;
-        let r_k_s2 = backend.matvec(&r_mat, &k_s2)?;
-        let mut u = vec![0.0; n];
+        // u = (I - R K) s2 = s2 - R (K s2)
+        matvec_into(&scratch.k, &scratch.s2, &mut scratch.k_s2);
+        matvec_into(&scratch.r_mat, &scratch.k_s2, &mut scratch.r_k_s2);
         for i in 0..n {
-            u[i] = s2[i] - r_k_s2[i];
+            scratch.u[i] = scratch.s2[i] - scratch.r_k_s2[i];
         }
 
-        // Accumulate analytical gradients for log(c), log(ls), and (if RbfWhite) log(noise_level)
-        // d(LML)/d(theta_m) = 0.5 * sum_{i,j} (a_i a_j - R_{ij}) * dK_{ij} + sum_{i,j} u_i * dK_{ij} * a_j
-        // By symmetry of dK, off-diagonal (i > j) contributes:
-        //   (a_i a_j - R_{ij} + u_i a_j + u_j a_i) * dK_{ij}
-        // Diagonal (i == j) contributes:
-        //   (0.5 * (a_i^2 - R_{ii}) + u_i a_i) * dK_{ii}
-        let mut g_log_c = 0.0;
-        let mut g_log_ls = 0.0;
-        let mut g_log_noise = 0.0;
+        let a_ref = &scratch.a;
+        let u_ref = &scratch.u;
+        let r_ref = &scratch.r_mat.data;
+        let k_ref = &scratch.k.data;
+        let d2_ref = &d2.data;
+        let ds_ref = d_sqrt.map(|m| m.data.as_slice());
 
-        for i in 0..n {
+        let accum_row = |i: usize| -> (f64, f64, f64) {
             let row = i * n;
-            let ai = a[i];
-            let ui = u[i];
-            let diag_coeff = 0.5 * (ai * ai - r_mat.data[row + i]) + ui * ai;
-            g_log_c += diag_coeff * c;
-            if is_rbf_white {
-                g_log_noise += diag_coeff * params.noise_level;
-            }
+            let ai = a_ref[i];
+            let ui = u_ref[i];
+            let diag_coeff = 0.5 * (ai * ai - r_ref[row + i]) + ui * ai;
+            let mut gc = diag_coeff * c;
+            let mut gl = 0.0;
+            let gn = if is_rbf_white {
+                diag_coeff * noise_level
+            } else {
+                0.0
+            };
             for j in 0..i {
-                let aj = a[j];
-                let coeff = (ai * aj - r_mat.data[row + j]) + ui * aj + u[j] * ai;
-                let k0_ij = k0.data[row + j];
-                let ck = coeff * k0_ij;
-                g_log_c += ck;
-                g_log_ls += ck * (d2.data[row + j].max(0.0) * inv_ls_sq);
+                let aj = a_ref[j];
+                let coeff = (ai * aj - r_ref[row + j]) + ui * aj + u_ref[j] * ai;
+                let ck = coeff * k_ref[row + j];
+                gc += ck;
+                let d2_val = d2_ref[row + j].max(0.0);
+                let ds_val = match ds_ref {
+                    Some(ds) => ds[row + j],
+                    None => d2_val.sqrt(),
+                };
+                gl += ck * dlog_ls_factor(kind, nu, ls, inv_ls_sq, d2_val, ds_val);
             }
-        }
+            (gc, gl, gn)
+        };
+
+        let (g_log_c, g_log_ls, g_log_noise) = if n >= 128 {
+            (0..n)
+                .into_par_iter()
+                .map(accum_row)
+                .reduce(|| (0.0, 0.0, 0.0), |x, y| (x.0 + y.0, x.1 + y.1, x.2 + y.2))
+        } else {
+            (0..n)
+                .map(accum_row)
+                .fold((0.0, 0.0, 0.0), |x, y| (x.0 + y.0, x.1 + y.1, x.2 + y.2))
+        };
 
         let grad = if is_rbf_white {
             vec![g_log_c, g_log_ls, g_log_noise]
@@ -2061,61 +2455,16 @@ impl BinaryLaplaceGP {
         Ok((lml, grad))
     }
 
-    /// Solve `L * V = B` for up to 8 RHS columns stored row-major in `v_block` (`n_train x 8`),
-    /// returning `||V[:, c]||^2` for each column `c in 0..8`.
-    #[inline]
-    fn solve_lower_triangular_block8(l: &Matrix, v_block: &mut [f64], n_train: usize) -> [f64; 8] {
-        let mut norm_sq = [0.0f64; 8];
-        for r in 0..n_train {
-            let row_off = r * n_train;
-            let l_row = &l.data[row_off..row_off + r];
-            let mut s0 = 0.0f64;
-            let mut s1 = 0.0f64;
-            let mut s2 = 0.0f64;
-            let mut s3 = 0.0f64;
-            let mut s4 = 0.0f64;
-            let mut s5 = 0.0f64;
-            let mut s6 = 0.0f64;
-            let mut s7 = 0.0f64;
-            for (j, &lrj) in l_row.iter().enumerate() {
-                let vj = &v_block[j * 8..(j + 1) * 8];
-                s0 += lrj * vj[0];
-                s1 += lrj * vj[1];
-                s2 += lrj * vj[2];
-                s3 += lrj * vj[3];
-                s4 += lrj * vj[4];
-                s5 += lrj * vj[5];
-                s6 += lrj * vj[6];
-                s7 += lrj * vj[7];
-            }
-            let inv_diag = 1.0 / l.data[row_off + r];
-            let vr = &mut v_block[r * 8..(r + 1) * 8];
-            let v0 = (vr[0] - s0) * inv_diag;
-            let v1 = (vr[1] - s1) * inv_diag;
-            let v2 = (vr[2] - s2) * inv_diag;
-            let v3 = (vr[3] - s3) * inv_diag;
-            let v4 = (vr[4] - s4) * inv_diag;
-            let v5 = (vr[5] - s5) * inv_diag;
-            let v6 = (vr[6] - s6) * inv_diag;
-            let v7 = (vr[7] - s7) * inv_diag;
-            vr[0] = v0;
-            vr[1] = v1;
-            vr[2] = v2;
-            vr[3] = v3;
-            vr[4] = v4;
-            vr[5] = v5;
-            vr[6] = v6;
-            vr[7] = v7;
-            norm_sq[0] += v0 * v0;
-            norm_sq[1] += v1 * v1;
-            norm_sq[2] += v2 * v2;
-            norm_sq[3] += v3 * v3;
-            norm_sq[4] += v4 * v4;
-            norm_sq[5] += v5 * v5;
-            norm_sq[6] += v6 * v6;
-            norm_sq[7] += v7 * v7;
-        }
-        norm_sq
+    #[allow(dead_code)]
+    fn fit_single_lml_and_grad(
+        _backend: &Backend<'_>,
+        d2: &Matrix,
+        y_bin: &[f64],
+        params: &KernelParams,
+        max_iter_predict: usize,
+    ) -> OchreResult<(f64, Vec<f64>)> {
+        let mut scratch = GpcScratch::new(d2.rows);
+        Self::fit_single_lml_and_grad_into(d2, None, y_bin, params, max_iter_predict, &mut scratch)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2132,33 +2481,25 @@ impl BinaryLaplaceGP {
         let count = out.len();
         let mut offset = 0usize;
         while offset < count {
-            let bs = (count - offset).min(8);
+            let bs = (count - offset).min(4);
             let global_start = start + offset;
-            if bs == 8 {
+            if bs == 4 {
                 let k0 = &k_star.data[global_start * n_train..(global_start + 1) * n_train];
                 let k1 = &k_star.data[(global_start + 1) * n_train..(global_start + 2) * n_train];
                 let k2 = &k_star.data[(global_start + 2) * n_train..(global_start + 3) * n_train];
                 let k3 = &k_star.data[(global_start + 3) * n_train..(global_start + 4) * n_train];
-                let k4 = &k_star.data[(global_start + 4) * n_train..(global_start + 5) * n_train];
-                let k5 = &k_star.data[(global_start + 5) * n_train..(global_start + 6) * n_train];
-                let k6 = &k_star.data[(global_start + 6) * n_train..(global_start + 7) * n_train];
-                let k7 = &k_star.data[(global_start + 7) * n_train..(global_start + 8) * n_train];
                 for j in 0..n_train {
                     let ws = self.w_sqrt[j];
-                    let dst = &mut v_block[j * 8..(j + 1) * 8];
+                    let dst = &mut v_block[j * 4..(j + 1) * 4];
                     dst[0] = ws * k0[j];
                     dst[1] = ws * k1[j];
                     dst[2] = ws * k2[j];
                     dst[3] = ws * k3[j];
-                    dst[4] = ws * k4[j];
-                    dst[5] = ws * k5[j];
-                    dst[6] = ws * k6[j];
-                    dst[7] = ws * k7[j];
                 }
             } else {
                 for j in 0..n_train {
                     let ws = self.w_sqrt[j];
-                    let dst = &mut v_block[j * 8..(j + 1) * 8];
+                    let dst = &mut v_block[j * 4..(j + 1) * 4];
                     for (c, d) in dst.iter_mut().enumerate().take(bs) {
                         *d = ws * k_star.data[(global_start + c) * n_train + j];
                     }
@@ -2168,7 +2509,7 @@ impl BinaryLaplaceGP {
                 }
             }
 
-            let norm_sq = Self::solve_lower_triangular_block8(&self.l, v_block, n_train);
+            let norm_sq = solve_lower_triangular_4col_4row_into(&self.l, v_block, n_train);
             for c in 0..bs {
                 let var_f = (k_diag - norm_sq[c]).max(0.0);
                 // Probit approximation matching sklearn GaussianProcessClassifier
@@ -2193,7 +2534,7 @@ impl BinaryLaplaceGP {
 
         let mut probs = vec![0.0; n_test];
         if n_test <= 512 {
-            let mut v_block = vec![0.0; n_train * 8];
+            let mut v_block = vec![0.0; n_train * 4];
             self.predict_pos_proba_range(
                 &k_star,
                 &f_star,
@@ -2209,7 +2550,7 @@ impl BinaryLaplaceGP {
                 .par_chunks_mut(PAR_CHUNK_TEST)
                 .enumerate()
                 .for_each_init(
-                    || vec![0.0; n_train * 8],
+                    || vec![0.0; n_train * 4],
                     |v_block, (chunk_idx, out_chunk)| {
                         self.predict_pos_proba_range(
                             &k_star,
@@ -2383,55 +2724,70 @@ impl GaussianProcessClassifier {
             Some(backend.pairwise_l2_sq(x, x)?)
         };
 
+        let d_sqrt = if base_params.kind == KernelKind::Matern {
+            d2.as_ref().map(compute_d_sqrt)
+        } else {
+            None
+        };
+        let mut scratch = GpcScratch::new(n);
+
         let mut estimators = Vec::new();
         let mut total_lml = 0.0;
 
-        let fit_binary = |y_bin: &[f64]| -> OchreResult<BinaryLaplaceGP> {
+        let mut fit_binary = |y_bin: &[f64]| -> OchreResult<BinaryLaplaceGP> {
             let best_params = if do_opt {
-                match (base_params.kind, d2.as_ref()) {
-                    (KernelKind::Rbf | KernelKind::RbfWhite, Some(d2_mat)) => optimize_lml_lbfgs(
+                let lbfgs_opt = match (base_params.kind, d2.as_ref()) {
+                    (KernelKind::Rbf | KernelKind::RbfWhite | KernelKind::Matern, Some(d2_mat)) => {
+                        optimize_lml_lbfgs(
+                            base_params,
+                            self.n_restarts_optimizer,
+                            self.random_state,
+                            |cand| {
+                                BinaryLaplaceGP::fit_single_lml_and_grad_into(
+                                    d2_mat,
+                                    d_sqrt.as_ref(),
+                                    y_bin,
+                                    cand,
+                                    self.max_iter_predict,
+                                    &mut scratch,
+                                )
+                                .ok()
+                            },
+                        )
+                    }
+                    _ => None,
+                };
+                match lbfgs_opt {
+                    Some(p) => p,
+                    None => optimize_lml(
                         base_params,
                         self.n_restarts_optimizer,
                         self.random_state,
                         |cand| {
-                            BinaryLaplaceGP::fit_single_lml_and_grad(
-                                &backend,
-                                d2_mat,
-                                y_bin,
-                                cand,
-                                self.max_iter_predict,
-                            )
-                            .ok()
-                        },
-                    ),
-                    _ => optimize_lml(
-                        base_params,
-                        self.n_restarts_optimizer,
-                        self.random_state,
-                        |cand| {
-                            BinaryLaplaceGP::fit_single_from_d2(
-                                &backend,
+                            BinaryLaplaceGP::fit_single_lml_from_d2_into(
                                 d2.as_ref(),
+                                d_sqrt.as_ref(),
                                 n,
                                 y_bin,
                                 cand,
                                 self.max_iter_predict,
+                                &mut scratch,
                             )
                             .ok()
-                            .map(|e| e.lml)
                         },
                     ),
                 }
             } else {
                 base_params
             };
-            BinaryLaplaceGP::fit_single_from_d2(
-                &backend,
+            BinaryLaplaceGP::fit_single_from_d2_into(
                 d2.as_ref(),
+                d_sqrt.as_ref(),
                 n,
                 y_bin,
                 &best_params,
                 self.max_iter_predict,
+                &mut scratch,
             )
         };
 
@@ -3032,6 +3388,182 @@ mod tests {
         for r in 0..600 {
             let sum = proba.get(r, 0) + proba.get(r, 1);
             assert!((sum - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_gpr_and_gpc_matern_analytical_grad_matches_finite_diff() {
+        let (x_reg, y_reg) = sample_regression_data();
+        let (x_cls, y_cls) = sample_classification_data();
+        let d2_reg = Backend::Cpu.pairwise_l2_sq(&x_reg, &x_reg).expect("d2_reg");
+        let ds_reg = compute_d_sqrt(&d2_reg);
+        let d2_cls = Backend::Cpu.pairwise_l2_sq(&x_cls, &x_cls).expect("d2_cls");
+        let ds_cls = compute_d_sqrt(&d2_cls);
+        let eps = 1e-5;
+
+        for nu in [0.5, 1.5, 2.5] {
+            let base = KernelParams {
+                kind: KernelKind::Matern,
+                length_scale: 1.4,
+                constant_value: 1.9,
+                nu,
+                noise_level: 0.1,
+                rq_alpha: 1.0,
+            };
+            let theta = params_to_log_vec(&base);
+
+            // GPR Matern analytical grad check
+            let mut gpr_scratch = GprScratch::new(x_reg.rows);
+            let (_lml, gpr_grad) = GaussianProcessRegressor::eval_gpr_lml_and_grad_into(
+                &d2_reg,
+                Some(&ds_reg),
+                &y_reg,
+                1e-4,
+                &base,
+                &mut gpr_scratch,
+            )
+            .expect("gpr matern grad");
+            for m in 0..theta.len() {
+                let mut tp = theta.clone();
+                let mut tm = theta.clone();
+                tp[m] += eps;
+                tm[m] -= eps;
+                let lp = GaussianProcessRegressor::eval_gpr_fit_from_d2_into(
+                    Some(&d2_reg),
+                    Some(&ds_reg),
+                    x_reg.rows,
+                    &y_reg,
+                    1e-4,
+                    &apply_log_vec(&base, &tp),
+                    &mut gpr_scratch,
+                )
+                .expect("plus");
+                let lm = GaussianProcessRegressor::eval_gpr_fit_from_d2_into(
+                    Some(&d2_reg),
+                    Some(&ds_reg),
+                    x_reg.rows,
+                    &y_reg,
+                    1e-4,
+                    &apply_log_vec(&base, &tm),
+                    &mut gpr_scratch,
+                )
+                .expect("minus");
+                let fd = (lp - lm) / (2.0 * eps);
+                let err = (gpr_grad[m] - fd).abs();
+                assert!(
+                    err / (1.0 + fd.abs()) < 1e-4,
+                    "GPR Matern(nu={nu}) grad mismatch dim {m}: analytical={} fd={fd}",
+                    gpr_grad[m]
+                );
+            }
+
+            // GPC Matern analytical grad check
+            let mut gpc_scratch = GpcScratch::new(x_cls.rows);
+            let (_lml, gpc_grad) = BinaryLaplaceGP::fit_single_lml_and_grad_into(
+                &d2_cls,
+                Some(&ds_cls),
+                &y_cls,
+                &base,
+                100,
+                &mut gpc_scratch,
+            )
+            .expect("gpc matern grad");
+            for m in 0..theta.len() {
+                let mut tp = theta.clone();
+                let mut tm = theta.clone();
+                tp[m] += eps;
+                tm[m] -= eps;
+                let lp = BinaryLaplaceGP::fit_single_lml_from_d2_into(
+                    Some(&d2_cls),
+                    Some(&ds_cls),
+                    x_cls.rows,
+                    &y_cls,
+                    &apply_log_vec(&base, &tp),
+                    100,
+                    &mut gpc_scratch,
+                )
+                .expect("plus");
+                let lm = BinaryLaplaceGP::fit_single_lml_from_d2_into(
+                    Some(&d2_cls),
+                    Some(&ds_cls),
+                    x_cls.rows,
+                    &y_cls,
+                    &apply_log_vec(&base, &tm),
+                    100,
+                    &mut gpc_scratch,
+                )
+                .expect("minus");
+                let fd = (lp - lm) / (2.0 * eps);
+                let err = (gpc_grad[m] - fd).abs();
+                assert!(
+                    err / (1.0 + fd.abs()) < 1e-4,
+                    "GPC Matern(nu={nu}) grad mismatch dim {m}: analytical={} fd={fd}",
+                    gpc_grad[m]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_gpr_and_gpc_280_lbfgs_matern_and_rbf_parity() {
+        let n = 280usize;
+        let p = 4usize;
+        let mut x_data = Vec::with_capacity(n * p);
+        let mut y_reg = Vec::with_capacity(n);
+        let mut y_cls = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = -2.5 + 5.0 * (i as f64) / ((n - 1) as f64);
+            let x0 = t;
+            let x1 = (t * 1.4).sin();
+            let x2 = (t * 0.7).cos();
+            let x3 = 0.2 * t * t - 0.5;
+            x_data.extend_from_slice(&[x0, x1, x2, x3]);
+            y_reg.push(x0.sin() + 0.5 * x1 - 0.3 * x2 + 0.05 * x3);
+            y_cls.push(if x0 + 0.6 * x1 > 0.0 { 1.0 } else { 0.0 });
+        }
+        let x = Matrix::from_vec(n, p, x_data).expect("x");
+
+        for kernel in ["rbf", "matern"] {
+            let mut gpr = GaussianProcessRegressor::new(
+                kernel.to_string(),
+                0.5,
+                1.0,
+                1.5,
+                1e-3,
+                1.0,
+                1.0,
+                true,
+                0,
+                true,
+                Some(42),
+                None,
+            )
+            .expect("new gpr");
+            gpr.fit(&x, &y_reg).expect("fit gpr");
+            let r2 = gpr.score(&x, &y_reg).expect("score gpr");
+            assert!(r2 > 0.99, "GPR 280 {kernel} R2={r2}");
+            let (_m, _s, cov) = gpr
+                .predict_with_uncertainty(&x, false, true)
+                .expect("predict cov");
+            assert_eq!(cov.expect("cov").rows, n);
+
+            let mut gpc = GaussianProcessClassifier::new(
+                kernel.to_string(),
+                0.5,
+                1.0,
+                1.5,
+                1.0,
+                1.0,
+                100,
+                true,
+                0,
+                Some(42),
+                None,
+            )
+            .expect("new gpc");
+            gpc.fit(&x, &y_cls).expect("fit gpc");
+            let acc = gpc.score(&x, &y_cls).expect("score gpc");
+            assert!(acc >= 0.95, "GPC 280 {kernel} acc={acc}");
         }
     }
 }
