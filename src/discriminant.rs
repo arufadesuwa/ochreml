@@ -23,6 +23,39 @@ use rayon::prelude::*;
 pub const TAG_LDA: u8 = 45;
 pub const TAG_QDA: u8 = 46;
 
+const PARALLEL_ROW_THRESHOLD: usize = 4096;
+
+#[inline]
+fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
+    if elems < 131_072 {
+        Backend::Cpu
+    } else {
+        get_backend(dev)
+    }
+}
+
+#[inline]
+fn dot4(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len();
+    let chunks = n / 4;
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    for i in 0..chunks {
+        let base = i * 4;
+        s0 += a[base] * b[base];
+        s1 += a[base + 1] * b[base + 1];
+        s2 += a[base + 2] * b[base + 2];
+        s3 += a[base + 3] * b[base + 3];
+    }
+    let mut sum = (s0 + s1) + (s2 + s3);
+    for i in (chunks * 4)..n {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
 fn validate_matrix_finite(x: &Matrix) -> OchreResult<()> {
     if x.rows == 0 || x.cols == 0 {
         return Err(OchreError::EmptyData);
@@ -167,14 +200,23 @@ fn ledoit_wolf_shrinkage(xc: &Matrix, s_emp: &Matrix) -> f64 {
         return 0.0;
     }
 
-    let sum_norm4: f64 = xc
-        .data
-        .par_chunks_exact(p)
-        .map(|row| {
-            let sq: f64 = row.iter().map(|&v| v * v).sum();
-            sq * sq
-        })
-        .sum();
+    let sum_norm4: f64 = if xc.rows >= PARALLEL_ROW_THRESHOLD {
+        xc.data
+            .par_chunks_exact(p)
+            .map(|row| {
+                let sq: f64 = row.iter().map(|&v| v * v).sum();
+                sq * sq
+            })
+            .sum()
+    } else {
+        xc.data
+            .chunks_exact(p)
+            .map(|row| {
+                let sq: f64 = row.iter().map(|&v| v * v).sum();
+                sq * sq
+            })
+            .sum()
+    };
 
     let beta_bar = (sum_norm4 / (n * n) - frob_sq_s / n) / p_f;
     let beta = beta_bar.max(0.0).min(delta);
@@ -267,24 +309,59 @@ fn log_softmax_matrix(scores: &Matrix) -> OchreResult<Matrix> {
     let n = scores.rows;
     let k = scores.cols;
     let mut out = vec![0.0; n * k];
-    out.par_chunks_exact_mut(k)
-        .zip(scores.data.par_chunks_exact(k))
-        .for_each(|(dst, src)| {
-            let max_v = src.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let sum_exp: f64 = src.iter().map(|&v| (v - max_v).exp()).sum();
-            let log_norm = max_v + sum_exp.ln();
-            for j in 0..k {
-                dst[j] = src[j] - log_norm;
-            }
-        });
+    let compute_row = |(dst, src): (&mut [f64], &[f64])| {
+        let max_v = src.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let sum_exp: f64 = src.iter().map(|&v| (v - max_v).exp()).sum();
+        let log_norm = max_v + sum_exp.ln();
+        for j in 0..k {
+            dst[j] = src[j] - log_norm;
+        }
+    };
+    if n >= PARALLEL_ROW_THRESHOLD {
+        out.par_chunks_exact_mut(k)
+            .zip(scores.data.par_chunks_exact(k))
+            .for_each(compute_row);
+    } else {
+        out.chunks_exact_mut(k)
+            .zip(scores.data.chunks_exact(k))
+            .for_each(compute_row);
+    }
+    Matrix::from_vec(n, k, out)
+}
+
+fn softmax_matrix(scores: &Matrix) -> OchreResult<Matrix> {
+    let n = scores.rows;
+    let k = scores.cols;
+    let mut out = vec![0.0; n * k];
+    let compute_row = |(dst, src): (&mut [f64], &[f64])| {
+        let max_v = src.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut sum_exp = 0.0;
+        for j in 0..k {
+            let e = (src[j] - max_v).exp();
+            dst[j] = e;
+            sum_exp += e;
+        }
+        let inv_sum = 1.0 / sum_exp;
+        for v in dst.iter_mut() {
+            *v *= inv_sum;
+        }
+    };
+    if n >= PARALLEL_ROW_THRESHOLD {
+        out.par_chunks_exact_mut(k)
+            .zip(scores.data.par_chunks_exact(k))
+            .for_each(compute_row);
+    } else {
+        out.chunks_exact_mut(k)
+            .zip(scores.data.chunks_exact(k))
+            .for_each(compute_row);
+    }
     Matrix::from_vec(n, k, out)
 }
 
 fn binary_log_proba_from_decision(scores: &Matrix) -> OchreResult<Matrix> {
     let n = scores.rows;
     let mut out = vec![0.0; n * 2];
-    for i in 0..n {
-        let z = scores.data[i];
+    let compute_row = |(dst, &z): (&mut [f64], &f64)| {
         // log P(y=1) = -softplus(-z), log P(y=0) = -softplus(z)
         let (lp0, lp1) = if z >= 0.0 {
             let e = (-z).exp();
@@ -295,18 +372,54 @@ fn binary_log_proba_from_decision(scores: &Matrix) -> OchreResult<Matrix> {
             let sp = e.ln_1p();
             (-sp, z - sp)
         };
-        out[2 * i] = lp0;
-        out[2 * i + 1] = lp1;
+        dst[0] = lp0;
+        dst[1] = lp1;
+    };
+    if n >= PARALLEL_ROW_THRESHOLD {
+        out.par_chunks_exact_mut(2)
+            .zip(scores.data.par_iter())
+            .for_each(compute_row);
+    } else {
+        for (dst, &z) in out
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(scores.data.iter())
+        {
+            compute_row((dst, &z));
+        }
     }
     Matrix::from_vec(n, 2, out)
 }
 
-fn proba_from_log_proba(log_proba: &Matrix) -> OchreResult<Matrix> {
-    let mut out = log_proba.data.clone();
-    out.par_iter_mut().for_each(|v| {
-        *v = v.exp();
-    });
-    Matrix::from_vec(log_proba.rows, log_proba.cols, out)
+fn binary_proba_from_decision(scores: &Matrix) -> OchreResult<Matrix> {
+    let n = scores.rows;
+    let mut out = vec![0.0; n * 2];
+    let compute_row = |(dst, &z): (&mut [f64], &f64)| {
+        let p1 = if z >= 0.0 {
+            1.0 / (1.0 + (-z).exp())
+        } else {
+            let ez = z.exp();
+            ez / (1.0 + ez)
+        };
+        dst[0] = 1.0 - p1;
+        dst[1] = p1;
+    };
+    if n >= PARALLEL_ROW_THRESHOLD {
+        out.par_chunks_exact_mut(2)
+            .zip(scores.data.par_iter())
+            .for_each(compute_row);
+    } else {
+        for (dst, &z) in out
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(scores.data.iter())
+        {
+            compute_row((dst, &z));
+        }
+    }
+    Matrix::from_vec(n, 2, out)
 }
 
 fn accuracy_score(y_true: &[f64], y_pred: &[f64]) -> OchreResult<f64> {
@@ -466,7 +579,7 @@ impl LinearDiscriminantAnalysis {
         let (counts, priors, means, xbar) =
             compute_class_stats(x, &y_idx, n_classes, self.priors.as_deref())?;
 
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, n_samples * n_features);
 
         // Centered class means: M_c = means - xbar (n_classes x n_features)
         let mut means_centered_data = vec![0.0; n_classes * n_features];
@@ -836,13 +949,50 @@ impl LinearDiscriminantAnalysis {
     }
 
     pub fn decision_function(&self, x: &Matrix) -> OchreResult<Matrix> {
-        self.validate_predict_input(x)?;
+        let p = self.validate_predict_input(x)?;
         let coef = self.coef_.as_ref().ok_or(OchreError::NotFitted)?;
         let intercept = self.intercept_.as_ref().ok_or(OchreError::NotFitted)?;
-        let backend = get_backend(&self.device);
+        let n = x.rows;
+        let k = coef.rows;
+        let backend = effective_backend(&self.device, n * p);
+
+        if matches!(backend, Backend::Cpu) {
+            let mut out = vec![0.0; n * k];
+            let x_data = &x.data;
+            let c_data = &coef.data;
+            if k == 1 {
+                let w0 = &c_data[..p];
+                let b0 = intercept[0];
+                let compute_row = |(r, dst): (usize, &mut f64)| {
+                    let x_row = &x_data[r * p..(r + 1) * p];
+                    *dst = dot4(x_row, w0) + b0;
+                };
+                if n >= PARALLEL_ROW_THRESHOLD {
+                    out.par_iter_mut().enumerate().for_each(compute_row);
+                } else {
+                    out.iter_mut().enumerate().for_each(compute_row);
+                }
+            } else {
+                let compute_row = |(r, dst): (usize, &mut [f64])| {
+                    let x_row = &x_data[r * p..(r + 1) * p];
+                    for c in 0..k {
+                        let c_row = &c_data[c * p..(c + 1) * p];
+                        dst[c] = dot4(x_row, c_row) + intercept[c];
+                    }
+                };
+                if n >= PARALLEL_ROW_THRESHOLD {
+                    out.par_chunks_exact_mut(k)
+                        .enumerate()
+                        .for_each(compute_row);
+                } else {
+                    out.chunks_exact_mut(k).enumerate().for_each(compute_row);
+                }
+            }
+            return Matrix::from_vec(n, k, out);
+        }
+
         let coef_t = coef.transpose();
         let mut scores = backend.matmul(x, &coef_t)?;
-        let k = scores.cols;
         for r in 0..scores.rows {
             for (c, &b) in intercept.iter().enumerate().take(k) {
                 scores.data[r * k + c] += b;
@@ -862,14 +1012,66 @@ impl LinearDiscriminantAnalysis {
     }
 
     pub fn predict_proba(&self, x: &Matrix) -> OchreResult<Matrix> {
-        let lp = self.predict_log_proba(x)?;
-        proba_from_log_proba(&lp)
+        let scores = self.decision_function(x)?;
+        let n_classes = self.classes_.as_ref().ok_or(OchreError::NotFitted)?.len();
+        if n_classes == 2 {
+            binary_proba_from_decision(&scores)
+        } else {
+            softmax_matrix(&scores)
+        }
     }
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
-        let scores = self.decision_function(x)?;
+        let p = self.validate_predict_input(x)?;
         let classes = self.classes_.as_ref().ok_or(OchreError::NotFitted)?;
-        let n = scores.rows;
+        let coef = self.coef_.as_ref().ok_or(OchreError::NotFitted)?;
+        let intercept = self.intercept_.as_ref().ok_or(OchreError::NotFitted)?;
+        let n = x.rows;
+        let backend = effective_backend(&self.device, n * p);
+
+        if matches!(backend, Backend::Cpu) {
+            let x_data = &x.data;
+            let c_data = &coef.data;
+            let mut preds = vec![0.0; n];
+            if classes.len() == 2 {
+                let w0 = &c_data[..p];
+                let b0 = intercept[0];
+                let c0 = classes[0];
+                let c1 = classes[1];
+                let compute_row = |(r, dst): (usize, &mut f64)| {
+                    let x_row = &x_data[r * p..(r + 1) * p];
+                    *dst = if dot4(x_row, w0) + b0 > 0.0 { c1 } else { c0 };
+                };
+                if n >= PARALLEL_ROW_THRESHOLD {
+                    preds.par_iter_mut().enumerate().for_each(compute_row);
+                } else {
+                    preds.iter_mut().enumerate().for_each(compute_row);
+                }
+            } else {
+                let k = classes.len();
+                let compute_row = |(r, dst): (usize, &mut f64)| {
+                    let x_row = &x_data[r * p..(r + 1) * p];
+                    let mut best_c = 0;
+                    let mut best_v = dot4(x_row, &c_data[..p]) + intercept[0];
+                    for c in 1..k {
+                        let v = dot4(x_row, &c_data[c * p..(c + 1) * p]) + intercept[c];
+                        if v > best_v {
+                            best_v = v;
+                            best_c = c;
+                        }
+                    }
+                    *dst = classes[best_c];
+                };
+                if n >= PARALLEL_ROW_THRESHOLD {
+                    preds.par_iter_mut().enumerate().for_each(compute_row);
+                } else {
+                    preds.iter_mut().enumerate().for_each(compute_row);
+                }
+            }
+            return Ok(preds);
+        }
+
+        let scores = self.decision_function(x)?;
         if classes.len() == 2 {
             Ok((0..n)
                 .map(|i| {
@@ -912,9 +1114,45 @@ impl LinearDiscriminantAnalysis {
         let n_comp = self.n_components_.ok_or(OchreError::NotFitted)?;
         let p = x.cols;
         let n = x.rows;
+        let cols_to_take = n_comp.min(scalings.cols);
+        let backend = effective_backend(&self.device, n * p);
+
+        if matches!(backend, Backend::Cpu) {
+            // Transpose first cols_to_take columns of scalings into contiguous rows (cols_to_take x p)
+            let mut s_t = vec![0.0; cols_to_take * p];
+            for c in 0..cols_to_take {
+                for r in 0..p {
+                    s_t[c * p + r] = scalings.data[r * scalings.cols + c];
+                }
+            }
+            let offset: Vec<f64> = if self.solver == "eigen" {
+                vec![0.0; cols_to_take]
+            } else {
+                (0..cols_to_take)
+                    .map(|c| dot4(xbar, &s_t[c * p..(c + 1) * p]))
+                    .collect()
+            };
+            let mut out = vec![0.0; n * cols_to_take];
+            let x_data = &x.data;
+            let compute_row = |(r, dst): (usize, &mut [f64])| {
+                let x_row = &x_data[r * p..(r + 1) * p];
+                for c in 0..cols_to_take {
+                    dst[c] = dot4(x_row, &s_t[c * p..(c + 1) * p]) - offset[c];
+                }
+            };
+            if n >= PARALLEL_ROW_THRESHOLD {
+                out.par_chunks_exact_mut(cols_to_take)
+                    .enumerate()
+                    .for_each(compute_row);
+            } else {
+                out.chunks_exact_mut(cols_to_take)
+                    .enumerate()
+                    .for_each(compute_row);
+            }
+            return Matrix::from_vec(n, cols_to_take, out);
+        }
 
         // Slice first n_comp columns of scalings (p x n_comp)
-        let cols_to_take = n_comp.min(scalings.cols);
         let mut s_sub_data = Vec::with_capacity(p * cols_to_take);
         for r in 0..p {
             for c in 0..cols_to_take {
@@ -934,7 +1172,6 @@ impl LinearDiscriminantAnalysis {
             }
             Matrix::from_vec(n, p, x_centered_data)?
         };
-        let backend = get_backend(&self.device);
         backend.matmul(&x_in, &s_sub)
     }
 
@@ -1112,7 +1349,7 @@ impl QuadraticDiscriminantAnalysis {
             }
         }
 
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, x.rows * n_features);
         let mut scalings_list = Vec::with_capacity(n_classes);
         let mut rotations_list = Vec::with_capacity(n_classes);
         let mut cov_list = if self.store_covariance {
@@ -1192,7 +1429,72 @@ impl QuadraticDiscriminantAnalysis {
 
         let n_classes = classes.len();
         let n_samples = x.rows;
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, n_samples * p);
+
+        if matches!(backend, Backend::Cpu) {
+            // Precompute per-class transposed rotations, projected means, inv_s2, and constants
+            let mut rot_ts = Vec::with_capacity(n_classes);
+            let mut proj_means = Vec::with_capacity(n_classes);
+            let mut inv_s2s = Vec::with_capacity(n_classes);
+            let mut class_consts = Vec::with_capacity(n_classes);
+
+            for k in 0..n_classes {
+                let m_row = &means.data[(k * p)..((k + 1) * p)];
+                let rot = &rotations[k];
+                let mut rot_t = vec![0.0; p * p];
+                for c in 0..p {
+                    for r in 0..p {
+                        rot_t[c * p + r] = rot.data[r * p + c];
+                    }
+                }
+                let mut pm = Vec::with_capacity(p);
+                for c in 0..p {
+                    pm.push(dot4(m_row, &rot_t[c * p..(c + 1) * p]));
+                }
+                let s2 = &scalings[k];
+                let inv_s2: Vec<f64> = s2.iter().map(|&v| 1.0 / v).collect();
+                let logdet: f64 = s2.iter().map(|&v| v.ln()).sum();
+                let log_prior = if priors[k] > 0.0 {
+                    priors[k].ln()
+                } else {
+                    f64::NEG_INFINITY
+                };
+                rot_ts.push(rot_t);
+                proj_means.push(pm);
+                inv_s2s.push(inv_s2);
+                class_consts.push(-0.5 * logdet + log_prior);
+            }
+
+            let mut scores = vec![0.0; n_samples * n_classes];
+            let x_data = &x.data;
+            let compute_row = |(r, dst): (usize, &mut [f64])| {
+                let x_row = &x_data[(r * p)..((r + 1) * p)];
+                for k in 0..n_classes {
+                    let rot_t = &rot_ts[k];
+                    let pm = &proj_means[k];
+                    let inv_s2 = &inv_s2s[k];
+                    let mut norm2 = 0.0;
+                    for c in 0..p {
+                        let proj_c = dot4(x_row, &rot_t[c * p..(c + 1) * p]) - pm[c];
+                        norm2 += proj_c * proj_c * inv_s2[c];
+                    }
+                    dst[k] = class_consts[k] - 0.5 * norm2;
+                }
+            };
+            if n_samples >= PARALLEL_ROW_THRESHOLD {
+                scores
+                    .par_chunks_exact_mut(n_classes)
+                    .enumerate()
+                    .for_each(compute_row);
+            } else {
+                scores
+                    .chunks_exact_mut(n_classes)
+                    .enumerate()
+                    .for_each(compute_row);
+            }
+            return Matrix::from_vec(n_samples, n_classes, scores);
+        }
+
         let mut scores = vec![0.0; n_samples * n_classes];
 
         for k in 0..n_classes {
@@ -1249,8 +1551,8 @@ impl QuadraticDiscriminantAnalysis {
     }
 
     pub fn predict_proba(&self, x: &Matrix) -> OchreResult<Matrix> {
-        let lp = self.predict_log_proba(x)?;
-        proba_from_log_proba(&lp)
+        let all_scores = self.decision_scores_all(x)?;
+        softmax_matrix(&all_scores)
     }
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {

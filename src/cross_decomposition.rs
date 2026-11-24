@@ -24,6 +24,37 @@ pub const TAG_NMF: u8 = 90;
 pub const TAG_CCA: u8 = 91;
 pub const TAG_PLS_REGRESSION: u8 = 92;
 
+#[inline]
+fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
+    if elems < 131_072 {
+        Backend::Cpu
+    } else {
+        get_backend(dev)
+    }
+}
+
+#[inline]
+fn dot4(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len();
+    let chunks = n / 4;
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    for i in 0..chunks {
+        let base = i * 4;
+        s0 += a[base] * b[base];
+        s1 += a[base + 1] * b[base + 1];
+        s2 += a[base + 2] * b[base + 2];
+        s3 += a[base + 3] * b[base + 3];
+    }
+    let mut sum = (s0 + s1) + (s2 + s3);
+    for i in (chunks * 4)..n {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
 #[derive(Clone, Debug)]
 struct SplitMix64 {
     state: u64,
@@ -235,6 +266,142 @@ fn frobenius_diff(a: &Matrix, b: &Matrix) -> f64 {
         sq += d * d;
     }
     sq.sqrt()
+}
+
+/// Compute `||X - W * H||_F` on CPU without allocating an `n x p` reconstruction matrix.
+fn frobenius_diff_wh_cpu(x: &Matrix, w: &Matrix, h: &Matrix, row_buf: &mut [f64]) -> f64 {
+    let n = x.rows;
+    let p = x.cols;
+    let k = w.cols;
+    let mut sq = 0.0f64;
+    for r in 0..n {
+        row_buf.fill(0.0);
+        let w_row = &w.data[r * k..(r + 1) * k];
+        for (c, &w_rc) in w_row.iter().enumerate() {
+            if w_rc != 0.0 {
+                let h_row = &h.data[c * p..(c + 1) * p];
+                for j in 0..p {
+                    row_buf[j] += w_rc * h_row[j];
+                }
+            }
+        }
+        let x_row = &x.data[r * p..(r + 1) * p];
+        for j in 0..p {
+            let d = x_row[j] - row_buf[j];
+            sq += d * d;
+        }
+    }
+    sq.sqrt()
+}
+
+/// Zero-allocation CPU multiplicative update for `W` using contiguous dot products.
+/// `h_ht` has length `k * k`, `denom_row` has length `k`.
+fn nmf_cpu_update_w(
+    x: &Matrix,
+    w: &mut Matrix,
+    h: &Matrix,
+    l1_w: f64,
+    l2_w: f64,
+    h_ht: &mut [f64],
+    denom_row: &mut [f64],
+) {
+    let n = x.rows;
+    let p = x.cols;
+    let k = w.cols;
+
+    // h_ht = H * H^T (symmetric k x k)
+    for a in 0..k {
+        let h_a = &h.data[a * p..(a + 1) * p];
+        for b in a..k {
+            let h_b = &h.data[b * p..(b + 1) * p];
+            let v = dot4(h_a, h_b);
+            h_ht[a * k + b] = v;
+            h_ht[b * k + a] = v;
+        }
+    }
+
+    // For each row r: denom[r, c] = dot(W[r], h_ht[c]), num[r, c] = dot(X[r], H[c])
+    for r in 0..n {
+        let x_row = &x.data[r * p..(r + 1) * p];
+        let w_row = &mut w.data[r * k..(r + 1) * k];
+        for c in 0..k {
+            let hh_row = &h_ht[c * k..(c + 1) * k];
+            denom_row[c] = dot4(w_row, hh_row);
+        }
+        for c in 0..k {
+            let h_row = &h.data[c * p..(c + 1) * p];
+            let num = dot4(x_row, h_row);
+            let w_rc = w_row[c];
+            let d = denom_row[c] + l1_w + l2_w * w_rc + 1e-12;
+            w_row[c] = (w_rc * num / d).max(0.0);
+        }
+    }
+}
+
+/// Zero-allocation CPU multiplicative update for `H` using contiguous slices.
+/// `num_h` and `denom_h` have length `k * p`; `wt_w` has length `k * k`.
+#[allow(clippy::too_many_arguments)]
+fn nmf_cpu_update_h(
+    x: &Matrix,
+    w: &Matrix,
+    h: &mut Matrix,
+    l1_h: f64,
+    l2_h: f64,
+    num_h: &mut [f64],
+    wt_w: &mut [f64],
+    denom_h: &mut [f64],
+) {
+    let n = x.rows;
+    let p = x.cols;
+    let k = w.cols;
+
+    num_h.fill(0.0);
+    wt_w.fill(0.0);
+
+    for r in 0..n {
+        let w_row = &w.data[r * k..(r + 1) * k];
+        let x_row = &x.data[r * p..(r + 1) * p];
+        for c in 0..k {
+            let w_rc = w_row[c];
+            if w_rc == 0.0 {
+                continue;
+            }
+            let num_row = &mut num_h[c * p..(c + 1) * p];
+            for j in 0..p {
+                num_row[j] += w_rc * x_row[j];
+            }
+            let wtw_row = &mut wt_w[c * k..(c + 1) * k];
+            for b in c..k {
+                wtw_row[b] += w_rc * w_row[b];
+            }
+        }
+    }
+    for a in 0..k {
+        for b in (a + 1)..k {
+            wt_w[b * k + a] = wt_w[a * k + b];
+        }
+    }
+
+    denom_h.fill(0.0);
+    for a in 0..k {
+        let d_row = &mut denom_h[a * p..(a + 1) * p];
+        let wtw_row = &wt_w[a * k..(a + 1) * k];
+        for (b, &coeff) in wtw_row.iter().enumerate() {
+            if coeff == 0.0 {
+                continue;
+            }
+            let h_row = &h.data[b * p..(b + 1) * p];
+            for j in 0..p {
+                d_row[j] += coeff * h_row[j];
+            }
+        }
+    }
+
+    for i in 0..h.data.len() {
+        let h_i = h.data[i];
+        let d = denom_h[i] + l1_h + l2_h * h_i + 1e-12;
+        h.data[i] = (h_i * num_h[i] / d).max(0.0);
+    }
 }
 
 // ============================================================================
@@ -504,7 +671,7 @@ impl NMF {
             }
         };
 
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, n * p);
         let (mut w, mut h) = self.initialize_wh(&backend, x, k, init_mode)?;
 
         let alpha_h_val = self.alpha_h.unwrap_or(self.alpha_w);
@@ -513,26 +680,64 @@ impl NMF {
         let l1_w = (p as f64) * self.alpha_w * self.l1_ratio;
         let l2_w = (p as f64) * self.alpha_w * (1.0 - self.l1_ratio);
 
-        let recon_init = backend.matmul(&w, &h)?;
-        let err_init = frobenius_diff(x, &recon_init);
-        let mut prev_err = err_init;
-        let mut final_err = err_init;
         let mut n_iter = 0usize;
+        let final_err = if matches!(backend, Backend::Cpu) {
+            let mut h_ht = vec![0.0; k * k];
+            let mut denom_row = vec![0.0; k];
+            let mut num_h = vec![0.0; k * p];
+            let mut wt_w = vec![0.0; k * k];
+            let mut denom_h = vec![0.0; k * p];
+            let mut row_buf = vec![0.0; p];
 
-        for it in 1..=self.max_iter {
-            Self::update_w(&backend, x, &mut w, &h, l1_w, l2_w)?;
-            Self::update_h(&backend, x, &w, &mut h, l1_h, l2_h)?;
-            n_iter = it;
+            let err_init = frobenius_diff_wh_cpu(x, &w, &h, &mut row_buf);
+            let mut prev_err = err_init;
+            let mut err = err_init;
 
-            if it == self.max_iter || it % 10 == 0 {
-                let recon = backend.matmul(&w, &h)?;
-                final_err = frobenius_diff(x, &recon);
-                if it > 1 && (prev_err - final_err).abs() / err_init.max(1e-12) < self.tol {
-                    break;
+            for it in 1..=self.max_iter {
+                nmf_cpu_update_w(x, &mut w, &h, l1_w, l2_w, &mut h_ht, &mut denom_row);
+                nmf_cpu_update_h(
+                    x,
+                    &w,
+                    &mut h,
+                    l1_h,
+                    l2_h,
+                    &mut num_h,
+                    &mut wt_w,
+                    &mut denom_h,
+                );
+                n_iter = it;
+
+                if it == self.max_iter || it % 10 == 0 {
+                    err = frobenius_diff_wh_cpu(x, &w, &h, &mut row_buf);
+                    if it > 1 && (prev_err - err).abs() / err_init.max(1e-12) < self.tol {
+                        break;
+                    }
+                    prev_err = err;
                 }
-                prev_err = final_err;
             }
-        }
+            err
+        } else {
+            let recon_init = backend.matmul(&w, &h)?;
+            let err_init = frobenius_diff(x, &recon_init);
+            let mut prev_err = err_init;
+            let mut err = err_init;
+
+            for it in 1..=self.max_iter {
+                Self::update_w(&backend, x, &mut w, &h, l1_w, l2_w)?;
+                Self::update_h(&backend, x, &w, &mut h, l1_h, l2_h)?;
+                n_iter = it;
+
+                if it == self.max_iter || it % 10 == 0 {
+                    let recon = backend.matmul(&w, &h)?;
+                    err = frobenius_diff(x, &recon);
+                    if it > 1 && (prev_err - err).abs() / err_init.max(1e-12) < self.tol {
+                        break;
+                    }
+                    prev_err = err;
+                }
+            }
+            err
+        };
 
         self.components_ = Some(h);
         self.n_components_ = Some(k);
@@ -561,13 +766,62 @@ impl NMF {
             });
         }
 
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, x.rows * expected_p);
         let mean_x = x.data.iter().sum::<f64>() / ((x.rows * x.cols) as f64);
         let init_val = (mean_x / (k as f64)).sqrt().max(1e-6);
         let mut w = Matrix::from_vec(x.rows, k, vec![init_val; x.rows * k])?;
 
         let l1_w = (expected_p as f64) * self.alpha_w * self.l1_ratio;
         let l2_w = (expected_p as f64) * self.alpha_w * (1.0 - self.l1_ratio);
+
+        if matches!(backend, Backend::Cpu) {
+            let n = x.rows;
+            let p = expected_p;
+            let mut h_ht = vec![0.0; k * k];
+            for a in 0..k {
+                let h_a = &h.data[a * p..(a + 1) * p];
+                for b in a..k {
+                    let h_b = &h.data[b * p..(b + 1) * p];
+                    let v = dot4(h_a, h_b);
+                    h_ht[a * k + b] = v;
+                    h_ht[b * k + a] = v;
+                }
+            }
+            let mut x_ht = vec![0.0; n * k];
+            for r in 0..n {
+                let x_row = &x.data[r * p..(r + 1) * p];
+                for c in 0..k {
+                    let h_row = &h.data[c * p..(c + 1) * p];
+                    x_ht[r * k + c] = dot4(x_row, h_row);
+                }
+            }
+            let mut denom_row = vec![0.0; k];
+            let mut row_buf = vec![0.0; p];
+            let mut prev_err = f64::INFINITY;
+            for it in 1..=self.max_iter {
+                for r in 0..n {
+                    let w_row = &mut w.data[r * k..(r + 1) * k];
+                    for c in 0..k {
+                        let hh_row = &h_ht[c * k..(c + 1) * k];
+                        denom_row[c] = dot4(w_row, hh_row);
+                    }
+                    let xht_row = &x_ht[r * k..(r + 1) * k];
+                    for c in 0..k {
+                        let w_rc = w_row[c];
+                        let d = denom_row[c] + l1_w + l2_w * w_rc + 1e-12;
+                        w_row[c] = (w_rc * xht_row[c] / d).max(0.0);
+                    }
+                }
+                if it % 10 == 0 {
+                    let err = frobenius_diff_wh_cpu(x, &w, h, &mut row_buf);
+                    if (prev_err - err).abs() / prev_err.max(1e-12) < self.tol {
+                        break;
+                    }
+                    prev_err = err;
+                }
+            }
+            return Ok(w);
+        }
 
         let h_t = h.transpose();
         let h_ht = backend.matmul(h, &h_t)?;
@@ -602,7 +856,7 @@ impl NMF {
                 expected: k,
             });
         }
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, w.rows * h.cols);
         backend.matmul(w, h)
     }
 
@@ -1104,7 +1358,7 @@ impl PLSRegression {
             )));
         }
 
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, x.rows * x.cols + y.rows * y.cols);
         let res = run_nipals(
             &backend,
             x,
@@ -1154,7 +1408,7 @@ impl PLSRegression {
             });
         }
 
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, x.rows * expected_p);
         let x_scaled = apply_center_scale(&backend, x, x_mean, x_std)?;
         let x_scores = backend.matmul(&x_scaled, x_rot)?;
 
@@ -1203,7 +1457,7 @@ impl PLSRegression {
                 expected: expected_p,
             });
         }
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, x.rows * expected_p);
         let coef_t = coef.transpose();
         let mut pred = backend.matmul(x, &coef_t)?;
         for r in 0..pred.rows {
@@ -1225,7 +1479,7 @@ impl PLSRegression {
                 expected: self.n_components,
             });
         }
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, x_scores.rows * x_load.rows);
         let x_load_t = x_load.transpose();
         let mut x_rec = backend.matmul(x_scores, &x_load_t)?;
         for r in 0..x_rec.rows {
@@ -1432,7 +1686,7 @@ impl CCA {
             )));
         }
 
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, x.rows * x.cols + y.rows * y.cols);
         let res = run_nipals(
             &backend,
             x,
@@ -1482,7 +1736,7 @@ impl CCA {
             });
         }
 
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, x.rows * expected_p);
         let x_scaled = apply_center_scale(&backend, x, x_mean, x_std)?;
         let x_scores = backend.matmul(&x_scaled, x_rot)?;
 
@@ -1531,7 +1785,7 @@ impl CCA {
                 expected: expected_p,
             });
         }
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, x.rows * expected_p);
         let coef_t = coef.transpose();
         let mut pred = backend.matmul(x, &coef_t)?;
         for r in 0..pred.rows {

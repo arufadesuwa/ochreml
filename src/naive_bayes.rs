@@ -25,8 +25,39 @@ pub const TAG_MULTINOMIAL_NB: u8 = 61;
 pub const TAG_BERNOULLI_NB: u8 = 62;
 pub const TAG_COMPLEMENT_NB: u8 = 63;
 
-const MATMUL_THRESHOLD: usize = 8192;
 const STATS_PRIMITIVE_THRESHOLD: usize = 1024;
+const PARALLEL_ROW_THRESHOLD: usize = 4096;
+
+#[inline]
+fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
+    if elems < 131_072 {
+        Backend::Cpu
+    } else {
+        get_backend(dev)
+    }
+}
+
+#[inline]
+fn dot4(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len();
+    let chunks = n / 4;
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    for i in 0..chunks {
+        let base = i * 4;
+        s0 += a[base] * b[base];
+        s1 += a[base + 1] * b[base + 1];
+        s2 += a[base + 2] * b[base + 2];
+        s3 += a[base + 3] * b[base + 3];
+    }
+    let mut sum = (s0 + s1) + (s2 + s3);
+    for i in (chunks * 4)..n {
+        sum += a[i] * b[i];
+    }
+    sum
+}
 
 // ---------------------------------------------------------------------------
 // Shared validation & numerical helpers
@@ -184,40 +215,75 @@ fn log_proba_from_jll(jll: &Matrix) -> OchreResult<Matrix> {
     let n_classes = jll.cols;
     let mut out = vec![0.0; n_samples * n_classes];
 
-    out.par_chunks_mut(n_classes)
-        .enumerate()
-        .for_each(|(i, dst)| {
-            let row = &jll.data[(i * n_classes)..((i + 1) * n_classes)];
-            let max_val = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            if !max_val.is_finite() {
-                let uniform = -(n_classes as f64).ln();
-                dst.fill(uniform);
-                return;
-            }
-            let sum_exp: f64 = row.iter().map(|&v| (v - max_val).exp()).sum();
-            let log_norm = max_val + sum_exp.ln();
-            for (k, &v) in row.iter().enumerate() {
-                dst[k] = v - log_norm;
-            }
-        });
+    let compute_row = |(dst, row): (&mut [f64], &[f64])| {
+        let max_val = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if !max_val.is_finite() {
+            let uniform = -(n_classes as f64).ln();
+            dst.fill(uniform);
+            return;
+        }
+        let sum_exp: f64 = row.iter().map(|&v| (v - max_val).exp()).sum();
+        let log_norm = max_val + sum_exp.ln();
+        for k in 0..n_classes {
+            dst[k] = row[k] - log_norm;
+        }
+    };
+
+    if n_samples >= PARALLEL_ROW_THRESHOLD {
+        out.par_chunks_exact_mut(n_classes)
+            .zip(jll.data.par_chunks_exact(n_classes))
+            .for_each(compute_row);
+    } else {
+        out.chunks_exact_mut(n_classes)
+            .zip(jll.data.chunks_exact(n_classes))
+            .for_each(compute_row);
+    }
 
     Matrix::from_vec(n_samples, n_classes, out)
 }
 
 fn proba_from_jll(jll: &Matrix) -> OchreResult<Matrix> {
-    let mut log_p = log_proba_from_jll(jll)?;
-    log_p.data.par_iter_mut().for_each(|v| {
-        *v = v.exp();
-    });
-    Ok(log_p)
+    let n_samples = jll.rows;
+    let n_classes = jll.cols;
+    let mut out = vec![0.0; n_samples * n_classes];
+
+    let compute_row = |(dst, row): (&mut [f64], &[f64])| {
+        let max_val = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if !max_val.is_finite() {
+            dst.fill(1.0 / (n_classes as f64));
+            return;
+        }
+        let mut sum_exp = 0.0;
+        for k in 0..n_classes {
+            let e = (row[k] - max_val).exp();
+            dst[k] = e;
+            sum_exp += e;
+        }
+        let inv = 1.0 / sum_exp;
+        for v in dst.iter_mut() {
+            *v *= inv;
+        }
+    };
+
+    if n_samples >= PARALLEL_ROW_THRESHOLD {
+        out.par_chunks_exact_mut(n_classes)
+            .zip(jll.data.par_chunks_exact(n_classes))
+            .for_each(compute_row);
+    } else {
+        out.chunks_exact_mut(n_classes)
+            .zip(jll.data.chunks_exact(n_classes))
+            .for_each(compute_row);
+    }
+
+    Matrix::from_vec(n_samples, n_classes, out)
 }
 
 fn predict_from_jll(jll: &Matrix, classes: &[f64]) -> Vec<f64> {
     let n_samples = jll.rows;
     let n_classes = jll.cols;
     let mut preds = vec![0.0; n_samples];
-    preds.par_iter_mut().enumerate().for_each(|(i, dst)| {
-        let row = &jll.data[(i * n_classes)..((i + 1) * n_classes)];
+
+    let compute_row = |(dst, row): (&mut f64, &[f64])| {
         let mut best_k = 0;
         let mut best_v = row[0];
         for (k, &v) in row.iter().enumerate().skip(1) {
@@ -227,7 +293,19 @@ fn predict_from_jll(jll: &Matrix, classes: &[f64]) -> Vec<f64> {
             }
         }
         *dst = classes[best_k];
-    });
+    };
+
+    if n_samples >= PARALLEL_ROW_THRESHOLD {
+        preds
+            .par_iter_mut()
+            .zip(jll.data.par_chunks_exact(n_classes))
+            .for_each(compute_row);
+    } else {
+        preds
+            .iter_mut()
+            .zip(jll.data.chunks_exact(n_classes))
+            .for_each(compute_row);
+    }
     preds
 }
 
@@ -251,7 +329,8 @@ fn transpose_matrix(mat: &Matrix) -> OchreResult<Matrix> {
     Matrix::from_vec(mat.cols, mat.rows, data)
 }
 
-/// Compute `X @ W^T + bias` using `backend.matmul` (E1) on large inputs and Rayon on small ones.
+/// Compute `X @ W^T + bias` using fast contiguous unrolled loops on CPU (Rayon only when `n >= 4096`)
+/// and `backend.matmul` (E1) on large GPU inputs.
 fn linear_jll(
     backend: &Backend<'_>,
     x: &Matrix,
@@ -262,36 +341,86 @@ fn linear_jll(
     let n_features = x.cols;
     let n_classes = weights.rows;
 
-    let mut out = if n_samples * n_features * n_classes >= MATMUL_THRESHOLD {
-        let wt = transpose_matrix(weights)?;
-        backend.matmul(x, &wt)?
-    } else {
+    if matches!(backend, Backend::Cpu) {
         let mut data = vec![0.0; n_samples * n_classes];
-        data.par_chunks_mut(n_classes)
-            .enumerate()
-            .for_each(|(i, dst)| {
-                let x_row = &x.data[(i * n_features)..((i + 1) * n_features)];
-                for (k, slot) in dst.iter_mut().enumerate() {
-                    let w_row = &weights.data[(k * n_features)..((k + 1) * n_features)];
-                    let mut acc = 0.0;
-                    for j in 0..n_features {
-                        acc += x_row[j] * w_row[j];
-                    }
-                    *slot = acc;
-                }
-            });
-        Matrix::from_vec(n_samples, n_classes, data)?
-    };
+        let x_data = &x.data;
+        let w_data = &weights.data;
+        let compute_row = |(i, dst): (usize, &mut [f64])| {
+            let x_row = &x_data[(i * n_features)..((i + 1) * n_features)];
+            for k in 0..n_classes {
+                let w_row = &w_data[(k * n_features)..((k + 1) * n_features)];
+                let acc = dot4(x_row, w_row);
+                dst[k] = match bias {
+                    Some(b) => acc + b[k],
+                    None => acc,
+                };
+            }
+        };
+        if n_samples >= PARALLEL_ROW_THRESHOLD {
+            data.par_chunks_exact_mut(n_classes)
+                .enumerate()
+                .for_each(compute_row);
+        } else {
+            data.chunks_exact_mut(n_classes)
+                .enumerate()
+                .for_each(compute_row);
+        }
+        return Matrix::from_vec(n_samples, n_classes, data);
+    }
 
+    let wt = transpose_matrix(weights)?;
+    let mut out = backend.matmul(x, &wt)?;
     if let Some(b) = bias {
-        out.data.par_chunks_mut(n_classes).for_each(|row| {
+        let add_bias = |row: &mut [f64]| {
             for (dst, &bk) in row.iter_mut().zip(b.iter()) {
                 *dst += bk;
             }
-        });
+        };
+        if n_samples >= PARALLEL_ROW_THRESHOLD {
+            out.data.par_chunks_exact_mut(n_classes).for_each(add_bias);
+        } else {
+            out.data.chunks_exact_mut(n_classes).for_each(add_bias);
+        }
     }
 
     Ok(out)
+}
+
+/// Fused argmax prediction for linear JLL `X @ W^T + bias` on CPU without allocating JLL matrix.
+fn linear_predict_cpu(
+    x: &Matrix,
+    weights: &Matrix,
+    bias: Option<&[f64]>,
+    classes: &[f64],
+) -> Vec<f64> {
+    let n_samples = x.rows;
+    let n_features = x.cols;
+    let n_classes = weights.rows;
+    let x_data = &x.data;
+    let w_data = &weights.data;
+    let mut preds = vec![0.0; n_samples];
+
+    let compute_row = |(i, dst): (usize, &mut f64)| {
+        let x_row = &x_data[(i * n_features)..((i + 1) * n_features)];
+        let mut best_k = 0;
+        let mut best_v = dot4(x_row, &w_data[..n_features]) + bias.map_or(0.0, |b| b[0]);
+        for k in 1..n_classes {
+            let w_row = &w_data[(k * n_features)..((k + 1) * n_features)];
+            let v = dot4(x_row, w_row) + bias.map_or(0.0, |b| b[k]);
+            if v > best_v {
+                best_v = v;
+                best_k = k;
+            }
+        }
+        *dst = classes[best_k];
+    };
+
+    if n_samples >= PARALLEL_ROW_THRESHOLD {
+        preds.par_iter_mut().enumerate().for_each(compute_row);
+    } else {
+        preds.iter_mut().enumerate().for_each(compute_row);
+    }
+    preds
 }
 
 // ---------------------------------------------------------------------------
@@ -368,7 +497,7 @@ impl GaussianNB {
 
         let n_samples = x.rows;
         let n_features = x.cols;
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, n_samples * n_features);
 
         let is_first_call = self.classes_.is_none();
         if is_first_call {
@@ -533,6 +662,7 @@ impl GaussianNB {
         let n_classes = priors.len();
 
         let mut class_const = vec![0.0; n_classes];
+        let mut inv_var = vec![0.0; n_classes * n_features];
         for c in 0..n_classes {
             let log_prior = if priors[c] > 0.0 {
                 priors[c].ln()
@@ -540,30 +670,65 @@ impl GaussianNB {
                 f64::NEG_INFINITY
             };
             let var_row = &var.data[(c * n_features)..((c + 1) * n_features)];
-            let log_det_sum: f64 = var_row.iter().map(|&v| (2.0 * PI * v).ln()).sum();
+            let iv_row = &mut inv_var[(c * n_features)..((c + 1) * n_features)];
+            let mut log_det_sum = 0.0;
+            for j in 0..n_features {
+                let v = var_row[j];
+                log_det_sum += (2.0 * PI * v).ln();
+                iv_row[j] = 1.0 / v;
+            }
             class_const[c] = log_prior - 0.5 * log_det_sum;
         }
 
         let mut jll = vec![0.0; n_samples * n_classes];
-        jll.par_chunks_mut(n_classes)
-            .enumerate()
-            .for_each(|(i, dst)| {
-                let x_row = &x.data[(i * n_features)..((i + 1) * n_features)];
-                for c in 0..n_classes {
-                    if !class_const[c].is_finite() {
-                        dst[c] = f64::NEG_INFINITY;
-                        continue;
-                    }
-                    let theta_row = &theta.data[(c * n_features)..((c + 1) * n_features)];
-                    let var_row = &var.data[(c * n_features)..((c + 1) * n_features)];
-                    let mut quad = 0.0;
-                    for j in 0..n_features {
-                        let d = x_row[j] - theta_row[j];
-                        quad += (d * d) / var_row[j];
-                    }
-                    dst[c] = class_const[c] - 0.5 * quad;
+        let x_data = &x.data;
+        let t_data = &theta.data;
+        let chunks = n_features / 4;
+        let tail_start = chunks * 4;
+
+        let compute_row = |(i, dst): (usize, &mut [f64])| {
+            let x_row = &x_data[(i * n_features)..((i + 1) * n_features)];
+            for c in 0..n_classes {
+                let cc = class_const[c];
+                if !cc.is_finite() {
+                    dst[c] = f64::NEG_INFINITY;
+                    continue;
                 }
-            });
+                let t_row = &t_data[(c * n_features)..((c + 1) * n_features)];
+                let iv_row = &inv_var[(c * n_features)..((c + 1) * n_features)];
+                let mut s0 = 0.0;
+                let mut s1 = 0.0;
+                let mut s2 = 0.0;
+                let mut s3 = 0.0;
+                for blk in 0..chunks {
+                    let b = blk * 4;
+                    let d0 = x_row[b] - t_row[b];
+                    let d1 = x_row[b + 1] - t_row[b + 1];
+                    let d2 = x_row[b + 2] - t_row[b + 2];
+                    let d3 = x_row[b + 3] - t_row[b + 3];
+                    s0 += d0 * d0 * iv_row[b];
+                    s1 += d1 * d1 * iv_row[b + 1];
+                    s2 += d2 * d2 * iv_row[b + 2];
+                    s3 += d3 * d3 * iv_row[b + 3];
+                }
+                let mut quad = (s0 + s1) + (s2 + s3);
+                for j in tail_start..n_features {
+                    let d = x_row[j] - t_row[j];
+                    quad += d * d * iv_row[j];
+                }
+                dst[c] = cc - 0.5 * quad;
+            }
+        };
+
+        if n_samples >= PARALLEL_ROW_THRESHOLD {
+            jll.par_chunks_exact_mut(n_classes)
+                .enumerate()
+                .for_each(compute_row);
+        } else {
+            jll.chunks_exact_mut(n_classes)
+                .enumerate()
+                .for_each(compute_row);
+        }
 
         Matrix::from_vec(n_samples, n_classes, jll)
     }
@@ -580,8 +745,96 @@ impl GaussianNB {
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
         let classes = self.classes_.as_ref().ok_or(OchreError::NotFitted)?;
-        let jll = self.predict_joint_log_likelihood(x)?;
-        Ok(predict_from_jll(&jll, classes))
+        let theta = self.theta_.as_ref().ok_or(OchreError::NotFitted)?;
+        let var = self.var_.as_ref().ok_or(OchreError::NotFitted)?;
+        let priors = self.class_prior_.as_ref().ok_or(OchreError::NotFitted)?;
+        let expected_p = self.n_features_in_.ok_or(OchreError::NotFitted)?;
+
+        validate_matrix_finite(x)?;
+        if x.cols != expected_p {
+            return Err(OchreError::FeatureCountMismatch {
+                features: x.cols,
+                expected: expected_p,
+            });
+        }
+
+        let n_samples = x.rows;
+        let n_features = x.cols;
+        let n_classes = priors.len();
+
+        let mut class_const = vec![0.0; n_classes];
+        let mut inv_var = vec![0.0; n_classes * n_features];
+        for c in 0..n_classes {
+            let log_prior = if priors[c] > 0.0 {
+                priors[c].ln()
+            } else {
+                f64::NEG_INFINITY
+            };
+            let var_row = &var.data[(c * n_features)..((c + 1) * n_features)];
+            let iv_row = &mut inv_var[(c * n_features)..((c + 1) * n_features)];
+            let mut log_det_sum = 0.0;
+            for j in 0..n_features {
+                let v = var_row[j];
+                log_det_sum += (2.0 * PI * v).ln();
+                iv_row[j] = 1.0 / v;
+            }
+            class_const[c] = log_prior - 0.5 * log_det_sum;
+        }
+
+        let mut preds = vec![0.0; n_samples];
+        let x_data = &x.data;
+        let t_data = &theta.data;
+        let chunks = n_features / 4;
+        let tail_start = chunks * 4;
+
+        let compute_row = |(i, dst): (usize, &mut f64)| {
+            let x_row = &x_data[(i * n_features)..((i + 1) * n_features)];
+            let mut best_c = 0;
+            let mut best_v = f64::NEG_INFINITY;
+            for c in 0..n_classes {
+                let cc = class_const[c];
+                let score = if !cc.is_finite() {
+                    f64::NEG_INFINITY
+                } else {
+                    let t_row = &t_data[(c * n_features)..((c + 1) * n_features)];
+                    let iv_row = &inv_var[(c * n_features)..((c + 1) * n_features)];
+                    let mut s0 = 0.0;
+                    let mut s1 = 0.0;
+                    let mut s2 = 0.0;
+                    let mut s3 = 0.0;
+                    for blk in 0..chunks {
+                        let b = blk * 4;
+                        let d0 = x_row[b] - t_row[b];
+                        let d1 = x_row[b + 1] - t_row[b + 1];
+                        let d2 = x_row[b + 2] - t_row[b + 2];
+                        let d3 = x_row[b + 3] - t_row[b + 3];
+                        s0 += d0 * d0 * iv_row[b];
+                        s1 += d1 * d1 * iv_row[b + 1];
+                        s2 += d2 * d2 * iv_row[b + 2];
+                        s3 += d3 * d3 * iv_row[b + 3];
+                    }
+                    let mut quad = (s0 + s1) + (s2 + s3);
+                    for j in tail_start..n_features {
+                        let d = x_row[j] - t_row[j];
+                        quad += d * d * iv_row[j];
+                    }
+                    cc - 0.5 * quad
+                };
+                if c == 0 || score > best_v {
+                    best_v = score;
+                    best_c = c;
+                }
+            }
+            *dst = classes[best_c];
+        };
+
+        if n_samples >= PARALLEL_ROW_THRESHOLD {
+            preds.par_iter_mut().enumerate().for_each(compute_row);
+        } else {
+            preds.iter_mut().enumerate().for_each(compute_row);
+        }
+
+        Ok(preds)
     }
 
     pub fn score(&self, x: &Matrix, y: &[f64]) -> OchreResult<f64> {
@@ -965,7 +1218,7 @@ impl MultinomialNB {
             });
         }
 
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, x.rows * expected_p);
         linear_jll(&backend, x, flp, Some(clp))
     }
 
@@ -981,7 +1234,29 @@ impl MultinomialNB {
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
         let classes = self.classes_.as_ref().ok_or(OchreError::NotFitted)?;
-        let jll = self.predict_joint_log_likelihood(x)?;
+        let flp = self
+            .feature_log_prob_
+            .as_ref()
+            .ok_or(OchreError::NotFitted)?;
+        let clp = self
+            .class_log_prior_
+            .as_ref()
+            .ok_or(OchreError::NotFitted)?;
+        let expected_p = self.n_features_in_.ok_or(OchreError::NotFitted)?;
+
+        validate_matrix_finite(x)?;
+        if x.cols != expected_p {
+            return Err(OchreError::FeatureCountMismatch {
+                features: x.cols,
+                expected: expected_p,
+            });
+        }
+
+        let backend = effective_backend(&self.device, x.rows * expected_p);
+        if matches!(backend, Backend::Cpu) {
+            return Ok(linear_predict_cpu(x, flp, Some(clp), classes));
+        }
+        let jll = linear_jll(&backend, x, flp, Some(clp))?;
         Ok(predict_from_jll(&jll, classes))
     }
 
@@ -1231,11 +1506,17 @@ fn binarize_matrix(x: &Matrix, threshold: Option<f64>) -> OchreResult<Matrix> {
     match threshold {
         Some(thresh) => {
             let mut data = vec![0.0; x.data.len()];
-            data.par_iter_mut()
-                .zip(x.data.par_iter())
-                .for_each(|(dst, &src)| {
+            if x.rows >= PARALLEL_ROW_THRESHOLD {
+                data.par_iter_mut()
+                    .zip(x.data.par_iter())
+                    .for_each(|(dst, &src)| {
+                        *dst = if src > thresh { 1.0 } else { 0.0 };
+                    });
+            } else {
+                for (dst, &src) in data.iter_mut().zip(x.data.iter()) {
                     *dst = if src > thresh { 1.0 } else { 0.0 };
-                });
+                }
+            }
             Matrix::from_vec(x.rows, x.cols, data)
         }
         None => Ok(x.clone()),
@@ -1421,34 +1702,41 @@ impl BernoulliNB {
                     .sum();
                 bias[c] = clp[c] + sum_neg;
             }
-            let backend = get_backend(&self.device);
+            let backend = effective_backend(&self.device, x_bin.rows * n_features);
             return linear_jll(&backend, &x_bin, &delta, Some(&bias));
         }
 
         // Exact fallback when alpha == 0 produces log(0) = -inf, avoiding 0 * inf = NaN
         let n_samples = x_bin.rows;
         let mut jll = vec![0.0; n_samples * n_classes];
-        jll.par_chunks_mut(n_classes)
-            .enumerate()
-            .for_each(|(i, dst)| {
-                let x_row = &x_bin.data[(i * n_features)..((i + 1) * n_features)];
-                for c in 0..n_classes {
-                    let lp_row = &flp.data[(c * n_features)..((c + 1) * n_features)];
-                    let lq_row = &neg_prob[(c * n_features)..((c + 1) * n_features)];
-                    let mut sum = clp[c];
-                    for j in 0..n_features {
-                        let xij = x_row[j];
-                        if xij != 0.0 {
-                            sum += xij * lp_row[j];
-                        }
-                        let one_minus_x = 1.0 - xij;
-                        if one_minus_x != 0.0 {
-                            sum += one_minus_x * lq_row[j];
-                        }
+        let compute_row = |(i, dst): (usize, &mut [f64])| {
+            let x_row = &x_bin.data[(i * n_features)..((i + 1) * n_features)];
+            for c in 0..n_classes {
+                let lp_row = &flp.data[(c * n_features)..((c + 1) * n_features)];
+                let lq_row = &neg_prob[(c * n_features)..((c + 1) * n_features)];
+                let mut sum = clp[c];
+                for j in 0..n_features {
+                    let xij = x_row[j];
+                    if xij != 0.0 {
+                        sum += xij * lp_row[j];
                     }
-                    dst[c] = sum;
+                    let one_minus_x = 1.0 - xij;
+                    if one_minus_x != 0.0 {
+                        sum += one_minus_x * lq_row[j];
+                    }
                 }
-            });
+                dst[c] = sum;
+            }
+        };
+        if n_samples >= PARALLEL_ROW_THRESHOLD {
+            jll.par_chunks_exact_mut(n_classes)
+                .enumerate()
+                .for_each(compute_row);
+        } else {
+            jll.chunks_exact_mut(n_classes)
+                .enumerate()
+                .for_each(compute_row);
+        }
         Matrix::from_vec(n_samples, n_classes, jll)
     }
 
@@ -1897,7 +2185,7 @@ impl ComplementNB {
             });
         }
 
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, x.rows * expected_p);
         let bias = if clp.len() == 1 {
             Some(clp.as_slice())
         } else {
@@ -1918,7 +2206,34 @@ impl ComplementNB {
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
         let classes = self.classes_.as_ref().ok_or(OchreError::NotFitted)?;
-        let jll = self.predict_joint_log_likelihood(x)?;
+        let flp = self
+            .feature_log_prob_
+            .as_ref()
+            .ok_or(OchreError::NotFitted)?;
+        let clp = self
+            .class_log_prior_
+            .as_ref()
+            .ok_or(OchreError::NotFitted)?;
+        let expected_p = self.n_features_in_.ok_or(OchreError::NotFitted)?;
+
+        validate_matrix_finite(x)?;
+        if x.cols != expected_p {
+            return Err(OchreError::FeatureCountMismatch {
+                features: x.cols,
+                expected: expected_p,
+            });
+        }
+
+        let backend = effective_backend(&self.device, x.rows * expected_p);
+        let bias = if clp.len() == 1 {
+            Some(clp.as_slice())
+        } else {
+            None
+        };
+        if matches!(backend, Backend::Cpu) {
+            return Ok(linear_predict_cpu(x, flp, bias, classes));
+        }
+        let jll = linear_jll(&backend, x, flp, bias)?;
         Ok(predict_from_jll(&jll, classes))
     }
 

@@ -17,9 +17,43 @@ use crate::pymethods_with_dit;
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use rayon::prelude::*;
 
 pub const TAG_PCA: u8 = 43;
 pub const TAG_TRUNCATED_SVD: u8 = 44;
+
+const PARALLEL_ROW_THRESHOLD: usize = 4096;
+
+#[inline]
+fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
+    if elems < 131_072 {
+        Backend::Cpu
+    } else {
+        get_backend(dev)
+    }
+}
+
+#[inline]
+fn dot4(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len();
+    let chunks = n / 4;
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    for i in 0..chunks {
+        let base = i * 4;
+        s0 += a[base] * b[base];
+        s1 += a[base + 1] * b[base + 1];
+        s2 += a[base + 2] * b[base + 2];
+        s3 += a[base + 3] * b[base + 3];
+    }
+    let mut sum = (s0 + s1) + (s2 + s3);
+    for i in (chunks * 4)..n {
+        sum += a[i] * b[i];
+    }
+    sum
+}
 
 // Deterministic SplitMix64 PRNG with Box-Muller Gaussian sampling for randomized SVD
 #[derive(Clone, Debug)]
@@ -268,7 +302,7 @@ impl PCA {
             )));
         }
 
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, n * p);
         let (singular_values_all, v_right, mean) = if n >= p || n > 4096 {
             backend.gram_svd(x, true)?
         } else {
@@ -347,22 +381,93 @@ impl PCA {
             .as_ref()
             .ok_or(OchreError::NotFitted)?;
 
-        let backend = get_backend(&self.device);
-        let ones = vec![1.0; expected];
-        let x_c = backend.col_scale_shift(x, &ones, mean)?;
-        let comp_t = components.transpose();
-        let mut out = backend.matmul(&x_c, &comp_t)?;
+        let n = x.rows;
+        let p = expected;
+        let k = components.rows;
 
-        if self.whiten {
-            let k = out.cols;
-            let inv_stds: Vec<f64> = exp_var
-                .iter()
-                .map(|&v| if v > 1e-12 { 1.0 / v.sqrt() } else { 0.0 })
-                .collect();
-            for r in 0..out.rows {
+        // Precompute proj_mean = mean @ components^T (length k) to avoid allocating full X_c
+        let mut proj_mean = Vec::with_capacity(k);
+        for j in 0..k {
+            let comp_row = &components.data[j * p..(j + 1) * p];
+            proj_mean.push(dot4(mean, comp_row));
+        }
+
+        let inv_stds: Option<Vec<f64>> = if self.whiten {
+            Some(
+                exp_var
+                    .iter()
+                    .take(k)
+                    .map(|&v| if v > 1e-12 { 1.0 / v.sqrt() } else { 0.0 })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        let backend = effective_backend(&self.device, n * p);
+        if matches!(backend, Backend::Cpu) {
+            let mut out_data = vec![0.0; n * k];
+            let x_data = &x.data;
+            let comp_data = &components.data;
+
+            if let Some(ref scales) = inv_stds {
+                let compute_row = |(r, dst): (usize, &mut [f64])| {
+                    let x_row = &x_data[r * p..(r + 1) * p];
+                    for j in 0..k {
+                        let comp_row = &comp_data[j * p..(j + 1) * p];
+                        dst[j] = (dot4(x_row, comp_row) - proj_mean[j]) * scales[j];
+                    }
+                };
+                if n >= PARALLEL_ROW_THRESHOLD {
+                    out_data
+                        .par_chunks_exact_mut(k)
+                        .enumerate()
+                        .for_each(compute_row);
+                } else {
+                    out_data
+                        .chunks_exact_mut(k)
+                        .enumerate()
+                        .for_each(compute_row);
+                }
+            } else {
+                let compute_row = |(r, dst): (usize, &mut [f64])| {
+                    let x_row = &x_data[r * p..(r + 1) * p];
+                    for j in 0..k {
+                        let comp_row = &comp_data[j * p..(j + 1) * p];
+                        dst[j] = dot4(x_row, comp_row) - proj_mean[j];
+                    }
+                };
+                if n >= PARALLEL_ROW_THRESHOLD {
+                    out_data
+                        .par_chunks_exact_mut(k)
+                        .enumerate()
+                        .for_each(compute_row);
+                } else {
+                    out_data
+                        .chunks_exact_mut(k)
+                        .enumerate()
+                        .for_each(compute_row);
+                }
+            }
+
+            return Matrix::from_vec(n, k, out_data);
+        }
+
+        // Large GPU path: compute X @ components^T directly and subtract proj_mean in-place
+        let comp_t = components.transpose();
+        let mut out = backend.matmul(x, &comp_t)?;
+        if let Some(ref scales) = inv_stds {
+            for r in 0..n {
                 let row = &mut out.data[r * k..(r + 1) * k];
                 for j in 0..k {
-                    row[j] *= inv_stds[j];
+                    row[j] = (row[j] - proj_mean[j]) * scales[j];
+                }
+            }
+        } else {
+            for r in 0..n {
+                let row = &mut out.data[r * k..(r + 1) * k];
+                for j in 0..k {
+                    row[j] -= proj_mean[j];
                 }
             }
         }
@@ -390,7 +495,7 @@ impl PCA {
             .as_ref()
             .ok_or(OchreError::NotFitted)?;
 
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, x.rows * components.cols);
         let x_rec = if self.whiten {
             let stds: Vec<f64> = exp_var.iter().map(|&v| v.max(0.0).sqrt()).collect();
             let mut scaled = x.clone();
@@ -451,9 +556,9 @@ impl PCA {
         }
         let cov = self.get_covariance()?;
         let mean = self.mean_.as_ref().ok_or(OchreError::NotFitted)?;
-        let eig = get_backend(&self.device).small_sym_eig_svd(&cov)?;
-
         let p = expected;
+        let eig = effective_backend(&self.device, p * p).small_sym_eig_svd(&cov)?;
+
         let mut log_det = 0.0;
         let mut inv_eigs = vec![0.0; p];
         for (i, dst) in inv_eigs.iter_mut().enumerate().take(p) {
@@ -462,9 +567,10 @@ impl PCA {
             *dst = 1.0 / lam;
         }
 
+        let backend = effective_backend(&self.device, x.rows * p);
         let ones = vec![1.0; p];
-        let x_c = get_backend(&self.device).col_scale_shift(x, &ones, mean)?;
-        let proj = get_backend(&self.device).matmul(&x_c, &eig.eigenvectors)?;
+        let x_c = backend.col_scale_shift(x, &ones, mean)?;
+        let proj = backend.matmul(&x_c, &eig.eigenvectors)?;
         let const_term = -0.5 * ((p as f64) * (2.0 * std::f64::consts::PI).ln() + log_det);
 
         let mut scores = Vec::with_capacity(x.rows);
@@ -812,7 +918,7 @@ impl TruncatedSVD {
             )));
         }
         let k = self.n_components.min(n).min(p);
-        let backend = get_backend(&self.device);
+        let backend = effective_backend(&self.device, n * p);
 
         let (singular_values, components) =
             if self.algorithm == "arpack" || self.algorithm == "exact" || p <= 512 {
@@ -862,8 +968,36 @@ impl TruncatedSVD {
             });
         }
         let components = self.components_.as_ref().ok_or(OchreError::NotFitted)?;
+        let backend = effective_backend(&self.device, x.rows * expected);
+        if matches!(backend, Backend::Cpu) {
+            let n = x.rows;
+            let p = expected;
+            let k = components.rows;
+            let mut out_data = vec![0.0; n * k];
+            let x_data = &x.data;
+            let comp_data = &components.data;
+            let compute_row = |(r, dst): (usize, &mut [f64])| {
+                let x_row = &x_data[r * p..(r + 1) * p];
+                for j in 0..k {
+                    let comp_row = &comp_data[j * p..(j + 1) * p];
+                    dst[j] = dot4(x_row, comp_row);
+                }
+            };
+            if n >= PARALLEL_ROW_THRESHOLD {
+                out_data
+                    .par_chunks_exact_mut(k)
+                    .enumerate()
+                    .for_each(compute_row);
+            } else {
+                out_data
+                    .chunks_exact_mut(k)
+                    .enumerate()
+                    .for_each(compute_row);
+            }
+            return Matrix::from_vec(n, k, out_data);
+        }
         let comp_t = components.transpose();
-        get_backend(&self.device).matmul(x, &comp_t)
+        backend.matmul(x, &comp_t)
     }
 
     pub fn fit_transform(&mut self, x: &Matrix) -> OchreResult<Matrix> {
@@ -881,7 +1015,7 @@ impl TruncatedSVD {
                 expected: k,
             });
         }
-        get_backend(&self.device).matmul(x, components)
+        effective_backend(&self.device, x.rows * components.cols).matmul(x, components)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
