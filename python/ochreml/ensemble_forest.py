@@ -86,6 +86,13 @@ class _BaseForestMixin:
     _model: Any
     device: str
 
+    @classmethod
+    def _from_rust(cls, rust_model: Any, device: Optional[str] = None) -> Any:
+        inst = cls.__new__(cls)
+        inst._model = rust_model
+        inst.device = rust_model.device_ or _resolve_device(device)
+        return inst
+
     @property
     def n_features_in_(self) -> Optional[int]:
         return self._model.n_features_in_

@@ -659,6 +659,11 @@ impl LogisticRegression {
         if x.rows == 0 || x.cols == 0 {
             return Err(OchreError::EmptyData);
         }
+        if x.data.iter().any(|v| !v.is_finite()) || y.iter().any(|v| !v.is_finite()) {
+            return Err(OchreError::InvalidParameter(
+                "Input X or y contains NaN or Inf values ( >_< )".to_string(),
+            ));
+        }
         if x.rows != y.len() {
             return Err(OchreError::LengthMismatch {
                 features: x.rows,

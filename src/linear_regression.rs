@@ -268,6 +268,11 @@ impl LinearRegression {
         if x.rows == 0 || x.cols == 0 {
             return Err(OchreError::EmptyData);
         }
+        if x.data.iter().any(|v| !v.is_finite()) || y.iter().any(|v| !v.is_finite()) {
+            return Err(OchreError::InvalidParameter(
+                "Input X or y contains NaN or Inf values ( >_< )".to_string(),
+            ));
+        }
 
         if sample_weight.is_some() {
             let y_mat = Matrix::from_slice(x.rows, 1, y)?;
@@ -306,6 +311,11 @@ impl LinearRegression {
         }
         if x.rows == 0 || x.cols == 0 || y.cols == 0 {
             return Err(OchreError::EmptyData);
+        }
+        if x.data.iter().any(|v| !v.is_finite()) || y.data.iter().any(|v| !v.is_finite()) {
+            return Err(OchreError::InvalidParameter(
+                "Input X or y contains NaN or Inf values ( >_< )".to_string(),
+            ));
         }
 
         if y.cols == 1 && !is_2d_input && sample_weight.is_none() {

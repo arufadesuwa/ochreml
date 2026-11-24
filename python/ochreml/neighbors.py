@@ -90,6 +90,23 @@ class _BaseNeighborsMixin:
     _model: Any
     device: str
 
+    @classmethod
+    def _from_rust(cls, rust_model: Any, device: Optional[str] = None) -> Any:
+        inst = cls.__new__(cls)
+        inst._model = rust_model
+        inst.weights = "uniform"
+        inst.metric = "minkowski"
+        inst.p = 2.0
+        if hasattr(rust_model, "outlier_label_"):
+            inst.radius = 1.0
+            inst.outlier_label = rust_model.outlier_label_
+        elif issubclass(cls, _RadiusNeighborsMixin):
+            inst.radius = 1.0
+        else:
+            inst.n_neighbors = 5
+        inst.device = rust_model.device_ or _resolve_device(device)
+        return inst
+
     def _sync_params_from_rust(self) -> None:
         raise NotImplementedError
 

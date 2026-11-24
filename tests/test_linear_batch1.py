@@ -26,7 +26,7 @@ from ochreml import linear_model as ochre_lm
 
 
 def test_version_and_linear_model_exports():
-    assert ochreml.__version__ == "0.3.5b1"
+    assert ochreml.__version__ == "0.3.5b2"
     assert ochre_lm.LogisticRegression is LogisticRegression
     assert ochre_lm.Lasso is Lasso
     assert ochre_lm.ElasticNet is ElasticNet
@@ -135,6 +135,7 @@ def test_lasso_1d_multi_output_positive_and_dit(tmp_path):
     np.testing.assert_allclose(loaded.predict(X), oc_m.predict(X), atol=1e-12)
     unpickled = pickle.loads(pickle.dumps(oc))
     np.testing.assert_allclose(unpickled.predict(X), oc.predict(X), atol=1e-12)
+
 
 
 def test_elastic_net_1d_multi_output_and_dit(tmp_path):
@@ -270,4 +271,38 @@ def test_sgd_regressor_losses_and_serialization(tmp_path):
     np.testing.assert_allclose(loaded.predict(X), oc.predict(X), atol=1e-12)
     unpickled = pickle.loads(pickle.dumps(oc))
     np.testing.assert_allclose(unpickled.predict(X), oc.predict(X), atol=1e-12)
+
+
+def test_nan_inf_rejection_and_top_level_load(tmp_path):
+    X = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+    y_reg = np.array([1.0, 2.0, 3.0, 4.0])
+    y_cls = np.array([0, 0, 1, 1])
+
+    X_nan = X.copy()
+    X_nan[0, 0] = np.nan
+    X_inf = X.copy()
+    X_inf[1, 1] = np.inf
+
+    with pytest.raises(ValueError):
+        ochreml.LinearRegression().fit(X_nan, y_reg)
+    with pytest.raises(ValueError):
+        ochreml.LinearRegression().fit(
+            X, np.column_stack([y_reg, np.array([1.0, np.inf, 3.0, 4.0])])
+        )
+    with pytest.raises(ValueError):
+        ochreml.LogisticRegression().fit(X_inf, y_cls)
+
+    for name, est in [
+        ("rf", ochreml.RandomForestClassifier(n_estimators=5, max_depth=3, random_state=42).fit(X, y_cls)),
+        ("hgb", ochreml.HistGradientBoostingClassifier(max_iter=5, random_state=42).fit(X, y_cls)),
+        ("knn", ochreml.KNeighborsClassifier(n_neighbors=2).fit(X, y_cls)),
+        ("svc", ochreml.SVC(kernel="rbf").fit(X, y_cls)),
+        ("mlp", ochreml.MLPClassifier(hidden_layer_sizes=(8,), max_iter=20, random_state=42).fit(X, y_cls)),
+        ("krr", ochreml.KernelRidge(alpha=1.0).fit(X, y_reg)),
+    ]:
+        p = str(tmp_path / f"{name}.dit")
+        ochreml.save(est, p)
+        loaded = ochreml.load(p, device="cpu")
+        np.testing.assert_allclose(loaded.predict(X), est.predict(X), atol=1e-12)
+
 

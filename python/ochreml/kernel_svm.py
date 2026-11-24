@@ -221,6 +221,22 @@ class SVC:
         self._model.save(validate_dit_path(path))
 
     @classmethod
+    def _from_rust(cls, rust_model: Any, device: Optional[str] = None) -> "SVC":
+        obj = cls.__new__(cls)
+        obj._model = rust_model
+        obj.device = rust_model.device_ or (device or "auto")
+        obj.C = 1.0
+        obj.kernel = "rbf"
+        obj.degree = 3
+        obj.gamma = "scale"
+        obj.coef0 = 0.0
+        obj.probability = False
+        obj.tol = 1e-3
+        obj.max_iter = -1
+        obj.random_state = None
+        return obj
+
+    @classmethod
     def load(cls, path: str, device: Optional[str] = None) -> "SVC":
         """Load a model from a '.dit' file (*≧ω≦*)."""
         rust_model = _RustSVC.load(validate_dit_path(path), device=device)
@@ -404,6 +420,21 @@ class SVR:
     def save(self, path: str) -> None:
         """Save the fitted model to a '.dit' file (＾▽＾)."""
         self._model.save(validate_dit_path(path))
+
+    @classmethod
+    def _from_rust(cls, rust_model: Any, device: Optional[str] = None) -> "SVR":
+        obj = cls.__new__(cls)
+        obj._model = rust_model
+        obj.device = rust_model.device_ or (device or "auto")
+        obj.kernel = "rbf"
+        obj.degree = 3
+        obj.gamma = "scale"
+        obj.coef0 = 0.0
+        obj.tol = 1e-3
+        obj.C = 1.0
+        obj.epsilon = 0.1
+        obj.max_iter = -1
+        return obj
 
     @classmethod
     def load(cls, path: str, device: Optional[str] = None) -> "SVR":
@@ -593,6 +624,20 @@ class OneClassSVM:
         self._model.save(validate_dit_path(path))
 
     @classmethod
+    def _from_rust(cls, rust_model: Any, device: Optional[str] = None) -> "OneClassSVM":
+        obj = cls.__new__(cls)
+        obj._model = rust_model
+        obj.device = rust_model.device_ or (device or "auto")
+        obj.kernel = "rbf"
+        obj.degree = 3
+        obj.gamma = "scale"
+        obj.coef0 = 0.0
+        obj.tol = 1e-3
+        obj.nu = 0.5
+        obj.max_iter = -1
+        return obj
+
+    @classmethod
     def load(cls, path: str, device: Optional[str] = None) -> "OneClassSVM":
         """Load a model from a '.dit' file (*≧ω≦*)."""
         rust_model = _RustOneClassSVM.load(validate_dit_path(path), device=device)
@@ -756,6 +801,20 @@ class KernelPCA:
     def save(self, path: str) -> None:
         """Save the fitted model to a '.dit' file (＾▽＾)."""
         self._model.save(validate_dit_path(path))
+
+    @classmethod
+    def _from_rust(cls, rust_model: Any, device: Optional[str] = None) -> "KernelPCA":
+        obj = cls.__new__(cls)
+        obj._model = rust_model
+        obj.device = rust_model.device_ or (device or "auto")
+        obj.n_components = None
+        obj.kernel = "linear"
+        obj.gamma = None
+        obj.degree = 3
+        obj.coef0 = 1.0
+        obj.fit_inverse_transform = False
+        obj.alpha = 1.0
+        return obj
 
     @classmethod
     def load(cls, path: str, device: Optional[str] = None) -> "KernelPCA":

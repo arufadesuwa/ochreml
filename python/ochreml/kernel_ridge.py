@@ -189,6 +189,20 @@ class KernelRidge:
         self._model.save(validate_dit_path(path))
 
     @classmethod
+    def _from_rust(cls, rust_model: Any, device: Optional[str] = None) -> "KernelRidge":
+        obj = cls.__new__(cls)
+        obj._model = rust_model
+        obj.device = rust_model.device_ or (device or "auto")
+        dc = rust_model.dual_coef_
+        obj._y_1d = dc is not None and dc[1] == 1
+        obj.alpha = 1.0
+        obj.kernel = "linear"
+        obj.gamma = None
+        obj.degree = 3
+        obj.coef0 = 1.0
+        return obj
+
+    @classmethod
     def load(cls, path: str, device: Optional[str] = None) -> "KernelRidge":
         """Load a model from a '.dit' file (*≧ω≦*)."""
         rust_model = _RustKernelRidge.load(validate_dit_path(path), device=device)

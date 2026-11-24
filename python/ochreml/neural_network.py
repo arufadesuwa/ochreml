@@ -115,6 +115,14 @@ class _BaseMlpMixin:
         self._model.save(validate_dit_path(path))
 
     @classmethod
+    def _from_rust(cls, rust_model: Any, device: Optional[str] = None) -> Any:
+        obj = cls.__new__(cls)
+        obj._model = rust_model
+        obj.device = rust_model.device_ or _resolve_device(device)
+        obj._sync_params_from_rust()
+        return obj
+
+    @classmethod
     def load(cls, path: str, device: Optional[str] = None) -> Any:
         """
         Load a fitted model from a `.dit` file (o´∀｀o).
