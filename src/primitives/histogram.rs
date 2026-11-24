@@ -40,7 +40,7 @@ pub struct HistogramSplit {
     pub left_count: u32,
 }
 
-const MAX_QUANTILE_SAMPLES: usize = 200_000;
+const MAX_QUANTILE_SAMPLES: usize = 65_536;
 
 fn compute_feature_edges(col_vals: &mut [f64], max_bins: usize) -> Vec<f64> {
     col_vals.sort_unstable_by(|a, b| a.total_cmp(b));
@@ -98,25 +98,47 @@ pub fn cpu_quantize_features(x: &Matrix, max_bins: usize) -> OchreResult<BinnedM
         .collect();
 
     let mut data = vec![0u8; rows * cols];
-    data.par_chunks_mut(cols)
-        .zip(x.data.par_chunks(cols))
-        .for_each(|(dst_row, src_row)| {
-            for c in 0..cols {
-                let edges = &bin_edges[c];
-                let val = src_row[c];
-                dst_row[c] = edges.partition_point(|&e| val > e) as u8;
+    let block_rows = (4096 / cols).clamp(16, 512);
+    let block_elems = block_rows * cols;
+    if rows * cols >= 16_384 {
+        // Cache-block by rows and iterate column-outer so each feature's bin_edges stays L1-hot
+        data.par_chunks_mut(block_elems)
+            .zip(x.data.par_chunks(block_elems))
+            .for_each(|(dst_block, src_block)| {
+                let n_r = dst_block.len() / cols;
+                for (c, edges) in bin_edges.iter().enumerate() {
+                    for r in 0..n_r {
+                        let val = src_block[r * cols + c];
+                        dst_block[r * cols + c] = edges.partition_point(|&e| val > e) as u8;
+                    }
+                }
+            });
+    } else {
+        for (c, edges) in bin_edges.iter().enumerate() {
+            for r in 0..rows {
+                let val = x.data[r * cols + c];
+                data[r * cols + c] = edges.partition_point(|&e| val > e) as u8;
             }
-        });
+        }
+    }
 
     let mut col_data = vec![0u8; rows * cols];
-    col_data
-        .par_chunks_exact_mut(rows)
-        .enumerate()
-        .for_each(|(c, col_dst)| {
+    if rows * cols >= 16_384 {
+        col_data
+            .par_chunks_exact_mut(rows)
+            .enumerate()
+            .for_each(|(c, col_dst)| {
+                for (r, dst) in col_dst.iter_mut().enumerate() {
+                    *dst = data[r * cols + c];
+                }
+            });
+    } else {
+        for (c, col_dst) in col_data.chunks_exact_mut(rows).enumerate() {
             for (r, dst) in col_dst.iter_mut().enumerate() {
                 *dst = data[r * cols + c];
             }
-        });
+        }
+    }
 
     Ok(BinnedMatrix {
         data,
@@ -129,21 +151,13 @@ pub fn cpu_quantize_features(x: &Matrix, max_bins: usize) -> OchreResult<BinnedM
 }
 
 #[inline]
-fn accumulate_feature_hist(
-    col: &[u8],
-    sample_indices: &[u32],
-    grad: &[f64],
-    hess: &[f64],
-    hist: &mut [GradHessBin],
-) {
-    let num_bins = hist.len();
-    for &idx in sample_indices {
-        let r = idx as usize;
-        let b = col[r] as usize;
-        if b < num_bins {
-            let cell = &mut hist[b];
-            cell.sum_grad += grad[r];
-            cell.sum_hess += hess[r];
+fn accumulate_row_hist(row_bins: &[u8], g: f64, h: f64, num_bins: usize, hist: &mut [GradHessBin]) {
+    for (hist_f, &b) in hist.chunks_exact_mut(num_bins).zip(row_bins.iter()) {
+        let b_idx = b as usize;
+        if b_idx < num_bins {
+            let cell = &mut hist_f[b_idx];
+            cell.sum_grad += g;
+            cell.sum_hess += h;
             cell.count += 1;
         }
     }
@@ -163,26 +177,45 @@ pub fn cpu_batched_histogram_grad(
         });
     }
 
-    let rows = binned.rows;
     let cols = binned.cols;
     let num_bins = binned.num_bins;
-    let mut out = vec![GradHessBin::default(); cols * num_bins];
+    let hist_len = cols * num_bins;
 
-    if sample_indices.len() < 1024 {
-        for (f, hist) in out.chunks_exact_mut(num_bins).enumerate() {
-            let col = &binned.col_data[f * rows..(f + 1) * rows];
-            accumulate_feature_hist(col, sample_indices, grad, hess, hist);
-        }
+    if sample_indices.len() >= 16_384 {
+        let out = sample_indices
+            .par_chunks(4096)
+            .fold(
+                || vec![GradHessBin::default(); hist_len],
+                |mut local_hist, chunk| {
+                    for &idx in chunk {
+                        let r = idx as usize;
+                        let row_bins = &binned.data[r * cols..(r + 1) * cols];
+                        accumulate_row_hist(row_bins, grad[r], hess[r], num_bins, &mut local_hist);
+                    }
+                    local_hist
+                },
+            )
+            .reduce(
+                || vec![GradHessBin::default(); hist_len],
+                |mut a, b| {
+                    for (dst, src) in a.iter_mut().zip(b.iter()) {
+                        dst.sum_grad += src.sum_grad;
+                        dst.sum_hess += src.sum_hess;
+                        dst.count += src.count;
+                    }
+                    a
+                },
+            );
+        Ok(out)
     } else {
-        out.par_chunks_exact_mut(num_bins)
-            .enumerate()
-            .for_each(|(f, hist)| {
-                let col = &binned.col_data[f * rows..(f + 1) * rows];
-                accumulate_feature_hist(col, sample_indices, grad, hess, hist);
-            });
+        let mut out = vec![GradHessBin::default(); hist_len];
+        for &idx in sample_indices {
+            let r = idx as usize;
+            let row_bins = &binned.data[r * cols..(r + 1) * cols];
+            accumulate_row_hist(row_bins, grad[r], hess[r], num_bins, &mut out);
+        }
+        Ok(out)
     }
-
-    Ok(out)
 }
 
 /// Subtract child histogram from parent histogram to obtain sibling histogram in `O(P * B)`.
@@ -207,6 +240,64 @@ pub fn subtract_histogram(
         .collect())
 }
 
+#[inline]
+fn find_best_feature_split(
+    f: usize,
+    edges: &[f64],
+    hist: &[GradHessBin],
+    l2_reg: f64,
+    min_samples_leaf: u32,
+) -> Option<HistogramSplit> {
+    if edges.is_empty() {
+        return None;
+    }
+    let mut total_g = 0.0;
+    let mut total_h = 0.0;
+    let mut total_n = 0u32;
+    for bin in hist {
+        total_g += bin.sum_grad;
+        total_h += bin.sum_hess;
+        total_n += bin.count;
+    }
+    if total_n < 2 * min_samples_leaf {
+        return None;
+    }
+    let parent_score = (total_g * total_g) / (total_h + l2_reg).max(1e-12);
+
+    let mut left_g = 0.0;
+    let mut left_h = 0.0;
+    let mut left_n = 0u32;
+    let mut best_feat: Option<HistogramSplit> = None;
+
+    for (b, &threshold) in edges.iter().enumerate() {
+        left_g += hist[b].sum_grad;
+        left_h += hist[b].sum_hess;
+        left_n += hist[b].count;
+        let right_n = total_n.saturating_sub(left_n);
+        if left_n < min_samples_leaf || right_n < min_samples_leaf {
+            continue;
+        }
+        let right_g = total_g - left_g;
+        let right_h = total_h - left_h;
+        let gain = 0.5
+            * ((left_g * left_g) / (left_h + l2_reg).max(1e-12)
+                + (right_g * right_g) / (right_h + l2_reg).max(1e-12)
+                - parent_score);
+        if best_feat.is_none_or(|cur| gain > cur.gain) {
+            best_feat = Some(HistogramSplit {
+                feature_idx: f,
+                bin_idx: b,
+                threshold,
+                gain,
+                left_grad: left_g,
+                left_hess: left_h,
+                left_count: left_n,
+            });
+        }
+    }
+    best_feat
+}
+
 /// Find the highest-gain split across all features and histogram bins.
 pub fn find_best_histogram_split(
     binned: &BinnedMatrix,
@@ -223,61 +314,61 @@ pub fn find_best_histogram_split(
     }
 
     let num_bins = binned.num_bins;
-    let best = (0..binned.cols)
-        .into_par_iter()
-        .filter_map(|f| {
-            let edges = &binned.bin_edges[f];
-            if edges.is_empty() {
-                return None;
-            }
-            let hist = &histograms[f * num_bins..(f + 1) * num_bins];
-            let mut total_g = 0.0;
-            let mut total_h = 0.0;
-            let mut total_n = 0u32;
-            for bin in hist {
-                total_g += bin.sum_grad;
-                total_h += bin.sum_hess;
-                total_n += bin.count;
-            }
-            if total_n < 2 * min_samples_leaf {
-                return None;
-            }
-            let parent_score = (total_g * total_g) / (total_h + l2_reg).max(1e-12);
-
-            let mut left_g = 0.0;
-            let mut left_h = 0.0;
-            let mut left_n = 0u32;
-            let mut best_feat: Option<HistogramSplit> = None;
-
-            for (b, &threshold) in edges.iter().enumerate() {
-                left_g += hist[b].sum_grad;
-                left_h += hist[b].sum_hess;
-                left_n += hist[b].count;
-                let right_n = total_n.saturating_sub(left_n);
-                if left_n < min_samples_leaf || right_n < min_samples_leaf {
-                    continue;
-                }
-                let right_g = total_g - left_g;
-                let right_h = total_h - left_h;
-                let gain = 0.5
-                    * ((left_g * left_g) / (left_h + l2_reg).max(1e-12)
-                        + (right_g * right_g) / (right_h + l2_reg).max(1e-12)
-                        - parent_score);
-                if best_feat.is_none_or(|cur| gain > cur.gain) {
-                    best_feat = Some(HistogramSplit {
-                        feature_idx: f,
-                        bin_idx: b,
-                        threshold,
-                        gain,
-                        left_grad: left_g,
-                        left_hess: left_h,
-                        left_count: left_n,
-                    });
-                }
-            }
-            best_feat
-        })
-        .reduce_with(|a, b| if a.gain >= b.gain { a } else { b });
+    let best = if expected >= 16_384 {
+        (0..binned.cols)
+            .into_par_iter()
+            .filter_map(|f| {
+                let hist = &histograms[f * num_bins..(f + 1) * num_bins];
+                find_best_feature_split(f, &binned.bin_edges[f], hist, l2_reg, min_samples_leaf)
+            })
+            .reduce_with(|a, b| if a.gain >= b.gain { a } else { b })
+    } else {
+        (0..binned.cols)
+            .filter_map(|f| {
+                let hist = &histograms[f * num_bins..(f + 1) * num_bins];
+                find_best_feature_split(f, &binned.bin_edges[f], hist, l2_reg, min_samples_leaf)
+            })
+            .reduce(|a, b| if a.gain >= b.gain { a } else { b })
+    };
 
     Ok(best)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_batched_histogram_large_and_small_parity() {
+        let rows = 20_000usize;
+        let cols = 6usize;
+        let mut data = Vec::with_capacity(rows * cols);
+        let mut grad = Vec::with_capacity(rows);
+        let mut hess = Vec::with_capacity(rows);
+        for r in 0..rows {
+            for c in 0..cols {
+                data.push((((r * 37 + c * 13) % 997) as f64) / 997.0);
+            }
+            grad.push(((r % 17) as f64) - 8.0);
+            hess.push(1.0 + ((r % 5) as f64) * 0.25);
+        }
+        let x = Matrix::from_vec(rows, cols, data).unwrap();
+        let binned = cpu_quantize_features(&x, 64).unwrap();
+
+        let large_idx: Vec<u32> = (0..rows as u32).step_by(1).collect();
+        let hist_large = cpu_batched_histogram_grad(&binned, &large_idx, &grad, &hess).unwrap();
+
+        let split_point = 10_000usize;
+        let small_a: Vec<u32> = (0..split_point as u32).collect();
+        let small_b: Vec<u32> = (split_point as u32..rows as u32).collect();
+        let hist_a = cpu_batched_histogram_grad(&binned, &small_a, &grad, &hess).unwrap();
+        let hist_b = cpu_batched_histogram_grad(&binned, &small_b, &grad, &hess).unwrap();
+
+        assert_eq!(hist_large.len(), cols * 64);
+        for ((hl, ha), hb) in hist_large.iter().zip(hist_a.iter()).zip(hist_b.iter()) {
+            assert_eq!(hl.count, ha.count + hb.count);
+            assert!((hl.sum_grad - (ha.sum_grad + hb.sum_grad)).abs() < 1e-9);
+            assert!((hl.sum_hess - (ha.sum_hess + hb.sum_hess)).abs() < 1e-9);
+        }
+    }
 }

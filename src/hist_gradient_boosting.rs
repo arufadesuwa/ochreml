@@ -14,7 +14,7 @@ use crate::matrix::{Matrix, r2_score};
 use crate::preprocessing::py_helpers::{
     buffer_to_f64_1d, buffer_to_pooled_matrix, f64_slice_to_pybytes, matrix_to_pybytes,
 };
-use crate::primitives::{BinnedMatrix, GradHessBin, HistogramSplit, subtract_histogram};
+use crate::primitives::{BinnedMatrix, GradHessBin, HistogramSplit};
 use crate::pymethods_with_dit;
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
@@ -494,7 +494,18 @@ fn build_hgb_tree(
                     &sample_indices[mid..cand.end]
                 };
                 let small_hist = backend.batched_histogram_grad(binned, small_idx, grad, hess)?;
-                let large_hist = subtract_histogram(&cand.hist, &small_hist)?;
+                if cand.hist.len() != small_hist.len() {
+                    return Err(OchreError::LengthMismatch {
+                        features: cand.hist.len(),
+                        targets: small_hist.len(),
+                    });
+                }
+                let mut large_hist = cand.hist;
+                for (p, c) in large_hist.iter_mut().zip(small_hist.iter()) {
+                    p.sum_grad -= c.sum_grad;
+                    p.sum_hess -= c.sum_hess;
+                    p.count = p.count.saturating_sub(c.count);
+                }
                 let (left_hist, right_hist) = if left_is_smaller {
                     (small_hist, large_hist)
                 } else {
@@ -760,16 +771,45 @@ impl HistGradientBoostingRegressor {
         let mut sample_indices = vec![0u32; x.rows];
         for _ in 0..self.max_iter {
             if is_abs {
-                for i in 0..x.rows {
-                    let diff = raw[i] - y[i];
-                    grad[i] = if diff > 0.0 {
-                        weights[i]
-                    } else if diff < 0.0 {
-                        -weights[i]
-                    } else {
-                        0.0
-                    };
+                if x.rows >= 16_384 {
+                    grad.par_chunks_mut(4096)
+                        .enumerate()
+                        .for_each(|(chunk_idx, g_chunk)| {
+                            let base = chunk_idx * 4096;
+                            for (off, dst) in g_chunk.iter_mut().enumerate() {
+                                let i = base + off;
+                                let diff = raw[i] - y[i];
+                                *dst = if diff > 0.0 {
+                                    weights[i]
+                                } else if diff < 0.0 {
+                                    -weights[i]
+                                } else {
+                                    0.0
+                                };
+                            }
+                        });
+                } else {
+                    for i in 0..x.rows {
+                        let diff = raw[i] - y[i];
+                        grad[i] = if diff > 0.0 {
+                            weights[i]
+                        } else if diff < 0.0 {
+                            -weights[i]
+                        } else {
+                            0.0
+                        };
+                    }
                 }
+            } else if x.rows >= 16_384 {
+                grad.par_chunks_mut(4096)
+                    .enumerate()
+                    .for_each(|(chunk_idx, g_chunk)| {
+                        let base = chunk_idx * 4096;
+                        for (off, dst) in g_chunk.iter_mut().enumerate() {
+                            let i = base + off;
+                            *dst = weights[i] * (raw[i] - y[i]);
+                        }
+                    });
             } else {
                 for i in 0..x.rows {
                     grad[i] = weights[i] * (raw[i] - y[i]);
@@ -1016,11 +1056,28 @@ impl HistGradientBoostingClassifier {
             let mut trees = Vec::with_capacity(self.max_iter);
 
             for _ in 0..self.max_iter {
-                for i in 0..x.rows {
-                    let p = 1.0 / (1.0 + (-raw[i]).exp());
-                    let yi = if class_indices[i] == 1 { 1.0 } else { 0.0 };
-                    grad[i] = weights[i] * (p - yi);
-                    hess[i] = weights[i] * (p * (1.0 - p)).max(1e-15);
+                if x.rows >= 8192 {
+                    grad.par_chunks_mut(2048)
+                        .zip(hess.par_chunks_mut(2048))
+                        .enumerate()
+                        .for_each(|(chunk_idx, (g_chunk, h_chunk))| {
+                            let base = chunk_idx * 2048;
+                            for off in 0..g_chunk.len() {
+                                let i = base + off;
+                                let p = 1.0 / (1.0 + (-raw[i]).exp());
+                                let yi = if class_indices[i] == 1 { 1.0 } else { 0.0 };
+                                let w = weights[i];
+                                g_chunk[off] = w * (p - yi);
+                                h_chunk[off] = w * (p * (1.0 - p)).max(1e-15);
+                            }
+                        });
+                } else {
+                    for i in 0..x.rows {
+                        let p = 1.0 / (1.0 + (-raw[i]).exp());
+                        let yi = if class_indices[i] == 1 { 1.0 } else { 0.0 };
+                        grad[i] = weights[i] * (p - yi);
+                        hess[i] = weights[i] * (p * (1.0 - p)).max(1e-15);
+                    }
                 }
                 let tree = build_hgb_tree(
                     &backend,
@@ -1057,31 +1114,75 @@ impl HistGradientBoostingClassifier {
             let mut trees = Vec::with_capacity(self.max_iter * n_classes);
 
             for _ in 0..self.max_iter {
-                for i in 0..x.rows {
-                    let mut max_r = f64::NEG_INFINITY;
-                    for raw_k in raws.iter().take(n_classes) {
-                        if raw_k[i] > max_r {
-                            max_r = raw_k[i];
+                if x.rows >= 8192 {
+                    probs.par_chunks_mut(2048 * n_classes).enumerate().for_each(
+                        |(chunk_idx, p_chunk)| {
+                            let base = chunk_idx * 2048;
+                            for (off, row_p) in p_chunk.chunks_exact_mut(n_classes).enumerate() {
+                                let i = base + off;
+                                let mut max_r = f64::NEG_INFINITY;
+                                for raw_k in raws.iter().take(n_classes) {
+                                    if raw_k[i] > max_r {
+                                        max_r = raw_k[i];
+                                    }
+                                }
+                                let mut sum_exp = 0.0;
+                                for k in 0..n_classes {
+                                    let e = (raws[k][i] - max_r).exp();
+                                    row_p[k] = e;
+                                    sum_exp += e;
+                                }
+                                let inv = 1.0 / sum_exp;
+                                for v in row_p.iter_mut() {
+                                    *v *= inv;
+                                }
+                            }
+                        },
+                    );
+                } else {
+                    for i in 0..x.rows {
+                        let mut max_r = f64::NEG_INFINITY;
+                        for raw_k in raws.iter().take(n_classes) {
+                            if raw_k[i] > max_r {
+                                max_r = raw_k[i];
+                            }
                         }
-                    }
-                    let mut sum_exp = 0.0;
-                    for k in 0..n_classes {
-                        let e = (raws[k][i] - max_r).exp();
-                        probs[i * n_classes + k] = e;
-                        sum_exp += e;
-                    }
-                    let inv = 1.0 / sum_exp;
-                    for k in 0..n_classes {
-                        probs[i * n_classes + k] *= inv;
+                        let mut sum_exp = 0.0;
+                        for k in 0..n_classes {
+                            let e = (raws[k][i] - max_r).exp();
+                            probs[i * n_classes + k] = e;
+                            sum_exp += e;
+                        }
+                        let inv = 1.0 / sum_exp;
+                        for k in 0..n_classes {
+                            probs[i * n_classes + k] *= inv;
+                        }
                     }
                 }
 
                 for k in 0..n_classes {
-                    for i in 0..x.rows {
-                        let p = probs[i * n_classes + k];
-                        let yk = if class_indices[i] == k { 1.0 } else { 0.0 };
-                        grad[i] = weights[i] * (p - yk);
-                        hess[i] = weights[i] * (p * (1.0 - p)).max(1e-15);
+                    if x.rows >= 8192 {
+                        grad.par_chunks_mut(2048)
+                            .zip(hess.par_chunks_mut(2048))
+                            .enumerate()
+                            .for_each(|(chunk_idx, (g_chunk, h_chunk))| {
+                                let base = chunk_idx * 2048;
+                                for off in 0..g_chunk.len() {
+                                    let i = base + off;
+                                    let p = probs[i * n_classes + k];
+                                    let yk = if class_indices[i] == k { 1.0 } else { 0.0 };
+                                    let w = weights[i];
+                                    g_chunk[off] = w * (p - yk);
+                                    h_chunk[off] = w * (p * (1.0 - p)).max(1e-15);
+                                }
+                            });
+                    } else {
+                        for i in 0..x.rows {
+                            let p = probs[i * n_classes + k];
+                            let yk = if class_indices[i] == k { 1.0 } else { 0.0 };
+                            grad[i] = weights[i] * (p - yk);
+                            hess[i] = weights[i] * (p * (1.0 - p)).max(1e-15);
+                        }
                     }
                     let tree = build_hgb_tree(
                         &backend,

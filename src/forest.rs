@@ -522,6 +522,7 @@ struct ClfBuildCfg<'a> {
     n_samples: usize,
     n_features: usize,
     total_tree_weight: f64,
+    x_rows: &'a [f64],
     x_cols: &'a [f64],
     class_idx: &'a [usize],
 }
@@ -532,16 +533,37 @@ struct ClfTreeScratch {
     left_counts: Vec<f64>,
     right_counts: Vec<f64>,
     sorted: Vec<(f64, usize, f64)>,
+    et_min: Vec<f64>,
+    et_max: Vec<f64>,
+    et_active_feats: Vec<usize>,
+    et_active_thresh: Vec<f64>,
+    et_left_counts: Vec<f64>,
+    et_left_w: Vec<f64>,
+    et_left_n: Vec<usize>,
 }
 
 impl ClfTreeScratch {
-    fn new(n_features: usize, n_classes: usize, sorted_cap: usize) -> Self {
+    fn new(
+        n_features: usize,
+        max_feat: usize,
+        n_classes: usize,
+        sorted_cap: usize,
+        extra_trees: bool,
+    ) -> Self {
+        let et_cap = if extra_trees { max_feat } else { 0 };
         Self {
             counts: vec![0.0; n_classes],
             feat_pool: Vec::with_capacity(n_features),
             left_counts: vec![0.0; n_classes],
             right_counts: vec![0.0; n_classes],
             sorted: Vec::with_capacity(sorted_cap),
+            et_min: vec![0.0; et_cap],
+            et_max: vec![0.0; et_cap],
+            et_active_feats: Vec::with_capacity(et_cap),
+            et_active_thresh: Vec::with_capacity(et_cap),
+            et_left_counts: vec![0.0; et_cap * n_classes],
+            et_left_w: vec![0.0; et_cap],
+            et_left_n: vec![0; et_cap],
         }
     }
 }
@@ -619,61 +641,97 @@ fn build_clf_tree(
     let n_samples = cfg.n_samples;
 
     if cfg.extra_trees {
-        for fi in 0..scratch.feat_pool.len() {
-            let f = scratch.feat_pool[fi];
-            let col = &cfg.x_cols[f * n_samples..(f + 1) * n_samples];
-            let mut min_v = f64::INFINITY;
-            let mut max_v = f64::NEG_INFINITY;
-            for &(idx, _) in samples.iter() {
-                let v = col[idx];
-                if v < min_v {
-                    min_v = v;
+        let k = scratch.feat_pool.len();
+        let p = cfg.n_features;
+        let n_classes = cfg.n_classes;
+        let feat_pool = &scratch.feat_pool[..k];
+        let min_v = &mut scratch.et_min[..k];
+        let max_v = &mut scratch.et_max[..k];
+        min_v.fill(f64::INFINITY);
+        max_v.fill(f64::NEG_INFINITY);
+
+        for &(idx, _) in samples.iter() {
+            let row = &cfg.x_rows[idx * p..(idx + 1) * p];
+            for fi in 0..k {
+                let v = row[feat_pool[fi]];
+                if v < min_v[fi] {
+                    min_v[fi] = v;
                 }
-                if v > max_v {
-                    max_v = v;
+                if v > max_v[fi] {
+                    max_v[fi] = v;
                 }
             }
-            if max_v <= min_v + 1e-12 {
+        }
+
+        scratch.et_active_feats.clear();
+        scratch.et_active_thresh.clear();
+        for fi in 0..k {
+            let mn = min_v[fi];
+            let mx = max_v[fi];
+            if mx <= mn + 1e-12 {
                 continue;
             }
-            let thresh = min_v + rng.next_f64() * (max_v - min_v);
-            let thresh = if thresh >= max_v {
-                0.5 * (min_v + max_v)
+            let thresh = mn + rng.next_f64() * (mx - mn);
+            let thresh = if thresh >= mx {
+                0.5 * (mn + mx)
             } else {
                 thresh
             };
+            scratch.et_active_feats.push(feat_pool[fi]);
+            scratch.et_active_thresh.push(thresh);
+        }
 
-            scratch.left_counts.fill(0.0);
-            scratch.right_counts.fill(0.0);
-            let mut left_w = 0.0;
-            let mut left_n = 0usize;
+        let m = scratch.et_active_feats.len();
+        if m > 0 {
+            let active_feats = &scratch.et_active_feats[..m];
+            let active_thresh = &scratch.et_active_thresh[..m];
+            let left_counts = &mut scratch.et_left_counts[..m * n_classes];
+            let left_w = &mut scratch.et_left_w[..m];
+            let left_n = &mut scratch.et_left_n[..m];
+            left_counts.fill(0.0);
+            left_w.fill(0.0);
+            left_n.fill(0);
+
             for &(idx, w) in samples.iter() {
-                let v = col[idx];
+                let row = &cfg.x_rows[idx * p..(idx + 1) * p];
                 let c = cfg.class_idx[idx];
-                if v <= thresh {
-                    scratch.left_counts[c] += w;
-                    left_w += w;
-                    left_n += 1;
-                } else {
-                    scratch.right_counts[c] += w;
+                for ai in 0..m {
+                    if row[active_feats[ai]] <= active_thresh[ai] {
+                        left_counts[ai * n_classes + c] += w;
+                        left_w[ai] += w;
+                        left_n[ai] += 1;
+                    }
                 }
             }
-            let right_n = n - left_n;
-            if left_n < cfg.min_samples_leaf || right_n < cfg.min_samples_leaf {
-                continue;
-            }
-            let right_w = total_w - left_w;
-            if left_w <= 0.0 || right_w <= 0.0 {
-                continue;
-            }
-            let left_imp = impurity_weighted(&scratch.left_counts, left_w, cfg.criterion_entropy);
-            let right_imp =
-                impurity_weighted(&scratch.right_counts, right_w, cfg.criterion_entropy);
-            let gain = parent_imp - (left_w / total_w) * left_imp - (right_w / total_w) * right_imp;
-            if gain > best_gain {
-                best_gain = gain;
-                best_feat = f;
-                best_thresh = thresh;
+
+            for ai in 0..m {
+                let ln = left_n[ai];
+                let rn = n - ln;
+                if ln < cfg.min_samples_leaf || rn < cfg.min_samples_leaf {
+                    continue;
+                }
+                let lw = left_w[ai];
+                let rw = total_w - lw;
+                if lw <= 0.0 || rw <= 0.0 {
+                    continue;
+                }
+                let lc = &left_counts[ai * n_classes..(ai + 1) * n_classes];
+                for ((dst, &tot), &left) in scratch
+                    .right_counts
+                    .iter_mut()
+                    .zip(scratch.counts.iter())
+                    .zip(lc.iter())
+                {
+                    *dst = (tot - left).max(0.0);
+                }
+                let left_imp = impurity_weighted(lc, lw, cfg.criterion_entropy);
+                let right_imp = impurity_weighted(&scratch.right_counts, rw, cfg.criterion_entropy);
+                let gain = parent_imp - (lw / total_w) * left_imp - (rw / total_w) * right_imp;
+                if gain > best_gain {
+                    best_gain = gain;
+                    best_feat = active_feats[ai];
+                    best_thresh = active_thresh[ai];
+                }
             }
         }
     } else {
@@ -795,6 +853,7 @@ struct RegBuildCfg<'a> {
     n_samples: usize,
     n_features: usize,
     total_tree_weight: f64,
+    x_rows: &'a [f64],
     x_cols: &'a [f64],
     y: &'a [f64],
 }
@@ -802,13 +861,28 @@ struct RegBuildCfg<'a> {
 struct RegTreeScratch {
     feat_pool: Vec<usize>,
     sorted: Vec<(f64, f64, f64)>,
+    et_min: Vec<f64>,
+    et_max: Vec<f64>,
+    et_active_feats: Vec<usize>,
+    et_active_thresh: Vec<f64>,
+    et_left_sum: Vec<f64>,
+    et_left_w: Vec<f64>,
+    et_left_n: Vec<usize>,
 }
 
 impl RegTreeScratch {
-    fn new(n_features: usize, sorted_cap: usize) -> Self {
+    fn new(n_features: usize, max_feat: usize, sorted_cap: usize, extra_trees: bool) -> Self {
+        let et_cap = if extra_trees { max_feat } else { 0 };
         Self {
             feat_pool: Vec::with_capacity(n_features),
             sorted: Vec::with_capacity(sorted_cap),
+            et_min: vec![0.0; et_cap],
+            et_max: vec![0.0; et_cap],
+            et_active_feats: Vec::with_capacity(et_cap),
+            et_active_thresh: Vec::with_capacity(et_cap),
+            et_left_sum: vec![0.0; et_cap],
+            et_left_w: vec![0.0; et_cap],
+            et_left_n: vec![0; et_cap],
         }
     }
 }
@@ -860,55 +934,87 @@ fn build_reg_tree(
     let n_samples = cfg.n_samples;
 
     if cfg.extra_trees {
-        for fi in 0..scratch.feat_pool.len() {
-            let f = scratch.feat_pool[fi];
-            let col = &cfg.x_cols[f * n_samples..(f + 1) * n_samples];
-            let mut min_v = f64::INFINITY;
-            let mut max_v = f64::NEG_INFINITY;
-            for &(idx, _) in samples.iter() {
-                let v = col[idx];
-                if v < min_v {
-                    min_v = v;
+        let k = scratch.feat_pool.len();
+        let p = cfg.n_features;
+        let feat_pool = &scratch.feat_pool[..k];
+        let min_v = &mut scratch.et_min[..k];
+        let max_v = &mut scratch.et_max[..k];
+        min_v.fill(f64::INFINITY);
+        max_v.fill(f64::NEG_INFINITY);
+
+        for &(idx, _) in samples.iter() {
+            let row = &cfg.x_rows[idx * p..(idx + 1) * p];
+            for fi in 0..k {
+                let v = row[feat_pool[fi]];
+                if v < min_v[fi] {
+                    min_v[fi] = v;
                 }
-                if v > max_v {
-                    max_v = v;
+                if v > max_v[fi] {
+                    max_v[fi] = v;
                 }
             }
-            if max_v <= min_v + 1e-12 {
+        }
+
+        scratch.et_active_feats.clear();
+        scratch.et_active_thresh.clear();
+        for fi in 0..k {
+            let mn = min_v[fi];
+            let mx = max_v[fi];
+            if mx <= mn + 1e-12 {
                 continue;
             }
-            let thresh = min_v + rng.next_f64() * (max_v - min_v);
-            let thresh = if thresh >= max_v {
-                0.5 * (min_v + max_v)
+            let thresh = mn + rng.next_f64() * (mx - mn);
+            let thresh = if thresh >= mx {
+                0.5 * (mn + mx)
             } else {
                 thresh
             };
+            scratch.et_active_feats.push(feat_pool[fi]);
+            scratch.et_active_thresh.push(thresh);
+        }
 
-            let mut left_sum = 0.0;
-            let mut left_w = 0.0;
-            let mut left_n = 0usize;
+        let m = scratch.et_active_feats.len();
+        if m > 0 {
+            let active_feats = &scratch.et_active_feats[..m];
+            let active_thresh = &scratch.et_active_thresh[..m];
+            let left_sum = &mut scratch.et_left_sum[..m];
+            let left_w = &mut scratch.et_left_w[..m];
+            let left_n = &mut scratch.et_left_n[..m];
+            left_sum.fill(0.0);
+            left_w.fill(0.0);
+            left_n.fill(0);
+
             for &(idx, w) in samples.iter() {
-                if col[idx] <= thresh {
-                    left_sum += w * cfg.y[idx];
-                    left_w += w;
-                    left_n += 1;
+                let row = &cfg.x_rows[idx * p..(idx + 1) * p];
+                let wy = w * cfg.y[idx];
+                for ai in 0..m {
+                    let go_left = row[active_feats[ai]] <= active_thresh[ai];
+                    let mask = if go_left { 1.0 } else { 0.0 };
+                    left_sum[ai] += mask * wy;
+                    left_w[ai] += mask * w;
+                    left_n[ai] += usize::from(go_left);
                 }
             }
-            let right_n = n - left_n;
-            if left_n < cfg.min_samples_leaf || right_n < cfg.min_samples_leaf {
-                continue;
-            }
-            let right_w = total_w - left_w;
-            if left_w <= 0.0 || right_w <= 0.0 {
-                continue;
-            }
-            let right_sum = sum_y - left_sum;
-            let gain =
-                (left_sum * left_sum) / left_w + (right_sum * right_sum) / right_w - parent_score;
-            if gain > best_score_gain {
-                best_score_gain = gain;
-                best_feat = f;
-                best_thresh = thresh;
+
+            for ai in 0..m {
+                let ln = left_n[ai];
+                let rn = n - ln;
+                if ln < cfg.min_samples_leaf || rn < cfg.min_samples_leaf {
+                    continue;
+                }
+                let lw = left_w[ai];
+                let rw = total_w - lw;
+                if lw <= 0.0 || rw <= 0.0 {
+                    continue;
+                }
+                let ls = left_sum[ai];
+                let rs = sum_y - ls;
+                let gain = (ls * ls) / lw + (rs * rs) / rw - parent_score;
+                if gain > best_score_gain {
+                    best_score_gain = gain;
+                    best_feat = active_feats[ai];
+                    best_thresh = active_thresh[ai];
+                }
             }
         }
     } else {
@@ -1393,12 +1499,19 @@ impl ForestClassifierCore {
                     n_samples,
                     n_features,
                     total_tree_weight,
+                    x_rows: &x.data,
                     x_cols: &x_cols,
                     class_idx: &class_idx,
                 };
                 let mut imp = vec![0.0; n_features];
                 let sorted_cap = if self.extra_trees { 0 } else { samples.len() };
-                let mut scratch = ClfTreeScratch::new(n_features, n_classes, sorted_cap);
+                let mut scratch = ClfTreeScratch::new(
+                    n_features,
+                    max_feat,
+                    n_classes,
+                    sorted_cap,
+                    self.extra_trees,
+                );
                 let root = build_clf_tree(&cfg, &mut samples, 0, &mut rng, &mut imp, &mut scratch);
                 (root, imp)
             })
@@ -1760,12 +1873,14 @@ impl ForestRegressorCore {
                         n_samples,
                         n_features,
                         total_tree_weight,
+                        x_rows: &x.data,
                         x_cols: &x_cols,
                         y,
                     };
                     let mut imp = vec![0.0; n_features];
                     let sorted_cap = if self.extra_trees { 0 } else { samples.len() };
-                    let mut scratch = RegTreeScratch::new(n_features, sorted_cap);
+                    let mut scratch =
+                        RegTreeScratch::new(n_features, max_feat, sorted_cap, self.extra_trees);
                     let root =
                         build_reg_tree(&cfg, &mut samples, 0, &mut rng, &mut imp, &mut scratch);
                     (root, imp)
