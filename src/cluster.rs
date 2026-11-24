@@ -464,31 +464,235 @@ fn cpu_assign_labels_fused(x: &Matrix, centers: &Matrix) -> (Vec<usize>, Vec<f64
     (labels, sq_dists)
 }
 
+#[inline(always)]
+fn assign_chunk_4centers<const USE_FMA: bool>(
+    row: &[f64],
+    centers_data: &[f64],
+    half_norms: &[f64],
+    k: usize,
+    p: usize,
+) -> usize {
+    let mut best_k = 0usize;
+    let mut best_score = f64::NEG_INFINITY;
+    let mut c = 0usize;
+
+    while c + 4 <= k {
+        let c0 = &centers_data[c * p..(c + 1) * p];
+        let c1 = &centers_data[(c + 1) * p..(c + 2) * p];
+        let c2 = &centers_data[(c + 2) * p..(c + 3) * p];
+        let c3 = &centers_data[(c + 3) * p..(c + 4) * p];
+        let mut acc0 = [0.0f64; 4];
+        let mut acc1 = [0.0f64; 4];
+        let mut acc2 = [0.0f64; 4];
+        let mut acc3 = [0.0f64; 4];
+
+        let mut j = 0usize;
+        while j + 4 <= p {
+            let x0 = row[j];
+            let x1 = row[j + 1];
+            let x2 = row[j + 2];
+            let x3 = row[j + 3];
+            if USE_FMA {
+                acc0[0] = x0.mul_add(c0[j], acc0[0]);
+                acc0[1] = x1.mul_add(c0[j + 1], acc0[1]);
+                acc0[2] = x2.mul_add(c0[j + 2], acc0[2]);
+                acc0[3] = x3.mul_add(c0[j + 3], acc0[3]);
+
+                acc1[0] = x0.mul_add(c1[j], acc1[0]);
+                acc1[1] = x1.mul_add(c1[j + 1], acc1[1]);
+                acc1[2] = x2.mul_add(c1[j + 2], acc1[2]);
+                acc1[3] = x3.mul_add(c1[j + 3], acc1[3]);
+
+                acc2[0] = x0.mul_add(c2[j], acc2[0]);
+                acc2[1] = x1.mul_add(c2[j + 1], acc2[1]);
+                acc2[2] = x2.mul_add(c2[j + 2], acc2[2]);
+                acc2[3] = x3.mul_add(c2[j + 3], acc2[3]);
+
+                acc3[0] = x0.mul_add(c3[j], acc3[0]);
+                acc3[1] = x1.mul_add(c3[j + 1], acc3[1]);
+                acc3[2] = x2.mul_add(c3[j + 2], acc3[2]);
+                acc3[3] = x3.mul_add(c3[j + 3], acc3[3]);
+            } else {
+                acc0[0] += x0 * c0[j];
+                acc0[1] += x1 * c0[j + 1];
+                acc0[2] += x2 * c0[j + 2];
+                acc0[3] += x3 * c0[j + 3];
+
+                acc1[0] += x0 * c1[j];
+                acc1[1] += x1 * c1[j + 1];
+                acc1[2] += x2 * c1[j + 2];
+                acc1[3] += x3 * c1[j + 3];
+
+                acc2[0] += x0 * c2[j];
+                acc2[1] += x1 * c2[j + 1];
+                acc2[2] += x2 * c2[j + 2];
+                acc2[3] += x3 * c2[j + 3];
+
+                acc3[0] += x0 * c3[j];
+                acc3[1] += x1 * c3[j + 1];
+                acc3[2] += x2 * c3[j + 2];
+                acc3[3] += x3 * c3[j + 3];
+            }
+            j += 4;
+        }
+        let mut s0 = (acc0[0] + acc0[1]) + (acc0[2] + acc0[3]);
+        let mut s1 = (acc1[0] + acc1[1]) + (acc1[2] + acc1[3]);
+        let mut s2 = (acc2[0] + acc2[1]) + (acc2[2] + acc2[3]);
+        let mut s3 = (acc3[0] + acc3[1]) + (acc3[2] + acc3[3]);
+        while j < p {
+            let xj = row[j];
+            if USE_FMA {
+                s0 = xj.mul_add(c0[j], s0);
+                s1 = xj.mul_add(c1[j], s1);
+                s2 = xj.mul_add(c2[j], s2);
+                s3 = xj.mul_add(c3[j], s3);
+            } else {
+                s0 += xj * c0[j];
+                s1 += xj * c1[j];
+                s2 += xj * c2[j];
+                s3 += xj * c3[j];
+            }
+            j += 1;
+        }
+        s0 -= half_norms[c];
+        s1 -= half_norms[c + 1];
+        s2 -= half_norms[c + 2];
+        s3 -= half_norms[c + 3];
+
+        if s0 > best_score {
+            best_score = s0;
+            best_k = c;
+        }
+        if s1 > best_score {
+            best_score = s1;
+            best_k = c + 1;
+        }
+        if s2 > best_score {
+            best_score = s2;
+            best_k = c + 2;
+        }
+        if s3 > best_score {
+            best_score = s3;
+            best_k = c + 3;
+        }
+        c += 4;
+    }
+
+    while c < k {
+        let cr = &centers_data[c * p..(c + 1) * p];
+        let mut acc = [0.0f64; 4];
+        let mut j = 0usize;
+        while j + 4 <= p {
+            if USE_FMA {
+                acc[0] = row[j].mul_add(cr[j], acc[0]);
+                acc[1] = row[j + 1].mul_add(cr[j + 1], acc[1]);
+                acc[2] = row[j + 2].mul_add(cr[j + 2], acc[2]);
+                acc[3] = row[j + 3].mul_add(cr[j + 3], acc[3]);
+            } else {
+                acc[0] += row[j] * cr[j];
+                acc[1] += row[j + 1] * cr[j + 1];
+                acc[2] += row[j + 2] * cr[j + 2];
+                acc[3] += row[j + 3] * cr[j + 3];
+            }
+            j += 4;
+        }
+        let mut s = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+        while j < p {
+            if USE_FMA {
+                s = row[j].mul_add(cr[j], s);
+            } else {
+                s += row[j] * cr[j];
+            }
+            j += 1;
+        }
+        s -= half_norms[c];
+        if s > best_score {
+            best_score = s;
+            best_k = c;
+        }
+        c += 1;
+    }
+
+    best_k
+}
+
+#[inline(always)]
+fn assign_labels_chunk_impl<const USE_FMA: bool>(
+    x_chunk: &[f64],
+    lbl_chunk: &mut [usize],
+    centers_data: &[f64],
+    half_norms: &[f64],
+    k: usize,
+    p: usize,
+) {
+    if p == 0 || k == 0 {
+        return;
+    }
+    for (row, lbl) in x_chunk.chunks_exact(p).zip(lbl_chunk.iter_mut()) {
+        *lbl = assign_chunk_4centers::<USE_FMA>(row, centers_data, half_norms, k, p);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn assign_labels_chunk_fma(
+    x_chunk: &[f64],
+    lbl_chunk: &mut [usize],
+    centers_data: &[f64],
+    half_norms: &[f64],
+    k: usize,
+    p: usize,
+) {
+    assign_labels_chunk_impl::<true>(x_chunk, lbl_chunk, centers_data, half_norms, k, p);
+}
+
+#[inline]
+fn assign_labels_chunk(
+    x_chunk: &[f64],
+    lbl_chunk: &mut [usize],
+    centers_data: &[f64],
+    half_norms: &[f64],
+    k: usize,
+    p: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: guarded by runtime AVX2 + FMA feature detection.
+        unsafe {
+            assign_labels_chunk_fma(x_chunk, lbl_chunk, centers_data, half_norms, k, p);
+        }
+        return;
+    }
+    assign_labels_chunk_impl::<false>(x_chunk, lbl_chunk, centers_data, half_norms, k, p);
+}
+
 /// Zero-allocation fused nearest-center label-only kernel for `predict`.
+/// Uses `argmax_k (dot(x_i, c_k) - 0.5 * ||c_k||^2)` with 4-center FMA blocking.
 fn cpu_assign_labels_only(x: &Matrix, centers: &Matrix) -> Vec<usize> {
     let n = x.rows;
     let p = x.cols;
     let k = centers.rows;
     let centers_data = &centers.data;
+    let mut half_norms = Vec::with_capacity(k);
+    for c in 0..k {
+        let cr = &centers_data[c * p..(c + 1) * p];
+        let mut norm_sq = 0.0;
+        for &v in cr {
+            norm_sq += v * v;
+        }
+        half_norms.push(0.5 * norm_sq);
+    }
     let mut labels = vec![0usize; n];
 
     if n < PAR_ROW_THRESHOLD {
-        for (i, lbl) in labels.iter_mut().enumerate().take(n) {
-            let row = &x.data[i * p..(i + 1) * p];
-            let (best_k, _) = nearest_center_row(row, centers_data, k, p);
-            *lbl = best_k;
-        }
+        assign_labels_chunk(&x.data, &mut labels, centers_data, &half_norms, k, p);
     } else {
-        const CHUNK_ROWS: usize = 1024;
+        const CHUNK_ROWS: usize = 2048;
         labels
             .par_chunks_mut(CHUNK_ROWS)
             .zip(x.data.par_chunks(CHUNK_ROWS * p))
             .for_each(|(lbl_chunk, x_chunk)| {
-                for (i, lbl) in lbl_chunk.iter_mut().enumerate() {
-                    let row = &x_chunk[i * p..(i + 1) * p];
-                    let (best_k, _) = nearest_center_row(row, centers_data, k, p);
-                    *lbl = best_k;
-                }
+                assign_labels_chunk(x_chunk, lbl_chunk, centers_data, &half_norms, k, p);
             });
     }
     labels
@@ -2500,6 +2704,23 @@ mod tests {
             for i in (c..n).step_by(k) {
                 assert_eq!(mb_labels[i], expected);
             }
+        }
+    }
+
+    #[test]
+    fn test_predict_fma_identity_matches_sq_dist_all_shapes() {
+        let mut rng = DeterministicRng::new(Some(98765));
+        for &(n, k, p) in &[(64, 3, 5), (100, 5, 11), (4500, 10, 7)] {
+            let x_data: Vec<f64> = (0..n * p).map(|_| rng.next_f64() * 4.0 - 2.0).collect();
+            let c_data: Vec<f64> = (0..k * p).map(|_| rng.next_f64() * 4.0 - 2.0).collect();
+            let x = Matrix::from_vec(n, p, x_data).unwrap();
+            let centers = Matrix::from_vec(k, p, c_data).unwrap();
+            let fast_labels = cpu_assign_labels_only(&x, &centers);
+            let (exact_labels, _) = cpu_assign_labels_fused(&x, &centers);
+            assert_eq!(
+                fast_labels, exact_labels,
+                "mismatch for n={n}, k={k}, p={p}"
+            );
         }
     }
 }

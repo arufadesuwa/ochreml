@@ -236,6 +236,21 @@ fn run_lbfgs<F, C>(
     init_theta: Vec<f64>,
     max_iter: usize,
     tol: f64,
+    clamp_fn: C,
+    eval_fn: F,
+) -> OchreResult<(Vec<f64>, usize)>
+where
+    F: FnMut(&[f64], &mut [f64]) -> OchreResult<f64>,
+    C: FnMut(&mut [f64]),
+{
+    run_lbfgs_scaled(init_theta, max_iter, tol, 1.0, clamp_fn, eval_fn)
+}
+
+fn run_lbfgs_scaled<F, C>(
+    init_theta: Vec<f64>,
+    max_iter: usize,
+    tol: f64,
+    grad_scale: f64,
     mut clamp_fn: C,
     mut eval_fn: F,
 ) -> OchreResult<(Vec<f64>, usize)>
@@ -244,6 +259,7 @@ where
     C: FnMut(&mut [f64]),
 {
     let dim = init_theta.len();
+    let scale_denom = grad_scale.max(1.0);
     let mut theta = init_theta;
     clamp_fn(&mut theta);
 
@@ -260,7 +276,8 @@ where
 
     for iter in 0..max_iter {
         let g_inf = grad.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        if g_inf <= tol {
+        let scaled_g_inf = g_inf / scale_denom;
+        if scaled_g_inf <= tol {
             break;
         }
         n_iter = iter + 1;
@@ -322,7 +339,7 @@ where
         }
         let sy = dot_unrolled(&s_vec, &y_vec);
 
-        let rel_change = (loss - next_loss).abs() / loss.abs().max(1.0);
+        let rel_change = (loss - next_loss).abs() / loss.abs().max(scale_denom);
         theta.copy_from_slice(&next_theta);
         grad.copy_from_slice(&next_grad);
         loss = next_loss;
@@ -338,7 +355,9 @@ where
             y_hist.push(y_vec);
         }
 
-        if rel_change < 1e-13 && g_inf <= tol.max(1e-4) {
+        let next_g_inf = grad.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let next_scaled_g_inf = next_g_inf / scale_denom;
+        if next_scaled_g_inf <= tol || (rel_change <= 1e-9 && next_scaled_g_inf <= tol.max(1e-3)) {
             break;
         }
     }
@@ -353,6 +372,23 @@ fn compute_linear_eta(
     b: f64,
 ) -> OchreResult<Vec<f64>> {
     if matches!(backend, Backend::Cpu) {
+        if x.rows < 8192 {
+            if x.cols != w.len() {
+                return Err(OchreError::FeatureCountMismatch {
+                    features: x.cols,
+                    expected: w.len(),
+                });
+            }
+            let d = x.cols;
+            if d == 0 {
+                return Ok(vec![b; x.rows]);
+            }
+            let mut predictions = Vec::with_capacity(x.rows);
+            for row_slice in x.data.chunks_exact(d) {
+                predictions.push(b + dot_unrolled(row_slice, w));
+            }
+            return Ok(predictions);
+        }
         predict_linear_1d(x, w, b)
     } else {
         let mut eta = backend.matvec(x, w)?;
@@ -664,11 +700,13 @@ impl HuberRegressor {
         let alpha = self.alpha;
         let fit_intercept = self.fit_intercept;
         let is_cpu = matches!(backend, Backend::Cpu);
+        let weight_sum: f64 = sample_weight.map_or(n as f64, |sw| sw.iter().sum());
 
-        let (theta, n_iter) = run_lbfgs(
+        let (theta, n_iter) = run_lbfgs_scaled(
             init_theta,
             self.max_iter,
             self.tol,
+            weight_sum.max(1.0),
             |t| {
                 t[dim - 1] = t[dim - 1].clamp(-27.6, 50.0);
             },
@@ -1987,7 +2025,11 @@ impl TweedieRegressor {
                     let eta_mat = Matrix::from_vec(x.rows, 1, eta)?;
                     Ok(backend.elementwise_op(&eta_mat, ElementwiseOp::Exp)?.data)
                 } else {
-                    Ok(eta.into_iter().map(|v| v.exp()).collect())
+                    let mut out = eta;
+                    for v in &mut out {
+                        *v = v.exp();
+                    }
+                    Ok(out)
                 }
             }
         }
@@ -2540,6 +2582,20 @@ mod tests {
             let loaded = HuberRegressor::from_bytes(&bytes, Some("cpu")).unwrap();
             assert_eq!(loaded.predict(&x).unwrap(), huber.predict(&x).unwrap());
         }
+
+        // Large-N (20k) convergence check: normalized L-BFGS stopping should converge well under max_iter
+        let (x_big, y_big) = synthetic_data(20_000, 8);
+        let mut huber_big =
+            HuberRegressor::new(1.35, 100, 1e-4, true, 1e-5, Some("cpu".to_string())).unwrap();
+        huber_big.fit(&x_big, &y_big, None).unwrap();
+        let coef_big = huber_big.coef_.as_ref().unwrap();
+        assert!((coef_big[0] - 0.5).abs() < 0.02, "coef[0]={}", coef_big[0]);
+        assert!((coef_big[1] - 1.0).abs() < 0.02, "coef[1]={}", coef_big[1]);
+        assert!(
+            huber_big.n_iter_ <= 25,
+            "Expected normalized Huber L-BFGS on 20k rows to converge in <=25 iters, took {}",
+            huber_big.n_iter_
+        );
     }
 
     #[test]

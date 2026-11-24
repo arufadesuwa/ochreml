@@ -2061,6 +2061,124 @@ impl BinaryLaplaceGP {
         Ok((lml, grad))
     }
 
+    /// Solve `L * V = B` for up to 8 RHS columns stored row-major in `v_block` (`n_train x 8`),
+    /// returning `||V[:, c]||^2` for each column `c in 0..8`.
+    #[inline]
+    fn solve_lower_triangular_block8(l: &Matrix, v_block: &mut [f64], n_train: usize) -> [f64; 8] {
+        let mut norm_sq = [0.0f64; 8];
+        for r in 0..n_train {
+            let row_off = r * n_train;
+            let l_row = &l.data[row_off..row_off + r];
+            let mut s0 = 0.0f64;
+            let mut s1 = 0.0f64;
+            let mut s2 = 0.0f64;
+            let mut s3 = 0.0f64;
+            let mut s4 = 0.0f64;
+            let mut s5 = 0.0f64;
+            let mut s6 = 0.0f64;
+            let mut s7 = 0.0f64;
+            for (j, &lrj) in l_row.iter().enumerate() {
+                let vj = &v_block[j * 8..(j + 1) * 8];
+                s0 += lrj * vj[0];
+                s1 += lrj * vj[1];
+                s2 += lrj * vj[2];
+                s3 += lrj * vj[3];
+                s4 += lrj * vj[4];
+                s5 += lrj * vj[5];
+                s6 += lrj * vj[6];
+                s7 += lrj * vj[7];
+            }
+            let inv_diag = 1.0 / l.data[row_off + r];
+            let vr = &mut v_block[r * 8..(r + 1) * 8];
+            let v0 = (vr[0] - s0) * inv_diag;
+            let v1 = (vr[1] - s1) * inv_diag;
+            let v2 = (vr[2] - s2) * inv_diag;
+            let v3 = (vr[3] - s3) * inv_diag;
+            let v4 = (vr[4] - s4) * inv_diag;
+            let v5 = (vr[5] - s5) * inv_diag;
+            let v6 = (vr[6] - s6) * inv_diag;
+            let v7 = (vr[7] - s7) * inv_diag;
+            vr[0] = v0;
+            vr[1] = v1;
+            vr[2] = v2;
+            vr[3] = v3;
+            vr[4] = v4;
+            vr[5] = v5;
+            vr[6] = v6;
+            vr[7] = v7;
+            norm_sq[0] += v0 * v0;
+            norm_sq[1] += v1 * v1;
+            norm_sq[2] += v2 * v2;
+            norm_sq[3] += v3 * v3;
+            norm_sq[4] += v4 * v4;
+            norm_sq[5] += v5 * v5;
+            norm_sq[6] += v6 * v6;
+            norm_sq[7] += v7 * v7;
+        }
+        norm_sq
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn predict_pos_proba_range(
+        &self,
+        k_star: &Matrix,
+        f_star: &[f64],
+        n_train: usize,
+        k_diag: f64,
+        start: usize,
+        v_block: &mut [f64],
+        out: &mut [f64],
+    ) {
+        let count = out.len();
+        let mut offset = 0usize;
+        while offset < count {
+            let bs = (count - offset).min(8);
+            let global_start = start + offset;
+            if bs == 8 {
+                let k0 = &k_star.data[global_start * n_train..(global_start + 1) * n_train];
+                let k1 = &k_star.data[(global_start + 1) * n_train..(global_start + 2) * n_train];
+                let k2 = &k_star.data[(global_start + 2) * n_train..(global_start + 3) * n_train];
+                let k3 = &k_star.data[(global_start + 3) * n_train..(global_start + 4) * n_train];
+                let k4 = &k_star.data[(global_start + 4) * n_train..(global_start + 5) * n_train];
+                let k5 = &k_star.data[(global_start + 5) * n_train..(global_start + 6) * n_train];
+                let k6 = &k_star.data[(global_start + 6) * n_train..(global_start + 7) * n_train];
+                let k7 = &k_star.data[(global_start + 7) * n_train..(global_start + 8) * n_train];
+                for j in 0..n_train {
+                    let ws = self.w_sqrt[j];
+                    let dst = &mut v_block[j * 8..(j + 1) * 8];
+                    dst[0] = ws * k0[j];
+                    dst[1] = ws * k1[j];
+                    dst[2] = ws * k2[j];
+                    dst[3] = ws * k3[j];
+                    dst[4] = ws * k4[j];
+                    dst[5] = ws * k5[j];
+                    dst[6] = ws * k6[j];
+                    dst[7] = ws * k7[j];
+                }
+            } else {
+                for j in 0..n_train {
+                    let ws = self.w_sqrt[j];
+                    let dst = &mut v_block[j * 8..(j + 1) * 8];
+                    for (c, d) in dst.iter_mut().enumerate().take(bs) {
+                        *d = ws * k_star.data[(global_start + c) * n_train + j];
+                    }
+                    for d in dst.iter_mut().skip(bs) {
+                        *d = 0.0;
+                    }
+                }
+            }
+
+            let norm_sq = Self::solve_lower_triangular_block8(&self.l, v_block, n_train);
+            for c in 0..bs {
+                let var_f = (k_diag - norm_sq[c]).max(0.0);
+                // Probit approximation matching sklearn GaussianProcessClassifier
+                let kappa = 1.0 / (1.0 + (PI / 8.0) * var_f).sqrt();
+                out[offset + c] = sigmoid(kappa * f_star[global_start + c]);
+            }
+            offset += bs;
+        }
+    }
+
     fn predict_pos_proba(
         &self,
         backend: &Backend<'_>,
@@ -2073,41 +2191,38 @@ impl BinaryLaplaceGP {
         let n_train = x_train.rows;
         let k_diag = kernel_diag_value(&self.params);
 
-        let probs: Vec<f64> = if n_test <= 256 {
-            let mut wk = vec![0.0; n_train];
-            let mut v = vec![0.0; n_train];
-            let mut out = Vec::with_capacity(n_test);
-            for (i, &fs) in f_star.iter().enumerate().take(n_test) {
-                let k_row = &k_star.data[i * n_train..(i + 1) * n_train];
-                for j in 0..n_train {
-                    wk[j] = self.w_sqrt[j] * k_row[j];
-                }
-                solve_lower_triangular_into(&self.l, &wk, &mut v);
-                let var_f = (k_diag - dot_unrolled(&v, &v)).max(0.0);
-                // Probit approximation matching sklearn GaussianProcessClassifier
-                let kappa = 1.0 / (1.0 + (PI / 8.0) * var_f).sqrt();
-                out.push(sigmoid(kappa * fs));
-            }
-            out
+        let mut probs = vec![0.0; n_test];
+        if n_test <= 512 {
+            let mut v_block = vec![0.0; n_train * 8];
+            self.predict_pos_proba_range(
+                &k_star,
+                &f_star,
+                n_train,
+                k_diag,
+                0,
+                &mut v_block,
+                &mut probs,
+            );
         } else {
-            (0..n_test)
-                .into_par_iter()
-                .map_init(
-                    || (vec![0.0; n_train], vec![0.0; n_train]),
-                    |(wk, v), i| {
-                        let k_row = &k_star.data[i * n_train..(i + 1) * n_train];
-                        for j in 0..n_train {
-                            wk[j] = self.w_sqrt[j] * k_row[j];
-                        }
-                        solve_lower_triangular_into(&self.l, wk, v);
-                        let var_f = (k_diag - dot_unrolled(v, v)).max(0.0);
-                        // Probit approximation matching sklearn GaussianProcessClassifier
-                        let kappa = 1.0 / (1.0 + (PI / 8.0) * var_f).sqrt();
-                        sigmoid(kappa * f_star[i])
+            const PAR_CHUNK_TEST: usize = 64;
+            probs
+                .par_chunks_mut(PAR_CHUNK_TEST)
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0; n_train * 8],
+                    |v_block, (chunk_idx, out_chunk)| {
+                        self.predict_pos_proba_range(
+                            &k_star,
+                            &f_star,
+                            n_train,
+                            k_diag,
+                            chunk_idx * PAR_CHUNK_TEST,
+                            v_block,
+                            out_chunk,
+                        );
                     },
-                )
-                .collect()
-        };
+                );
+        }
 
         Ok(probs)
     }
@@ -2903,18 +3018,18 @@ mod tests {
         let acc = gpc.score(&x_cls, &y_cls).expect("score gpc");
         assert!(acc >= 0.85, "expected high training accuracy, got {acc}");
 
-        // Exercise both small (<= 256) and large (> 256) predict_pos_proba paths
-        let mut x_big = Vec::with_capacity(300 * 2);
-        for i in 0..300 {
-            let t = -2.5 + 5.0 * (i as f64) / 299.0;
+        // Exercise both sequential (<= 512) and parallel (> 512) blocked predict_pos_proba paths
+        let mut x_big = Vec::with_capacity(600 * 2);
+        for i in 0..600 {
+            let t = -2.5 + 5.0 * (i as f64) / 599.0;
             x_big.push(t);
             x_big.push((t * 1.3).cos());
         }
-        let x_big_mat = Matrix::from_vec(300, 2, x_big).expect("big mat");
+        let x_big_mat = Matrix::from_vec(600, 2, x_big).expect("big mat");
         let proba = gpc.predict_proba(&x_big_mat).expect("predict_proba big");
-        assert_eq!(proba.rows, 300);
+        assert_eq!(proba.rows, 600);
         assert_eq!(proba.cols, 2);
-        for r in 0..300 {
+        for r in 0..600 {
             let sum = proba.get(r, 0) + proba.get(r, 1);
             assert!((sum - 1.0).abs() < 1e-12);
         }

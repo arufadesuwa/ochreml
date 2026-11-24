@@ -10,7 +10,7 @@ use crate::dit_io::{
     write_opt_usize, write_str, write_usize,
 };
 use crate::error::{OchreError, OchreResult};
-use crate::linear_regression::{dot_unrolled, predict_linear_1d, predict_linear_multi};
+use crate::linear_regression::{predict_linear_1d, predict_linear_multi};
 use crate::logistic_regression::{
     build_effective_weights, extract_sorted_classes, map_labels_to_indices, validate_sample_weights,
 };
@@ -41,9 +41,9 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
-    fn shuffle(&mut self, slice: &mut [usize]) {
+    fn shuffle<T>(&mut self, slice: &mut [T]) {
         for i in (1..slice.len()).rev() {
-            let j = (self.next_u64() as usize) % (i + 1);
+            let j = ((self.next_u64() as u128 * (i as u128 + 1)) >> 64) as usize;
             slice.swap(i, j);
         }
     }
@@ -155,6 +155,38 @@ impl RegLoss {
 }
 
 #[inline(always)]
+fn dot_unrolled_chunks(a: &[f64], b: &[f64]) -> f64 {
+    let (a_chunks, a_rem) = a.as_chunks::<4>();
+    let (b_chunks, b_rem) = b.as_chunks::<4>();
+    let mut acc = [0.0f64; 4];
+    for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
+        acc[0] += ac[0] * bc[0];
+        acc[1] += ac[1] * bc[1];
+        acc[2] += ac[2] * bc[2];
+        acc[3] += ac[3] * bc[3];
+    }
+    let mut tail = 0.0;
+    for (&aj, &bj) in a_rem.iter().zip(b_rem.iter()) {
+        tail += aj * bj;
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3]) + tail
+}
+
+#[inline(always)]
+fn scale_slice_unrolled(w: &mut [f64], scale: f64) {
+    let (w_chunks, w_rem) = w.as_chunks_mut::<4>();
+    for wc in w_chunks {
+        wc[0] *= scale;
+        wc[1] *= scale;
+        wc[2] *= scale;
+        wc[3] *= scale;
+    }
+    for wj in w_rem {
+        *wj *= scale;
+    }
+}
+
+#[inline(always)]
 fn axpy_sub_unrolled(w: &mut [f64], row: &[f64], scale: f64) {
     let (w_chunks, w_rem) = w.as_chunks_mut::<4>();
     let (r_chunks, r_rem) = row.as_chunks::<4>();
@@ -245,9 +277,9 @@ const LARGE_N_BLOCK_SHUFFLE_THRESHOLD: usize = 100_000;
 const SHUFFLE_BLOCK_SIZE: usize = 512;
 
 enum EpochOrder {
-    Rows(Vec<usize>),
+    Rows(Vec<u32>),
     Blocks {
-        block_ids: Vec<usize>,
+        block_ids: Vec<u32>,
         n: usize,
         block_size: usize,
     },
@@ -258,12 +290,12 @@ impl EpochOrder {
         if n >= LARGE_N_BLOCK_SHUFFLE_THRESHOLD {
             let n_blocks = n.div_ceil(SHUFFLE_BLOCK_SIZE);
             Self::Blocks {
-                block_ids: (0..n_blocks).collect(),
+                block_ids: (0..n_blocks as u32).collect(),
                 n,
                 block_size: SHUFFLE_BLOCK_SIZE,
             }
         } else {
-            Self::Rows((0..n).collect())
+            Self::Rows((0..n as u32).collect())
         }
     }
 
@@ -274,12 +306,12 @@ impl EpochOrder {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn for_each<F: FnMut(usize)>(&self, mut f: F) {
         match self {
             Self::Rows(rows) => {
                 for &idx in rows {
-                    f(idx);
+                    f(idx as usize);
                 }
             }
             Self::Blocks {
@@ -288,7 +320,7 @@ impl EpochOrder {
                 block_size,
             } => {
                 for &bid in block_ids {
-                    let start = bid * block_size;
+                    let start = (bid as usize) * block_size;
                     let end = (start + block_size).min(*n);
                     for idx in start..end {
                         f(idx);
@@ -300,7 +332,7 @@ impl EpochOrder {
 }
 
 #[inline(always)]
-fn sgd_update_weights(
+fn sgd_update_l1(
     w: &mut [f64],
     w_scale: &mut f64,
     row: &[f64],
@@ -310,37 +342,14 @@ fn sgd_update_weights(
     l2_reg: f64,
 ) {
     let decay = (1.0 - eta * l2_reg).max(0.0);
-    if l1_reg > 0.0 {
-        if (*w_scale - 1.0).abs() > 1e-12 {
-            let s = *w_scale;
-            for v in w.iter_mut() {
-                *v *= s;
-            }
-            *w_scale = 1.0;
-        }
-        let thr = eta * l1_reg;
-        for j in 0..w.len() {
-            let updated = w[j] * decay - step_g * row[j];
-            w[j] = apply_scalar_op(updated, ElementwiseOp::SoftThreshold { lambda: thr });
-        }
-    } else {
-        if decay > 1e-12 {
-            *w_scale *= decay;
-        } else {
-            w.fill(0.0);
-            *w_scale = 1.0;
-        }
-        if *w_scale < 1e-9 {
-            let s = *w_scale;
-            for v in w.iter_mut() {
-                *v *= s;
-            }
-            *w_scale = 1.0;
-        }
-        if step_g != 0.0 {
-            let adj = step_g / *w_scale;
-            axpy_sub_unrolled(w, row, adj);
-        }
+    if (*w_scale - 1.0).abs() > 1e-12 {
+        scale_slice_unrolled(w, *w_scale);
+        *w_scale = 1.0;
+    }
+    let thr = eta * l1_reg;
+    for (wj, &rj) in w.iter_mut().zip(row.iter()) {
+        let updated = *wj * decay - step_g * rj;
+        *wj = apply_scalar_op(updated, ElementwiseOp::SoftThreshold { lambda: thr });
     }
 }
 
@@ -380,6 +389,7 @@ fn fit_sgd_binary_classifier(
     let mut best_loss = f64::INFINITY;
     let mut no_improve = 0usize;
     let mut n_iter = 0usize;
+    let no_l1 = l1_reg == 0.0;
 
     for epoch in 0..max_iter {
         n_iter = epoch + 1;
@@ -388,42 +398,59 @@ fn fit_sgd_binary_classifier(
         }
         let mut epoch_loss = 0.0;
 
-        order.for_each(|idx| {
-            let row = &x.data[idx * p..(idx + 1) * p];
-            let pred = dot_unrolled(row, &w) * w_scale + b;
-            let (l_val, dloss) = classifier_loss_and_dloss_enum(loss_kind, pred, y_pm1[idx]);
-            let eta = step_size_sched(lr_sched, eta0, power_t, alpha, t, t0);
+        if no_l1 {
+            order.for_each(|idx| {
+                let row = &x.data[idx * p..(idx + 1) * p];
+                let pred = dot_unrolled_chunks(row, &w) * w_scale + b;
+                let (l_val, dloss) = classifier_loss_and_dloss_enum(loss_kind, pred, y_pm1[idx]);
+                let eta = step_size_sched(lr_sched, eta0, power_t, alpha, t, t0);
 
-            if dloss == 0.0 {
-                if l1_reg == 0.0 {
-                    let decay = (1.0 - eta * l2_reg).max(0.0);
-                    if decay > 1e-12 {
-                        w_scale *= decay;
-                        if w_scale < 1e-9 {
-                            for v in &mut w {
-                                *v *= w_scale;
-                            }
-                            w_scale = 1.0;
-                        }
-                    } else {
-                        w.fill(0.0);
+                let decay = (1.0 - eta * l2_reg).max(0.0);
+                if decay > 1e-12 {
+                    w_scale *= decay;
+                    if w_scale < 1e-9 {
+                        scale_slice_unrolled(&mut w, w_scale);
                         w_scale = 1.0;
                     }
                 } else {
-                    sgd_update_weights(&mut w, &mut w_scale, row, eta, 0.0, l1_reg, l2_reg);
+                    w.fill(0.0);
+                    w_scale = 1.0;
                 }
-            } else {
-                let sw = weights[idx];
-                epoch_loss += sw * l_val;
-                let step_g = eta * sw * dloss;
-                sgd_update_weights(&mut w, &mut w_scale, row, eta, step_g, l1_reg, l2_reg);
-                if fit_intercept {
-                    b -= (eta * intercept_eta_scale) * sw * dloss;
-                }
-            }
 
-            t += 1.0;
-        });
+                if dloss != 0.0 {
+                    let sw = weights[idx];
+                    epoch_loss += sw * l_val;
+                    let step_g = eta * sw * dloss;
+                    axpy_sub_unrolled(&mut w, row, step_g / w_scale);
+                    if fit_intercept {
+                        b -= (eta * intercept_eta_scale) * sw * dloss;
+                    }
+                }
+
+                t += 1.0;
+            });
+        } else {
+            order.for_each(|idx| {
+                let row = &x.data[idx * p..(idx + 1) * p];
+                let pred = dot_unrolled_chunks(row, &w) * w_scale + b;
+                let (l_val, dloss) = classifier_loss_and_dloss_enum(loss_kind, pred, y_pm1[idx]);
+                let eta = step_size_sched(lr_sched, eta0, power_t, alpha, t, t0);
+
+                if dloss == 0.0 {
+                    sgd_update_l1(&mut w, &mut w_scale, row, eta, 0.0, l1_reg, l2_reg);
+                } else {
+                    let sw = weights[idx];
+                    epoch_loss += sw * l_val;
+                    let step_g = eta * sw * dloss;
+                    sgd_update_l1(&mut w, &mut w_scale, row, eta, step_g, l1_reg, l2_reg);
+                    if fit_intercept {
+                        b -= (eta * intercept_eta_scale) * sw * dloss;
+                    }
+                }
+
+                t += 1.0;
+            });
+        }
 
         let avg_loss = epoch_loss / (n as f64);
         if let Some(tol_val) = tol {
@@ -440,9 +467,7 @@ fn fit_sgd_binary_classifier(
     }
 
     if (w_scale - 1.0).abs() > 1e-12 {
-        for v in &mut w {
-            *v *= w_scale;
-        }
+        scale_slice_unrolled(&mut w, w_scale);
     }
     (w, b, n_iter, t - 1.0)
 }
@@ -1083,6 +1108,8 @@ impl SGDRegressor {
         let mut no_improve = 0usize;
         let mut n_iter = 0usize;
 
+        let no_l1 = l1_reg == 0.0;
+
         for epoch in 0..self.max_iter {
             n_iter = epoch + 1;
             if self.shuffle {
@@ -1090,43 +1117,61 @@ impl SGDRegressor {
             }
             let mut epoch_loss = 0.0;
 
-            order.for_each(|idx| {
-                let row = &x.data[idx * p..(idx + 1) * p];
-                let pred = dot_unrolled(row, &w) * w_scale + b;
-                let (l_val, dloss) =
-                    regressor_loss_and_dloss_enum(loss_kind, pred, y[idx], self.epsilon);
-                let eta = step_size_sched(lr_sched, self.eta0, self.power_t, self.alpha, t, t0);
+            if no_l1 {
+                order.for_each(|idx| {
+                    let row = &x.data[idx * p..(idx + 1) * p];
+                    let pred = dot_unrolled_chunks(row, &w) * w_scale + b;
+                    let (l_val, dloss) =
+                        regressor_loss_and_dloss_enum(loss_kind, pred, y[idx], self.epsilon);
+                    let eta = step_size_sched(lr_sched, self.eta0, self.power_t, self.alpha, t, t0);
 
-                if dloss == 0.0 {
-                    if l1_reg == 0.0 {
-                        let decay = (1.0 - eta * l2_reg).max(0.0);
-                        if decay > 1e-12 {
-                            w_scale *= decay;
-                            if w_scale < 1e-9 {
-                                for v in &mut w {
-                                    *v *= w_scale;
-                                }
-                                w_scale = 1.0;
-                            }
-                        } else {
-                            w.fill(0.0);
+                    let decay = (1.0 - eta * l2_reg).max(0.0);
+                    if decay > 1e-12 {
+                        w_scale *= decay;
+                        if w_scale < 1e-9 {
+                            scale_slice_unrolled(&mut w, w_scale);
                             w_scale = 1.0;
                         }
                     } else {
-                        sgd_update_weights(&mut w, &mut w_scale, row, eta, 0.0, l1_reg, l2_reg);
+                        w.fill(0.0);
+                        w_scale = 1.0;
                     }
-                } else {
-                    let sw = sample_weight.map_or(1.0, |s| s[idx]);
-                    epoch_loss += sw * l_val;
-                    let step_g = eta * sw * dloss;
-                    sgd_update_weights(&mut w, &mut w_scale, row, eta, step_g, l1_reg, l2_reg);
-                    if self.fit_intercept {
-                        b -= (eta * intercept_eta_scale) * sw * dloss;
-                    }
-                }
 
-                t += 1.0;
-            });
+                    if dloss != 0.0 {
+                        let sw = sample_weight.map_or(1.0, |s| s[idx]);
+                        epoch_loss += sw * l_val;
+                        let step_g = eta * sw * dloss;
+                        axpy_sub_unrolled(&mut w, row, step_g / w_scale);
+                        if self.fit_intercept {
+                            b -= (eta * intercept_eta_scale) * sw * dloss;
+                        }
+                    }
+
+                    t += 1.0;
+                });
+            } else {
+                order.for_each(|idx| {
+                    let row = &x.data[idx * p..(idx + 1) * p];
+                    let pred = dot_unrolled_chunks(row, &w) * w_scale + b;
+                    let (l_val, dloss) =
+                        regressor_loss_and_dloss_enum(loss_kind, pred, y[idx], self.epsilon);
+                    let eta = step_size_sched(lr_sched, self.eta0, self.power_t, self.alpha, t, t0);
+
+                    if dloss == 0.0 {
+                        sgd_update_l1(&mut w, &mut w_scale, row, eta, 0.0, l1_reg, l2_reg);
+                    } else {
+                        let sw = sample_weight.map_or(1.0, |s| s[idx]);
+                        epoch_loss += sw * l_val;
+                        let step_g = eta * sw * dloss;
+                        sgd_update_l1(&mut w, &mut w_scale, row, eta, step_g, l1_reg, l2_reg);
+                        if self.fit_intercept {
+                            b -= (eta * intercept_eta_scale) * sw * dloss;
+                        }
+                    }
+
+                    t += 1.0;
+                });
+            }
 
             let avg_loss = epoch_loss / (n as f64);
             if let Some(tol_val) = self.tol {
@@ -1143,9 +1188,7 @@ impl SGDRegressor {
         }
 
         if (w_scale - 1.0).abs() > 1e-12 {
-            for v in &mut w {
-                *v *= w_scale;
-            }
+            scale_slice_unrolled(&mut w, w_scale);
         }
         self.coef_ = Some(w);
         self.intercept_ = Some(b);
