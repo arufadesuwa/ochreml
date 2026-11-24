@@ -31,6 +31,38 @@ pub const TAG_TWEEDIE_REGRESSOR: u8 = 53;
 const LBFGS_HISTORY: usize = 10;
 const SMALL_MATRIX_GPU_THRESHOLD: usize = 262_144;
 const SMALL_VEC_GPU_THRESHOLD: usize = 16_384;
+const FUSED_PAR_THRESHOLD: usize = 4096;
+const FUSED_CHUNK_ROWS: usize = 1024;
+
+#[inline(always)]
+fn axpy_add_unrolled(dst: &mut [f64], src: &[f64], scale: f64) {
+    let (d_chunks, d_rem) = dst.as_chunks_mut::<4>();
+    let (s_chunks, s_rem) = src.as_chunks::<4>();
+    for (dc, sc) in d_chunks.iter_mut().zip(s_chunks.iter()) {
+        dc[0] += scale * sc[0];
+        dc[1] += scale * sc[1];
+        dc[2] += scale * sc[2];
+        dc[3] += scale * sc[3];
+    }
+    for (dj, &sj) in d_rem.iter_mut().zip(s_rem.iter()) {
+        *dj += scale * sj;
+    }
+}
+
+fn median_in_place(buf: &mut [f64]) -> f64 {
+    let n = buf.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mid = n / 2;
+    let (_, med_hi, left) = buf.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    if n % 2 == 1 {
+        *med_hi
+    } else {
+        let med_lo = left.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        0.5 * (med_lo + *med_hi)
+    }
+}
 
 #[inline]
 fn effective_backend<'a>(device: &'a DeviceType, rows: usize, cols: usize) -> Backend<'a> {
@@ -252,7 +284,7 @@ where
         let mut accepted = false;
         let mut next_loss = loss;
 
-        for _ in 0..40 {
+        for _ in 0..15 {
             for d in 0..dim {
                 next_theta[d] = theta[d] + step * dir[d];
             }
@@ -265,7 +297,17 @@ where
                 accepted = true;
                 break;
             }
-            step *= 0.5;
+            if next_loss.is_finite() {
+                let denom = 2.0 * (next_loss - loss - step * dg);
+                let quad_step = if denom > 1e-20 {
+                    -(dg * step * step) / denom
+                } else {
+                    0.5 * step
+                };
+                step = quad_step.clamp(0.1 * step, 0.5 * step);
+            } else {
+                step *= 0.25;
+            }
         }
 
         if !accepted {
@@ -473,20 +515,155 @@ impl HuberRegressor {
         validate_fit_inputs(x, y, sample_weight)?;
         let n = x.rows;
         let p = x.cols;
-        let weights: Vec<f64> = match sample_weight {
-            Some(sw) => sw.to_vec(),
-            None => vec![1.0; n],
-        };
 
         let backend = effective_backend(&self.parsed_device, n, p);
         let dim = p + usize::from(self.fit_intercept) + 1;
         let mut init_theta = vec![0.0; dim];
-        init_theta[dim - 1] = 0.0; // log_scale = 0.0 => scale = 1.0
+
+        // Warm-start scale from 1.4826 * MAD(y) (fallback std(y), clamped >= 1e-3)
+        // and w, b from fast Ridge/normal equation (p <= 256) or median intercept.
+        let mut y_buf = y.to_vec();
+        let med_y = median_in_place(&mut y_buf);
+        for v in &mut y_buf {
+            *v = (*v - med_y).abs();
+        }
+        let mad = median_in_place(&mut y_buf);
+        let mad_scale = 1.4826 * mad;
+        let init_scale = if mad_scale.is_finite() && mad_scale > 1e-6 {
+            mad_scale.max(1e-3)
+        } else {
+            let mean_y = y.iter().sum::<f64>() / (n as f64);
+            let var_y = y.iter().map(|&v| (v - mean_y).powi(2)).sum::<f64>() / (n as f64);
+            var_y.sqrt().max(1e-3)
+        };
+
+        let mut w_init = vec![0.0; p];
+        let mut b_init = if self.fit_intercept { med_y } else { 0.0 };
+        if p <= 256 && matches!(backend, Backend::Cpu) {
+            let (x_bar, y_bar) = if self.fit_intercept {
+                let (mut xb, mut yb, mut sw_sum) = (vec![0.0; p], 0.0, 0.0);
+                if let Some(sw) = sample_weight {
+                    for i in 0..n {
+                        let wi = sw[i];
+                        sw_sum += wi;
+                        yb += wi * y[i];
+                        axpy_add_unrolled(&mut xb, &x.data[i * p..(i + 1) * p], wi);
+                    }
+                } else {
+                    sw_sum = n as f64;
+                    for (i, &yi) in y.iter().enumerate() {
+                        yb += yi;
+                        axpy_add_unrolled(&mut xb, &x.data[i * p..(i + 1) * p], 1.0);
+                    }
+                }
+                if sw_sum > 0.0 {
+                    let inv = 1.0 / sw_sum;
+                    for v in &mut xb {
+                        *v *= inv;
+                    }
+                    (xb, yb * inv)
+                } else {
+                    (vec![0.0; p], 0.0)
+                }
+            } else {
+                (vec![0.0; p], 0.0)
+            };
+
+            let (mut gram_data, rhs) = if n >= FUSED_PAR_THRESHOLD {
+                let (g, r) = x
+                    .data
+                    .par_chunks(FUSED_CHUNK_ROWS * p)
+                    .zip(y.par_chunks(FUSED_CHUNK_ROWS))
+                    .enumerate()
+                    .fold(
+                        || (vec![0.0; p * p], vec![0.0; p], vec![0.0; p]),
+                        |(mut lg, mut lr, mut centered), (c_idx, (xc, yc))| {
+                            let base = c_idx * FUSED_CHUNK_ROWS;
+                            for i in 0..yc.len() {
+                                let wi = sample_weight.map_or(1.0, |s| s[base + i]);
+                                let row = &xc[i * p..(i + 1) * p];
+                                for j in 0..p {
+                                    centered[j] = row[j] - x_bar[j];
+                                }
+                                let yci = wi * (yc[i] - y_bar);
+                                for j in 0..p {
+                                    let w_xj = wi * centered[j];
+                                    lr[j] += yci * centered[j];
+                                    let g_row = &mut lg[j * p..(j + 1) * p];
+                                    for k in j..p {
+                                        g_row[k] += w_xj * centered[k];
+                                    }
+                                }
+                            }
+                            (lg, lr, centered)
+                        },
+                    )
+                    .map(|(g, r, _)| (g, r))
+                    .reduce(
+                        || (vec![0.0; p * p], vec![0.0; p]),
+                        |(mut g1, mut r1), (g2, r2)| {
+                            for idx in 0..p * p {
+                                g1[idx] += g2[idx];
+                            }
+                            for idx in 0..p {
+                                r1[idx] += r2[idx];
+                            }
+                            (g1, r1)
+                        },
+                    );
+                (g, r)
+            } else {
+                let mut lg = vec![0.0; p * p];
+                let mut lr = vec![0.0; p];
+                let mut centered = vec![0.0; p];
+                for i in 0..n {
+                    let wi = sample_weight.map_or(1.0, |s| s[i]);
+                    let row = &x.data[i * p..(i + 1) * p];
+                    for j in 0..p {
+                        centered[j] = row[j] - x_bar[j];
+                    }
+                    let yci = wi * (y[i] - y_bar);
+                    for j in 0..p {
+                        let w_xj = wi * centered[j];
+                        lr[j] += yci * centered[j];
+                        let g_row = &mut lg[j * p..(j + 1) * p];
+                        for k in j..p {
+                            g_row[k] += w_xj * centered[k];
+                        }
+                    }
+                }
+                (lg, lr)
+            };
+
+            for j in 0..p {
+                for k in (j + 1)..p {
+                    gram_data[k * p + j] = gram_data[j * p + k];
+                }
+            }
+            if let Ok(mut gram) = Matrix::from_vec(p, p, gram_data) {
+                gram.add_ridge_diagonal(self.alpha.max(1e-4));
+                if let Ok(sol) = solve_cholesky(&gram, &rhs)
+                    && sol.iter().all(|v| v.is_finite())
+                {
+                    w_init = sol;
+                    if self.fit_intercept {
+                        b_init = y_bar - dot_unrolled(&x_bar, &w_init);
+                    }
+                }
+            }
+        }
+
+        init_theta[..p].copy_from_slice(&w_init);
+        if self.fit_intercept {
+            init_theta[p] = b_init;
+        }
+        init_theta[dim - 1] = init_scale.ln().clamp(-27.6, 50.0);
 
         let eps = self.epsilon;
         let eps_sq = eps * eps;
         let alpha = self.alpha;
         let fit_intercept = self.fit_intercept;
+        let is_cpu = matches!(backend, Backend::Cpu);
 
         let (theta, n_iter) = run_lbfgs(
             init_theta,
@@ -502,38 +679,111 @@ impl HuberRegressor {
                 let inv_scale = 1.0 / scale;
                 let threshold = eps * scale;
 
-                let preds = compute_linear_eta(&backend, x, w, b)?;
-                let mut grad_r = vec![0.0; n];
-                let mut data_loss = 0.0;
-                let mut grad_b = 0.0;
-                let mut grad_scale = 0.0;
-
-                for i in 0..n {
-                    let r = preds[i] - y[i];
-                    let abs_r = r.abs();
-                    let wi = weights[i];
-                    if abs_r <= threshold {
-                        let z = r * inv_scale;
-                        data_loss += wi * (scale + r * z);
-                        let gr = wi * 2.0 * z;
-                        grad_r[i] = gr;
-                        grad_b += gr;
-                        grad_scale += wi * (1.0 - z * z);
+                let (data_loss, grad_b, grad_scale) = if is_cpu {
+                    if n >= FUSED_PAR_THRESHOLD {
+                        let (dl, gb, gs, gw) = x
+                            .data
+                            .par_chunks(FUSED_CHUNK_ROWS * p)
+                            .zip(y.par_chunks(FUSED_CHUNK_ROWS))
+                            .enumerate()
+                            .fold(
+                                || (0.0_f64, 0.0_f64, 0.0_f64, vec![0.0_f64; p]),
+                                |(mut dl, mut gb, mut gs, mut gw), (c_idx, (xc, yc))| {
+                                    let base = c_idx * FUSED_CHUNK_ROWS;
+                                    for i in 0..yc.len() {
+                                        let row = &xc[i * p..(i + 1) * p];
+                                        let r = dot_unrolled(row, w) + b - yc[i];
+                                        let abs_r = r.abs();
+                                        let wi = sample_weight.map_or(1.0, |s| s[base + i]);
+                                        let gr = if abs_r <= threshold {
+                                            let z = r * inv_scale;
+                                            dl += wi * (scale + r * z);
+                                            gs += wi * (1.0 - z * z);
+                                            wi * 2.0 * z
+                                        } else {
+                                            dl += wi * (scale + 2.0 * eps * abs_r - eps_sq * scale);
+                                            gs += wi * (1.0 - eps_sq);
+                                            wi * 2.0 * eps * r.signum()
+                                        };
+                                        gb += gr;
+                                        axpy_add_unrolled(&mut gw, row, gr);
+                                    }
+                                    (dl, gb, gs, gw)
+                                },
+                            )
+                            .reduce(
+                                || (0.0_f64, 0.0_f64, 0.0_f64, vec![0.0_f64; p]),
+                                |(dl1, gb1, gs1, mut gw1), (dl2, gb2, gs2, gw2)| {
+                                    for j in 0..p {
+                                        gw1[j] += gw2[j];
+                                    }
+                                    (dl1 + dl2, gb1 + gb2, gs1 + gs2, gw1)
+                                },
+                            );
+                        grad_out[..p].copy_from_slice(&gw);
+                        (dl, gb, gs)
                     } else {
-                        data_loss += wi * (scale + 2.0 * eps * abs_r - eps_sq * scale);
-                        let gr = wi * 2.0 * eps * r.signum();
-                        grad_r[i] = gr;
-                        grad_b += gr;
-                        grad_scale += wi * (1.0 - eps_sq);
+                        grad_out[..p].fill(0.0);
+                        let mut dl = 0.0;
+                        let mut gb = 0.0;
+                        let mut gs = 0.0;
+                        for i in 0..n {
+                            let row = &x.data[i * p..(i + 1) * p];
+                            let r = dot_unrolled(row, w) + b - y[i];
+                            let abs_r = r.abs();
+                            let wi = sample_weight.map_or(1.0, |s| s[i]);
+                            let gr = if abs_r <= threshold {
+                                let z = r * inv_scale;
+                                dl += wi * (scale + r * z);
+                                gs += wi * (1.0 - z * z);
+                                wi * 2.0 * z
+                            } else {
+                                dl += wi * (scale + 2.0 * eps * abs_r - eps_sq * scale);
+                                gs += wi * (1.0 - eps_sq);
+                                wi * 2.0 * eps * r.signum()
+                            };
+                            gb += gr;
+                            axpy_add_unrolled(&mut grad_out[..p], row, gr);
+                        }
+                        (dl, gb, gs)
                     }
-                }
+                } else {
+                    let preds = compute_linear_eta(&backend, x, w, b)?;
+                    let mut grad_r = vec![0.0; n];
+                    let mut dl = 0.0;
+                    let mut gb = 0.0;
+                    let mut gs = 0.0;
 
-                let grad_w = compute_xt_r(&backend, x, &grad_r)?;
+                    for i in 0..n {
+                        let r = preds[i] - y[i];
+                        let abs_r = r.abs();
+                        let wi = sample_weight.map_or(1.0, |s| s[i]);
+                        if abs_r <= threshold {
+                            let z = r * inv_scale;
+                            dl += wi * (scale + r * z);
+                            let gr = wi * 2.0 * z;
+                            grad_r[i] = gr;
+                            gb += gr;
+                            gs += wi * (1.0 - z * z);
+                        } else {
+                            dl += wi * (scale + 2.0 * eps * abs_r - eps_sq * scale);
+                            let gr = wi * 2.0 * eps * r.signum();
+                            grad_r[i] = gr;
+                            gb += gr;
+                            gs += wi * (1.0 - eps_sq);
+                        }
+                    }
+
+                    let grad_w = compute_xt_r(&backend, x, &grad_r)?;
+                    grad_out[..p].copy_from_slice(&grad_w);
+                    (dl, gb, gs)
+                };
+
                 let mut reg_loss = 0.0;
                 for j in 0..p {
                     let wj = w[j];
                     reg_loss += wj * wj;
-                    grad_out[j] = grad_w[j] + 2.0 * alpha * wj;
+                    grad_out[j] += 2.0 * alpha * wj;
                 }
                 if fit_intercept {
                     grad_out[p] = grad_b;
@@ -997,12 +1247,40 @@ impl QuantileRegressor {
 
         for iter in 0..self.max_iter {
             n_iter = iter + 1;
-            let preds = compute_linear_eta(&backend, x, &w, b)?;
-            for i in 0..n {
-                let r = y[i] - preds[i];
-                let d = r.abs().max(eps);
-                wt[i] = sw_norm[i] / (2.0 * d);
-                y_tilde[i] = y[i] + d * q_shift;
+            if matches!(backend, Backend::Cpu) {
+                if n >= FUSED_PAR_THRESHOLD {
+                    x.data
+                        .par_chunks(FUSED_CHUNK_ROWS * p)
+                        .zip(y.par_chunks(FUSED_CHUNK_ROWS))
+                        .zip(sw_norm.par_chunks(FUSED_CHUNK_ROWS))
+                        .zip(wt.par_chunks_mut(FUSED_CHUNK_ROWS))
+                        .zip(y_tilde.par_chunks_mut(FUSED_CHUNK_ROWS))
+                        .for_each(|((((xc, yc), swc), wtc), ytc)| {
+                            for i in 0..yc.len() {
+                                let row = &xc[i * p..(i + 1) * p];
+                                let r = yc[i] - (dot_unrolled(row, &w) + b);
+                                let d = r.abs().max(eps);
+                                wtc[i] = swc[i] / (2.0 * d);
+                                ytc[i] = yc[i] + d * q_shift;
+                            }
+                        });
+                } else {
+                    for i in 0..n {
+                        let row = &x.data[i * p..(i + 1) * p];
+                        let r = y[i] - (dot_unrolled(row, &w) + b);
+                        let d = r.abs().max(eps);
+                        wt[i] = sw_norm[i] / (2.0 * d);
+                        y_tilde[i] = y[i] + d * q_shift;
+                    }
+                }
+            } else {
+                let preds = compute_linear_eta(&backend, x, &w, b)?;
+                for i in 0..n {
+                    let r = y[i] - preds[i];
+                    let d = r.abs().max(eps);
+                    wt[i] = sw_norm[i] / (2.0 * d);
+                    y_tilde[i] = y[i] + d * q_shift;
+                }
             }
 
             let (mut gram, rhs, x_bar, y_bar) =
@@ -1379,6 +1657,87 @@ fn tweedie_d2_score(
     Ok(1.0 - dev_model / dev_null)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TweediePowerKind {
+    Normal,
+    Poisson,
+    Gamma,
+    General {
+        power: f64,
+        one_m_p: f64,
+        two_m_p: f64,
+    },
+}
+
+impl TweediePowerKind {
+    fn from_power(power: f64) -> Self {
+        if power == 0.0 {
+            Self::Normal
+        } else if (power - 1.0).abs() < 1e-12 {
+            Self::Poisson
+        } else if (power - 2.0).abs() < 1e-12 {
+            Self::Gamma
+        } else {
+            Self::General {
+                power,
+                one_m_p: 1.0 - power,
+                two_m_p: 2.0 - power,
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn loss_and_grad(self, eff_link: GlmLink, yi: f64, mui: f64, wi: f64) -> (f64, f64) {
+        match self {
+            Self::Normal => {
+                let d = mui - yi;
+                let loss = 0.5 * wi * d * d;
+                let g = match eff_link {
+                    GlmLink::Identity => wi * d,
+                    GlmLink::Log => wi * d * mui,
+                };
+                (loss, g)
+            }
+            Self::Poisson => {
+                let term = if yi > 0.0 { yi * (yi / mui).ln() } else { 0.0 };
+                let loss = wi * (term - yi + mui);
+                let g = match eff_link {
+                    GlmLink::Identity => wi * (mui - yi) / mui,
+                    GlmLink::Log => wi * (mui - yi),
+                };
+                (loss, g)
+            }
+            Self::Gamma => {
+                let loss = wi * ((mui / yi).ln() + yi / mui - 1.0);
+                let g = match eff_link {
+                    GlmLink::Identity => wi * (mui - yi) / (mui * mui),
+                    GlmLink::Log => wi * (mui - yi) / mui,
+                };
+                (loss, g)
+            }
+            Self::General {
+                power,
+                one_m_p,
+                two_m_p,
+            } => {
+                let y_term = if yi > 0.0 {
+                    yi.powf(two_m_p) / (one_m_p * two_m_p)
+                } else {
+                    0.0
+                };
+                let mu_1mp = mui.powf(one_m_p);
+                let mu_2mp = mu_1mp * mui;
+                let loss = wi * (y_term - yi * mu_1mp / one_m_p + mu_2mp / two_m_p);
+                let g = match eff_link {
+                    GlmLink::Identity => wi * (mui - yi) * mui.powf(-power),
+                    GlmLink::Log => wi * (mui - yi) * mu_1mp,
+                };
+                (loss, g)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TweedieRegressor {
     pub power: f64,
@@ -1446,15 +1805,17 @@ impl TweedieRegressor {
 
         let n = x.rows;
         let p = x.cols;
-        let sw_norm: Vec<f64> = match sample_weight {
-            Some(sw) => {
-                let s: f64 = sw.iter().sum();
-                sw.iter().map(|&v| v / s).collect()
-            }
-            None => vec![1.0 / (n as f64); n],
-        };
+        let inv_n = 1.0 / (n as f64);
+        let sw_norm_opt: Option<Vec<f64>> = sample_weight.map(|sw| {
+            let s: f64 = sw.iter().sum();
+            sw.iter().map(|&v| v / s).collect()
+        });
+        let sw_slice = sw_norm_opt.as_deref();
 
-        let y_mean: f64 = y.iter().zip(sw_norm.iter()).map(|(&yi, &wi)| yi * wi).sum();
+        let y_mean: f64 = match sw_slice {
+            Some(sw) => y.iter().zip(sw.iter()).map(|(&yi, &wi)| yi * wi).sum(),
+            None => y.iter().sum::<f64>() * inv_n,
+        };
         let backend = effective_backend(&self.parsed_device, n, p);
 
         let dim = p + usize::from(self.fit_intercept);
@@ -1467,8 +1828,11 @@ impl TweedieRegressor {
         }
 
         let power = self.power;
+        let power_kind = TweediePowerKind::from_power(power);
         let alpha = self.alpha;
         let fit_intercept = self.fit_intercept;
+        let is_cpu = matches!(backend, Backend::Cpu);
+        let check_pos_mu = eff_link == GlmLink::Identity && power > 0.0;
 
         let (theta, n_iter) = run_lbfgs(
             init_theta,
@@ -1478,62 +1842,121 @@ impl TweedieRegressor {
             |t, grad_out| {
                 let w = &t[..p];
                 let b = if fit_intercept { t[p] } else { 0.0 };
-                let eta = compute_linear_eta(&backend, x, w, b)?;
 
-                let mu: Vec<f64> = match eff_link {
-                    GlmLink::Identity => eta,
-                    GlmLink::Log => {
-                        if n >= SMALL_VEC_GPU_THRESHOLD && !matches!(backend, Backend::Cpu) {
-                            let clamped: Vec<f64> =
-                                eta.iter().map(|&v| v.clamp(-50.0, 50.0)).collect();
-                            let eta_mat = Matrix::from_vec(n, 1, clamped)?;
-                            backend.elementwise_op(&eta_mat, ElementwiseOp::Exp)?.data
-                        } else {
-                            eta.iter().map(|&v| v.clamp(-50.0, 50.0).exp()).collect()
+                let (data_loss, grad_b) = if is_cpu {
+                    if n >= FUSED_PAR_THRESHOLD {
+                        let (dl, gb, gw, invalid) = x
+                            .data
+                            .par_chunks(FUSED_CHUNK_ROWS * p)
+                            .zip(y.par_chunks(FUSED_CHUNK_ROWS))
+                            .enumerate()
+                            .fold(
+                                || (0.0_f64, 0.0_f64, vec![0.0_f64; p], false),
+                                |(mut dl, mut gb, mut gw, mut inv), (c_idx, (xc, yc))| {
+                                    if inv {
+                                        return (dl, gb, gw, true);
+                                    }
+                                    let base = c_idx * FUSED_CHUNK_ROWS;
+                                    for i in 0..yc.len() {
+                                        let row = &xc[i * p..(i + 1) * p];
+                                        let eta = dot_unrolled(row, w) + b;
+                                        let mui = match eff_link {
+                                            GlmLink::Identity => eta,
+                                            GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
+                                        };
+                                        if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
+                                            inv = true;
+                                            break;
+                                        }
+                                        let wi = sw_slice.map_or(inv_n, |s| s[base + i]);
+                                        let (l_i, g) =
+                                            power_kind.loss_and_grad(eff_link, yc[i], mui, wi);
+                                        dl += l_i;
+                                        gb += g;
+                                        axpy_add_unrolled(&mut gw, row, g);
+                                    }
+                                    (dl, gb, gw, inv)
+                                },
+                            )
+                            .reduce(
+                                || (0.0_f64, 0.0_f64, vec![0.0_f64; p], false),
+                                |(dl1, gb1, mut gw1, inv1), (dl2, gb2, gw2, inv2)| {
+                                    if inv1 || inv2 {
+                                        return (0.0, 0.0, gw1, true);
+                                    }
+                                    for j in 0..p {
+                                        gw1[j] += gw2[j];
+                                    }
+                                    (dl1 + dl2, gb1 + gb2, gw1, false)
+                                },
+                            );
+                        if invalid {
+                            return Ok(f64::INFINITY);
                         }
-                    }
-                };
-
-                let mut data_loss = 0.0;
-                let mut grad_eta = vec![0.0; n];
-                let mut grad_b = 0.0;
-
-                for i in 0..n {
-                    let mui = mu[i];
-                    if (eff_link == GlmLink::Identity && power > 0.0 && mui <= 1e-15)
-                        || !mui.is_finite()
-                    {
-                        return Ok(f64::INFINITY);
-                    }
-                    let wi = sw_norm[i];
-                    let yi = y[i];
-                    data_loss += 0.5 * wi * unit_tweedie_deviance(yi, mui, power);
-                    let g = match eff_link {
-                        GlmLink::Identity => {
-                            if power == 0.0 {
-                                wi * (mui - yi)
-                            } else {
-                                wi * (mui - yi) * mui.powf(-power)
+                        grad_out[..p].copy_from_slice(&gw);
+                        (dl, gb)
+                    } else {
+                        grad_out[..p].fill(0.0);
+                        let mut dl = 0.0;
+                        let mut gb = 0.0;
+                        for i in 0..n {
+                            let row = &x.data[i * p..(i + 1) * p];
+                            let eta = dot_unrolled(row, w) + b;
+                            let mui = match eff_link {
+                                GlmLink::Identity => eta,
+                                GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
+                            };
+                            if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
+                                return Ok(f64::INFINITY);
                             }
+                            let wi = sw_slice.map_or(inv_n, |s| s[i]);
+                            let (l_i, g) = power_kind.loss_and_grad(eff_link, y[i], mui, wi);
+                            dl += l_i;
+                            gb += g;
+                            axpy_add_unrolled(&mut grad_out[..p], row, g);
                         }
+                        (dl, gb)
+                    }
+                } else {
+                    let eta = compute_linear_eta(&backend, x, w, b)?;
+                    let mu: Vec<f64> = match eff_link {
+                        GlmLink::Identity => eta,
                         GlmLink::Log => {
-                            if (power - 1.0).abs() < 1e-12 {
-                                wi * (mui - yi)
+                            if n >= SMALL_VEC_GPU_THRESHOLD {
+                                let clamped: Vec<f64> =
+                                    eta.iter().map(|&v| v.clamp(-50.0, 50.0)).collect();
+                                let eta_mat = Matrix::from_vec(n, 1, clamped)?;
+                                backend.elementwise_op(&eta_mat, ElementwiseOp::Exp)?.data
                             } else {
-                                wi * (mui - yi) * mui.powf(1.0 - power)
+                                eta.iter().map(|&v| v.clamp(-50.0, 50.0).exp()).collect()
                             }
                         }
                     };
-                    grad_eta[i] = g;
-                    grad_b += g;
-                }
 
-                let grad_w = compute_xt_r(&backend, x, &grad_eta)?;
+                    let mut dl = 0.0;
+                    let mut grad_eta = vec![0.0; n];
+                    let mut gb = 0.0;
+                    for i in 0..n {
+                        let mui = mu[i];
+                        if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
+                            return Ok(f64::INFINITY);
+                        }
+                        let wi = sw_slice.map_or(inv_n, |s| s[i]);
+                        let (l_i, g) = power_kind.loss_and_grad(eff_link, y[i], mui, wi);
+                        dl += l_i;
+                        grad_eta[i] = g;
+                        gb += g;
+                    }
+                    let grad_w = compute_xt_r(&backend, x, &grad_eta)?;
+                    grad_out[..p].copy_from_slice(&grad_w);
+                    (dl, gb)
+                };
+
                 let mut reg_loss = 0.0;
                 for j in 0..p {
                     let wj = w[j];
                     reg_loss += wj * wj;
-                    grad_out[j] = grad_w[j] + alpha * wj;
+                    grad_out[j] += alpha * wj;
                 }
                 if fit_intercept {
                     grad_out[p] = grad_b;
@@ -2064,4 +2487,109 @@ pub fn register_py_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGammaRegressor>()?;
     m.add_class::<PyTweedieRegressor>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic_data(n: usize, p: usize) -> (Matrix, Vec<f64>) {
+        let mut x_data = Vec::with_capacity(n * p);
+        let mut y = Vec::with_capacity(n);
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next_f64 = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u = ((state >> 11) as f64) / ((1u64 << 53) as f64);
+            u * 2.0 - 1.0
+        };
+        for i in 0..n {
+            let mut lin = 1.5;
+            for j in 0..p {
+                let v = next_f64();
+                x_data.push(v);
+                lin += ((j + 1) as f64 * 0.5) * v;
+            }
+            let noise = 0.05 * next_f64();
+            let outlier = if i % 50 == 0 { 25.0 } else { 0.0 };
+            y.push(lin + noise + outlier);
+        }
+        (Matrix::from_vec(n, p, x_data).unwrap(), y)
+    }
+
+    #[test]
+    fn test_huber_small_and_large_fused() {
+        for n in [200, 5000] {
+            let (x, y) = synthetic_data(n, 6);
+            let mut huber =
+                HuberRegressor::new(1.35, 100, 1e-4, true, 1e-5, Some("cpu".to_string())).unwrap();
+            huber.fit(&x, &y, None).unwrap();
+            let coef = huber.coef_.as_ref().unwrap();
+            assert!((coef[0] - 0.5).abs() < 0.1, "coef[0]={}", coef[0]);
+            assert!((coef[1] - 1.0).abs() < 0.1, "coef[1]={}", coef[1]);
+            assert!(
+                (huber.intercept_ - 1.5).abs() < 0.15,
+                "intercept={}",
+                huber.intercept_
+            );
+            assert!(
+                huber.n_iter_ <= 40,
+                "Expected warm-started Huber to converge quickly, took {} iters",
+                huber.n_iter_
+            );
+            let bytes = huber.to_bytes();
+            let loaded = HuberRegressor::from_bytes(&bytes, Some("cpu")).unwrap();
+            assert_eq!(loaded.predict(&x).unwrap(), huber.predict(&x).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_glms_and_quantile_fused() {
+        let n = 4500;
+        let p = 4;
+        let mut x_data = Vec::with_capacity(n * p);
+        let mut y_pos = Vec::with_capacity(n);
+        let mut state: u64 = 0xCAFE_BABE_DEAD_BEEF;
+        let mut next_f64 = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
+        };
+        for _ in 0..n {
+            let mut eta = 0.5;
+            for j in 0..p {
+                let v = next_f64();
+                x_data.push(v);
+                eta += 0.3 * ((j + 1) as f64) * v;
+            }
+            y_pos.push(eta.exp());
+        }
+        let x = Matrix::from_vec(n, p, x_data).unwrap();
+
+        let mut pois =
+            PoissonRegressor::new(1e-4, true, 100, 1e-4, Some("cpu".to_string())).unwrap();
+        pois.fit(&x, &y_pos, None).unwrap();
+        assert!(pois.score(&x, &y_pos, None).unwrap() > 0.99);
+
+        let mut gamma =
+            GammaRegressor::new(1e-4, true, 100, 1e-4, Some("cpu".to_string())).unwrap();
+        gamma.fit(&x, &y_pos, None).unwrap();
+        assert!(gamma.score(&x, &y_pos, None).unwrap() > 0.99);
+
+        let mut tweedie = TweedieRegressor::new(
+            1.5,
+            1e-4,
+            true,
+            "log".to_string(),
+            100,
+            1e-4,
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        tweedie.fit(&x, &y_pos, None).unwrap();
+        assert!(tweedie.score(&x, &y_pos, None).unwrap() > 0.99);
+
+        let mut quant =
+            QuantileRegressor::new(0.5, 0.0, true, 100, 1e-5, Some("cpu".to_string())).unwrap();
+        quant.fit(&x, &y_pos, None).unwrap();
+        assert!(quant.score(&x, &y_pos, None).unwrap() > 0.90);
+    }
 }

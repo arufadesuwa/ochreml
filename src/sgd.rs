@@ -103,48 +103,108 @@ fn compute_t0_optimal(alpha: f64, loss_name: &str) -> f64 {
     1.0 / (alpha * init_eta0)
 }
 
-#[inline]
-fn step_size(lr: &str, eta0: f64, power_t: f64, alpha: f64, t: f64, t0: f64) -> f64 {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LrSchedule {
+    Optimal,
+    Constant,
+    InvScaling,
+}
+
+impl LrSchedule {
+    fn from_str(lr: &str) -> Self {
+        match lr {
+            "constant" => Self::Constant,
+            "invscaling" => Self::InvScaling,
+            _ => Self::Optimal,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClfLoss {
+    Hinge,
+    LogLoss,
+    ModifiedHuber,
+}
+
+impl ClfLoss {
+    fn from_str(loss: &str) -> Self {
+        match loss {
+            "log_loss" => Self::LogLoss,
+            "modified_huber" => Self::ModifiedHuber,
+            _ => Self::Hinge,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegLoss {
+    SquaredError,
+    Huber,
+    EpsilonInsensitive,
+}
+
+impl RegLoss {
+    fn from_str(loss: &str) -> Self {
+        match loss {
+            "huber" => Self::Huber,
+            "epsilon_insensitive" => Self::EpsilonInsensitive,
+            _ => Self::SquaredError,
+        }
+    }
+}
+
+#[inline(always)]
+fn axpy_sub_unrolled(w: &mut [f64], row: &[f64], scale: f64) {
+    let (w_chunks, w_rem) = w.as_chunks_mut::<4>();
+    let (r_chunks, r_rem) = row.as_chunks::<4>();
+    for (wc, rc) in w_chunks.iter_mut().zip(r_chunks.iter()) {
+        wc[0] -= scale * rc[0];
+        wc[1] -= scale * rc[1];
+        wc[2] -= scale * rc[2];
+        wc[3] -= scale * rc[3];
+    }
+    for (wj, &rj) in w_rem.iter_mut().zip(r_rem.iter()) {
+        *wj -= scale * rj;
+    }
+}
+
+#[inline(always)]
+fn step_size_sched(lr: LrSchedule, eta0: f64, power_t: f64, alpha: f64, t: f64, t0: f64) -> f64 {
     match lr {
-        "constant" => eta0,
-        "invscaling" => eta0 / t.powf(power_t),
-        "optimal" => {
+        LrSchedule::Constant => eta0,
+        LrSchedule::InvScaling => eta0 / t.powf(power_t),
+        LrSchedule::Optimal => {
             if alpha <= 0.0 {
                 1.0 / (1.0 + t)
             } else {
                 1.0 / (alpha * (t0 + t - 1.0))
             }
         }
-        _ => eta0,
     }
 }
 
-#[inline]
-fn classifier_loss_and_dloss(loss: &str, p: f64, y_pm1: f64) -> (f64, f64) {
+#[inline(always)]
+fn classifier_loss_and_dloss_enum(loss: ClfLoss, p: f64, y_pm1: f64) -> (f64, f64) {
     let z = p * y_pm1;
     match loss {
-        "hinge" => {
+        ClfLoss::Hinge => {
             if z < 1.0 {
                 (1.0 - z, -y_pm1)
             } else {
                 (0.0, 0.0)
             }
         }
-        "log_loss" => {
-            let l = if z >= 0.0 {
-                (-z).exp().ln_1p()
-            } else {
-                -z + z.exp().ln_1p()
-            };
-            let sig_neg_z = if z >= 0.0 {
+        ClfLoss::LogLoss => {
+            if z >= 0.0 {
                 let e = (-z).exp();
-                e / (1.0 + e)
+                (e.ln_1p(), -y_pm1 * (e / (1.0 + e)))
             } else {
-                1.0 / (1.0 + z.exp())
-            };
-            (l, -y_pm1 * sig_neg_z)
+                let e = z.exp();
+                (-z + e.ln_1p(), -y_pm1 / (1.0 + e))
+            }
         }
-        "modified_huber" => {
+        ClfLoss::ModifiedHuber => {
             if z >= 1.0 {
                 (0.0, 0.0)
             } else if z >= -1.0 {
@@ -154,31 +214,30 @@ fn classifier_loss_and_dloss(loss: &str, p: f64, y_pm1: f64) -> (f64, f64) {
                 (-4.0 * z, -4.0 * y_pm1)
             }
         }
-        _ => (0.0, 0.0),
     }
 }
 
-#[inline]
-fn regressor_loss_and_dloss(loss: &str, pred: f64, y: f64, epsilon: f64) -> (f64, f64) {
+#[inline(always)]
+fn regressor_loss_and_dloss_enum(loss: RegLoss, pred: f64, y: f64, epsilon: f64) -> (f64, f64) {
     let diff = pred - y;
-    let abs_d = diff.abs();
     match loss {
-        "squared_error" => (0.5 * diff * diff, diff),
-        "huber" => {
+        RegLoss::SquaredError => (0.5 * diff * diff, diff),
+        RegLoss::Huber => {
+            let abs_d = diff.abs();
             if abs_d <= epsilon {
                 (0.5 * diff * diff, diff)
             } else {
                 (epsilon * (abs_d - 0.5 * epsilon), epsilon * diff.signum())
             }
         }
-        "epsilon_insensitive" => {
+        RegLoss::EpsilonInsensitive => {
+            let abs_d = diff.abs();
             if abs_d <= epsilon {
                 (0.0, 0.0)
             } else {
                 (abs_d - epsilon, diff.signum())
             }
         }
-        _ => (0.5 * diff * diff, diff),
     }
 }
 
@@ -278,9 +337,9 @@ fn sgd_update_weights(
             }
             *w_scale = 1.0;
         }
-        let adj = step_g / *w_scale;
-        for j in 0..w.len() {
-            w[j] -= adj * row[j];
+        if step_g != 0.0 {
+            let adj = step_g / *w_scale;
+            axpy_sub_unrolled(w, row, adj);
         }
     }
 }
@@ -309,6 +368,13 @@ fn fit_sgd_binary_classifier(
     let mut w_scale = 1.0_f64;
     let mut b = 0.0_f64;
     let mut order = EpochOrder::new(n);
+    let loss_kind = ClfLoss::from_str(loss_name);
+    let lr_sched = LrSchedule::from_str(lr);
+    let intercept_eta_scale = if lr_sched == LrSchedule::Optimal {
+        0.5
+    } else {
+        1.0
+    };
     let t0 = compute_t0_optimal(alpha, loss_name);
     let mut t = 1.0_f64;
     let mut best_loss = f64::INFINITY;
@@ -324,18 +390,36 @@ fn fit_sgd_binary_classifier(
 
         order.for_each(|idx| {
             let row = &x.data[idx * p..(idx + 1) * p];
-            let sw = weights[idx];
             let pred = dot_unrolled(row, &w) * w_scale + b;
-            let (l_val, dloss) = classifier_loss_and_dloss(loss_name, pred, y_pm1[idx]);
-            epoch_loss += sw * l_val;
+            let (l_val, dloss) = classifier_loss_and_dloss_enum(loss_kind, pred, y_pm1[idx]);
+            let eta = step_size_sched(lr_sched, eta0, power_t, alpha, t, t0);
 
-            let eta = step_size(lr, eta0, power_t, alpha, t, t0);
-            let step_g = eta * sw * dloss;
-            sgd_update_weights(&mut w, &mut w_scale, row, eta, step_g, l1_reg, l2_reg);
-
-            if fit_intercept {
-                let intercept_eta = if lr == "optimal" { eta * 0.5 } else { eta };
-                b -= intercept_eta * sw * dloss;
+            if dloss == 0.0 {
+                if l1_reg == 0.0 {
+                    let decay = (1.0 - eta * l2_reg).max(0.0);
+                    if decay > 1e-12 {
+                        w_scale *= decay;
+                        if w_scale < 1e-9 {
+                            for v in &mut w {
+                                *v *= w_scale;
+                            }
+                            w_scale = 1.0;
+                        }
+                    } else {
+                        w.fill(0.0);
+                        w_scale = 1.0;
+                    }
+                } else {
+                    sgd_update_weights(&mut w, &mut w_scale, row, eta, 0.0, l1_reg, l2_reg);
+                }
+            } else {
+                let sw = weights[idx];
+                epoch_loss += sw * l_val;
+                let step_g = eta * sw * dloss;
+                sgd_update_weights(&mut w, &mut w_scale, row, eta, step_g, l1_reg, l2_reg);
+                if fit_intercept {
+                    b -= (eta * intercept_eta_scale) * sw * dloss;
+                }
             }
 
             t += 1.0;
@@ -986,6 +1070,13 @@ impl SGDRegressor {
         let mut w_scale = 1.0_f64;
         let mut b = 0.0_f64;
         let mut order = EpochOrder::new(n);
+        let loss_kind = RegLoss::from_str(&self.loss);
+        let lr_sched = LrSchedule::from_str(&self.learning_rate);
+        let intercept_eta_scale = if lr_sched == LrSchedule::Optimal {
+            0.5
+        } else {
+            1.0
+        };
         let t0 = compute_t0_optimal(self.alpha, &self.loss);
         let mut t = 1.0_f64;
         let mut best_loss = f64::INFINITY;
@@ -1001,30 +1092,37 @@ impl SGDRegressor {
 
             order.for_each(|idx| {
                 let row = &x.data[idx * p..(idx + 1) * p];
-                let sw = sample_weight.map_or(1.0, |s| s[idx]);
                 let pred = dot_unrolled(row, &w) * w_scale + b;
                 let (l_val, dloss) =
-                    regressor_loss_and_dloss(&self.loss, pred, y[idx], self.epsilon);
-                epoch_loss += sw * l_val;
+                    regressor_loss_and_dloss_enum(loss_kind, pred, y[idx], self.epsilon);
+                let eta = step_size_sched(lr_sched, self.eta0, self.power_t, self.alpha, t, t0);
 
-                let eta = step_size(
-                    &self.learning_rate,
-                    self.eta0,
-                    self.power_t,
-                    self.alpha,
-                    t,
-                    t0,
-                );
-                let step_g = eta * sw * dloss;
-                sgd_update_weights(&mut w, &mut w_scale, row, eta, step_g, l1_reg, l2_reg);
-
-                if self.fit_intercept {
-                    let intercept_eta = if self.learning_rate == "optimal" {
-                        eta * 0.5
+                if dloss == 0.0 {
+                    if l1_reg == 0.0 {
+                        let decay = (1.0 - eta * l2_reg).max(0.0);
+                        if decay > 1e-12 {
+                            w_scale *= decay;
+                            if w_scale < 1e-9 {
+                                for v in &mut w {
+                                    *v *= w_scale;
+                                }
+                                w_scale = 1.0;
+                            }
+                        } else {
+                            w.fill(0.0);
+                            w_scale = 1.0;
+                        }
                     } else {
-                        eta
-                    };
-                    b -= intercept_eta * sw * dloss;
+                        sgd_update_weights(&mut w, &mut w_scale, row, eta, 0.0, l1_reg, l2_reg);
+                    }
+                } else {
+                    let sw = sample_weight.map_or(1.0, |s| s[idx]);
+                    epoch_loss += sw * l_val;
+                    let step_g = eta * sw * dloss;
+                    sgd_update_weights(&mut w, &mut w_scale, row, eta, step_g, l1_reg, l2_reg);
+                    if self.fit_intercept {
+                        b -= (eta * intercept_eta_scale) * sw * dloss;
+                    }
                 }
 
                 t += 1.0;

@@ -30,6 +30,22 @@ pub const TAG_LINEAR_SVR: u8 = 55;
 
 const LBFGS_HISTORY: usize = 10;
 const LARGE_MATRIX_THRESHOLD: usize = 262_144;
+const SMALL_MATRIX_GPU_THRESHOLD: usize = 131_072;
+
+#[inline(always)]
+fn axpy_add_unrolled(dst: &mut [f64], src: &[f64], scale: f64) {
+    let (d_chunks, d_rem) = dst.as_chunks_mut::<4>();
+    let (s_chunks, s_rem) = src.as_chunks::<4>();
+    for (dc, sc) in d_chunks.iter_mut().zip(s_chunks.iter()) {
+        dc[0] += scale * sc[0];
+        dc[1] += scale * sc[1];
+        dc[2] += scale * sc[2];
+        dc[3] += scale * sc[3];
+    }
+    for (dj, &sj) in d_rem.iter_mut().zip(s_rem.iter()) {
+        *dj += scale * sj;
+    }
+}
 
 #[derive(Clone, Debug)]
 struct SplitMix64 {
@@ -385,9 +401,7 @@ fn solve_svc_dual_l2(
                 alpha[i] = alpha_new;
                 let d = (alpha_new - alpha_old) * yi;
                 if d != 0.0 {
-                    for (wj, &xij) in w.iter_mut().zip(row.iter()) {
-                        *wj += d * xij;
-                    }
+                    axpy_add_unrolled(&mut w, row, d);
                     w_bias += d * b_scale;
                 }
             }
@@ -639,7 +653,7 @@ fn solve_svc_primal_l1(
     (coef, intercept, n_iter)
 }
 
-/// LIBLINEAR Dual Coordinate Descent for L1/L2-loss epsilon-insensitive SVR.
+/// LIBLINEAR Dual Coordinate Descent for L1/L2-loss epsilon-insensitive SVR with active-set shrinking.
 fn solve_svr_dual(
     x: &Matrix,
     y: &[f64],
@@ -661,7 +675,8 @@ fn solve_svr_dual(
     let mut w = vec![0.0; p];
     let mut w_bias = 0.0_f64;
     let mut beta = vec![0.0; n];
-    let mut qd = vec![0.0; n];
+    let mut inv_qd = vec![0.0; n];
+    let mut eps_inv_qd = vec![0.0; n];
     let mut upper = vec![0.0; n];
     let mut lambda = vec![0.0; n];
 
@@ -669,71 +684,124 @@ fn solve_svr_dual(
         let row = &x.data[i * p..(i + 1) * p];
         let x_sq = dot_unrolled(row, row) + b_sq;
         let ci = cfg.c * sample_weights[i];
-        if ci <= 0.0 {
+        let q_ii = if ci <= 0.0 {
             lambda[i] = 0.0;
             upper[i] = 0.0;
-            qd[i] = x_sq.max(1e-12);
+            x_sq.max(1e-12)
         } else if is_l2_loss {
             let lam = 0.5 / ci;
             lambda[i] = lam;
             upper[i] = f64::INFINITY;
-            qd[i] = (x_sq + lam).max(1e-12);
+            (x_sq + lam).max(1e-12)
         } else {
             lambda[i] = 0.0;
             upper[i] = ci;
-            qd[i] = x_sq.max(1e-12);
-        }
+            x_sq.max(1e-12)
+        };
+        let inv = 1.0 / q_ii;
+        inv_qd[i] = inv;
+        eps_inv_qd[i] = epsilon * inv;
     }
 
     let mut index: Vec<usize> = (0..n).filter(|&i| sample_weights[i] > 0.0).collect();
+    let mut active_size = index.len();
     let mut rng = SplitMix64::new(cfg.random_state);
+    let mut gmax_old = f64::INFINITY;
     let mut n_iter = 0usize;
 
     for iter in 0..cfg.max_iter {
         n_iter = iter + 1;
-        rng.shuffle(&mut index);
-        let mut max_vio = 0.0_f64;
+        rng.shuffle(&mut index[..active_size]);
+        let mut gmax_new = 0.0_f64;
 
-        for &i in &index {
+        let mut s = 0usize;
+        while s < active_size {
+            let i = index[s];
             let row = &x.data[i * p..(i + 1) * p];
             let wx = dot_unrolled(&w, row) + w_bias * b_scale;
-            let g = wx - y[i] + lambda[i] * beta[i];
+            let b_old = beta[i];
+            let g = wx - y[i] + lambda[i] * b_old;
             let gp = g + epsilon;
             let gm = g - epsilon;
-
-            let b_old = beta[i];
             let u = upper[i];
+
             let vio = if b_old == 0.0 {
-                (-gp).max(gm).max(0.0)
-            } else if b_old > 0.0 {
-                if b_old >= u { gp.max(0.0) } else { gp.abs() }
+                if gp < 0.0 {
+                    -gp
+                } else if gm > 0.0 {
+                    gm
+                } else {
+                    if gp > gmax_old && gm < -gmax_old {
+                        active_size -= 1;
+                        index.swap(s, active_size);
+                        continue;
+                    }
+                    0.0
+                }
+            } else if b_old >= u {
+                if gp > 0.0 {
+                    gp
+                } else {
+                    if gp < -gmax_old {
+                        active_size -= 1;
+                        index.swap(s, active_size);
+                        continue;
+                    }
+                    0.0
+                }
             } else if b_old <= -u {
-                (-gm).max(0.0)
+                if gm < 0.0 {
+                    -gm
+                } else {
+                    if gm > gmax_old {
+                        active_size -= 1;
+                        index.swap(s, active_size);
+                        continue;
+                    }
+                    0.0
+                }
+            } else if b_old > 0.0 {
+                gp.abs()
             } else {
                 gm.abs()
             };
 
-            max_vio = max_vio.max(vio);
-            if vio <= 1e-12 {
-                continue;
+            if vio > gmax_new {
+                gmax_new = vio;
+            }
+            if vio > 1e-12 {
+                let z = b_old - g * inv_qd[i];
+                let thresh = eps_inv_qd[i];
+                let b_new = if z > thresh {
+                    (z - thresh).min(u)
+                } else if z < -thresh {
+                    (z + thresh).max(-u)
+                } else {
+                    0.0
+                };
+                let d = b_new - b_old;
+                if d != 0.0 {
+                    beta[i] = b_new;
+                    axpy_add_unrolled(&mut w, row, d);
+                    w_bias += d * b_scale;
+                }
             }
 
-            let z = b_old - g / qd[i];
-            let thresh = epsilon / qd[i];
-            let b_new =
-                apply_scalar_op(z, ElementwiseOp::SoftThreshold { lambda: thresh }).clamp(-u, u);
-            let d = b_new - b_old;
-            if d != 0.0 {
-                beta[i] = b_new;
-                for (wj, &xij) in w.iter_mut().zip(row.iter()) {
-                    *wj += d * xij;
-                }
-                w_bias += d * b_scale;
-            }
+            s += 1;
         }
 
-        if max_vio <= cfg.tol {
-            break;
+        if gmax_new <= cfg.tol {
+            if active_size == index.len() {
+                break;
+            }
+            active_size = index.len();
+            gmax_old = f64::INFINITY;
+        } else {
+            gmax_old = if gmax_new <= 0.0 {
+                f64::INFINITY
+            } else {
+                gmax_new
+            };
         }
     }
 
@@ -1304,7 +1372,23 @@ impl LinearSVR {
                 expected: n_features,
             });
         }
-        predict_linear_1d(x, coef, intercept)
+        let elems = x.rows.saturating_mul(x.cols);
+        let backend = if elems < SMALL_MATRIX_GPU_THRESHOLD {
+            Backend::Cpu
+        } else {
+            get_backend(&self.device)
+        };
+        if matches!(backend, Backend::Cpu) {
+            predict_linear_1d(x, coef, intercept)
+        } else {
+            let mut out = backend.matvec(x, coef)?;
+            if intercept != 0.0 {
+                for v in &mut out {
+                    *v += intercept;
+                }
+            }
+            Ok(out)
+        }
     }
 
     pub fn score(&self, x: &Matrix, y: &[f64]) -> OchreResult<f64> {
