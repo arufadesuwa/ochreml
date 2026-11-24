@@ -1068,12 +1068,16 @@ fn run_nipals(
 
         // Precompute Gram matrices if Mode B (CCA)
         let xk_gram = if mode_b {
-            Some(backend.matmul_at_b(&xk, &xk)?)
+            let mut g = backend.matmul_at_b(&xk, &xk)?;
+            g.add_ridge_diagonal(1e-12);
+            Some(g)
         } else {
             None
         };
         let yk_gram = if mode_b {
-            Some(backend.matmul_at_b(&yk, &yk)?)
+            let mut g = backend.matmul_at_b(&yk, &yk)?;
+            g.add_ridge_diagonal(1e-12);
+            Some(g)
         } else {
             None
         };
@@ -1099,6 +1103,11 @@ fn run_nipals(
                 }
             } else {
                 w[0] = 1.0;
+            }
+            if mode_b && dot_slice(&w, &w_old) < 0.0 {
+                for val in &mut w {
+                    *val = -*val;
+                }
             }
 
             t = backend.matvec(&xk, &w)?;
@@ -2472,5 +2481,41 @@ mod tests {
         let (xs, ys) = cca.transform(&x, Some(&y)).unwrap();
         assert_eq!(xs.cols, 2);
         assert_eq!(ys.unwrap().cols, 2);
+    }
+
+    #[test]
+    fn test_cca_component2_fast_convergence() {
+        let n = 150usize;
+        let mut x_data = vec![0.0; n * 4];
+        let mut y_data = vec![0.0; n * 3];
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next_norm = || -> f64 {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            let bits = (z ^ (z >> 31)) >> 11;
+            ((bits as f64) * (1.0 / ((1u64 << 53) as f64))) * 2.0 - 1.0
+        };
+        for r in 0..n {
+            let z0 = next_norm();
+            let z1 = next_norm();
+            x_data[r * 4] = z0;
+            x_data[r * 4 + 1] = z1;
+            x_data[r * 4 + 2] = next_norm();
+            x_data[r * 4 + 3] = next_norm();
+            y_data[r * 3] = 2.0 * z0 + 0.1 * next_norm();
+            y_data[r * 3 + 1] = -1.5 * z1 + 0.1 * next_norm();
+            y_data[r * 3 + 2] = next_norm();
+        }
+        let x = Matrix::from_vec(n, 4, x_data).unwrap();
+        let y = Matrix::from_vec(n, 3, y_data).unwrap();
+        let mut cca = CCA::new(2, true, 500, 1e-6, Some("cpu".to_string())).unwrap();
+        cca.fit(&x, &y).unwrap();
+        let iters = cca.n_iter_.as_ref().unwrap();
+        assert!(
+            iters.iter().all(|&it| it <= 20),
+            "expected fast CCA convergence, got n_iter={iters:?}"
+        );
     }
 }

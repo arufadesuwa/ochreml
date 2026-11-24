@@ -9,6 +9,7 @@ use crate::dit_io::{
     write_opt_matrix, write_opt_str, write_opt_u64, write_opt_usize, write_str, write_usize,
 };
 use crate::error::{OchreError, OchreResult};
+use crate::linear_regression::dot_unrolled;
 use crate::matrix::Matrix;
 use crate::preprocessing::py_helpers::{
     buffer_to_pooled_matrix, f64_slice_to_pybytes, matrix_to_pybytes,
@@ -31,28 +32,6 @@ fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
     } else {
         get_backend(dev)
     }
-}
-
-#[inline]
-fn dot4(a: &[f64], b: &[f64]) -> f64 {
-    let n = a.len();
-    let chunks = n / 4;
-    let mut s0 = 0.0;
-    let mut s1 = 0.0;
-    let mut s2 = 0.0;
-    let mut s3 = 0.0;
-    for i in 0..chunks {
-        let base = i * 4;
-        s0 += a[base] * b[base];
-        s1 += a[base + 1] * b[base + 1];
-        s2 += a[base + 2] * b[base + 2];
-        s3 += a[base + 3] * b[base + 3];
-    }
-    let mut sum = (s0 + s1) + (s2 + s3);
-    for i in (chunks * 4)..n {
-        sum += a[i] * b[i];
-    }
-    sum
 }
 
 // Deterministic SplitMix64 PRNG with Box-Muller Gaussian sampling for randomized SVD
@@ -389,7 +368,7 @@ impl PCA {
         let mut proj_mean = Vec::with_capacity(k);
         for j in 0..k {
             let comp_row = &components.data[j * p..(j + 1) * p];
-            proj_mean.push(dot4(mean, comp_row));
+            proj_mean.push(dot_unrolled(mean, comp_row));
         }
 
         let inv_stds: Option<Vec<f64>> = if self.whiten {
@@ -415,7 +394,7 @@ impl PCA {
                     let x_row = &x_data[r * p..(r + 1) * p];
                     for j in 0..k {
                         let comp_row = &comp_data[j * p..(j + 1) * p];
-                        dst[j] = (dot4(x_row, comp_row) - proj_mean[j]) * scales[j];
+                        dst[j] = (dot_unrolled(x_row, comp_row) - proj_mean[j]) * scales[j];
                     }
                 };
                 if n >= PARALLEL_ROW_THRESHOLD {
@@ -434,7 +413,7 @@ impl PCA {
                     let x_row = &x_data[r * p..(r + 1) * p];
                     for j in 0..k {
                         let comp_row = &comp_data[j * p..(j + 1) * p];
-                        dst[j] = dot4(x_row, comp_row) - proj_mean[j];
+                        dst[j] = dot_unrolled(x_row, comp_row) - proj_mean[j];
                     }
                 };
                 if n >= PARALLEL_ROW_THRESHOLD {
@@ -976,23 +955,26 @@ impl TruncatedSVD {
             let mut out_data = vec![0.0; n * k];
             let x_data = &x.data;
             let comp_data = &components.data;
-            let compute_row = |(r, dst): (usize, &mut [f64])| {
-                let x_row = &x_data[r * p..(r + 1) * p];
-                for j in 0..k {
-                    let comp_row = &comp_data[j * p..(j + 1) * p];
-                    dst[j] = dot4(x_row, comp_row);
+            let compute_chunk = |(chunk_idx, out_chunk): (usize, &mut [f64])| {
+                let start_r = chunk_idx * 512;
+                let n_chunk = out_chunk.len() / k;
+                for i in 0..n_chunk {
+                    let r = start_r + i;
+                    let x_row = &x_data[r * p..(r + 1) * p];
+                    let dst = &mut out_chunk[i * k..(i + 1) * k];
+                    for j in 0..k {
+                        let comp_row = &comp_data[j * p..(j + 1) * p];
+                        dst[j] = dot_unrolled(x_row, comp_row);
+                    }
                 }
             };
-            if n >= PARALLEL_ROW_THRESHOLD {
+            if n >= 2048 {
                 out_data
-                    .par_chunks_exact_mut(k)
+                    .par_chunks_mut(512 * k)
                     .enumerate()
-                    .for_each(compute_row);
+                    .for_each(compute_chunk);
             } else {
-                out_data
-                    .chunks_exact_mut(k)
-                    .enumerate()
-                    .for_each(compute_row);
+                compute_chunk((0, &mut out_data));
             }
             return Matrix::from_vec(n, k, out_data);
         }

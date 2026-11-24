@@ -766,8 +766,12 @@ impl KernelPCA {
             }
         }
 
-        let eig = backend.small_sym_eig_svd(&k_centered)?;
         let max_comp = self.n_components.unwrap_or(n).min(n);
+        let eig = if n >= 64 && max_comp >= 1 && max_comp <= n / 4 {
+            crate::primitives::eig_svd::cpu_top_k_sym_eig(&k_centered, max_comp)?
+        } else {
+            backend.small_sym_eig_svd(&k_centered)?
+        };
 
         let mut pos_indices = Vec::with_capacity(max_comp);
         for (idx, &lam) in eig.eigenvalues.iter().enumerate() {
@@ -783,6 +787,7 @@ impl KernelPCA {
         let mut kept_eigs = Vec::with_capacity(k_kept);
         let mut kept_vecs = Matrix::zeros(n, k_kept);
         let mut kept_alphas = Matrix::zeros(n, k_kept);
+        let eig_cols = eig.eigenvectors.cols;
 
         for (out_col, &eig_col) in pos_indices.iter().enumerate() {
             let lam = eig.eigenvalues[eig_col];
@@ -792,14 +797,14 @@ impl KernelPCA {
             let mut max_abs = -1.0f64;
             let mut sign = 1.0f64;
             for r in 0..n {
-                let v = eig.eigenvectors.data[r * n + eig_col];
+                let v = eig.eigenvectors.data[r * eig_cols + eig_col];
                 if v.abs() > max_abs {
                     max_abs = v.abs();
                     sign = if v < 0.0 { -1.0 } else { 1.0 };
                 }
             }
             for r in 0..n {
-                let v = eig.eigenvectors.data[r * n + eig_col] * sign;
+                let v = eig.eigenvectors.data[r * eig_cols + eig_col] * sign;
                 kept_vecs.data[r * k_kept + out_col] = v;
                 kept_alphas.data[r * k_kept + out_col] = v * inv_sqrt;
             }
@@ -3377,6 +3382,39 @@ mod tests {
         let x_rec = kpca.inverse_transform(&z).unwrap();
         assert_eq!(x_rec.rows, 4);
         assert_eq!(x_rec.cols, 3);
+    }
+
+    #[test]
+    fn test_kernel_pca_top_k_fast_path() {
+        let n = 80usize;
+        let mut x_data = vec![0.0; n * 2];
+        for i in 0..n {
+            let theta = 2.0 * std::f64::consts::PI * (i as f64) / (n as f64);
+            let r = if i % 2 == 0 { 1.0 } else { 0.3 };
+            x_data[i * 2] = r * theta.cos();
+            x_data[i * 2 + 1] = r * theta.sin();
+        }
+        let x = Matrix::from_vec(n, 2, x_data).unwrap();
+        let mut kpca = KernelPCA::new(
+            Some(4),
+            "rbf".to_string(),
+            Some(5.0),
+            3,
+            1.0,
+            true,
+            0.1,
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        let z = kpca.fit_transform(&x).unwrap();
+        assert_eq!(z.rows, n);
+        assert_eq!(z.cols, 4);
+        let eigs = kpca.eigenvalues_.as_ref().unwrap();
+        assert_eq!(eigs.len(), 4);
+        assert!(eigs[0] >= eigs[1] && eigs[1] >= eigs[2] && eigs[2] >= eigs[3]);
+        let x_rec = kpca.inverse_transform(&z).unwrap();
+        assert_eq!(x_rec.rows, n);
+        assert_eq!(x_rec.cols, 2);
     }
 
     #[test]
