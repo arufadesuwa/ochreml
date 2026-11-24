@@ -31,6 +31,16 @@ pub const TAG_KERNEL_PCA: u8 = 80;
 
 const LARGE_ELEMENTWISE_THRESHOLD: usize = 16_384;
 const LARGE_MATMUL_THRESHOLD: usize = 4_096;
+const GPU_MIN_ELEMS: usize = 131_072;
+
+#[inline]
+fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
+    if elems < GPU_MIN_ELEMS {
+        Backend::Cpu
+    } else {
+        get_backend(dev)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KernelKind {
@@ -470,7 +480,7 @@ impl KernelRidge {
         };
 
         let dev = self.device_type()?;
-        let backend = get_backend(&dev);
+        let backend = effective_backend(&dev, n.saturating_mul(n).max(x.data.len()));
         let gamma_val = resolve_gamma(&backend, x, k_kind, "auto", self.gamma)?;
         let mut k_mat =
             compute_kernel_matrix(&backend, x, x, k_kind, gamma_val, self.degree, self.coef0)?;
@@ -522,7 +532,11 @@ impl KernelRidge {
         validate_finite_matrix(x)?;
         let k_kind = KernelKind::parse(&self.kernel)?;
         let dev = self.device_type()?;
-        let backend = get_backend(&dev);
+        let backend = effective_backend(
+            &dev,
+            x.rows
+                .saturating_mul(self.n_samples_fit_.max(dual_coef.cols)),
+        );
         let gamma_val = self.gamma_.unwrap_or(1.0);
 
         let k_test = if k_kind == KernelKind::Precomputed {
@@ -731,7 +745,7 @@ impl KernelPCA {
 
         let n = x.rows;
         let dev = self.device_type()?;
-        let backend = get_backend(&dev);
+        let backend = effective_backend(&dev, n.saturating_mul(n).max(x.data.len()));
         let gamma_val = resolve_gamma(&backend, x, k_kind, "auto", self.gamma)?;
         let k_mat =
             compute_kernel_matrix(&backend, x, x, k_kind, gamma_val, self.degree, self.coef0)?;
@@ -840,7 +854,10 @@ impl KernelPCA {
         validate_finite_matrix(x)?;
         let k_kind = KernelKind::parse(&self.kernel)?;
         let dev = self.device_type()?;
-        let backend = get_backend(&dev);
+        let backend = effective_backend(
+            &dev,
+            x.rows.saturating_mul(self.n_samples_fit_.max(alphas.cols)),
+        );
         let gamma_val = self.gamma_.unwrap_or(1.0);
 
         let mut k_test = if k_kind == KernelKind::Precomputed {
@@ -914,7 +931,10 @@ impl KernelPCA {
         }
         let k_kind = KernelKind::parse(&self.kernel)?;
         let dev = self.device_type()?;
-        let backend = get_backend(&dev);
+        let backend = effective_backend(
+            &dev,
+            z.rows.saturating_mul(x_trans_fit.rows.max(dual_coef.cols)),
+        );
         let gamma_val = self.gamma_.unwrap_or(1.0);
         let k_z = compute_kernel_matrix(
             &backend,
@@ -1457,7 +1477,7 @@ impl SVC {
         }
 
         let dev = self.device_type()?;
-        let backend = get_backend(&dev);
+        let backend = effective_backend(&dev, x.rows.saturating_mul(x.rows).max(x.data.len()));
         let gamma_val = resolve_gamma(&backend, x, k_kind, &self.gamma_mode, self.gamma)?;
         let k_mat =
             compute_kernel_matrix(&backend, x, x, k_kind, gamma_val, self.degree, self.coef0)?;
@@ -1660,7 +1680,7 @@ impl SVC {
 
         let k_kind = KernelKind::parse(&self.kernel)?;
         let dev = self.device_type()?;
-        let backend = get_backend(&dev);
+        let backend = effective_backend(&dev, x.rows.saturating_mul(support.len()));
         let gamma_val = self.gamma_.unwrap_or(1.0);
 
         let k_sv = if k_kind == KernelKind::Precomputed {
@@ -2083,7 +2103,7 @@ impl SVR {
 
         let n = x.rows;
         let dev = self.device_type()?;
-        let backend = get_backend(&dev);
+        let backend = effective_backend(&dev, x.rows.saturating_mul(x.rows).max(x.data.len()));
         let gamma_val = resolve_gamma(&backend, x, k_kind, &self.gamma_mode, self.gamma)?;
         let k_mat =
             compute_kernel_matrix(&backend, x, x, k_kind, gamma_val, self.degree, self.coef0)?;
@@ -2252,7 +2272,7 @@ impl SVR {
 
         let k_kind = KernelKind::parse(&self.kernel)?;
         let dev = self.device_type()?;
-        let backend = get_backend(&dev);
+        let backend = effective_backend(&dev, x.rows.saturating_mul(support.len()));
         let gamma_val = self.gamma_.unwrap_or(1.0);
 
         let k_sv = if k_kind == KernelKind::Precomputed {
@@ -2481,7 +2501,7 @@ impl OneClassSVM {
 
         let n = x.rows;
         let dev = self.device_type()?;
-        let backend = get_backend(&dev);
+        let backend = effective_backend(&dev, x.rows.saturating_mul(x.rows).max(x.data.len()));
         let gamma_val = resolve_gamma(&backend, x, k_kind, &self.gamma_mode, self.gamma)?;
         let k_mat =
             compute_kernel_matrix(&backend, x, x, k_kind, gamma_val, self.degree, self.coef0)?;
@@ -2641,7 +2661,7 @@ impl OneClassSVM {
 
         let k_kind = KernelKind::parse(&self.kernel)?;
         let dev = self.device_type()?;
-        let backend = get_backend(&dev);
+        let backend = effective_backend(&dev, x.rows.saturating_mul(support.len()));
         let gamma_val = self.gamma_.unwrap_or(1.0);
 
         let k_sv = if k_kind == KernelKind::Precomputed {

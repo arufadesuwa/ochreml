@@ -28,6 +28,16 @@ pub const TAG_GP_CLASSIFIER: u8 = 84;
 
 const LOG_BOUND_MIN: f64 = -11.512925464970229; // ln(1e-5)
 const LOG_BOUND_MAX: f64 = 11.512925464970229; // ln(1e5)
+const GPU_MIN_ELEMS: usize = 131_072;
+
+#[inline]
+fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
+    if elems < GPU_MIN_ELEMS {
+        Backend::Cpu
+    } else {
+        get_backend(dev)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KernelKind {
@@ -246,6 +256,105 @@ fn compute_kernel_matrix(
     Ok(k)
 }
 
+/// Build kernel matrix K from precomputed squared Euclidean distance matrix D2.
+fn compute_kernel_from_d2(
+    backend: &Backend<'_>,
+    d2: &Matrix,
+    params: &KernelParams,
+    is_self: bool,
+) -> OchreResult<Matrix> {
+    let rows = d2.rows;
+    let cols = d2.cols;
+    if params.kind == KernelKind::White {
+        let mut k = Matrix::zeros(rows, cols);
+        if is_self {
+            for i in 0..rows.min(cols) {
+                k.set(i, i, params.noise_level);
+            }
+        }
+        return Ok(k);
+    }
+
+    let mut k = d2.clone();
+    let ls = params.length_scale;
+    let ls_sq = ls * ls;
+    let c = params.constant_value;
+
+    match params.kind {
+        KernelKind::Rbf | KernelKind::RbfWhite => {
+            let inv_two_ls_sq = -0.5 / ls_sq;
+            if k.data.len() >= 16_384 {
+                k.data.par_iter_mut().for_each(|d| {
+                    *d = d.max(0.0) * inv_two_ls_sq;
+                });
+                backend.elementwise_op_inplace(&mut k, ElementwiseOp::Exp)?;
+                if (c - 1.0).abs() > 0.0 {
+                    backend.elementwise_op_inplace(
+                        &mut k,
+                        ElementwiseOp::Affine {
+                            scale: c,
+                            shift: 0.0,
+                        },
+                    )?;
+                }
+            } else {
+                for d in &mut k.data {
+                    *d = c * (d.max(0.0) * inv_two_ls_sq).exp();
+                }
+            }
+            if is_self && params.kind == KernelKind::RbfWhite {
+                for i in 0..rows.min(cols) {
+                    let cur = k.get(i, i);
+                    k.set(i, i, cur + params.noise_level);
+                }
+            }
+        }
+        KernelKind::Matern => {
+            let nu = params.nu;
+            if (nu - 0.5).abs() <= 1e-12 {
+                k.data.par_iter_mut().for_each(|d| {
+                    let r = d.max(0.0).sqrt() / ls;
+                    *d = c * (-r).exp();
+                });
+            } else if (nu - 1.5).abs() <= 1e-12 {
+                let s3 = 3.0_f64.sqrt() / ls;
+                k.data.par_iter_mut().for_each(|d| {
+                    let r = d.max(0.0).sqrt() * s3;
+                    *d = c * (1.0 + r) * (-r).exp();
+                });
+            } else {
+                let s5 = 5.0_f64.sqrt() / ls;
+                k.data.par_iter_mut().for_each(|d| {
+                    let r = d.max(0.0).sqrt() * s5;
+                    *d = c * (1.0 + r + (r * r) / 3.0) * (-r).exp();
+                });
+            }
+        }
+        KernelKind::RationalQuadratic => {
+            let alpha = params.rq_alpha;
+            let denom = 2.0 * alpha * ls_sq;
+            k.data.par_iter_mut().for_each(|d| {
+                let base = 1.0 + d.max(0.0) / denom;
+                *d = c * base.powf(-alpha);
+            });
+        }
+        KernelKind::White => unreachable!(),
+    }
+
+    if is_self {
+        for i in 0..rows.min(cols) {
+            let diag = match params.kind {
+                KernelKind::White => params.noise_level,
+                KernelKind::RbfWhite => params.constant_value + params.noise_level,
+                _ => params.constant_value,
+            };
+            k.set(i, i, diag);
+        }
+    }
+
+    Ok(k)
+}
+
 #[inline]
 fn kernel_diag_value(params: &KernelParams) -> f64 {
     match params.kind {
@@ -253,6 +362,30 @@ fn kernel_diag_value(params: &KernelParams) -> f64 {
         KernelKind::RbfWhite => params.constant_value + params.noise_level,
         _ => params.constant_value,
     }
+}
+
+#[inline]
+fn dot_unrolled(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    let chunks = n / 4;
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    let mut idx = 0;
+    for _ in 0..chunks {
+        s0 += a[idx] * b[idx];
+        s1 += a[idx + 1] * b[idx + 1];
+        s2 += a[idx + 2] * b[idx + 2];
+        s3 += a[idx + 3] * b[idx + 3];
+        idx += 4;
+    }
+    let mut sum = (s0 + s1) + (s2 + s3);
+    while idx < n {
+        sum += a[idx] * b[idx];
+        idx += 1;
+    }
+    sum
 }
 
 /// Lower-triangular Cholesky factorization: A = L * L^T.
@@ -263,21 +396,17 @@ fn cholesky_lower(a: &Matrix) -> OchreResult<Matrix> {
     let n = a.rows;
     let mut l = Matrix::zeros(n, n);
     for i in 0..n {
+        let row_i_off = i * n;
         for j in 0..=i {
-            let mut sum = 0.0;
-            let row_i = &l.data[i * n..i * n + j];
-            let row_j = &l.data[j * n..j * n + j];
-            for k in 0..j {
-                sum += row_i[k] * row_j[k];
-            }
+            let sum = dot_unrolled(&l.data[row_i_off..row_i_off + j], &l.data[j * n..j * n + j]);
             if i == j {
-                let diag = a.data[i * n + i] - sum;
+                let diag = a.data[row_i_off + i] - sum;
                 if !diag.is_finite() || diag <= 1e-15 {
                     return Err(OchreError::SingularMatrix(
                         "Kernel matrix is not positive definite; consider increasing alpha or noise_level".to_string(),
                     ));
                 }
-                l.data[i * n + i] = diag.sqrt();
+                l.data[row_i_off + i] = diag.sqrt();
             } else {
                 let ljj = l.data[j * n + j];
                 if ljj.abs() <= 1e-15 {
@@ -285,38 +414,54 @@ fn cholesky_lower(a: &Matrix) -> OchreResult<Matrix> {
                         "Zero diagonal encountered during Cholesky factorization".to_string(),
                     ));
                 }
-                l.data[i * n + j] = (a.data[i * n + j] - sum) / ljj;
+                l.data[row_i_off + j] = (a.data[row_i_off + j] - sum) / ljj;
             }
         }
     }
     Ok(l)
 }
 
+/// Forward substitution into preallocated buffer: solve L * z = b where L is lower triangular (n x n).
+#[inline]
+fn solve_lower_triangular_into(l: &Matrix, b: &[f64], z: &mut [f64]) {
+    let n = l.rows;
+    for i in 0..n {
+        let row_off = i * n;
+        let sum = dot_unrolled(&l.data[row_off..row_off + i], &z[..i]);
+        z[i] = (b[i] - sum) / l.data[row_off + i];
+    }
+}
+
 /// Forward substitution: solve L * z = b where L is lower triangular (n x n).
 fn solve_lower_triangular(l: &Matrix, b: &[f64]) -> Vec<f64> {
-    let n = l.rows;
-    let mut z = vec![0.0; n];
-    for i in 0..n {
-        let mut sum = 0.0;
-        let row_i = &l.data[i * n..i * n + i];
-        for k in 0..i {
-            sum += row_i[k] * z[k];
-        }
-        z[i] = (b[i] - sum) / l.data[i * n + i];
-    }
+    let mut z = vec![0.0; l.rows];
+    solve_lower_triangular_into(l, b, &mut z);
     z
 }
 
 /// Backward substitution: solve L^T * x = z where L is lower triangular (n x n).
+/// Uses contiguous row-major scatter-subtract for cache locality and 4x unrolling.
 fn solve_upper_triangular_t(l: &Matrix, z: &[f64]) -> Vec<f64> {
     let n = l.rows;
-    let mut x = vec![0.0; n];
+    let mut x = z[..n].to_vec();
     for i in (0..n).rev() {
-        let mut sum = 0.0;
-        for (k, &xk) in x.iter().enumerate().take(n).skip(i + 1) {
-            sum += l.data[k * n + i] * xk;
+        let row_off = i * n;
+        let xi = x[i] / l.data[row_off + i];
+        x[i] = xi;
+        let row_i = &l.data[row_off..row_off + i];
+        let mut k = 0;
+        let chunks = i / 4;
+        for _ in 0..chunks {
+            x[k] -= row_i[k] * xi;
+            x[k + 1] -= row_i[k + 1] * xi;
+            x[k + 2] -= row_i[k + 2] * xi;
+            x[k + 3] -= row_i[k + 3] * xi;
+            k += 4;
         }
-        x[i] = (z[i] - sum) / l.data[i * n + i];
+        while k < i {
+            x[k] -= row_i[k] * xi;
+            k += 1;
+        }
     }
     x
 }
@@ -327,9 +472,29 @@ fn solve_cholesky_from_l(l: &Matrix, b: &[f64]) -> Vec<f64> {
     solve_upper_triangular_t(l, &z)
 }
 
+/// Compute (L^{-1})^T where L is lower triangular (n x n).
+/// Entry (i, k) stores (L^{-1})_{k, i} for k >= i, so columns of L^{-1} are stored contiguously as rows.
+fn invert_lower_triangular_t(l: &Matrix) -> Vec<f64> {
+    let n = l.rows;
+    let mut m_t = vec![0.0; n * n];
+    for i in 0..n {
+        let mi_off = i * n;
+        m_t[mi_off + i] = 1.0 / l.data[i * n + i];
+        for k in (i + 1)..n {
+            let lk_off = k * n;
+            let sum = dot_unrolled(
+                &l.data[lk_off + i..lk_off + k],
+                &m_t[mi_off + i..mi_off + k],
+            );
+            m_t[mi_off + k] = -sum / l.data[lk_off + k];
+        }
+    }
+    m_t
+}
+
 #[inline]
 fn dot(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
+    dot_unrolled(a, b)
 }
 
 #[inline]
@@ -569,6 +734,250 @@ where
     apply_log_vec(&base, &best_theta)
 }
 
+/// Compact box-constrained L-BFGS minimizer on `[LOG_BOUND_MIN, LOG_BOUND_MAX]^dim`.
+/// `f_and_grad` returns `Some((neg_lml, neg_grad))` or `None` if evaluation fails (e.g. non-PD).
+fn lbfgs_minimize<F>(init: &[f64], max_iter: usize, gtol: f64, mut f_and_grad: F) -> (Vec<f64>, f64)
+where
+    F: FnMut(&[f64]) -> Option<(f64, Vec<f64>)>,
+{
+    let dim = init.len();
+    if dim == 0 {
+        return (Vec::new(), 0.0);
+    }
+
+    let clamp_vec = |v: &mut [f64]| {
+        for x in v.iter_mut() {
+            *x = x.clamp(LOG_BOUND_MIN, LOG_BOUND_MAX);
+        }
+    };
+
+    let mut x = init.to_vec();
+    clamp_vec(&mut x);
+    let (mut f_val, mut grad) = match f_and_grad(&x) {
+        Some((fv, g)) if fv.is_finite() && g.iter().all(|v| v.is_finite()) => (fv, g),
+        _ => return (x, 1e30),
+    };
+
+    let mut best_x = x.clone();
+    let mut best_f = f_val;
+
+    const M: usize = 8;
+    let mut s_hist: Vec<Vec<f64>> = Vec::with_capacity(M);
+    let mut y_hist: Vec<Vec<f64>> = Vec::with_capacity(M);
+    let mut rho_hist: Vec<f64> = Vec::with_capacity(M);
+
+    let mut q = vec![0.0; dim];
+    let mut dir = vec![0.0; dim];
+    let mut x_cand = vec![0.0; dim];
+    let mut alpha_buf = [0.0_f64; M];
+
+    for _iter in 0..max_iter {
+        // Projected gradient infinity norm check
+        let mut pg_inf = 0.0_f64;
+        for j in 0..dim {
+            let gj = if (x[j] <= LOG_BOUND_MIN && grad[j] > 0.0)
+                || (x[j] >= LOG_BOUND_MAX && grad[j] < 0.0)
+            {
+                0.0
+            } else {
+                grad[j]
+            };
+            pg_inf = pg_inf.max(gj.abs());
+        }
+        if pg_inf < gtol {
+            break;
+        }
+
+        // L-BFGS two-loop recursion
+        q.copy_from_slice(&grad);
+        let h_len = s_hist.len();
+        for idx in (0..h_len).rev() {
+            let a = rho_hist[idx] * dot_unrolled(&s_hist[idx], &q);
+            alpha_buf[idx] = a;
+            let yi = &y_hist[idx];
+            for j in 0..dim {
+                q[j] -= a * yi[j];
+            }
+        }
+        let gamma = if h_len > 0 {
+            let s_last = &s_hist[h_len - 1];
+            let y_last = &y_hist[h_len - 1];
+            let yy = dot_unrolled(y_last, y_last);
+            if yy > 1e-24 {
+                (dot_unrolled(s_last, y_last) / yy).clamp(1e-6, 1e6)
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        };
+        for j in 0..dim {
+            dir[j] = gamma * q[j];
+        }
+        for idx in 0..h_len {
+            let beta = rho_hist[idx] * dot_unrolled(&y_hist[idx], &dir);
+            let diff = alpha_buf[idx] - beta;
+            let si = &s_hist[idx];
+            for j in 0..dim {
+                dir[j] += si[j] * diff;
+            }
+        }
+        for j in 0..dim {
+            dir[j] = -dir[j];
+            if (x[j] <= LOG_BOUND_MIN && dir[j] < 0.0) || (x[j] >= LOG_BOUND_MAX && dir[j] > 0.0) {
+                dir[j] = 0.0;
+            }
+        }
+
+        // Fallback to projected steepest descent if direction is not a descent direction
+        let mut dg = dot_unrolled(&dir, &grad);
+        if !dg.is_finite() || dg >= 0.0 {
+            s_hist.clear();
+            y_hist.clear();
+            rho_hist.clear();
+            for j in 0..dim {
+                let gj = if (x[j] <= LOG_BOUND_MIN && grad[j] > 0.0)
+                    || (x[j] >= LOG_BOUND_MAX && grad[j] < 0.0)
+                {
+                    0.0
+                } else {
+                    grad[j]
+                };
+                dir[j] = -gj;
+            }
+            dg = dot_unrolled(&dir, &grad);
+            if !dg.is_finite() || dg >= 0.0 {
+                break;
+            }
+        }
+
+        // Cap initial step when history is empty so log-space parameters don't explode
+        let max_d = dir.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let mut step = if s_hist.is_empty() && max_d > 1.0 {
+            (1.0 / max_d).min(1.0)
+        } else if max_d > 4.0 {
+            4.0 / max_d
+        } else {
+            1.0
+        };
+
+        let mut accepted = false;
+        let mut next_f = f_val;
+        let mut next_grad = Vec::new();
+        for _ls in 0..12 {
+            let mut actual_dg = 0.0;
+            for j in 0..dim {
+                let xj_new = (x[j] + step * dir[j]).clamp(LOG_BOUND_MIN, LOG_BOUND_MAX);
+                x_cand[j] = xj_new;
+                actual_dg += grad[j] * (xj_new - x[j]);
+            }
+            if let Some((fc, gc)) = f_and_grad(&x_cand)
+                && fc.is_finite()
+                && gc.iter().all(|v| v.is_finite())
+            {
+                if fc < best_f {
+                    best_f = fc;
+                    best_x.copy_from_slice(&x_cand);
+                }
+                if fc <= f_val + 1e-4 * actual_dg {
+                    next_f = fc;
+                    next_grad = gc;
+                    accepted = true;
+                    break;
+                }
+            }
+            step *= 0.5;
+        }
+
+        if !accepted {
+            if !s_hist.is_empty() {
+                s_hist.clear();
+                y_hist.clear();
+                rho_hist.clear();
+                continue;
+            }
+            break;
+        }
+
+        let mut s_vec = vec![0.0; dim];
+        let mut y_vec = vec![0.0; dim];
+        let mut step_norm_inf = 0.0_f64;
+        for j in 0..dim {
+            s_vec[j] = x_cand[j] - x[j];
+            y_vec[j] = next_grad[j] - grad[j];
+            step_norm_inf = step_norm_inf.max(s_vec[j].abs());
+        }
+        let sy = dot_unrolled(&s_vec, &y_vec);
+        let ss = dot_unrolled(&s_vec, &s_vec);
+        let yy = dot_unrolled(&y_vec, &y_vec);
+        if sy > 1e-12 * (ss * yy).sqrt() {
+            if s_hist.len() == M {
+                s_hist.remove(0);
+                y_hist.remove(0);
+                rho_hist.remove(0);
+            }
+            s_hist.push(s_vec);
+            y_hist.push(y_vec);
+            rho_hist.push(1.0 / sy);
+        }
+
+        let f_diff = (f_val - next_f).abs();
+        x.copy_from_slice(&x_cand);
+        f_val = next_f;
+        grad = next_grad;
+
+        if step_norm_inf < 1e-7 && f_diff < 1e-9 * (1.0 + f_val.abs()) {
+            break;
+        }
+    }
+
+    (best_x, best_f)
+}
+
+fn optimize_lml_lbfgs<F>(
+    base: KernelParams,
+    n_restarts: usize,
+    random_state: Option<u64>,
+    mut eval_lml_grad: F,
+) -> KernelParams
+where
+    F: FnMut(&KernelParams) -> Option<(f64, Vec<f64>)>,
+{
+    let init = params_to_log_vec(&base);
+    let dim = init.len();
+    let mut best_theta = init.clone();
+    let mut best_lml = f64::NEG_INFINITY;
+
+    let (opt_theta, opt_neg_lml) = lbfgs_minimize(&init, 30, 1e-5, |pt| {
+        let cand = apply_log_vec(&base, pt);
+        eval_lml_grad(&cand).map(|(lml, g)| (-lml, g.into_iter().map(|v| -v).collect()))
+    });
+    if -opt_neg_lml > best_lml {
+        best_lml = -opt_neg_lml;
+        best_theta = opt_theta;
+    }
+
+    if n_restarts > 0 {
+        let mut rng = SplitMix64::new(random_state.unwrap_or(42));
+        for _ in 0..n_restarts {
+            let mut start = Vec::with_capacity(dim);
+            for _ in 0..dim {
+                start.push(rng.next_f64_uniform(-3.0, 3.0));
+            }
+            let (cand_theta, cand_neg_lml) = lbfgs_minimize(&start, 30, 1e-5, |pt| {
+                let cand = apply_log_vec(&base, pt);
+                eval_lml_grad(&cand).map(|(lml, g)| (-lml, g.into_iter().map(|v| -v).collect()))
+            });
+            if -cand_neg_lml > best_lml {
+                best_lml = -cand_neg_lml;
+                best_theta = cand_theta;
+            }
+        }
+    }
+
+    apply_log_vec(&base, &best_theta)
+}
+
 // ============================================================================
 // GaussianProcessRegressor
 // ============================================================================
@@ -685,15 +1094,24 @@ impl GaussianProcessRegressor {
         })
     }
 
-    fn eval_gpr_fit(
+    fn eval_gpr_fit_from_d2(
         backend: &Backend<'_>,
-        x: &Matrix,
+        d2: Option<&Matrix>,
+        n: usize,
         y_norm: &[f64],
         alpha_reg: f64,
         params: &KernelParams,
     ) -> OchreResult<(Matrix, Vec<f64>, f64)> {
-        let mut k = compute_kernel_matrix(backend, x, x, params, true)?;
-        let n = x.rows;
+        let mut k = match d2 {
+            Some(d) => compute_kernel_from_d2(backend, d, params, true)?,
+            None => {
+                let mut m = Matrix::zeros(n, n);
+                for i in 0..n {
+                    m.set(i, i, params.noise_level);
+                }
+                m
+            }
+        };
         for i in 0..n {
             let cur = k.get(i, i);
             k.set(i, i, cur + alpha_reg);
@@ -709,6 +1127,92 @@ impl GaussianProcessRegressor {
             -0.5 * dot(y_norm, &alpha_vec) - log_det_half - 0.5 * (n as f64) * (2.0 * PI).ln();
 
         Ok((l, alpha_vec, lml))
+    }
+
+    /// Evaluate GPR LML and analytical gradient wrt log-hyperparameters for `Rbf` and `RbfWhite`.
+    /// Gradient formula: d(LML)/d(theta_m) = 0.5 * tr((alpha * alpha^T - K^{-1}) * dK/d(theta_m)).
+    fn eval_gpr_lml_and_grad(
+        d2: &Matrix,
+        y_norm: &[f64],
+        alpha_reg: f64,
+        params: &KernelParams,
+    ) -> OchreResult<(f64, Vec<f64>)> {
+        let n = d2.rows;
+        let ls = params.length_scale;
+        let ls_sq = ls * ls;
+        let inv_ls_sq = 1.0 / ls_sq;
+        let inv_two_ls_sq = -0.5 * inv_ls_sq;
+        let c = params.constant_value;
+        let is_rbf_white = params.kind == KernelKind::RbfWhite;
+        let extra_diag = if is_rbf_white {
+            params.noise_level + alpha_reg
+        } else {
+            alpha_reg
+        };
+
+        // Build K0 (RBF part) and K = K0 + extra_diag * I
+        let mut k0 = Matrix::zeros(n, n);
+        let mut k = Matrix::zeros(n, n);
+        for i in 0..n {
+            let row = i * n;
+            k0.data[row + i] = c;
+            k.data[row + i] = c + extra_diag;
+            for j in 0..i {
+                let d_ij = d2.data[row + j].max(0.0);
+                let val = c * (d_ij * inv_two_ls_sq).exp();
+                k0.data[row + j] = val;
+                k0.data[j * n + i] = val;
+                k.data[row + j] = val;
+                k.data[j * n + i] = val;
+            }
+        }
+
+        let l = cholesky_lower(&k)?;
+        let alpha_vec = solve_cholesky_from_l(&l, y_norm);
+
+        let mut log_det_half = 0.0;
+        for i in 0..n {
+            log_det_half += l.data[i * n + i].ln();
+        }
+        let lml =
+            -0.5 * dot(y_norm, &alpha_vec) - log_det_half - 0.5 * (n as f64) * (2.0 * PI).ln();
+
+        // Compute M^T = (L^{-1})^T so K^{-1}_{ij} = dot(m_t[i, i..n], m_t[j, i..n]) for i >= j
+        let m_t = invert_lower_triangular_t(&l);
+
+        let mut g_log_c = 0.0;
+        let mut g_log_ls = 0.0;
+        let mut g_log_noise = 0.0;
+
+        for i in 0..n {
+            let row = i * n;
+            let ai = alpha_vec[i];
+            let mi = &m_t[row + i..row + n];
+            let k_inv_ii = dot_unrolled(mi, mi);
+            let w_ii = ai * ai - k_inv_ii;
+            g_log_c += 0.5 * w_ii * c;
+            if is_rbf_white {
+                g_log_noise += 0.5 * w_ii * params.noise_level;
+            }
+
+            for j in 0..i {
+                let mj = &m_t[j * n + i..j * n + n];
+                let k_inv_ij = dot_unrolled(mi, mj);
+                let w_ij = ai * alpha_vec[j] - k_inv_ij;
+                let k0_ij = k0.data[row + j];
+                // Factor 2 for symmetric off-diagonal * 0.5 in LML grad = 1.0
+                let wk = w_ij * k0_ij;
+                g_log_c += wk;
+                g_log_ls += wk * (d2.data[row + j].max(0.0) * inv_ls_sq);
+            }
+        }
+
+        let grad = if is_rbf_white {
+            vec![g_log_c, g_log_ls, g_log_noise]
+        } else {
+            vec![g_log_c, g_log_ls]
+        };
+        Ok((lml, grad))
     }
 
     pub fn fit(&mut self, x: &Matrix, y: &[f64]) -> OchreResult<()> {
@@ -733,26 +1237,52 @@ impl GaussianProcessRegressor {
             (0.0, 1.0, y.to_vec())
         };
 
-        let backend = get_backend(&self.parsed_device);
+        let backend = effective_backend(&self.parsed_device, n.saturating_mul(n));
         let base_params = self.base_kernel_params()?;
+        let d2 = if base_params.kind == KernelKind::White {
+            None
+        } else {
+            Some(backend.pairwise_l2_sq(x, x)?)
+        };
 
         let best_params = if self.optimize_hyperparams || self.n_restarts_optimizer > 0 {
-            optimize_lml(
-                base_params,
-                self.n_restarts_optimizer,
-                self.random_state,
-                |cand| {
-                    Self::eval_gpr_fit(&backend, x, &y_norm, self.alpha, cand)
+            match (base_params.kind, d2.as_ref()) {
+                (KernelKind::Rbf | KernelKind::RbfWhite, Some(d2_mat)) => optimize_lml_lbfgs(
+                    base_params,
+                    self.n_restarts_optimizer,
+                    self.random_state,
+                    |cand| Self::eval_gpr_lml_and_grad(d2_mat, &y_norm, self.alpha, cand).ok(),
+                ),
+                _ => optimize_lml(
+                    base_params,
+                    self.n_restarts_optimizer,
+                    self.random_state,
+                    |cand| {
+                        Self::eval_gpr_fit_from_d2(
+                            &backend,
+                            d2.as_ref(),
+                            n,
+                            &y_norm,
+                            self.alpha,
+                            cand,
+                        )
                         .ok()
                         .map(|r| r.2)
-                },
-            )
+                    },
+                ),
+            }
         } else {
             base_params
         };
 
-        let (l, alpha_vec, lml) =
-            Self::eval_gpr_fit(&backend, x, &y_norm, self.alpha, &best_params)?;
+        let (l, alpha_vec, lml) = Self::eval_gpr_fit_from_d2(
+            &backend,
+            d2.as_ref(),
+            n,
+            &y_norm,
+            self.alpha,
+            &best_params,
+        )?;
 
         self.x_train_ = Some(x.clone());
         self.y_train_mean_ = y_mean;
@@ -793,7 +1323,14 @@ impl GaussianProcessRegressor {
             });
         }
 
-        let backend = get_backend(&self.parsed_device);
+        let n_test = x.rows;
+        let n_train = x_train.rows;
+        let elems = if return_cov {
+            n_test.saturating_mul(n_train.max(n_test))
+        } else {
+            n_test.saturating_mul(n_train)
+        };
+        let backend = effective_backend(&self.parsed_device, elems);
         let params = self.fitted_kernel_params()?;
         let k_trans = compute_kernel_matrix(&backend, x, x_train, &params, false)?;
 
@@ -804,12 +1341,39 @@ impl GaussianProcessRegressor {
             .map(|v| v * self.y_train_std_ + self.y_train_mean_)
             .collect();
 
-        let n_test = x.rows;
-        let n_train = x_train.rows;
         let var_scale = self.y_train_std_ * self.y_train_std_;
 
         if !return_std && !return_cov {
             return Ok((y_mean, None, None));
+        }
+
+        if return_std {
+            let k_diag = kernel_diag_value(&params);
+            let y_std: Vec<f64> = if n_test <= 256 {
+                let mut v = vec![0.0; n_train];
+                let mut out = Vec::with_capacity(n_test);
+                for i in 0..n_test {
+                    let row = &k_trans.data[i * n_train..(i + 1) * n_train];
+                    solve_lower_triangular_into(l, row, &mut v);
+                    let v_sq = dot_unrolled(&v, &v);
+                    out.push(((k_diag - v_sq).max(0.0) * var_scale).sqrt());
+                }
+                out
+            } else {
+                (0..n_test)
+                    .into_par_iter()
+                    .map_init(
+                        || vec![0.0; n_train],
+                        |v, i| {
+                            let row = &k_trans.data[i * n_train..(i + 1) * n_train];
+                            solve_lower_triangular_into(l, row, v);
+                            let v_sq = dot_unrolled(v, v);
+                            ((k_diag - v_sq).max(0.0) * var_scale).sqrt()
+                        },
+                    )
+                    .collect()
+            };
+            return Ok((y_mean, Some(y_std), None));
         }
 
         // Solve L * V = K_trans^T => V has shape (n_train, n_test), stored column-by-column
@@ -820,18 +1384,6 @@ impl GaussianProcessRegressor {
                 solve_lower_triangular(l, row)
             })
             .collect();
-
-        if return_std {
-            let k_diag = kernel_diag_value(&params);
-            let y_std: Vec<f64> = v_cols
-                .into_par_iter()
-                .map(|v| {
-                    let v_sq = dot(&v, &v);
-                    ((k_diag - v_sq).max(0.0) * var_scale).sqrt()
-                })
-                .collect();
-            return Ok((y_mean, Some(y_std), None));
-        }
 
         // return_cov == true
         let mut y_cov = compute_kernel_matrix(&backend, x, x, &params, true)?;
@@ -1198,23 +1750,35 @@ struct BinaryLaplaceGP {
 }
 
 impl BinaryLaplaceGP {
-    fn fit_single(
+    fn fit_single_from_d2(
         backend: &Backend<'_>,
-        x: &Matrix,
+        d2: Option<&Matrix>,
+        n: usize,
         y_bin: &[f64],
         params: &KernelParams,
         max_iter_predict: usize,
     ) -> OchreResult<Self> {
-        let n = x.rows;
-        let k = compute_kernel_matrix(backend, x, x, params, true)?;
+        let k = match d2 {
+            Some(d) => compute_kernel_from_d2(backend, d, params, true)?,
+            None => {
+                let mut m = Matrix::zeros(n, n);
+                for i in 0..n {
+                    m.set(i, i, params.noise_level);
+                }
+                m
+            }
+        };
         let mut f = vec![0.0; n];
 
         let mut pi = vec![0.5; n];
+        let mut w = vec![0.25; n];
         let mut w_sqrt = vec![0.5; n];
         let mut a = vec![0.0; n];
+        let mut b_mat = Matrix::zeros(n, n);
+        let mut b_vec = vec![0.0; n];
+        let mut rhs = vec![0.0; n];
 
         for _iter in 0..max_iter_predict {
-            let mut w = vec![0.0; n];
             for i in 0..n {
                 let p = sigmoid(f[i]);
                 pi[i] = p;
@@ -1224,25 +1788,23 @@ impl BinaryLaplaceGP {
             }
 
             // B = I + W^{1/2} K W^{1/2}
-            let mut b_mat = Matrix::zeros(n, n);
             for i in 0..n {
                 let wsi = w_sqrt[i];
+                let row_off = i * n;
                 for (j, &wsj) in w_sqrt.iter().enumerate().take(n) {
-                    let val = wsi * k.data[i * n + j] * wsj;
-                    b_mat.data[i * n + j] = if i == j { 1.0 + val } else { val };
+                    let val = wsi * k.data[row_off + j] * wsj;
+                    b_mat.data[row_off + j] = if i == j { 1.0 + val } else { val };
                 }
             }
             let l_iter = cholesky_lower(&b_mat)?;
 
             // b_vec = W * f + (y_bin - pi)
-            let mut b_vec = vec![0.0; n];
             for i in 0..n {
                 b_vec[i] = w[i] * f[i] + (y_bin[i] - pi[i]);
             }
 
             // kb = K * b_vec
             let kb = backend.matvec(&k, &b_vec)?;
-            let mut rhs = vec![0.0; n];
             for i in 0..n {
                 rhs[i] = w_sqrt[i] * kb[i];
             }
@@ -1269,12 +1831,12 @@ impl BinaryLaplaceGP {
             pi[i] = p;
             w_sqrt[i] = (p * (1.0 - p)).max(1e-12).sqrt();
         }
-        let mut b_mat = Matrix::zeros(n, n);
         for i in 0..n {
             let wsi = w_sqrt[i];
+            let row_off = i * n;
             for (j, &wsj) in w_sqrt.iter().enumerate().take(n) {
-                let val = wsi * k.data[i * n + j] * wsj;
-                b_mat.data[i * n + j] = if i == j { 1.0 + val } else { val };
+                let val = wsi * k.data[row_off + j] * wsj;
+                b_mat.data[row_off + j] = if i == j { 1.0 + val } else { val };
             }
         }
         let l = cholesky_lower(&b_mat)?;
@@ -1305,6 +1867,200 @@ impl BinaryLaplaceGP {
         })
     }
 
+    /// Evaluate Laplace LML and analytical gradient wrt log-hyperparameters (Rasmussen & Williams Alg 5.1)
+    /// for `Rbf` and `RbfWhite` kernels.
+    fn fit_single_lml_and_grad(
+        backend: &Backend<'_>,
+        d2: &Matrix,
+        y_bin: &[f64],
+        params: &KernelParams,
+        max_iter_predict: usize,
+    ) -> OchreResult<(f64, Vec<f64>)> {
+        let n = d2.rows;
+        let ls = params.length_scale;
+        let ls_sq = ls * ls;
+        let inv_ls_sq = 1.0 / ls_sq;
+        let inv_two_ls_sq = -0.5 * inv_ls_sq;
+        let c = params.constant_value;
+        let is_rbf_white = params.kind == KernelKind::RbfWhite;
+
+        let mut k0 = Matrix::zeros(n, n);
+        let mut k = Matrix::zeros(n, n);
+        let extra_diag = if is_rbf_white {
+            params.noise_level
+        } else {
+            0.0
+        };
+        for i in 0..n {
+            let row = i * n;
+            k0.data[row + i] = c;
+            k.data[row + i] = c + extra_diag;
+            for j in 0..i {
+                let val = c * (d2.data[row + j].max(0.0) * inv_two_ls_sq).exp();
+                k0.data[row + j] = val;
+                k0.data[j * n + i] = val;
+                k.data[row + j] = val;
+                k.data[j * n + i] = val;
+            }
+        }
+
+        let mut f = vec![0.0; n];
+        let mut pi = vec![0.5; n];
+        let mut w = vec![0.25; n];
+        let mut w_sqrt = vec![0.5; n];
+        let mut a = vec![0.0; n];
+        let mut b_mat = Matrix::zeros(n, n);
+        let mut b_vec = vec![0.0; n];
+        let mut rhs = vec![0.0; n];
+
+        for _iter in 0..max_iter_predict {
+            for i in 0..n {
+                let p = sigmoid(f[i]);
+                pi[i] = p;
+                let wi = (p * (1.0 - p)).max(1e-12);
+                w[i] = wi;
+                w_sqrt[i] = wi.sqrt();
+            }
+            for i in 0..n {
+                let wsi = w_sqrt[i];
+                let row_off = i * n;
+                for (j, &wsj) in w_sqrt.iter().enumerate().take(n) {
+                    let val = wsi * k.data[row_off + j] * wsj;
+                    b_mat.data[row_off + j] = if i == j { 1.0 + val } else { val };
+                }
+            }
+            let l_iter = cholesky_lower(&b_mat)?;
+            for i in 0..n {
+                b_vec[i] = w[i] * f[i] + (y_bin[i] - pi[i]);
+            }
+            let kb = backend.matvec(&k, &b_vec)?;
+            for i in 0..n {
+                rhs[i] = w_sqrt[i] * kb[i];
+            }
+            let solved = solve_cholesky_from_l(&l_iter, &rhs);
+            for i in 0..n {
+                a[i] = b_vec[i] - w_sqrt[i] * solved[i];
+            }
+            let f_new = backend.matvec(&k, &a)?;
+            let max_diff = f
+                .iter()
+                .zip(f_new.iter())
+                .map(|(&old, &new)| (old - new).abs())
+                .fold(0.0_f64, f64::max);
+            f = f_new;
+            if max_diff < 1e-8 {
+                break;
+            }
+        }
+
+        for i in 0..n {
+            let p = sigmoid(f[i]);
+            pi[i] = p;
+            let wi = (p * (1.0 - p)).max(1e-12);
+            w[i] = wi;
+            w_sqrt[i] = wi.sqrt();
+        }
+        for i in 0..n {
+            let wsi = w_sqrt[i];
+            let row_off = i * n;
+            for (j, &wsj) in w_sqrt.iter().enumerate().take(n) {
+                let val = wsi * k.data[row_off + j] * wsj;
+                b_mat.data[row_off + j] = if i == j { 1.0 + val } else { val };
+            }
+        }
+        let l = cholesky_lower(&b_mat)?;
+
+        let mut log_lik = 0.0;
+        for i in 0..n {
+            let fi = f[i];
+            let log_1_plus_exp = fi.max(0.0) + (-fi.abs()).exp().ln_1p();
+            log_lik += y_bin[i] * fi - log_1_plus_exp;
+        }
+        let mut log_det_b_half = 0.0;
+        for i in 0..n {
+            log_det_b_half += l.data[i * n + i].ln();
+        }
+        let lml = -0.5 * dot(&a, &f) + log_lik - log_det_b_half;
+
+        // R = W^{1/2} * B^{-1} * W^{1/2} via M^T = (L^{-1})^T
+        let m_t = invert_lower_triangular_t(&l);
+        let mut r_mat = Matrix::zeros(n, n);
+        for i in 0..n {
+            let row = i * n;
+            let mi = &m_t[row + i..row + n];
+            let wsi = w_sqrt[i];
+            r_mat.data[row + i] = wsi * wsi * dot_unrolled(mi, mi);
+            for j in 0..i {
+                let mj = &m_t[j * n + i..j * n + n];
+                let val = wsi * w_sqrt[j] * dot_unrolled(mi, mj);
+                r_mat.data[row + j] = val;
+                r_mat.data[j * n + i] = val;
+            }
+        }
+
+        // s2[i] = -0.5 * (K_{ii} - ||L^{-1} W^{1/2} K_{:,i}||^2) * d^3 log p(y_i | f_i) / df_i^3
+        // where d^3 log p / df_i^3 = -pi_i * (1 - pi_i) * (1 - 2 * pi_i)
+        let mut s2 = vec![0.0; n];
+        let mut wk_col = vec![0.0; n];
+        let mut c_col = vec![0.0; n];
+        for i in 0..n {
+            let k_row = &k.data[i * n..(i + 1) * n];
+            for j in 0..n {
+                wk_col[j] = w_sqrt[j] * k_row[j];
+            }
+            solve_lower_triangular_into(&l, &wk_col, &mut c_col);
+            let post_var_i = k.data[i * n + i] - dot_unrolled(&c_col, &c_col);
+            let p = pi[i];
+            let dw_df = p * (1.0 - p) * (1.0 - 2.0 * p);
+            s2[i] = -0.5 * post_var_i * dw_df;
+        }
+
+        // Precompute u = (I - R K) s2 so s2^T (I - K R) b_m = u^T b_m, where b_m = dK_m * a
+        // Since R and K are symmetric: (s2^T (I - K R))^T = s2 - R (K s2)
+        let k_s2 = backend.matvec(&k, &s2)?;
+        let r_k_s2 = backend.matvec(&r_mat, &k_s2)?;
+        let mut u = vec![0.0; n];
+        for i in 0..n {
+            u[i] = s2[i] - r_k_s2[i];
+        }
+
+        // Accumulate analytical gradients for log(c), log(ls), and (if RbfWhite) log(noise_level)
+        // d(LML)/d(theta_m) = 0.5 * sum_{i,j} (a_i a_j - R_{ij}) * dK_{ij} + sum_{i,j} u_i * dK_{ij} * a_j
+        // By symmetry of dK, off-diagonal (i > j) contributes:
+        //   (a_i a_j - R_{ij} + u_i a_j + u_j a_i) * dK_{ij}
+        // Diagonal (i == j) contributes:
+        //   (0.5 * (a_i^2 - R_{ii}) + u_i a_i) * dK_{ii}
+        let mut g_log_c = 0.0;
+        let mut g_log_ls = 0.0;
+        let mut g_log_noise = 0.0;
+
+        for i in 0..n {
+            let row = i * n;
+            let ai = a[i];
+            let ui = u[i];
+            let diag_coeff = 0.5 * (ai * ai - r_mat.data[row + i]) + ui * ai;
+            g_log_c += diag_coeff * c;
+            if is_rbf_white {
+                g_log_noise += diag_coeff * params.noise_level;
+            }
+            for j in 0..i {
+                let aj = a[j];
+                let coeff = (ai * aj - r_mat.data[row + j]) + ui * aj + u[j] * ai;
+                let k0_ij = k0.data[row + j];
+                let ck = coeff * k0_ij;
+                g_log_c += ck;
+                g_log_ls += ck * (d2.data[row + j].max(0.0) * inv_ls_sq);
+            }
+        }
+
+        let grad = if is_rbf_white {
+            vec![g_log_c, g_log_ls, g_log_noise]
+        } else {
+            vec![g_log_c, g_log_ls]
+        };
+        Ok((lml, grad))
+    }
+
     fn predict_pos_proba(
         &self,
         backend: &Backend<'_>,
@@ -1317,21 +2073,41 @@ impl BinaryLaplaceGP {
         let n_train = x_train.rows;
         let k_diag = kernel_diag_value(&self.params);
 
-        let probs: Vec<f64> = (0..n_test)
-            .into_par_iter()
-            .map(|i| {
+        let probs: Vec<f64> = if n_test <= 256 {
+            let mut wk = vec![0.0; n_train];
+            let mut v = vec![0.0; n_train];
+            let mut out = Vec::with_capacity(n_test);
+            for (i, &fs) in f_star.iter().enumerate().take(n_test) {
                 let k_row = &k_star.data[i * n_train..(i + 1) * n_train];
-                let mut wk = vec![0.0; n_train];
                 for j in 0..n_train {
                     wk[j] = self.w_sqrt[j] * k_row[j];
                 }
-                let v = solve_lower_triangular(&self.l, &wk);
-                let var_f = (k_diag - dot(&v, &v)).max(0.0);
+                solve_lower_triangular_into(&self.l, &wk, &mut v);
+                let var_f = (k_diag - dot_unrolled(&v, &v)).max(0.0);
                 // Probit approximation matching sklearn GaussianProcessClassifier
                 let kappa = 1.0 / (1.0 + (PI / 8.0) * var_f).sqrt();
-                sigmoid(kappa * f_star[i])
-            })
-            .collect();
+                out.push(sigmoid(kappa * fs));
+            }
+            out
+        } else {
+            (0..n_test)
+                .into_par_iter()
+                .map_init(
+                    || (vec![0.0; n_train], vec![0.0; n_train]),
+                    |(wk, v), i| {
+                        let k_row = &k_star.data[i * n_train..(i + 1) * n_train];
+                        for j in 0..n_train {
+                            wk[j] = self.w_sqrt[j] * k_row[j];
+                        }
+                        solve_lower_triangular_into(&self.l, wk, v);
+                        let var_f = (k_diag - dot_unrolled(v, v)).max(0.0);
+                        // Probit approximation matching sklearn GaussianProcessClassifier
+                        let kappa = 1.0 / (1.0 + (PI / 8.0) * var_f).sqrt();
+                        sigmoid(kappa * f_star[i])
+                    },
+                )
+                .collect()
+        };
 
         Ok(probs)
     }
@@ -1482,12 +2258,67 @@ impl GaussianProcessClassifier {
             return Err(OchreError::InsufficientClasses(classes.len()));
         }
 
-        let backend = get_backend(&self.parsed_device);
+        let n = x.rows;
+        let backend = effective_backend(&self.parsed_device, n.saturating_mul(n));
         let base_params = self.base_kernel_params()?;
         let do_opt = self.optimize_hyperparams || self.n_restarts_optimizer > 0;
+        let d2 = if base_params.kind == KernelKind::White {
+            None
+        } else {
+            Some(backend.pairwise_l2_sq(x, x)?)
+        };
 
         let mut estimators = Vec::new();
         let mut total_lml = 0.0;
+
+        let fit_binary = |y_bin: &[f64]| -> OchreResult<BinaryLaplaceGP> {
+            let best_params = if do_opt {
+                match (base_params.kind, d2.as_ref()) {
+                    (KernelKind::Rbf | KernelKind::RbfWhite, Some(d2_mat)) => optimize_lml_lbfgs(
+                        base_params,
+                        self.n_restarts_optimizer,
+                        self.random_state,
+                        |cand| {
+                            BinaryLaplaceGP::fit_single_lml_and_grad(
+                                &backend,
+                                d2_mat,
+                                y_bin,
+                                cand,
+                                self.max_iter_predict,
+                            )
+                            .ok()
+                        },
+                    ),
+                    _ => optimize_lml(
+                        base_params,
+                        self.n_restarts_optimizer,
+                        self.random_state,
+                        |cand| {
+                            BinaryLaplaceGP::fit_single_from_d2(
+                                &backend,
+                                d2.as_ref(),
+                                n,
+                                y_bin,
+                                cand,
+                                self.max_iter_predict,
+                            )
+                            .ok()
+                            .map(|e| e.lml)
+                        },
+                    ),
+                }
+            } else {
+                base_params
+            };
+            BinaryLaplaceGP::fit_single_from_d2(
+                &backend,
+                d2.as_ref(),
+                n,
+                y_bin,
+                &best_params,
+                self.max_iter_predict,
+            )
+        };
 
         if classes.len() == 2 {
             let pos_cls = classes[1];
@@ -1502,34 +2333,7 @@ impl GaussianProcessClassifier {
                 })
                 .collect();
 
-            let best_params = if do_opt {
-                optimize_lml(
-                    base_params,
-                    self.n_restarts_optimizer,
-                    self.random_state,
-                    |cand| {
-                        BinaryLaplaceGP::fit_single(
-                            &backend,
-                            x,
-                            &y_bin,
-                            cand,
-                            self.max_iter_predict,
-                        )
-                        .ok()
-                        .map(|e| e.lml)
-                    },
-                )
-            } else {
-                base_params
-            };
-
-            let est = BinaryLaplaceGP::fit_single(
-                &backend,
-                x,
-                &y_bin,
-                &best_params,
-                self.max_iter_predict,
-            )?;
+            let est = fit_binary(&y_bin)?;
             total_lml = est.lml;
             estimators.push(est);
         } else {
@@ -1539,34 +2343,7 @@ impl GaussianProcessClassifier {
                     .map(|&v| if (v - cls).abs() <= 1e-12 { 1.0 } else { 0.0 })
                     .collect();
 
-                let best_params = if do_opt {
-                    optimize_lml(
-                        base_params,
-                        self.n_restarts_optimizer,
-                        self.random_state,
-                        |cand| {
-                            BinaryLaplaceGP::fit_single(
-                                &backend,
-                                x,
-                                &y_bin,
-                                cand,
-                                self.max_iter_predict,
-                            )
-                            .ok()
-                            .map(|e| e.lml)
-                        },
-                    )
-                } else {
-                    base_params
-                };
-
-                let est = BinaryLaplaceGP::fit_single(
-                    &backend,
-                    x,
-                    &y_bin,
-                    &best_params,
-                    self.max_iter_predict,
-                )?;
+                let est = fit_binary(&y_bin)?;
                 total_lml += est.lml;
                 estimators.push(est);
             }
@@ -1593,8 +2370,8 @@ impl GaussianProcessClassifier {
             });
         }
 
-        let backend = get_backend(&self.parsed_device);
         let n_test = x.rows;
+        let backend = effective_backend(&self.parsed_device, n_test.saturating_mul(x_train.rows));
         let n_classes = classes.len();
         let mut proba = Matrix::zeros(n_test, n_classes);
 
@@ -1916,4 +2693,230 @@ pub fn register_py_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGaussianProcessRegressor>()?;
     m.add_class::<PyGaussianProcessClassifier>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_regression_data() -> (Matrix, Vec<f64>) {
+        let mut x_data = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..24 {
+            let t = -3.0 + 6.0 * (i as f64) / 23.0;
+            x_data.push(t);
+            x_data.push(0.5 * t * t);
+            y.push(t.sin() + 0.1 * t);
+        }
+        let x = Matrix::from_vec(24, 2, x_data).expect("valid matrix");
+        (x, y)
+    }
+
+    fn sample_classification_data() -> (Matrix, Vec<f64>) {
+        let mut x_data = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..24 {
+            let t = -2.5 + 5.0 * (i as f64) / 23.0;
+            x_data.push(t);
+            x_data.push((t * 1.3).cos());
+            y.push(if t > 0.0 { 1.0 } else { 0.0 });
+        }
+        let x = Matrix::from_vec(24, 2, x_data).expect("valid matrix");
+        (x, y)
+    }
+
+    #[test]
+    fn test_gpr_analytical_grad_matches_finite_diff() {
+        let (x, y) = sample_regression_data();
+        let d2 = Backend::Cpu.pairwise_l2_sq(&x, &x).expect("d2");
+        let eps = 1e-6;
+
+        for kind in [KernelKind::Rbf, KernelKind::RbfWhite] {
+            let base = KernelParams {
+                kind,
+                length_scale: 1.3,
+                constant_value: 2.1,
+                nu: 1.5,
+                noise_level: 0.25,
+                rq_alpha: 1.0,
+            };
+            let theta = params_to_log_vec(&base);
+            let (_lml, grad) =
+                GaussianProcessRegressor::eval_gpr_lml_and_grad(&d2, &y, 1e-4, &base)
+                    .expect("eval_gpr_lml_and_grad");
+            assert_eq!(grad.len(), theta.len());
+
+            for m in 0..theta.len() {
+                let mut t_plus = theta.clone();
+                let mut t_minus = theta.clone();
+                t_plus[m] += eps;
+                t_minus[m] -= eps;
+                let p_plus = apply_log_vec(&base, &t_plus);
+                let p_minus = apply_log_vec(&base, &t_minus);
+                let lml_plus = GaussianProcessRegressor::eval_gpr_fit_from_d2(
+                    &Backend::Cpu,
+                    Some(&d2),
+                    x.rows,
+                    &y,
+                    1e-4,
+                    &p_plus,
+                )
+                .expect("plus")
+                .2;
+                let lml_minus = GaussianProcessRegressor::eval_gpr_fit_from_d2(
+                    &Backend::Cpu,
+                    Some(&d2),
+                    x.rows,
+                    &y,
+                    1e-4,
+                    &p_minus,
+                )
+                .expect("minus")
+                .2;
+                let fd = (lml_plus - lml_minus) / (2.0 * eps);
+                let err = (grad[m] - fd).abs();
+                let scale = 1.0 + fd.abs();
+                assert!(
+                    err / scale < 1e-5,
+                    "GPR grad mismatch for {kind:?} dim {m}: analytical={} fd={}",
+                    grad[m],
+                    fd
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_gpc_analytical_grad_matches_finite_diff() {
+        let (x, y) = sample_classification_data();
+        let d2 = Backend::Cpu.pairwise_l2_sq(&x, &x).expect("d2");
+        let eps = 1e-5;
+
+        for kind in [KernelKind::Rbf, KernelKind::RbfWhite] {
+            let base = KernelParams {
+                kind,
+                length_scale: 1.2,
+                constant_value: 1.7,
+                nu: 1.5,
+                noise_level: 0.15,
+                rq_alpha: 1.0,
+            };
+            let theta = params_to_log_vec(&base);
+            let (_lml, grad) =
+                BinaryLaplaceGP::fit_single_lml_and_grad(&Backend::Cpu, &d2, &y, &base, 100)
+                    .expect("fit_single_lml_and_grad");
+            assert_eq!(grad.len(), theta.len());
+
+            for m in 0..theta.len() {
+                let mut t_plus = theta.clone();
+                let mut t_minus = theta.clone();
+                t_plus[m] += eps;
+                t_minus[m] -= eps;
+                let p_plus = apply_log_vec(&base, &t_plus);
+                let p_minus = apply_log_vec(&base, &t_minus);
+                let lml_plus = BinaryLaplaceGP::fit_single_from_d2(
+                    &Backend::Cpu,
+                    Some(&d2),
+                    x.rows,
+                    &y,
+                    &p_plus,
+                    100,
+                )
+                .expect("plus")
+                .lml;
+                let lml_minus = BinaryLaplaceGP::fit_single_from_d2(
+                    &Backend::Cpu,
+                    Some(&d2),
+                    x.rows,
+                    &y,
+                    &p_minus,
+                    100,
+                )
+                .expect("minus")
+                .lml;
+                let fd = (lml_plus - lml_minus) / (2.0 * eps);
+                let err = (grad[m] - fd).abs();
+                let scale = 1.0 + fd.abs();
+                assert!(
+                    err / scale < 1e-4,
+                    "GPC grad mismatch for {kind:?} dim {m}: analytical={} fd={}",
+                    grad[m],
+                    fd
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_gpr_and_gpc_lbfgs_optimization_and_predict_paths() {
+        let (x_reg, y_reg) = sample_regression_data();
+        let mut gpr = GaussianProcessRegressor::new(
+            "rbf".to_string(),
+            0.5,
+            1.0,
+            1.5,
+            1e-4,
+            1.0,
+            1.0,
+            true,
+            0,
+            false,
+            Some(42),
+            None,
+        )
+        .expect("new gpr");
+        gpr.fit(&x_reg, &y_reg).expect("fit gpr");
+        let (mean, std_opt, _) = gpr
+            .predict_with_uncertainty(&x_reg, true, false)
+            .expect("predict gpr");
+        assert_eq!(mean.len(), x_reg.rows);
+        assert!(
+            std_opt
+                .expect("std")
+                .iter()
+                .all(|&s| s.is_finite() && s >= 0.0)
+        );
+
+        let bytes = gpr.to_bytes();
+        let loaded = GaussianProcessRegressor::from_bytes(&bytes, None).expect("from_bytes");
+        let mean2 = loaded.predict(&x_reg).expect("predict loaded");
+        for (a, b) in mean.iter().zip(mean2.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+
+        let (x_cls, y_cls) = sample_classification_data();
+        let mut gpc = GaussianProcessClassifier::new(
+            "rbf".to_string(),
+            0.5,
+            1.0,
+            1.5,
+            1.0,
+            1.0,
+            100,
+            true,
+            0,
+            Some(42),
+            None,
+        )
+        .expect("new gpc");
+        gpc.fit(&x_cls, &y_cls).expect("fit gpc");
+        let acc = gpc.score(&x_cls, &y_cls).expect("score gpc");
+        assert!(acc >= 0.85, "expected high training accuracy, got {acc}");
+
+        // Exercise both small (<= 256) and large (> 256) predict_pos_proba paths
+        let mut x_big = Vec::with_capacity(300 * 2);
+        for i in 0..300 {
+            let t = -2.5 + 5.0 * (i as f64) / 299.0;
+            x_big.push(t);
+            x_big.push((t * 1.3).cos());
+        }
+        let x_big_mat = Matrix::from_vec(300, 2, x_big).expect("big mat");
+        let proba = gpc.predict_proba(&x_big_mat).expect("predict_proba big");
+        assert_eq!(proba.rows, 300);
+        assert_eq!(proba.cols, 2);
+        for r in 0..300 {
+            let sum = proba.get(r, 0) + proba.get(r, 1);
+            assert!((sum - 1.0).abs() < 1e-12);
+        }
+    }
 }
