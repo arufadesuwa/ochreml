@@ -43,7 +43,7 @@ impl SplitMix64 {
 
     fn shuffle<T>(&mut self, slice: &mut [T]) {
         for i in (1..slice.len()).rev() {
-            let j = ((self.next_u64() as u128 * (i as u128 + 1)) >> 64) as usize;
+            let j = (self.next_u64() as usize) % (i + 1);
             slice.swap(i, j);
         }
     }
