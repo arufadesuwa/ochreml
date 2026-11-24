@@ -18,11 +18,14 @@ use crate::preprocessing::py_helpers::{
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use rayon::prelude::*;
 
 pub const TAG_KMEANS: u8 = 47;
 pub const TAG_MINI_BATCH_KMEANS: u8 = 48;
 
 const MAX_DIST_ELEMENTS: usize = 4_000_000;
+const FUSED_CPU_OPS_THRESHOLD: usize = 4_000_000;
+const PAR_ROW_THRESHOLD: usize = 4_096;
 
 /// Deterministic SplitMix64 + Xorshift64 PRNG (zero external crate dependencies).
 struct DeterministicRng {
@@ -69,7 +72,14 @@ fn validate_x(x: &Matrix) -> OchreResult<()> {
     if x.rows == 0 || x.cols == 0 {
         return Err(OchreError::EmptyData);
     }
-    if x.data.iter().any(|v| !v.is_finite()) {
+    let has_non_finite = if x.data.len() >= 65_536 {
+        x.data
+            .par_chunks(16_384)
+            .any(|chunk| chunk.iter().any(|v| !v.is_finite()))
+    } else {
+        x.data.iter().any(|v| !v.is_finite())
+    };
+    if has_non_finite {
         return Err(OchreError::InvalidParameter(
             "Input X contains NaN or infinite values ( >_< )".to_string(),
         ));
@@ -152,38 +162,589 @@ fn validate_common_params(
 fn compute_mean_variance(x: &Matrix, sample_weight: Option<&[f64]>) -> f64 {
     let n = x.rows;
     let p = x.cols;
-    let mut means = vec![0.0; p];
-    let mut w_sum = 0.0;
-
-    for i in 0..n {
-        let w = sample_weight.map_or(1.0, |sw| sw[i]);
-        w_sum += w;
-        let row = &x.data[i * p..(i + 1) * p];
-        for j in 0..p {
-            means[j] += w * row[j];
-        }
+    if n == 0 || p == 0 {
+        return 0.0;
     }
+
+    let (mut means, w_sum) = if n >= PAR_ROW_THRESHOLD {
+        const CHUNK_ROWS: usize = 2048;
+        match sample_weight {
+            Some(sw) => x
+                .data
+                .par_chunks(CHUNK_ROWS * p)
+                .zip(sw.par_chunks(CHUNK_ROWS))
+                .fold(
+                    || (vec![0.0f64; p], 0.0f64),
+                    |(mut acc_m, mut acc_w), (x_chunk, w_chunk)| {
+                        for (i, &w) in w_chunk.iter().enumerate() {
+                            acc_w += w;
+                            let row = &x_chunk[i * p..(i + 1) * p];
+                            for j in 0..p {
+                                acc_m[j] += w * row[j];
+                            }
+                        }
+                        (acc_m, acc_w)
+                    },
+                )
+                .reduce(
+                    || (vec![0.0f64; p], 0.0f64),
+                    |(mut a_m, a_w), (b_m, b_w)| {
+                        for j in 0..p {
+                            a_m[j] += b_m[j];
+                        }
+                        (a_m, a_w + b_w)
+                    },
+                ),
+            None => {
+                let sum_vec = x
+                    .data
+                    .par_chunks(CHUNK_ROWS * p)
+                    .fold(
+                        || vec![0.0f64; p],
+                        |mut acc_m, x_chunk| {
+                            let rows = x_chunk.len() / p;
+                            for i in 0..rows {
+                                let row = &x_chunk[i * p..(i + 1) * p];
+                                for j in 0..p {
+                                    acc_m[j] += row[j];
+                                }
+                            }
+                            acc_m
+                        },
+                    )
+                    .reduce(
+                        || vec![0.0f64; p],
+                        |mut a_m, b_m| {
+                            for j in 0..p {
+                                a_m[j] += b_m[j];
+                            }
+                            a_m
+                        },
+                    );
+                (sum_vec, n as f64)
+            }
+        }
+    } else {
+        let mut means = vec![0.0; p];
+        let mut w_sum = 0.0;
+        match sample_weight {
+            Some(sw) => {
+                for (i, &w) in sw.iter().enumerate().take(n) {
+                    w_sum += w;
+                    let row = &x.data[i * p..(i + 1) * p];
+                    for j in 0..p {
+                        means[j] += w * row[j];
+                    }
+                }
+            }
+            None => {
+                w_sum = n as f64;
+                for i in 0..n {
+                    let row = &x.data[i * p..(i + 1) * p];
+                    for j in 0..p {
+                        means[j] += row[j];
+                    }
+                }
+            }
+        }
+        (means, w_sum)
+    };
+
     if w_sum <= 0.0 {
         return 0.0;
     }
+    let inv_w = 1.0 / w_sum;
     for m in &mut means {
-        *m /= w_sum;
+        *m *= inv_w;
     }
 
-    let mut var_sum = 0.0;
-    for i in 0..n {
-        let w = sample_weight.map_or(1.0, |sw| sw[i]);
-        let row = &x.data[i * p..(i + 1) * p];
-        for j in 0..p {
-            let d = row[j] - means[j];
-            var_sum += w * d * d;
+    let var_sum: f64 = if n >= PAR_ROW_THRESHOLD {
+        const CHUNK_ROWS: usize = 2048;
+        match sample_weight {
+            Some(sw) => x
+                .data
+                .par_chunks(CHUNK_ROWS * p)
+                .zip(sw.par_chunks(CHUNK_ROWS))
+                .map(|(x_chunk, w_chunk)| {
+                    let mut local = 0.0;
+                    for (i, &w) in w_chunk.iter().enumerate() {
+                        let row = &x_chunk[i * p..(i + 1) * p];
+                        let mut s = 0.0;
+                        for j in 0..p {
+                            let d = row[j] - means[j];
+                            s += d * d;
+                        }
+                        local += w * s;
+                    }
+                    local
+                })
+                .sum(),
+            None => x
+                .data
+                .par_chunks(CHUNK_ROWS * p)
+                .map(|x_chunk| {
+                    let rows = x_chunk.len() / p;
+                    let mut local = 0.0;
+                    for i in 0..rows {
+                        let row = &x_chunk[i * p..(i + 1) * p];
+                        for j in 0..p {
+                            let d = row[j] - means[j];
+                            local += d * d;
+                        }
+                    }
+                    local
+                })
+                .sum(),
         }
-    }
+    } else {
+        let mut var_sum = 0.0;
+        match sample_weight {
+            Some(sw) => {
+                for (i, &w) in sw.iter().enumerate().take(n) {
+                    let row = &x.data[i * p..(i + 1) * p];
+                    let mut s = 0.0;
+                    for j in 0..p {
+                        let d = row[j] - means[j];
+                        s += d * d;
+                    }
+                    var_sum += w * s;
+                }
+            }
+            None => {
+                for i in 0..n {
+                    let row = &x.data[i * p..(i + 1) * p];
+                    for j in 0..p {
+                        let d = row[j] - means[j];
+                        var_sum += d * d;
+                    }
+                }
+            }
+        }
+        var_sum
+    };
+
     var_sum / (w_sum * p as f64)
 }
 
-/// Compute nearest center labels and squared distances using N3 (`pairwise_l2_sq`) + N4 (`row_argmin`),
-/// chunking rows when `n_samples * n_clusters` exceeds `MAX_DIST_ELEMENTS`.
+#[inline(always)]
+fn sq_dist_row(a: &[f64], b: &[f64]) -> f64 {
+    let p = a.len();
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    let mut j = 0;
+    while j + 4 <= p {
+        let d0 = a[j] - b[j];
+        let d1 = a[j + 1] - b[j + 1];
+        let d2 = a[j + 2] - b[j + 2];
+        let d3 = a[j + 3] - b[j + 3];
+        s0 += d0 * d0;
+        s1 += d1 * d1;
+        s2 += d2 * d2;
+        s3 += d3 * d3;
+        j += 4;
+    }
+    let mut dist = (s0 + s1) + (s2 + s3);
+    while j < p {
+        let d = a[j] - b[j];
+        dist += d * d;
+        j += 1;
+    }
+    dist
+}
+
+#[inline(always)]
+fn nearest_center_row(row: &[f64], centers_data: &[f64], k: usize, p: usize) -> (usize, f64) {
+    let mut best_k = 0usize;
+    let mut best_dist = f64::INFINITY;
+    let mut c = 0usize;
+
+    while c + 4 <= k {
+        let c0 = &centers_data[c * p..(c + 1) * p];
+        let c1 = &centers_data[(c + 1) * p..(c + 2) * p];
+        let c2 = &centers_data[(c + 2) * p..(c + 3) * p];
+        let c3 = &centers_data[(c + 3) * p..(c + 4) * p];
+        let mut d0 = 0.0;
+        let mut d1 = 0.0;
+        let mut d2 = 0.0;
+        let mut d3 = 0.0;
+        for j in 0..p {
+            let xj = row[j];
+            let t0 = xj - c0[j];
+            let t1 = xj - c1[j];
+            let t2 = xj - c2[j];
+            let t3 = xj - c3[j];
+            d0 += t0 * t0;
+            d1 += t1 * t1;
+            d2 += t2 * t2;
+            d3 += t3 * t3;
+        }
+        if d0 < best_dist {
+            best_dist = d0;
+            best_k = c;
+        }
+        if d1 < best_dist {
+            best_dist = d1;
+            best_k = c + 1;
+        }
+        if d2 < best_dist {
+            best_dist = d2;
+            best_k = c + 2;
+        }
+        if d3 < best_dist {
+            best_dist = d3;
+            best_k = c + 3;
+        }
+        c += 4;
+    }
+
+    while c < k {
+        let c_row = &centers_data[c * p..(c + 1) * p];
+        let d = sq_dist_row(row, c_row);
+        if d < best_dist {
+            best_dist = d;
+            best_k = c;
+        }
+        c += 1;
+    }
+
+    (best_k, best_dist)
+}
+
+#[inline(always)]
+fn should_use_fused_cpu(backend: &Backend<'_>, n: usize, k: usize, p: usize) -> bool {
+    matches!(backend, Backend::Cpu)
+        || n.saturating_mul(k).saturating_mul(p) < FUSED_CPU_OPS_THRESHOLD
+        || n.saturating_mul(k) < MAX_DIST_ELEMENTS
+}
+
+/// Zero-allocation fused nearest-center kernel filling pre-allocated label and squared-distance buffers.
+fn cpu_assign_labels_fused_into(
+    x: &Matrix,
+    centers: &Matrix,
+    labels: &mut [usize],
+    sq_dists: &mut [f64],
+) {
+    let n = x.rows;
+    let p = x.cols;
+    let k = centers.rows;
+    let centers_data = &centers.data;
+
+    if n < PAR_ROW_THRESHOLD {
+        for i in 0..n {
+            let row = &x.data[i * p..(i + 1) * p];
+            let (best_k, best_dist) = nearest_center_row(row, centers_data, k, p);
+            labels[i] = best_k;
+            sq_dists[i] = best_dist;
+        }
+    } else {
+        const CHUNK_ROWS: usize = 1024;
+        labels
+            .par_chunks_mut(CHUNK_ROWS)
+            .zip(sq_dists.par_chunks_mut(CHUNK_ROWS))
+            .zip(x.data.par_chunks(CHUNK_ROWS * p))
+            .for_each(|((lbl_chunk, dist_chunk), x_chunk)| {
+                let rows = lbl_chunk.len();
+                for i in 0..rows {
+                    let row = &x_chunk[i * p..(i + 1) * p];
+                    let (best_k, best_dist) = nearest_center_row(row, centers_data, k, p);
+                    lbl_chunk[i] = best_k;
+                    dist_chunk[i] = best_dist;
+                }
+            });
+    }
+}
+
+/// Zero-allocation fused nearest-center kernel returning `(labels, sq_dists)`.
+fn cpu_assign_labels_fused(x: &Matrix, centers: &Matrix) -> (Vec<usize>, Vec<f64>) {
+    let mut labels = vec![0usize; x.rows];
+    let mut sq_dists = vec![0.0f64; x.rows];
+    cpu_assign_labels_fused_into(x, centers, &mut labels, &mut sq_dists);
+    (labels, sq_dists)
+}
+
+/// Zero-allocation fused nearest-center label-only kernel for `predict`.
+fn cpu_assign_labels_only(x: &Matrix, centers: &Matrix) -> Vec<usize> {
+    let n = x.rows;
+    let p = x.cols;
+    let k = centers.rows;
+    let centers_data = &centers.data;
+    let mut labels = vec![0usize; n];
+
+    if n < PAR_ROW_THRESHOLD {
+        for (i, lbl) in labels.iter_mut().enumerate().take(n) {
+            let row = &x.data[i * p..(i + 1) * p];
+            let (best_k, _) = nearest_center_row(row, centers_data, k, p);
+            *lbl = best_k;
+        }
+    } else {
+        const CHUNK_ROWS: usize = 1024;
+        labels
+            .par_chunks_mut(CHUNK_ROWS)
+            .zip(x.data.par_chunks(CHUNK_ROWS * p))
+            .for_each(|(lbl_chunk, x_chunk)| {
+                for (i, lbl) in lbl_chunk.iter_mut().enumerate() {
+                    let row = &x_chunk[i * p..(i + 1) * p];
+                    let (best_k, _) = nearest_center_row(row, centers_data, k, p);
+                    *lbl = best_k;
+                }
+            });
+    }
+    labels
+}
+
+/// Fused Lloyd assignment + parallel centroid accumulation in a single memory pass over `X`.
+fn cpu_lloyd_step_fused(
+    x: &Matrix,
+    centers: &Matrix,
+    sw: Option<&[f64]>,
+    labels: &mut [usize],
+    sq_dists: &mut [f64],
+) -> (Vec<f64>, Vec<f64>) {
+    let n = x.rows;
+    let p = x.cols;
+    let k = centers.rows;
+    let centers_data = &centers.data;
+
+    if n < PAR_ROW_THRESHOLD {
+        let mut new_centers = vec![0.0f64; k * p];
+        let mut cluster_weights = vec![0.0f64; k];
+        match sw {
+            Some(weights) => {
+                for (i, &w) in weights.iter().enumerate().take(n) {
+                    let row = &x.data[i * p..(i + 1) * p];
+                    let (best_k, best_dist) = nearest_center_row(row, centers_data, k, p);
+                    labels[i] = best_k;
+                    sq_dists[i] = best_dist;
+                    cluster_weights[best_k] += w;
+                    let dst = &mut new_centers[best_k * p..(best_k + 1) * p];
+                    for j in 0..p {
+                        dst[j] += w * row[j];
+                    }
+                }
+            }
+            None => {
+                for i in 0..n {
+                    let row = &x.data[i * p..(i + 1) * p];
+                    let (best_k, best_dist) = nearest_center_row(row, centers_data, k, p);
+                    labels[i] = best_k;
+                    sq_dists[i] = best_dist;
+                    cluster_weights[best_k] += 1.0;
+                    let dst = &mut new_centers[best_k * p..(best_k + 1) * p];
+                    for j in 0..p {
+                        dst[j] += row[j];
+                    }
+                }
+            }
+        }
+        return (new_centers, cluster_weights);
+    }
+
+    const CHUNK_ROWS: usize = 2048;
+    match sw {
+        Some(weights) => labels
+            .par_chunks_mut(CHUNK_ROWS)
+            .zip(sq_dists.par_chunks_mut(CHUNK_ROWS))
+            .zip(x.data.par_chunks(CHUNK_ROWS * p))
+            .zip(weights.par_chunks(CHUNK_ROWS))
+            .fold(
+                || (vec![0.0f64; k * p], vec![0.0f64; k]),
+                |(mut local_c, mut local_w), (((lbl_chunk, dist_chunk), x_chunk), w_chunk)| {
+                    for (i, &w) in w_chunk.iter().enumerate() {
+                        let row = &x_chunk[i * p..(i + 1) * p];
+                        let (best_k, best_dist) = nearest_center_row(row, centers_data, k, p);
+                        lbl_chunk[i] = best_k;
+                        dist_chunk[i] = best_dist;
+                        local_w[best_k] += w;
+                        let dst = &mut local_c[best_k * p..(best_k + 1) * p];
+                        for j in 0..p {
+                            dst[j] += w * row[j];
+                        }
+                    }
+                    (local_c, local_w)
+                },
+            )
+            .reduce(
+                || (vec![0.0f64; k * p], vec![0.0f64; k]),
+                |(mut ac, mut aw), (bc, bw)| {
+                    for idx in 0..ac.len() {
+                        ac[idx] += bc[idx];
+                    }
+                    for idx in 0..aw.len() {
+                        aw[idx] += bw[idx];
+                    }
+                    (ac, aw)
+                },
+            ),
+        None => labels
+            .par_chunks_mut(CHUNK_ROWS)
+            .zip(sq_dists.par_chunks_mut(CHUNK_ROWS))
+            .zip(x.data.par_chunks(CHUNK_ROWS * p))
+            .fold(
+                || (vec![0.0f64; k * p], vec![0.0f64; k]),
+                |(mut local_c, mut local_w), ((lbl_chunk, dist_chunk), x_chunk)| {
+                    let rows = lbl_chunk.len();
+                    for i in 0..rows {
+                        let row = &x_chunk[i * p..(i + 1) * p];
+                        let (best_k, best_dist) = nearest_center_row(row, centers_data, k, p);
+                        lbl_chunk[i] = best_k;
+                        dist_chunk[i] = best_dist;
+                        local_w[best_k] += 1.0;
+                        let dst = &mut local_c[best_k * p..(best_k + 1) * p];
+                        for j in 0..p {
+                            dst[j] += row[j];
+                        }
+                    }
+                    (local_c, local_w)
+                },
+            )
+            .reduce(
+                || (vec![0.0f64; k * p], vec![0.0f64; k]),
+                |(mut ac, mut aw), (bc, bw)| {
+                    for idx in 0..ac.len() {
+                        ac[idx] += bc[idx];
+                    }
+                    for idx in 0..aw.len() {
+                        aw[idx] += bw[idx];
+                    }
+                    (ac, aw)
+                },
+            ),
+    }
+}
+
+/// Parallel centroid accumulation from pre-computed `labels` via `par_chunks(2048)` + thread-local reduction.
+fn accumulate_centers_parallel(
+    x: &Matrix,
+    labels: &[usize],
+    sw: Option<&[f64]>,
+    k: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let n = x.rows;
+    let p = x.cols;
+    if n < PAR_ROW_THRESHOLD {
+        let mut new_centers = vec![0.0f64; k * p];
+        let mut cluster_weights = vec![0.0f64; k];
+        match sw {
+            Some(weights) => {
+                for i in 0..n {
+                    let c = labels[i];
+                    let w = weights[i];
+                    cluster_weights[c] += w;
+                    let row = &x.data[i * p..(i + 1) * p];
+                    let dst = &mut new_centers[c * p..(c + 1) * p];
+                    for j in 0..p {
+                        dst[j] += w * row[j];
+                    }
+                }
+            }
+            None => {
+                for (i, &c) in labels.iter().enumerate().take(n) {
+                    cluster_weights[c] += 1.0;
+                    let row = &x.data[i * p..(i + 1) * p];
+                    let dst = &mut new_centers[c * p..(c + 1) * p];
+                    for j in 0..p {
+                        dst[j] += row[j];
+                    }
+                }
+            }
+        }
+        return (new_centers, cluster_weights);
+    }
+
+    const CHUNK_ROWS: usize = 2048;
+    match sw {
+        Some(weights) => x
+            .data
+            .par_chunks(CHUNK_ROWS * p)
+            .zip(labels.par_chunks(CHUNK_ROWS))
+            .zip(weights.par_chunks(CHUNK_ROWS))
+            .fold(
+                || (vec![0.0f64; k * p], vec![0.0f64; k]),
+                |(mut local_c, mut local_w), ((x_chunk, lbl_chunk), w_chunk)| {
+                    for i in 0..lbl_chunk.len() {
+                        let c = lbl_chunk[i];
+                        let w = w_chunk[i];
+                        local_w[c] += w;
+                        let row = &x_chunk[i * p..(i + 1) * p];
+                        let dst = &mut local_c[c * p..(c + 1) * p];
+                        for j in 0..p {
+                            dst[j] += w * row[j];
+                        }
+                    }
+                    (local_c, local_w)
+                },
+            )
+            .reduce(
+                || (vec![0.0f64; k * p], vec![0.0f64; k]),
+                |(mut ac, mut aw), (bc, bw)| {
+                    for idx in 0..ac.len() {
+                        ac[idx] += bc[idx];
+                    }
+                    for idx in 0..aw.len() {
+                        aw[idx] += bw[idx];
+                    }
+                    (ac, aw)
+                },
+            ),
+        None => x
+            .data
+            .par_chunks(CHUNK_ROWS * p)
+            .zip(labels.par_chunks(CHUNK_ROWS))
+            .fold(
+                || (vec![0.0f64; k * p], vec![0.0f64; k]),
+                |(mut local_c, mut local_w), (x_chunk, lbl_chunk)| {
+                    for (i, &c) in lbl_chunk.iter().enumerate() {
+                        local_w[c] += 1.0;
+                        let row = &x_chunk[i * p..(i + 1) * p];
+                        let dst = &mut local_c[c * p..(c + 1) * p];
+                        for j in 0..p {
+                            dst[j] += row[j];
+                        }
+                    }
+                    (local_c, local_w)
+                },
+            )
+            .reduce(
+                || (vec![0.0f64; k * p], vec![0.0f64; k]),
+                |(mut ac, mut aw), (bc, bw)| {
+                    for idx in 0..ac.len() {
+                        ac[idx] += bc[idx];
+                    }
+                    for idx in 0..aw.len() {
+                        aw[idx] += bw[idx];
+                    }
+                    (ac, aw)
+                },
+            ),
+    }
+}
+
+/// Compute nearest center labels and squared distances into pre-allocated buffers.
+fn assign_labels_and_sq_dists_into(
+    backend: &Backend<'_>,
+    x: &Matrix,
+    centers: &Matrix,
+    labels: &mut [usize],
+    sq_dists: &mut [f64],
+) -> OchreResult<()> {
+    let n = x.rows;
+    let k = centers.rows;
+    let p = x.cols;
+    if should_use_fused_cpu(backend, n, k, p) {
+        cpu_assign_labels_fused_into(x, centers, labels, sq_dists);
+        return Ok(());
+    }
+
+    let (l, d) = assign_labels_and_sq_dists(backend, x, centers)?;
+    labels.copy_from_slice(&l);
+    sq_dists.copy_from_slice(&d);
+    Ok(())
+}
+
+/// Compute nearest center labels and squared distances using fused CPU kernel or
+/// Backend Primitives N3 (`pairwise_l2_sq`) + N4 (`row_argmin`), chunking large inputs.
 fn assign_labels_and_sq_dists(
     backend: &Backend<'_>,
     x: &Matrix,
@@ -192,6 +753,10 @@ fn assign_labels_and_sq_dists(
     let n = x.rows;
     let k = centers.rows;
     let p = x.cols;
+    if should_use_fused_cpu(backend, n, k, p) {
+        return Ok(cpu_assign_labels_fused(x, centers));
+    }
+
     if n.saturating_mul(k) <= MAX_DIST_ELEMENTS {
         let dist = backend.pairwise_l2_sq(x, centers)?;
         return backend.row_argmin(&dist);
@@ -215,6 +780,21 @@ fn assign_labels_and_sq_dists(
     Ok((all_labels, all_dists))
 }
 
+fn assign_labels_only(
+    backend: &Backend<'_>,
+    x: &Matrix,
+    centers: &Matrix,
+) -> OchreResult<Vec<usize>> {
+    let n = x.rows;
+    let k = centers.rows;
+    let p = x.cols;
+    if should_use_fused_cpu(backend, n, k, p) {
+        return Ok(cpu_assign_labels_only(x, centers));
+    }
+    let (labels, _) = assign_labels_and_sq_dists(backend, x, centers)?;
+    Ok(labels)
+}
+
 /// Compute Euclidean distance matrix `sqrt(pairwise_l2_sq(X, centers))`, chunked for large inputs.
 fn compute_euclidean_transform(
     backend: &Backend<'_>,
@@ -224,6 +804,37 @@ fn compute_euclidean_transform(
     let n = x.rows;
     let k = centers.rows;
     let p = x.cols;
+    if should_use_fused_cpu(backend, n, k, p) {
+        let mut out = vec![0.0f64; n * k];
+        let centers_data = &centers.data;
+        if n < PAR_ROW_THRESHOLD {
+            for i in 0..n {
+                let row = &x.data[i * p..(i + 1) * p];
+                let out_row = &mut out[i * k..(i + 1) * k];
+                for c in 0..k {
+                    let c_row = &centers_data[c * p..(c + 1) * p];
+                    out_row[c] = sq_dist_row(row, c_row).sqrt();
+                }
+            }
+        } else {
+            const CHUNK_ROWS: usize = 1024;
+            out.par_chunks_mut(CHUNK_ROWS * k)
+                .zip(x.data.par_chunks(CHUNK_ROWS * p))
+                .for_each(|(out_chunk, x_chunk)| {
+                    let rows = x_chunk.len() / p;
+                    for i in 0..rows {
+                        let row = &x_chunk[i * p..(i + 1) * p];
+                        let out_row = &mut out_chunk[i * k..(i + 1) * k];
+                        for c in 0..k {
+                            let c_row = &centers_data[c * p..(c + 1) * p];
+                            out_row[c] = sq_dist_row(row, c_row).sqrt();
+                        }
+                    }
+                });
+        }
+        return Matrix::from_vec(n, k, out);
+    }
+
     if n.saturating_mul(k) <= MAX_DIST_ELEMENTS {
         let mut dist = backend.pairwise_l2_sq(x, centers)?;
         for v in &mut dist.data {
@@ -264,8 +875,94 @@ fn sample_weighted_index(weights: &[f64], rng: &mut DeterministicRng) -> usize {
     weights.len() - 1
 }
 
+/// Update `min_sq_dist[i] = min(min_sq_dist[i], ||x_i - center||^2)` and return per-chunk potential sums.
+fn update_min_sq_dist_and_chunk_sums(
+    x: &Matrix,
+    center: &[f64],
+    sample_weight: Option<&[f64]>,
+    min_sq_dist: &mut [f64],
+    is_first: bool,
+) -> (Vec<f64>, f64) {
+    let n = x.rows;
+    let p = x.cols;
+    const CHUNK_ROWS: usize = 2048;
+
+    if n < PAR_ROW_THRESHOLD {
+        let mut total = 0.0;
+        match sample_weight {
+            Some(sw) => {
+                for i in 0..n {
+                    let d = sq_dist_row(&x.data[i * p..(i + 1) * p], center);
+                    let m = if is_first || d < min_sq_dist[i] {
+                        min_sq_dist[i] = d;
+                        d
+                    } else {
+                        min_sq_dist[i]
+                    };
+                    total += m * sw[i];
+                }
+            }
+            None => {
+                for (i, m_slot) in min_sq_dist.iter_mut().enumerate().take(n) {
+                    let d = sq_dist_row(&x.data[i * p..(i + 1) * p], center);
+                    let m = if is_first || d < *m_slot {
+                        *m_slot = d;
+                        d
+                    } else {
+                        *m_slot
+                    };
+                    total += m;
+                }
+            }
+        }
+        return (vec![total], total);
+    }
+
+    let chunk_sums: Vec<f64> = match sample_weight {
+        Some(sw) => min_sq_dist
+            .par_chunks_mut(CHUNK_ROWS)
+            .zip(x.data.par_chunks(CHUNK_ROWS * p))
+            .zip(sw.par_chunks(CHUNK_ROWS))
+            .map(|((m_chunk, x_chunk), w_chunk)| {
+                let mut sum = 0.0;
+                for i in 0..m_chunk.len() {
+                    let d = sq_dist_row(&x_chunk[i * p..(i + 1) * p], center);
+                    let m = if is_first || d < m_chunk[i] {
+                        m_chunk[i] = d;
+                        d
+                    } else {
+                        m_chunk[i]
+                    };
+                    sum += m * w_chunk[i];
+                }
+                sum
+            })
+            .collect(),
+        None => min_sq_dist
+            .par_chunks_mut(CHUNK_ROWS)
+            .zip(x.data.par_chunks(CHUNK_ROWS * p))
+            .map(|(m_chunk, x_chunk)| {
+                let mut sum = 0.0;
+                for i in 0..m_chunk.len() {
+                    let d = sq_dist_row(&x_chunk[i * p..(i + 1) * p], center);
+                    let m = if is_first || d < m_chunk[i] {
+                        m_chunk[i] = d;
+                        d
+                    } else {
+                        m_chunk[i]
+                    };
+                    sum += m;
+                }
+                sum
+            })
+            .collect(),
+    };
+    let total: f64 = chunk_sums.iter().sum();
+    (chunk_sums, total)
+}
+
 fn init_centers_kmeans_pp(
-    backend: &Backend<'_>,
+    _backend: &Backend<'_>,
     x: &Matrix,
     sample_weight: Option<&[f64]>,
     n_clusters: usize,
@@ -285,30 +982,49 @@ fn init_centers_kmeans_pp(
         return Matrix::from_vec(n_clusters, p, centers_data);
     }
 
-    let first_mat = Matrix::from_slice(1, p, &centers_data[0..p])?;
-    let mut min_sq_dist = backend.pairwise_l2_sq(x, &first_mat)?.data;
-    let mut potentials = vec![0.0; n];
+    let mut min_sq_dist = vec![0.0f64; n];
+    let (mut chunk_sums, mut total) = update_min_sq_dist_and_chunk_sums(
+        x,
+        &centers_data[0..p],
+        sample_weight,
+        &mut min_sq_dist,
+        true,
+    );
+
+    const CHUNK_ROWS: usize = 2048;
 
     for c in 1..n_clusters {
-        let mut total = 0.0;
-        for i in 0..n {
-            let w = sample_weight.map_or(1.0, |sw| sw[i]);
-            let pot = min_sq_dist[i].max(0.0) * w;
-            potentials[i] = pot;
-            total += pot;
-        }
-
         let next_idx = if total <= 0.0 || !total.is_finite() {
             rng.gen_range(n)
         } else {
             let target = rng.next_f64() * total;
             let mut cum = 0.0;
             let mut chosen = n - 1;
-            for (i, &pot) in potentials.iter().enumerate() {
-                cum += pot;
-                if cum >= target {
-                    chosen = i;
-                    break;
+            if chunk_sums.len() == 1 {
+                for i in 0..n {
+                    let pot = min_sq_dist[i] * sample_weight.map_or(1.0, |sw| sw[i]);
+                    cum += pot;
+                    if cum >= target {
+                        chosen = i;
+                        break;
+                    }
+                }
+            } else {
+                for (chunk_idx, &cs) in chunk_sums.iter().enumerate() {
+                    if cum + cs >= target {
+                        let start = chunk_idx * CHUNK_ROWS;
+                        let end = (start + CHUNK_ROWS).min(n);
+                        for i in start..end {
+                            let pot = min_sq_dist[i] * sample_weight.map_or(1.0, |sw| sw[i]);
+                            cum += pot;
+                            if cum >= target {
+                                chosen = i;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                    cum += cs;
                 }
             }
             chosen
@@ -317,13 +1033,15 @@ fn init_centers_kmeans_pp(
         centers_data[c * p..(c + 1) * p].copy_from_slice(&x.data[next_idx * p..(next_idx + 1) * p]);
 
         if c + 1 < n_clusters {
-            let new_c = Matrix::from_slice(1, p, &centers_data[c * p..(c + 1) * p])?;
-            let d_new = backend.pairwise_l2_sq(x, &new_c)?.data;
-            for i in 0..n {
-                if d_new[i] < min_sq_dist[i] {
-                    min_sq_dist[i] = d_new[i];
-                }
-            }
+            let (cs, tot) = update_min_sq_dist_and_chunk_sums(
+                x,
+                &centers_data[c * p..(c + 1) * p],
+                sample_weight,
+                &mut min_sq_dist,
+                false,
+            );
+            chunk_sums = cs;
+            total = tot;
         }
     }
 
@@ -369,13 +1087,32 @@ fn init_centers(
 }
 
 fn compute_weighted_inertia(sq_dists: &[f64], sample_weight: Option<&[f64]>) -> f64 {
-    match sample_weight {
-        Some(sw) => sq_dists
-            .iter()
-            .zip(sw.iter())
-            .map(|(&d, &w)| d.max(0.0) * w)
-            .sum(),
-        None => sq_dists.iter().map(|&d| d.max(0.0)).sum(),
+    if sq_dists.len() >= 16_384 {
+        match sample_weight {
+            Some(sw) => sq_dists
+                .par_chunks(4096)
+                .zip(sw.par_chunks(4096))
+                .map(|(dc, wc)| {
+                    dc.iter()
+                        .zip(wc.iter())
+                        .map(|(&d, &w)| d.max(0.0) * w)
+                        .sum::<f64>()
+                })
+                .sum(),
+            None => sq_dists
+                .par_chunks(4096)
+                .map(|dc| dc.iter().map(|&d| d.max(0.0)).sum::<f64>())
+                .sum(),
+        }
+    } else {
+        match sample_weight {
+            Some(sw) => sq_dists
+                .iter()
+                .zip(sw.iter())
+                .map(|(&d, &w)| d.max(0.0) * w)
+                .sum(),
+            None => sq_dists.iter().map(|&d| d.max(0.0)).sum(),
+        }
     }
 }
 
@@ -444,39 +1181,44 @@ impl KMeans {
         }
 
         let backend = get_backend(&self.device_type);
-        let mean_var = compute_mean_variance(x, sw);
-        let tol_scaled = self.tol * mean_var;
+        let tol_scaled = if self.tol > 0.0 {
+            self.tol * compute_mean_variance(x, sw)
+        } else {
+            0.0
+        };
         let mut rng = DeterministicRng::new(self.random_state);
 
         let n = x.rows;
         let p = x.cols;
         let k = self.n_clusters;
+        let use_fused = should_use_fused_cpu(&backend, n, k, p);
 
         let mut best_centers: Option<Matrix> = None;
         let mut best_labels: Option<Vec<usize>> = None;
         let mut best_inertia = f64::INFINITY;
         let mut best_n_iter = 0usize;
 
+        let mut labels = vec![0usize; n];
+        let mut sq_dists = vec![0.0f64; n];
+
         for _run in 0..self.n_init {
             let mut centers = init_centers(&backend, x, sw, k, &self.init, &mut rng)?;
             let mut run_iters = 0usize;
+            let mut last_shift_sq = f64::INFINITY;
 
             for iter in 0..self.max_iter {
-                let (mut labels, mut sq_dists) = assign_labels_and_sq_dists(&backend, x, &centers)?;
-
-                let mut new_centers_data = vec![0.0; k * p];
-                let mut cluster_weights = vec![0.0; k];
-
-                for i in 0..n {
-                    let c = labels[i];
-                    let w = sw.map_or(1.0, |weights| weights[i]);
-                    cluster_weights[c] += w;
-                    let row = &x.data[i * p..(i + 1) * p];
-                    let dst = &mut new_centers_data[c * p..(c + 1) * p];
-                    for j in 0..p {
-                        dst[j] += w * row[j];
-                    }
-                }
+                let (mut new_centers_data, mut cluster_weights) = if use_fused {
+                    cpu_lloyd_step_fused(x, &centers, sw, &mut labels, &mut sq_dists)
+                } else {
+                    assign_labels_and_sq_dists_into(
+                        &backend,
+                        x,
+                        &centers,
+                        &mut labels,
+                        &mut sq_dists,
+                    )?;
+                    accumulate_centers_parallel(x, &labels, sw, k)
+                };
 
                 // Reassign empty clusters using the farthest samples
                 for c in 0..k {
@@ -529,19 +1271,22 @@ impl KMeans {
 
                 centers = Matrix::from_vec(k, p, new_centers_data)?;
                 run_iters = iter + 1;
+                last_shift_sq = shift_sq;
 
                 if shift_sq <= tol_scaled {
                     break;
                 }
             }
 
-            let (final_labels, final_sq_dists) = assign_labels_and_sq_dists(&backend, x, &centers)?;
-            let inertia = compute_weighted_inertia(&final_sq_dists, sw);
+            if last_shift_sq > 0.0 {
+                assign_labels_and_sq_dists_into(&backend, x, &centers, &mut labels, &mut sq_dists)?;
+            }
+            let inertia = compute_weighted_inertia(&sq_dists, sw);
 
             if inertia < best_inertia || best_centers.is_none() {
                 best_inertia = inertia;
                 best_centers = Some(centers);
-                best_labels = Some(final_labels);
+                best_labels = Some(labels.clone());
                 best_n_iter = run_iters;
             }
         }
@@ -563,8 +1308,7 @@ impl KMeans {
             .as_ref()
             .ok_or(OchreError::NotFitted)?;
         let backend = get_backend(&self.device_type);
-        let (labels, _) = assign_labels_and_sq_dists(&backend, x, centers)?;
-        Ok(labels)
+        assign_labels_only(&backend, x, centers)
     }
 
     pub fn fit_predict(
@@ -741,7 +1485,8 @@ impl MiniBatchKMeans {
         Ok(())
     }
 
-    fn minibatch_step(
+    #[allow(clippy::too_many_arguments)]
+    fn minibatch_step_into(
         backend: &Backend<'_>,
         x_batch: &Matrix,
         w_batch: Option<&[f64]>,
@@ -749,26 +1494,43 @@ impl MiniBatchKMeans {
         counts: &mut [f64],
         reassignment_ratio: f64,
         rng: &mut DeterministicRng,
+        labels: &mut [usize],
+        sq_dists: &mut [f64],
     ) -> OchreResult<f64> {
-        let (labels, mut sq_dists) = assign_labels_and_sq_dists(backend, x_batch, centers)?;
+        assign_labels_and_sq_dists_into(backend, x_batch, centers, labels, sq_dists)?;
         let n = x_batch.rows;
         let p = x_batch.cols;
         let k = centers.rows;
 
-        let batch_inertia = compute_weighted_inertia(&sq_dists, w_batch);
+        let batch_inertia = compute_weighted_inertia(sq_dists, w_batch);
 
-        for i in 0..n {
-            let w = w_batch.map_or(1.0, |sw| sw[i]);
-            if w <= 0.0 {
-                continue;
+        match w_batch {
+            Some(weights) => {
+                for i in 0..n {
+                    let w = weights[i];
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let c = labels[i];
+                    counts[c] += w;
+                    let eta = w / counts[c];
+                    let row = &x_batch.data[i * p..(i + 1) * p];
+                    let center = &mut centers.data[c * p..(c + 1) * p];
+                    for j in 0..p {
+                        center[j] += eta * (row[j] - center[j]);
+                    }
+                }
             }
-            let c = labels[i];
-            counts[c] += w;
-            let eta = w / counts[c];
-            let row = &x_batch.data[i * p..(i + 1) * p];
-            let center = &mut centers.data[c * p..(c + 1) * p];
-            for j in 0..p {
-                center[j] += eta * (row[j] - center[j]);
+            None => {
+                for (i, &c) in labels.iter().enumerate().take(n) {
+                    counts[c] += 1.0;
+                    let eta = 1.0 / counts[c];
+                    let row = &x_batch.data[i * p..(i + 1) * p];
+                    let center = &mut centers.data[c * p..(c + 1) * p];
+                    for j in 0..p {
+                        center[j] += eta * (row[j] - center[j]);
+                    }
+                }
             }
         }
 
@@ -810,8 +1572,11 @@ impl MiniBatchKMeans {
         }
 
         let backend = get_backend(&self.device_type);
-        let mean_var = compute_mean_variance(x, sw);
-        let tol_scaled = self.tol * mean_var;
+        let tol_scaled = if self.tol > 0.0 {
+            self.tol * compute_mean_variance(x, sw)
+        } else {
+            0.0
+        };
         let mut rng = DeterministicRng::new(self.random_state);
 
         let n = x.rows;
@@ -819,6 +1584,7 @@ impl MiniBatchKMeans {
         let k = self.n_clusters;
         let eff_batch = self.batch_size.min(n).max(1);
         let ewma_alpha = ((2.0 * eff_batch as f64) / (n as f64 + 1.0)).clamp(0.01, 1.0);
+        let init_size = (3 * eff_batch).max(3 * k).min(n);
 
         let mut best_centers: Option<Matrix> = None;
         let mut best_counts: Option<Vec<f64>> = None;
@@ -827,35 +1593,90 @@ impl MiniBatchKMeans {
         let mut best_n_iter = 0usize;
         let mut best_n_steps = 0usize;
 
+        let mut init_mat = if init_size < n {
+            Some(Matrix::zeros(init_size, p))
+        } else {
+            None
+        };
+        let mut init_weights = if init_size < n && sw.is_some() {
+            Some(vec![0.0f64; init_size])
+        } else {
+            None
+        };
+
+        let mut x_batch = Matrix::zeros(eff_batch, p);
+        let mut batch_weights = vec![0.0f64; eff_batch];
+        let mut batch_labels = vec![0usize; eff_batch];
+        let mut batch_sq_dists = vec![0.0f64; eff_batch];
+        let mut full_labels = vec![0usize; n];
+        let mut full_sq_dists = vec![0.0f64; n];
+
         for _run in 0..self.n_init {
-            let mut centers = init_centers(&backend, x, sw, k, &self.init, &mut rng)?;
+            let mut centers = if let Some(ref mut sub_mat) = init_mat {
+                let mut sub_w_sum = 0.0;
+                for b in 0..init_size {
+                    let idx = rng.gen_range(n);
+                    sub_mat.data[b * p..(b + 1) * p]
+                        .copy_from_slice(&x.data[idx * p..(idx + 1) * p]);
+                    if let (Some(weights), Some(sub_w)) = (sw, init_weights.as_mut()) {
+                        let w = weights[idx];
+                        sub_w[b] = w;
+                        sub_w_sum += w;
+                    }
+                }
+                if sw.is_some() && sub_w_sum <= 0.0 {
+                    init_centers(&backend, x, sw, k, &self.init, &mut rng)?
+                } else {
+                    init_centers(
+                        &backend,
+                        sub_mat,
+                        init_weights.as_deref(),
+                        k,
+                        &self.init,
+                        &mut rng,
+                    )?
+                }
+            } else {
+                init_centers(&backend, x, sw, k, &self.init, &mut rng)?
+            };
+
             let mut counts = vec![0.0; k];
             let mut ewma_inertia: Option<f64> = None;
             let mut min_ewma = f64::INFINITY;
             let mut no_improvement = 0usize;
             let mut steps = 0usize;
 
-            let mut batch_data = vec![0.0; eff_batch * p];
-            let mut batch_weights = vec![0.0; eff_batch];
-
             for _step in 0..self.max_iter {
-                let mut w_sum = 0.0;
-                for b in 0..eff_batch {
-                    let idx = rng.gen_range(n);
-                    batch_data[b * p..(b + 1) * p].copy_from_slice(&x.data[idx * p..(idx + 1) * p]);
-                    let w = sw.map_or(1.0, |weights| weights[idx]);
-                    batch_weights[b] = w;
-                    w_sum += w;
-                }
+                let w_sum = match sw {
+                    Some(weights) => {
+                        let mut sum = 0.0;
+                        for (b, bw) in batch_weights.iter_mut().enumerate().take(eff_batch) {
+                            let idx = rng.gen_range(n);
+                            x_batch.data[b * p..(b + 1) * p]
+                                .copy_from_slice(&x.data[idx * p..(idx + 1) * p]);
+                            let w = weights[idx];
+                            *bw = w;
+                            sum += w;
+                        }
+                        sum
+                    }
+                    None => {
+                        for b in 0..eff_batch {
+                            let idx = rng.gen_range(n);
+                            x_batch.data[b * p..(b + 1) * p]
+                                .copy_from_slice(&x.data[idx * p..(idx + 1) * p]);
+                        }
+                        eff_batch as f64
+                    }
+                };
 
-                let x_batch = Matrix::from_slice(eff_batch, p, &batch_data)?;
                 let w_opt = if sw.is_some() {
                     Some(batch_weights.as_slice())
                 } else {
                     None
                 };
 
-                let batch_inertia = Self::minibatch_step(
+                let batch_inertia = Self::minibatch_step_into(
                     &backend,
                     &x_batch,
                     w_opt,
@@ -863,6 +1684,8 @@ impl MiniBatchKMeans {
                     &mut counts,
                     self.reassignment_ratio,
                     &mut rng,
+                    &mut batch_labels,
+                    &mut batch_sq_dists,
                 )?;
                 steps += 1;
 
@@ -888,14 +1711,20 @@ impl MiniBatchKMeans {
                 }
             }
 
-            let (final_labels, final_sq_dists) = assign_labels_and_sq_dists(&backend, x, &centers)?;
-            let inertia = compute_weighted_inertia(&final_sq_dists, sw);
+            assign_labels_and_sq_dists_into(
+                &backend,
+                x,
+                &centers,
+                &mut full_labels,
+                &mut full_sq_dists,
+            )?;
+            let inertia = compute_weighted_inertia(&full_sq_dists, sw);
 
             if inertia < best_inertia || best_centers.is_none() {
                 best_inertia = inertia;
                 best_centers = Some(centers);
                 best_counts = Some(counts);
-                best_labels = Some(final_labels);
+                best_labels = Some(full_labels.clone());
                 best_n_iter = steps.div_ceil((n.div_ceil(eff_batch)).max(1));
                 best_n_steps = steps;
             }
@@ -942,7 +1771,10 @@ impl MiniBatchKMeans {
             .ok_or(OchreError::NotFitted)?;
         let counts = self.counts_.as_mut().ok_or(OchreError::NotFitted)?;
 
-        let _ = Self::minibatch_step(
+        let mut labels = vec![0usize; x.rows];
+        let mut sq_dists = vec![0.0f64; x.rows];
+
+        let _ = Self::minibatch_step_into(
             &backend,
             x,
             sw,
@@ -950,9 +1782,11 @@ impl MiniBatchKMeans {
             counts,
             self.reassignment_ratio,
             &mut rng,
+            &mut labels,
+            &mut sq_dists,
         )?;
 
-        let (labels, sq_dists) = assign_labels_and_sq_dists(&backend, x, centers)?;
+        assign_labels_and_sq_dists_into(&backend, x, centers, &mut labels, &mut sq_dists)?;
         self.labels_ = Some(labels);
         self.inertia_ = Some(compute_weighted_inertia(&sq_dists, sw));
         self.n_steps_ += 1;
@@ -969,8 +1803,7 @@ impl MiniBatchKMeans {
             .as_ref()
             .ok_or(OchreError::NotFitted)?;
         let backend = get_backend(&self.device_type);
-        let (labels, _) = assign_labels_and_sq_dists(&backend, x, centers)?;
-        Ok(labels)
+        assign_labels_only(&backend, x, centers)
     }
 
     pub fn fit_predict(
@@ -1586,5 +2419,87 @@ mod tests {
         let bytes = mbk2.to_bytes();
         let loaded = MiniBatchKMeans::from_bytes(&bytes, Some("auto")).unwrap();
         assert_eq!(loaded.predict(&x).unwrap(), mbk2.predict(&x).unwrap());
+    }
+
+    #[test]
+    fn test_parallel_paths_large_dataset_parity() {
+        let n = 5_000usize;
+        let p = 12usize;
+        let k = 8usize;
+        let mut rng = DeterministicRng::new(Some(12345));
+        let mut data = vec![0.0f64; n * p];
+        let mut weights = vec![0.0f64; n];
+        for i in 0..n {
+            let cluster = i % k;
+            let base = (cluster as f64) * 10.0;
+            weights[i] = 0.5 + (i % 5) as f64 * 0.25;
+            for j in 0..p {
+                data[i * p + j] = base + (j as f64) * 0.1 + (rng.next_f64() - 0.5) * 0.4;
+            }
+        }
+        let x = Matrix::from_vec(n, p, data).unwrap();
+
+        let mut km = KMeans::new(
+            k,
+            "k-means++".to_string(),
+            3,
+            100,
+            1e-4,
+            Some(42),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        let labels = km.fit_predict(&x, None).unwrap();
+        assert_eq!(labels.len(), n);
+        assert_eq!(km.predict(&x).unwrap(), labels);
+        // All samples from the same synthetic cluster should share a label
+        for c in 0..k {
+            let expected = labels[c];
+            for i in (c..n).step_by(k) {
+                assert_eq!(labels[i], expected);
+            }
+        }
+        let dists = km.transform(&x).unwrap();
+        assert_eq!(dists.rows, n);
+        assert_eq!(dists.cols, k);
+        assert!((km.score(&x, None).unwrap() + km.inertia_.unwrap()).abs() < 1e-9);
+
+        // Weighted parallel KMeans
+        let mut km_w = KMeans::new(
+            k,
+            "k-means++".to_string(),
+            2,
+            100,
+            1e-4,
+            Some(42),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        km_w.fit(&x, Some(&weights)).unwrap();
+        assert!((km_w.score(&x, Some(&weights)).unwrap() + km_w.inertia_.unwrap()).abs() < 1e-9);
+
+        // Parallel MiniBatchKMeans with subsampled init
+        let mut mbk = MiniBatchKMeans::new(
+            k,
+            "k-means++".to_string(),
+            100,
+            512,
+            0.0,
+            10,
+            3,
+            0.01,
+            Some(42),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        let mb_labels = mbk.fit_predict(&x, None).unwrap();
+        assert_eq!(mb_labels.len(), n);
+        assert_eq!(mbk.predict(&x).unwrap(), mb_labels);
+        for c in 0..k {
+            let expected = mb_labels[c];
+            for i in (c..n).step_by(k) {
+                assert_eq!(mb_labels[i], expected);
+            }
+        }
     }
 }
