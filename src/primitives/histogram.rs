@@ -10,6 +10,8 @@ use rayon::prelude::*;
 #[derive(Clone, Debug)]
 pub struct BinnedMatrix {
     pub data: Vec<u8>,
+    /// Feature-major layout: `col_data[f * rows + r]`.
+    pub col_data: Vec<u8>,
     pub rows: usize,
     pub cols: usize,
     pub num_bins: usize,
@@ -38,8 +40,10 @@ pub struct HistogramSplit {
     pub left_count: u32,
 }
 
+const MAX_QUANTILE_SAMPLES: usize = 200_000;
+
 fn compute_feature_edges(col_vals: &mut [f64], max_bins: usize) -> Vec<f64> {
-    col_vals.sort_by(|a, b| a.total_cmp(b));
+    col_vals.sort_unstable_by(|a, b| a.total_cmp(b));
     let n = col_vals.len();
     if n <= 1 || max_bins <= 1 {
         return Vec::new();
@@ -74,12 +78,20 @@ pub fn cpu_quantize_features(x: &Matrix, max_bins: usize) -> OchreResult<BinnedM
 
     let rows = x.rows;
     let cols = x.cols;
+    let sample_n = rows.min(MAX_QUANTILE_SAMPLES);
     let bin_edges: Vec<Vec<f64>> = (0..cols)
         .into_par_iter()
         .map(|c| {
-            let mut col = Vec::with_capacity(rows);
-            for r in 0..rows {
-                col.push(x.data[r * cols + c]);
+            let mut col = Vec::with_capacity(sample_n);
+            if sample_n == rows {
+                for r in 0..rows {
+                    col.push(x.data[r * cols + c]);
+                }
+            } else {
+                for i in 0..sample_n {
+                    let r = (i * rows) / sample_n;
+                    col.push(x.data[r * cols + c]);
+                }
             }
             compute_feature_edges(&mut col, max_bins)
         })
@@ -96,13 +108,45 @@ pub fn cpu_quantize_features(x: &Matrix, max_bins: usize) -> OchreResult<BinnedM
             }
         });
 
+    let mut col_data = vec![0u8; rows * cols];
+    col_data
+        .par_chunks_exact_mut(rows)
+        .enumerate()
+        .for_each(|(c, col_dst)| {
+            for (r, dst) in col_dst.iter_mut().enumerate() {
+                *dst = data[r * cols + c];
+            }
+        });
+
     Ok(BinnedMatrix {
         data,
+        col_data,
         rows,
         cols,
         num_bins: max_bins,
         bin_edges,
     })
+}
+
+#[inline]
+fn accumulate_feature_hist(
+    col: &[u8],
+    sample_indices: &[u32],
+    grad: &[f64],
+    hess: &[f64],
+    hist: &mut [GradHessBin],
+) {
+    let num_bins = hist.len();
+    for &idx in sample_indices {
+        let r = idx as usize;
+        let b = col[r] as usize;
+        if b < num_bins {
+            let cell = &mut hist[b];
+            cell.sum_grad += grad[r];
+            cell.sum_hess += hess[r];
+            cell.count += 1;
+        }
+    }
 }
 
 /// Accumulate `(sum_grad, sum_hess, count)` histograms over `sample_indices` on CPU.
@@ -119,48 +163,26 @@ pub fn cpu_batched_histogram_grad(
         });
     }
 
-    let total_bins = binned.cols * binned.num_bins;
+    let rows = binned.rows;
     let cols = binned.cols;
     let num_bins = binned.num_bins;
+    let mut out = vec![GradHessBin::default(); cols * num_bins];
 
-    let accumulate_chunk = |indices: &[u32]| -> Vec<GradHessBin> {
-        let mut local = vec![GradHessBin::default(); total_bins];
-        for &idx in indices {
-            let r = idx as usize;
-            let g = grad[r];
-            let h = hess[r];
-            let row = &binned.data[r * cols..(r + 1) * cols];
-            for c in 0..cols {
-                let b = row[c] as usize;
-                let cell = &mut local[c * num_bins + b];
-                cell.sum_grad += g;
-                cell.sum_hess += h;
-                cell.count += 1;
-            }
+    if sample_indices.len() < 1024 {
+        for (f, hist) in out.chunks_exact_mut(num_bins).enumerate() {
+            let col = &binned.col_data[f * rows..(f + 1) * rows];
+            accumulate_feature_hist(col, sample_indices, grad, hess, hist);
         }
-        local
-    };
-
-    if sample_indices.len() < 4096 {
-        return Ok(accumulate_chunk(sample_indices));
+    } else {
+        out.par_chunks_exact_mut(num_bins)
+            .enumerate()
+            .for_each(|(f, hist)| {
+                let col = &binned.col_data[f * rows..(f + 1) * rows];
+                accumulate_feature_hist(col, sample_indices, grad, hess, hist);
+            });
     }
 
-    let merged = sample_indices
-        .par_chunks(2048)
-        .map(accumulate_chunk)
-        .reduce(
-            || vec![GradHessBin::default(); total_bins],
-            |mut acc, part| {
-                for (a, p) in acc.iter_mut().zip(part.iter()) {
-                    a.sum_grad += p.sum_grad;
-                    a.sum_hess += p.sum_hess;
-                    a.count += p.count;
-                }
-                acc
-            },
-        );
-
-    Ok(merged)
+    Ok(out)
 }
 
 /// Subtract child histogram from parent histogram to obtain sibling histogram in `O(P * B)`.

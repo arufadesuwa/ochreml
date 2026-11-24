@@ -142,10 +142,77 @@ impl ArenaNode {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct FlatHgbNode {
+    pub feature_index: u32,
+    pub left: u32,
+    pub right: u32,
+    pub value_or_threshold: f64,
+}
+
+fn flatten_hgb_tree(node: &HgbNode, out: &mut Vec<FlatHgbNode>) -> usize {
+    let idx = out.len();
+    match node {
+        HgbNode::Leaf { value } => {
+            out.push(FlatHgbNode {
+                feature_index: 0,
+                left: 0,
+                right: u32::MAX,
+                value_or_threshold: *value,
+            });
+        }
+        HgbNode::Internal {
+            feature_index,
+            threshold,
+            left,
+            right,
+        } => {
+            out.push(FlatHgbNode {
+                feature_index: *feature_index as u32,
+                left: 0,
+                right: 0,
+                value_or_threshold: *threshold,
+            });
+            let left_idx = flatten_hgb_tree(left, out);
+            let right_idx = flatten_hgb_tree(right, out);
+            out[idx].left = left_idx as u32;
+            out[idx].right = right_idx as u32;
+        }
+    }
+    idx
+}
+
+fn build_flat_hgb_forest(trees: &[HgbNode]) -> (Vec<FlatHgbNode>, Vec<usize>) {
+    let mut nodes = Vec::with_capacity(trees.len() * 64);
+    let mut roots = Vec::with_capacity(trees.len());
+    for tree in trees {
+        let root = flatten_hgb_tree(tree, &mut nodes);
+        roots.push(root);
+    }
+    (nodes, roots)
+}
+
+#[inline]
+fn predict_flat_hgb_tree(nodes: &[FlatHgbNode], root: usize, row: &[f64]) -> f64 {
+    let mut idx = root;
+    loop {
+        let node = nodes[idx];
+        if node.right == u32::MAX {
+            return node.value_or_threshold;
+        }
+        if row[node.feature_index as usize] <= node.value_or_threshold {
+            idx = node.left as usize;
+        } else {
+            idx = node.right as usize;
+        }
+    }
+}
+
 struct SplitCandidate {
     node_idx: usize,
     depth: usize,
-    sample_indices: Vec<u32>,
+    start: usize,
+    end: usize,
     hist: Vec<GradHessBin>,
     sum_grad: f64,
     sum_hess: f64,
@@ -345,11 +412,13 @@ fn build_hgb_tree(
     hess: &[f64],
     cfg: &TreeBuildConfig,
     raw: &mut [f64],
+    sample_indices: &mut [u32],
     abs_loss_targets: Option<(&[f64], &[f64])>,
 ) -> OchreResult<HgbNode> {
     let n_rows = binned.rows;
-    let cols = binned.cols;
-    let all_indices: Vec<u32> = (0..n_rows as u32).collect();
+    for (i, slot) in sample_indices.iter_mut().enumerate() {
+        *slot = i as u32;
+    }
     let root_sum_g: f64 = grad.iter().sum();
     let root_sum_h: f64 = hess.iter().sum();
 
@@ -360,7 +429,7 @@ fn build_hgb_tree(
         cfg.learning_rate,
     );
     let mut arena = vec![ArenaNode::Leaf { value: root_val }];
-    let mut leaf_samples: Vec<Option<Vec<u32>>> = vec![Some(all_indices.clone())];
+    let mut leaf_ranges: Vec<Option<(usize, usize)>> = vec![Some((0, n_rows))];
     let mut n_leaves = 1usize;
 
     let can_split_root = cfg.max_leaf_nodes.is_none_or(|m| n_leaves < m)
@@ -368,7 +437,7 @@ fn build_hgb_tree(
         && n_rows >= 2 * cfg.min_samples_leaf;
 
     if can_split_root {
-        let root_hist = backend.batched_histogram_grad(binned, &all_indices, grad, hess)?;
+        let root_hist = backend.batched_histogram_grad(binned, sample_indices, grad, hess)?;
         if let Some(root_split) = backend.find_best_histogram_split(
             binned,
             &root_hist,
@@ -380,7 +449,8 @@ fn build_hgb_tree(
             heap.push(SplitCandidate {
                 node_idx: 0,
                 depth: 0,
-                sample_indices: all_indices,
+                start: 0,
+                end: n_rows,
                 hist: root_hist,
                 sum_grad: root_sum_g,
                 sum_hess: root_sum_h,
@@ -397,27 +467,31 @@ fn build_hgb_tree(
 
                 let feat = cand.split.feature_idx;
                 let bin_thresh = cand.split.bin_idx as u8;
-                let mut left_indices = Vec::with_capacity(cand.sample_indices.len() / 2);
-                let mut right_indices = Vec::with_capacity(cand.sample_indices.len() / 2);
-                for &idx in &cand.sample_indices {
-                    if binned.data[idx as usize * cols + feat] <= bin_thresh {
-                        left_indices.push(idx);
+                let col = &binned.col_data[feat * n_rows..(feat + 1) * n_rows];
+                let slice = &mut sample_indices[cand.start..cand.end];
+                let mut lo = 0usize;
+                let mut hi = slice.len();
+                while lo < hi {
+                    if col[slice[lo] as usize] <= bin_thresh {
+                        lo += 1;
                     } else {
-                        right_indices.push(idx);
+                        hi -= 1;
+                        slice.swap(lo, hi);
                     }
                 }
+                let left_len = lo;
+                let right_len = slice.len() - left_len;
 
-                if left_indices.len() < cfg.min_samples_leaf
-                    || right_indices.len() < cfg.min_samples_leaf
-                {
+                if left_len < cfg.min_samples_leaf || right_len < cfg.min_samples_leaf {
                     continue;
                 }
 
-                let left_is_smaller = left_indices.len() <= right_indices.len();
+                let mid = cand.start + left_len;
+                let left_is_smaller = left_len <= right_len;
                 let small_idx = if left_is_smaller {
-                    &left_indices
+                    &sample_indices[cand.start..mid]
                 } else {
-                    &right_indices
+                    &sample_indices[mid..cand.end]
                 };
                 let small_hist = backend.batched_histogram_grad(binned, small_idx, grad, hess)?;
                 let large_hist = subtract_histogram(&cand.hist, &small_hist)?;
@@ -449,14 +523,15 @@ fn build_hgb_tree(
                     right: right_node_idx,
                 };
 
-                leaf_samples[cand.node_idx] = None;
+                leaf_ranges[cand.node_idx] = None;
+                leaf_ranges.push(Some((cand.start, mid)));
+                leaf_ranges.push(Some((mid, cand.end)));
+
                 let child_depth = cand.depth + 1;
                 let can_expand_depth = cfg.max_depth.is_none_or(|md| child_depth < md);
 
-                let left_can_split =
-                    can_expand_depth && left_indices.len() >= 2 * cfg.min_samples_leaf;
-                let right_can_split =
-                    can_expand_depth && right_indices.len() >= 2 * cfg.min_samples_leaf;
+                let left_can_split = can_expand_depth && left_len >= 2 * cfg.min_samples_leaf;
+                let right_can_split = can_expand_depth && right_len >= 2 * cfg.min_samples_leaf;
 
                 if left_can_split
                     && let Some(lsplit) = backend.find_best_histogram_split(
@@ -467,18 +542,16 @@ fn build_hgb_tree(
                     )?
                     && lsplit.gain > 1e-12
                 {
-                    leaf_samples.push(Some(left_indices.clone()));
                     heap.push(SplitCandidate {
                         node_idx: left_node_idx,
                         depth: child_depth,
-                        sample_indices: left_indices,
+                        start: cand.start,
+                        end: mid,
                         hist: left_hist,
                         sum_grad: left_g,
                         sum_hess: left_h,
                         split: lsplit,
                     });
-                } else {
-                    leaf_samples.push(Some(left_indices));
                 }
 
                 if right_can_split
@@ -490,18 +563,16 @@ fn build_hgb_tree(
                     )?
                     && rsplit.gain > 1e-12
                 {
-                    leaf_samples.push(Some(right_indices.clone()));
                     heap.push(SplitCandidate {
                         node_idx: right_node_idx,
                         depth: child_depth,
-                        sample_indices: right_indices,
+                        start: mid,
+                        end: cand.end,
                         hist: right_hist,
                         sum_grad: right_g,
                         sum_hess: right_h,
                         split: rsplit,
                     });
-                } else {
-                    leaf_samples.push(Some(right_indices));
                 }
 
                 n_leaves += 1;
@@ -509,14 +580,15 @@ fn build_hgb_tree(
         }
     }
 
-    for (node_idx, maybe_indices) in leaf_samples.into_iter().enumerate() {
-        let Some(indices) = maybe_indices else {
+    for (node_idx, maybe_range) in leaf_ranges.into_iter().enumerate() {
+        let Some((start, end)) = maybe_range else {
             continue;
         };
+        let indices = &sample_indices[start..end];
         let leaf_val = if let Some((y, weights)) = abs_loss_targets {
             let mut resids = Vec::with_capacity(indices.len());
             let mut ws = Vec::with_capacity(indices.len());
-            for &idx in &indices {
+            for &idx in indices {
                 let r = idx as usize;
                 resids.push(y[r] - raw[r]);
                 ws.push(weights[r]);
@@ -529,7 +601,7 @@ fn build_hgb_tree(
         } else {
             0.0
         };
-        for &idx in &indices {
+        for &idx in indices {
             raw[idx as usize] += leaf_val;
         }
     }
@@ -537,32 +609,40 @@ fn build_hgb_tree(
     Ok(ArenaNode::into_hgb_node(&arena, 0))
 }
 
-fn predict_trees_sum(trees: &[HgbNode], baseline: f64, x: &Matrix) -> Vec<f64> {
+fn predict_flat_trees_sum(
+    nodes: &[FlatHgbNode],
+    roots: &[usize],
+    baseline: f64,
+    x: &Matrix,
+) -> Vec<f64> {
     let cols = x.cols;
+    let mut out = vec![baseline; x.rows];
     if x.rows >= 256 {
-        (0..x.rows)
-            .into_par_iter()
-            .map(|r| {
-                let row = &x.data[r * cols..(r + 1) * cols];
-                let mut acc = baseline;
-                for tree in trees {
-                    acc += tree.predict_row(row);
+        out.par_chunks_mut(256)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let base_r = chunk_idx * 256;
+                for (offset, dst) in chunk.iter_mut().enumerate() {
+                    let r = base_r + offset;
+                    let row = &x.data[r * cols..(r + 1) * cols];
+                    let mut acc = baseline;
+                    for &root in roots {
+                        acc += predict_flat_hgb_tree(nodes, root, row);
+                    }
+                    *dst = acc;
                 }
-                acc
-            })
-            .collect()
+            });
     } else {
-        let mut out = Vec::with_capacity(x.rows);
-        for r in 0..x.rows {
+        for (r, dst) in out.iter_mut().enumerate() {
             let row = &x.data[r * cols..(r + 1) * cols];
             let mut acc = baseline;
-            for tree in trees {
-                acc += tree.predict_row(row);
+            for &root in roots {
+                acc += predict_flat_hgb_tree(nodes, root, row);
             }
-            out.push(acc);
+            *dst = acc;
         }
-        out
     }
+    out
 }
 
 // =========================================================================
@@ -586,6 +666,8 @@ pub struct HistGradientBoostingRegressor {
     pub n_iter_: usize,
     pub baseline_: f64,
     pub trees_: Vec<HgbNode>,
+    flat_nodes_: Vec<FlatHgbNode>,
+    flat_roots_: Vec<usize>,
 }
 
 impl HistGradientBoostingRegressor {
@@ -635,6 +717,8 @@ impl HistGradientBoostingRegressor {
             n_iter_: 0,
             baseline_: 0.0,
             trees_: Vec::new(),
+            flat_nodes_: Vec::new(),
+            flat_roots_: Vec::new(),
         })
     }
 
@@ -673,6 +757,7 @@ impl HistGradientBoostingRegressor {
         };
 
         let mut trees = Vec::with_capacity(self.max_iter);
+        let mut sample_indices = vec![0u32; x.rows];
         for _ in 0..self.max_iter {
             if is_abs {
                 for i in 0..x.rows {
@@ -698,13 +783,17 @@ impl HistGradientBoostingRegressor {
                 &hess,
                 &cfg,
                 &mut raw,
+                &mut sample_indices,
                 if is_abs { Some((y, &weights)) } else { None },
             )?;
             trees.push(tree);
         }
 
+        let (flat_nodes, flat_roots) = build_flat_hgb_forest(&trees);
         self.baseline_ = baseline;
         self.trees_ = trees;
+        self.flat_nodes_ = flat_nodes;
+        self.flat_roots_ = flat_roots;
         self.n_iter_ = self.trees_.len();
         self.n_features_in_ = Some(x.cols);
         self.device_ = Some(self.device.to_string());
@@ -713,7 +802,12 @@ impl HistGradientBoostingRegressor {
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
         validate_predict_matrix(x, self.n_features_in_)?;
-        Ok(predict_trees_sum(&self.trees_, self.baseline_, x))
+        Ok(predict_flat_trees_sum(
+            &self.flat_nodes_,
+            &self.flat_roots_,
+            self.baseline_,
+            x,
+        ))
     }
 
     pub fn score(&self, x: &Matrix, y: &[f64]) -> OchreResult<f64> {
@@ -770,6 +864,7 @@ impl HistGradientBoostingRegressor {
         for _ in 0..n_trees {
             trees_.push(HgbNode::read_from_reader(&mut r, 0)?);
         }
+        let (flat_nodes_, flat_roots_) = build_flat_hgb_forest(&trees_);
         let (dev, device_) = resolve_loaded_device(saved_device, n_features_in_.is_some(), device)?;
         Ok(Self {
             loss,
@@ -787,6 +882,8 @@ impl HistGradientBoostingRegressor {
             n_iter_,
             baseline_,
             trees_,
+            flat_nodes_,
+            flat_roots_,
         })
     }
 }
@@ -814,6 +911,8 @@ pub struct HistGradientBoostingClassifier {
     /// Trees stored in iteration-major order:
     /// binary -> `max_iter` trees; multiclass -> `max_iter * n_classes` trees.
     pub trees_: Vec<HgbNode>,
+    flat_nodes_: Vec<FlatHgbNode>,
+    flat_roots_: Vec<usize>,
 }
 
 impl HistGradientBoostingClassifier {
@@ -853,6 +952,8 @@ impl HistGradientBoostingClassifier {
             n_iter_: 0,
             baseline_: Vec::new(),
             trees_: Vec::new(),
+            flat_nodes_: Vec::new(),
+            flat_roots_: Vec::new(),
         })
     }
 
@@ -898,6 +999,7 @@ impl HistGradientBoostingClassifier {
         let n_classes = classes.len();
         let total_w: f64 = weights.iter().sum();
 
+        let mut sample_indices = vec![0u32; x.rows];
         if n_classes == 2 {
             let mut w_pos = 0.0;
             for i in 0..x.rows {
@@ -920,12 +1022,24 @@ impl HistGradientBoostingClassifier {
                     grad[i] = weights[i] * (p - yi);
                     hess[i] = weights[i] * (p * (1.0 - p)).max(1e-15);
                 }
-                let tree = build_hgb_tree(&backend, &binned, &grad, &hess, &cfg, &mut raw, None)?;
+                let tree = build_hgb_tree(
+                    &backend,
+                    &binned,
+                    &grad,
+                    &hess,
+                    &cfg,
+                    &mut raw,
+                    &mut sample_indices,
+                    None,
+                )?;
                 trees.push(tree);
             }
 
+            let (flat_nodes, flat_roots) = build_flat_hgb_forest(&trees);
             self.baseline_ = vec![baseline_val];
             self.trees_ = trees;
+            self.flat_nodes_ = flat_nodes;
+            self.flat_roots_ = flat_roots;
         } else {
             let mut class_w = vec![0.0; n_classes];
             for i in 0..x.rows {
@@ -969,14 +1083,25 @@ impl HistGradientBoostingClassifier {
                         grad[i] = weights[i] * (p - yk);
                         hess[i] = weights[i] * (p * (1.0 - p)).max(1e-15);
                     }
-                    let tree =
-                        build_hgb_tree(&backend, &binned, &grad, &hess, &cfg, &mut raws[k], None)?;
+                    let tree = build_hgb_tree(
+                        &backend,
+                        &binned,
+                        &grad,
+                        &hess,
+                        &cfg,
+                        &mut raws[k],
+                        &mut sample_indices,
+                        None,
+                    )?;
                     trees.push(tree);
                 }
             }
 
+            let (flat_nodes, flat_roots) = build_flat_hgb_forest(&trees);
             self.baseline_ = baseline;
             self.trees_ = trees;
+            self.flat_nodes_ = flat_nodes;
+            self.flat_roots_ = flat_roots;
         }
 
         self.classes_ = classes;
@@ -995,20 +1120,46 @@ impl HistGradientBoostingClassifier {
 
         let cols = x.cols;
         if n_classes == 2 {
-            let scores = predict_trees_sum(&self.trees_, self.baseline_[0], x);
+            let scores =
+                predict_flat_trees_sum(&self.flat_nodes_, &self.flat_roots_, self.baseline_[0], x);
             return Matrix::from_vec(x.rows, 1, scores);
         }
 
         let mut data = vec![0.0; x.rows * n_classes];
-        for r in 0..x.rows {
-            let row = &x.data[r * cols..(r + 1) * cols];
-            for k in 0..n_classes {
-                data[r * n_classes + k] = self.baseline_[k];
-            }
-            for iter in 0..self.n_iter_ {
-                let base = iter * n_classes;
-                for k in 0..n_classes {
-                    data[r * n_classes + k] += self.trees_[base + k].predict_row(row);
+        if x.rows >= 256 {
+            data.par_chunks_mut(256 * n_classes)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base_r = chunk_idx * 256;
+                    for (offset, row_out) in chunk.chunks_exact_mut(n_classes).enumerate() {
+                        let r = base_r + offset;
+                        let row = &x.data[r * cols..(r + 1) * cols];
+                        row_out.copy_from_slice(&self.baseline_);
+                        for iter in 0..self.n_iter_ {
+                            let base = iter * n_classes;
+                            for (k, slot) in row_out.iter_mut().enumerate() {
+                                *slot += predict_flat_hgb_tree(
+                                    &self.flat_nodes_,
+                                    self.flat_roots_[base + k],
+                                    row,
+                                );
+                            }
+                        }
+                    }
+                });
+        } else {
+            for (r, row_out) in data.chunks_exact_mut(n_classes).enumerate() {
+                let row = &x.data[r * cols..(r + 1) * cols];
+                row_out.copy_from_slice(&self.baseline_);
+                for iter in 0..self.n_iter_ {
+                    let base = iter * n_classes;
+                    for (k, slot) in row_out.iter_mut().enumerate() {
+                        *slot += predict_flat_hgb_tree(
+                            &self.flat_nodes_,
+                            self.flat_roots_[base + k],
+                            row,
+                        );
+                    }
                 }
             }
         }
@@ -1126,6 +1277,7 @@ impl HistGradientBoostingClassifier {
         for _ in 0..n_trees {
             trees_.push(HgbNode::read_from_reader(&mut r, 0)?);
         }
+        let (flat_nodes_, flat_roots_) = build_flat_hgb_forest(&trees_);
         let (dev, device_) = resolve_loaded_device(saved_device, n_features_in_.is_some(), device)?;
         Ok(Self {
             learning_rate,
@@ -1143,6 +1295,8 @@ impl HistGradientBoostingClassifier {
             n_iter_,
             baseline_,
             trees_,
+            flat_nodes_,
+            flat_roots_,
         })
     }
 }
@@ -1574,5 +1728,64 @@ mod tests {
         let bytes = clf_multi.to_bytes();
         let loaded = HistGradientBoostingClassifier::from_bytes(&bytes, None).unwrap();
         assert_eq!(loaded.predict(&x).unwrap(), clf_multi.predict(&x).unwrap());
+    }
+
+    #[test]
+    fn test_hgb_parallel_hist_and_flat_predict() {
+        let n = 1200usize;
+        let mut data = Vec::with_capacity(n * 4);
+        let mut y_reg = Vec::with_capacity(n);
+        let mut y_cls = Vec::with_capacity(n);
+        for i in 0..n {
+            let x0 = (i as f64) / (n as f64);
+            let x1 = ((i * 7) % 29) as f64 / 29.0;
+            let x2 = ((i * 11) % 37) as f64 / 37.0;
+            let x3 = x0 - x1;
+            data.extend_from_slice(&[x0, x1, x2, x3]);
+            y_reg.push(2.0 * x0 + 0.5 * x1);
+            y_cls.push(if x0 < 0.33 {
+                0.0
+            } else if x0 < 0.66 {
+                1.0
+            } else {
+                2.0
+            });
+        }
+        let x = Matrix::from_vec(n, 4, data).unwrap();
+
+        let mut reg = HistGradientBoostingRegressor::new(
+            None,
+            Some(0.15),
+            Some(25),
+            Some(15),
+            None,
+            Some(10),
+            Some(0.0),
+            Some(64),
+            Some(42),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        reg.fit(&x, &y_reg, None).unwrap();
+        assert!(reg.score(&x, &y_reg).unwrap() > 0.95);
+        let reg_loaded = HistGradientBoostingRegressor::from_bytes(&reg.to_bytes(), None).unwrap();
+        assert_eq!(reg.predict(&x).unwrap(), reg_loaded.predict(&x).unwrap());
+
+        let mut clf = HistGradientBoostingClassifier::new(
+            Some(0.15),
+            Some(20),
+            Some(15),
+            None,
+            Some(10),
+            Some(0.0),
+            Some(64),
+            Some(42),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        clf.fit(&x, &y_cls, None).unwrap();
+        assert!(clf.score(&x, &y_cls).unwrap() > 0.95);
+        let clf_loaded = HistGradientBoostingClassifier::from_bytes(&clf.to_bytes(), None).unwrap();
+        assert_eq!(clf.predict(&x).unwrap(), clf_loaded.predict(&x).unwrap());
     }
 }

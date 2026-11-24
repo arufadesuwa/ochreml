@@ -244,24 +244,6 @@ enum ClfTreeNode {
 }
 
 impl ClfTreeNode {
-    fn predict_proba_row(&self, row: &[f64]) -> &[f64] {
-        match self {
-            ClfTreeNode::Leaf { probs } => probs,
-            ClfTreeNode::Internal {
-                feature,
-                threshold,
-                left,
-                right,
-            } => {
-                if row[*feature] <= *threshold {
-                    left.predict_proba_row(row)
-                } else {
-                    right.predict_proba_row(row)
-                }
-            }
-        }
-    }
-
     fn write_to(&self, buf: &mut Vec<u8>) {
         match self {
             ClfTreeNode::Leaf { probs } => {
@@ -319,24 +301,6 @@ enum RegTreeNode {
 }
 
 impl RegTreeNode {
-    fn predict_row(&self, row: &[f64]) -> f64 {
-        match self {
-            RegTreeNode::Leaf { value } => *value,
-            RegTreeNode::Internal {
-                feature,
-                threshold,
-                left,
-                right,
-            } => {
-                if row[*feature] <= *threshold {
-                    left.predict_row(row)
-                } else {
-                    right.predict_row(row)
-                }
-            }
-        }
-    }
-
     fn write_to(&self, buf: &mut Vec<u8>) {
         match self {
             RegTreeNode::Leaf { value } => {
@@ -380,6 +344,168 @@ impl RegTreeNode {
     }
 }
 
+fn transpose_to_col_major(x: &Matrix) -> Vec<f64> {
+    let n_samples = x.rows;
+    let n_features = x.cols;
+    let mut x_cols = vec![0.0; n_features * n_samples];
+    x_cols
+        .par_chunks_exact_mut(n_samples)
+        .enumerate()
+        .for_each(|(f, col)| {
+            for (r, dst) in col.iter_mut().enumerate() {
+                *dst = x.data[r * n_features + f];
+            }
+        });
+    x_cols
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FlatClfNode {
+    feature_or_offset: u32,
+    left: u32,
+    right: u32,
+    threshold: f64,
+}
+
+fn flatten_clf_tree(
+    node: &ClfTreeNode,
+    nodes: &mut Vec<FlatClfNode>,
+    probs_out: &mut Vec<f64>,
+) -> usize {
+    let idx = nodes.len();
+    match node {
+        ClfTreeNode::Leaf { probs } => {
+            let offset = probs_out.len() as u32;
+            probs_out.extend_from_slice(probs);
+            nodes.push(FlatClfNode {
+                feature_or_offset: offset,
+                left: 0,
+                right: u32::MAX,
+                threshold: 0.0,
+            });
+        }
+        ClfTreeNode::Internal {
+            feature,
+            threshold,
+            left,
+            right,
+        } => {
+            nodes.push(FlatClfNode {
+                feature_or_offset: *feature as u32,
+                left: 0,
+                right: 0,
+                threshold: *threshold,
+            });
+            let left_idx = flatten_clf_tree(left, nodes, probs_out);
+            let right_idx = flatten_clf_tree(right, nodes, probs_out);
+            nodes[idx].left = left_idx as u32;
+            nodes[idx].right = right_idx as u32;
+        }
+    }
+    idx
+}
+
+fn build_flat_clf_forest(
+    trees: &[ClfTreeNode],
+    n_classes: usize,
+) -> (Vec<FlatClfNode>, Vec<usize>, Vec<f64>) {
+    let mut nodes = Vec::with_capacity(trees.len() * 64);
+    let mut roots = Vec::with_capacity(trees.len());
+    let mut probs = Vec::with_capacity(trees.len() * 32 * n_classes.max(1));
+    for tree in trees {
+        roots.push(flatten_clf_tree(tree, &mut nodes, &mut probs));
+    }
+    (nodes, roots, probs)
+}
+
+#[inline]
+fn predict_flat_clf_proba<'a>(
+    nodes: &[FlatClfNode],
+    probs: &'a [f64],
+    n_classes: usize,
+    root: usize,
+    row: &[f64],
+) -> &'a [f64] {
+    let mut idx = root;
+    loop {
+        let node = nodes[idx];
+        if node.right == u32::MAX {
+            let off = node.feature_or_offset as usize;
+            return &probs[off..off + n_classes];
+        }
+        if row[node.feature_or_offset as usize] <= node.threshold {
+            idx = node.left as usize;
+        } else {
+            idx = node.right as usize;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FlatRegNode {
+    feature: u32,
+    left: u32,
+    right: u32,
+    value_or_threshold: f64,
+}
+
+fn flatten_reg_tree(node: &RegTreeNode, nodes: &mut Vec<FlatRegNode>) -> usize {
+    let idx = nodes.len();
+    match node {
+        RegTreeNode::Leaf { value } => {
+            nodes.push(FlatRegNode {
+                feature: 0,
+                left: 0,
+                right: u32::MAX,
+                value_or_threshold: *value,
+            });
+        }
+        RegTreeNode::Internal {
+            feature,
+            threshold,
+            left,
+            right,
+        } => {
+            nodes.push(FlatRegNode {
+                feature: *feature as u32,
+                left: 0,
+                right: 0,
+                value_or_threshold: *threshold,
+            });
+            let left_idx = flatten_reg_tree(left, nodes);
+            let right_idx = flatten_reg_tree(right, nodes);
+            nodes[idx].left = left_idx as u32;
+            nodes[idx].right = right_idx as u32;
+        }
+    }
+    idx
+}
+
+fn build_flat_reg_forest(trees: &[RegTreeNode]) -> (Vec<FlatRegNode>, Vec<usize>) {
+    let mut nodes = Vec::with_capacity(trees.len() * 64);
+    let mut roots = Vec::with_capacity(trees.len());
+    for tree in trees {
+        roots.push(flatten_reg_tree(tree, &mut nodes));
+    }
+    (nodes, roots)
+}
+
+#[inline]
+fn predict_flat_reg_tree(nodes: &[FlatRegNode], root: usize, row: &[f64]) -> f64 {
+    let mut idx = root;
+    loop {
+        let node = nodes[idx];
+        if node.right == u32::MAX {
+            return node.value_or_threshold;
+        }
+        if row[node.feature as usize] <= node.value_or_threshold {
+            idx = node.left as usize;
+        } else {
+            idx = node.right as usize;
+        }
+    }
+}
+
 // =========================================================================
 // CLASSIFICATION TREE BUILDER (RF & EXTRA TREES)
 // =========================================================================
@@ -393,9 +519,31 @@ struct ClfBuildCfg<'a> {
     min_samples_leaf: usize,
     max_features: usize,
     n_classes: usize,
+    n_samples: usize,
+    n_features: usize,
     total_tree_weight: f64,
-    x: &'a Matrix,
+    x_cols: &'a [f64],
     class_idx: &'a [usize],
+}
+
+struct ClfTreeScratch {
+    counts: Vec<f64>,
+    feat_pool: Vec<usize>,
+    left_counts: Vec<f64>,
+    right_counts: Vec<f64>,
+    sorted: Vec<(f64, usize, f64)>,
+}
+
+impl ClfTreeScratch {
+    fn new(n_features: usize, n_classes: usize, sorted_cap: usize) -> Self {
+        Self {
+            counts: vec![0.0; n_classes],
+            feat_pool: Vec::with_capacity(n_features),
+            left_counts: vec![0.0; n_classes],
+            right_counts: vec![0.0; n_classes],
+            sorted: Vec::with_capacity(sorted_cap),
+        }
+    }
 }
 
 fn impurity_weighted(counts: &[f64], total_w: f64, entropy: bool) -> f64 {
@@ -423,20 +571,21 @@ fn impurity_weighted(counts: &[f64], total_w: f64, entropy: bool) -> f64 {
 
 fn build_clf_tree(
     cfg: &ClfBuildCfg<'_>,
-    samples: &[(usize, f64)],
+    samples: &mut [(usize, f64)],
     depth: usize,
     rng: &mut SplitMix64,
     importances: &mut [f64],
+    scratch: &mut ClfTreeScratch,
 ) -> ClfTreeNode {
     let n = samples.len();
-    let mut counts = vec![0.0; cfg.n_classes];
+    scratch.counts.fill(0.0);
     let mut total_w = 0.0;
-    for &(idx, w) in samples {
-        counts[cfg.class_idx[idx]] += w;
+    for &(idx, w) in samples.iter() {
+        scratch.counts[cfg.class_idx[idx]] += w;
         total_w += w;
     }
 
-    let make_leaf = || {
+    let make_leaf = |counts: &[f64]| {
         let probs = if total_w > 0.0 {
             counts.iter().map(|&c| c / total_w).collect()
         } else {
@@ -449,29 +598,34 @@ fn build_clf_tree(
         || n < 2 * cfg.min_samples_leaf
         || cfg.max_depth.is_some_and(|d| depth >= d)
     {
-        return make_leaf();
+        return make_leaf(&scratch.counts);
     }
 
-    let parent_imp = impurity_weighted(&counts, total_w, cfg.criterion_entropy);
+    let parent_imp = impurity_weighted(&scratch.counts, total_w, cfg.criterion_entropy);
     if parent_imp <= 1e-12 {
-        return make_leaf();
+        return make_leaf(&scratch.counts);
     }
 
-    let mut feat_pool = Vec::with_capacity(cfg.x.cols);
-    sample_feature_subset(&mut feat_pool, cfg.x.cols, cfg.max_features, rng);
+    sample_feature_subset(
+        &mut scratch.feat_pool,
+        cfg.n_features,
+        cfg.max_features,
+        rng,
+    );
 
     let mut best_gain = 0.0;
     let mut best_feat = 0usize;
     let mut best_thresh = 0.0;
+    let n_samples = cfg.n_samples;
 
     if cfg.extra_trees {
-        let mut left_counts = vec![0.0; cfg.n_classes];
-        let mut right_counts = vec![0.0; cfg.n_classes];
-        for &f in &feat_pool {
+        for fi in 0..scratch.feat_pool.len() {
+            let f = scratch.feat_pool[fi];
+            let col = &cfg.x_cols[f * n_samples..(f + 1) * n_samples];
             let mut min_v = f64::INFINITY;
             let mut max_v = f64::NEG_INFINITY;
-            for &(idx, _) in samples {
-                let v = cfg.x.data[idx * cfg.x.cols + f];
+            for &(idx, _) in samples.iter() {
+                let v = col[idx];
                 if v < min_v {
                     min_v = v;
                 }
@@ -489,19 +643,19 @@ fn build_clf_tree(
                 thresh
             };
 
-            left_counts.fill(0.0);
-            right_counts.fill(0.0);
+            scratch.left_counts.fill(0.0);
+            scratch.right_counts.fill(0.0);
             let mut left_w = 0.0;
             let mut left_n = 0usize;
-            for &(idx, w) in samples {
-                let v = cfg.x.data[idx * cfg.x.cols + f];
+            for &(idx, w) in samples.iter() {
+                let v = col[idx];
                 let c = cfg.class_idx[idx];
                 if v <= thresh {
-                    left_counts[c] += w;
+                    scratch.left_counts[c] += w;
                     left_w += w;
                     left_n += 1;
                 } else {
-                    right_counts[c] += w;
+                    scratch.right_counts[c] += w;
                 }
             }
             let right_n = n - left_n;
@@ -512,8 +666,9 @@ fn build_clf_tree(
             if left_w <= 0.0 || right_w <= 0.0 {
                 continue;
             }
-            let left_imp = impurity_weighted(&left_counts, left_w, cfg.criterion_entropy);
-            let right_imp = impurity_weighted(&right_counts, right_w, cfg.criterion_entropy);
+            let left_imp = impurity_weighted(&scratch.left_counts, left_w, cfg.criterion_entropy);
+            let right_imp =
+                impurity_weighted(&scratch.right_counts, right_w, cfg.criterion_entropy);
             let gain = parent_imp - (left_w / total_w) * left_imp - (right_w / total_w) * right_imp;
             if gain > best_gain {
                 best_gain = gain;
@@ -522,29 +677,27 @@ fn build_clf_tree(
             }
         }
     } else {
-        let mut sorted: Vec<(f64, usize, f64)> = Vec::with_capacity(n);
-        let mut left_counts = vec![0.0; cfg.n_classes];
-        let mut right_counts = vec![0.0; cfg.n_classes];
-
-        for &f in &feat_pool {
-            sorted.clear();
-            for &(idx, w) in samples {
-                sorted.push((cfg.x.data[idx * cfg.x.cols + f], cfg.class_idx[idx], w));
+        for fi in 0..scratch.feat_pool.len() {
+            let f = scratch.feat_pool[fi];
+            let col = &cfg.x_cols[f * n_samples..(f + 1) * n_samples];
+            scratch.sorted.clear();
+            for &(idx, w) in samples.iter() {
+                scratch.sorted.push((col[idx], cfg.class_idx[idx], w));
             }
-            sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+            scratch.sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
-            if sorted[n - 1].0 <= sorted[0].0 + 1e-12 {
+            if scratch.sorted[n - 1].0 <= scratch.sorted[0].0 + 1e-12 {
                 continue;
             }
 
-            left_counts.fill(0.0);
-            right_counts.copy_from_slice(&counts);
+            scratch.left_counts.fill(0.0);
+            scratch.right_counts.copy_from_slice(&scratch.counts);
             let mut left_w = 0.0;
 
             for i in 0..(n - 1) {
-                let (val_i, c_i, w_i) = sorted[i];
-                left_counts[c_i] += w_i;
-                right_counts[c_i] -= w_i;
+                let (val_i, c_i, w_i) = scratch.sorted[i];
+                scratch.left_counts[c_i] += w_i;
+                scratch.right_counts[c_i] -= w_i;
                 left_w += w_i;
 
                 let left_n = i + 1;
@@ -552,7 +705,7 @@ fn build_clf_tree(
                 if left_n < cfg.min_samples_leaf || right_n < cfg.min_samples_leaf {
                     continue;
                 }
-                let val_next = sorted[i + 1].0;
+                let val_next = scratch.sorted[i + 1].0;
                 if val_i + 1e-12 >= val_next {
                     continue;
                 }
@@ -561,8 +714,10 @@ fn build_clf_tree(
                 if left_w <= 0.0 || right_w <= 0.0 {
                     continue;
                 }
-                let left_imp = impurity_weighted(&left_counts, left_w, cfg.criterion_entropy);
-                let right_imp = impurity_weighted(&right_counts, right_w, cfg.criterion_entropy);
+                let left_imp =
+                    impurity_weighted(&scratch.left_counts, left_w, cfg.criterion_entropy);
+                let right_imp =
+                    impurity_weighted(&scratch.right_counts, right_w, cfg.criterion_entropy);
                 let gain =
                     parent_imp - (left_w / total_w) * left_imp - (right_w / total_w) * right_imp;
                 if gain > best_gain {
@@ -575,40 +730,47 @@ fn build_clf_tree(
     }
 
     if best_gain <= 1e-12 {
-        return make_leaf();
+        return make_leaf(&scratch.counts);
     }
 
-    let mut left_samples = Vec::with_capacity(n / 2);
-    let mut right_samples = Vec::with_capacity(n / 2);
-    for &item in samples {
-        if cfg.x.data[item.0 * cfg.x.cols + best_feat] <= best_thresh {
-            left_samples.push(item);
+    let best_col = &cfg.x_cols[best_feat * n_samples..(best_feat + 1) * n_samples];
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        if best_col[samples[lo].0] <= best_thresh {
+            lo += 1;
         } else {
-            right_samples.push(item);
+            hi -= 1;
+            samples.swap(lo, hi);
         }
     }
+    let left_len = lo;
+    let right_len = n - left_len;
 
-    if left_samples.len() < cfg.min_samples_leaf || right_samples.len() < cfg.min_samples_leaf {
-        return make_leaf();
+    if left_len < cfg.min_samples_leaf || right_len < cfg.min_samples_leaf {
+        return make_leaf(&scratch.counts);
     }
 
     if cfg.total_tree_weight > 0.0 {
         importances[best_feat] += (total_w / cfg.total_tree_weight) * best_gain;
     }
 
+    let (left_samples, right_samples) = samples.split_at_mut(left_len);
     let left = Box::new(build_clf_tree(
         cfg,
-        &left_samples,
+        left_samples,
         depth + 1,
         rng,
         importances,
+        scratch,
     ));
     let right = Box::new(build_clf_tree(
         cfg,
-        &right_samples,
+        right_samples,
         depth + 1,
         rng,
         importances,
+        scratch,
     ));
 
     ClfTreeNode::Internal {
@@ -630,23 +792,40 @@ struct RegBuildCfg<'a> {
     min_samples_split: usize,
     min_samples_leaf: usize,
     max_features: usize,
+    n_samples: usize,
+    n_features: usize,
     total_tree_weight: f64,
-    x: &'a Matrix,
+    x_cols: &'a [f64],
     y: &'a [f64],
+}
+
+struct RegTreeScratch {
+    feat_pool: Vec<usize>,
+    sorted: Vec<(f64, f64, f64)>,
+}
+
+impl RegTreeScratch {
+    fn new(n_features: usize, sorted_cap: usize) -> Self {
+        Self {
+            feat_pool: Vec::with_capacity(n_features),
+            sorted: Vec::with_capacity(sorted_cap),
+        }
+    }
 }
 
 fn build_reg_tree(
     cfg: &RegBuildCfg<'_>,
-    samples: &[(usize, f64)],
+    samples: &mut [(usize, f64)],
     depth: usize,
     rng: &mut SplitMix64,
     importances: &mut [f64],
+    scratch: &mut RegTreeScratch,
 ) -> RegTreeNode {
     let n = samples.len();
     let mut sum_y = 0.0;
     let mut sum_y2 = 0.0;
     let mut total_w = 0.0;
-    for &(idx, w) in samples {
+    for &(idx, w) in samples.iter() {
         let yi = cfg.y[idx];
         sum_y += w * yi;
         sum_y2 += w * yi * yi;
@@ -668,19 +847,26 @@ fn build_reg_tree(
     }
     let parent_score = (sum_y * sum_y) / total_w;
 
-    let mut feat_pool = Vec::with_capacity(cfg.x.cols);
-    sample_feature_subset(&mut feat_pool, cfg.x.cols, cfg.max_features, rng);
+    sample_feature_subset(
+        &mut scratch.feat_pool,
+        cfg.n_features,
+        cfg.max_features,
+        rng,
+    );
 
     let mut best_score_gain = 0.0;
     let mut best_feat = 0usize;
     let mut best_thresh = 0.0;
+    let n_samples = cfg.n_samples;
 
     if cfg.extra_trees {
-        for &f in &feat_pool {
+        for fi in 0..scratch.feat_pool.len() {
+            let f = scratch.feat_pool[fi];
+            let col = &cfg.x_cols[f * n_samples..(f + 1) * n_samples];
             let mut min_v = f64::INFINITY;
             let mut max_v = f64::NEG_INFINITY;
-            for &(idx, _) in samples {
-                let v = cfg.x.data[idx * cfg.x.cols + f];
+            for &(idx, _) in samples.iter() {
+                let v = col[idx];
                 if v < min_v {
                     min_v = v;
                 }
@@ -701,8 +887,8 @@ fn build_reg_tree(
             let mut left_sum = 0.0;
             let mut left_w = 0.0;
             let mut left_n = 0usize;
-            for &(idx, w) in samples {
-                if cfg.x.data[idx * cfg.x.cols + f] <= thresh {
+            for &(idx, w) in samples.iter() {
+                if col[idx] <= thresh {
                     left_sum += w * cfg.y[idx];
                     left_w += w;
                     left_n += 1;
@@ -726,22 +912,23 @@ fn build_reg_tree(
             }
         }
     } else {
-        let mut sorted: Vec<(f64, f64, f64)> = Vec::with_capacity(n);
-        for &f in &feat_pool {
-            sorted.clear();
-            for &(idx, w) in samples {
-                sorted.push((cfg.x.data[idx * cfg.x.cols + f], cfg.y[idx], w));
+        for fi in 0..scratch.feat_pool.len() {
+            let f = scratch.feat_pool[fi];
+            let col = &cfg.x_cols[f * n_samples..(f + 1) * n_samples];
+            scratch.sorted.clear();
+            for &(idx, w) in samples.iter() {
+                scratch.sorted.push((col[idx], cfg.y[idx], w));
             }
-            sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+            scratch.sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
-            if sorted[n - 1].0 <= sorted[0].0 + 1e-12 {
+            if scratch.sorted[n - 1].0 <= scratch.sorted[0].0 + 1e-12 {
                 continue;
             }
 
             let mut left_sum = 0.0;
             let mut left_w = 0.0;
             for i in 0..(n - 1) {
-                let (val_i, yi, wi) = sorted[i];
+                let (val_i, yi, wi) = scratch.sorted[i];
                 left_sum += wi * yi;
                 left_w += wi;
 
@@ -750,7 +937,7 @@ fn build_reg_tree(
                 if left_n < cfg.min_samples_leaf || right_n < cfg.min_samples_leaf {
                     continue;
                 }
-                let val_next = sorted[i + 1].0;
+                let val_next = scratch.sorted[i + 1].0;
                 if val_i + 1e-12 >= val_next {
                     continue;
                 }
@@ -775,17 +962,21 @@ fn build_reg_tree(
         return RegTreeNode::Leaf { value: mean_val };
     }
 
-    let mut left_samples = Vec::with_capacity(n / 2);
-    let mut right_samples = Vec::with_capacity(n / 2);
-    for &item in samples {
-        if cfg.x.data[item.0 * cfg.x.cols + best_feat] <= best_thresh {
-            left_samples.push(item);
+    let best_col = &cfg.x_cols[best_feat * n_samples..(best_feat + 1) * n_samples];
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        if best_col[samples[lo].0] <= best_thresh {
+            lo += 1;
         } else {
-            right_samples.push(item);
+            hi -= 1;
+            samples.swap(lo, hi);
         }
     }
+    let left_len = lo;
+    let right_len = n - left_len;
 
-    if left_samples.len() < cfg.min_samples_leaf || right_samples.len() < cfg.min_samples_leaf {
+    if left_len < cfg.min_samples_leaf || right_len < cfg.min_samples_leaf {
         return RegTreeNode::Leaf { value: mean_val };
     }
 
@@ -793,19 +984,22 @@ fn build_reg_tree(
         importances[best_feat] += best_score_gain / cfg.total_tree_weight;
     }
 
+    let (left_samples, right_samples) = samples.split_at_mut(left_len);
     let left = Box::new(build_reg_tree(
         cfg,
-        &left_samples,
+        left_samples,
         depth + 1,
         rng,
         importances,
+        scratch,
     ));
     let right = Box::new(build_reg_tree(
         cfg,
-        &right_samples,
+        right_samples,
         depth + 1,
         rng,
         importances,
+        scratch,
     ));
 
     RegTreeNode::Internal {
@@ -1068,6 +1262,9 @@ struct ForestClassifierCore {
     device: DeviceType,
     device_: Option<String>,
     trees: Vec<ClfTreeNode>,
+    flat_nodes: Vec<FlatClfNode>,
+    flat_roots: Vec<usize>,
+    flat_probs: Vec<f64>,
     classes_: Vec<f64>,
     n_features_in_: Option<usize>,
     feature_importances_: Option<Vec<f64>>,
@@ -1128,6 +1325,9 @@ impl ForestClassifierCore {
             device: dev,
             device_: None,
             trees: Vec::new(),
+            flat_nodes: Vec::new(),
+            flat_roots: Vec::new(),
+            flat_probs: Vec::new(),
             classes_: Vec::new(),
             n_features_in_: None,
             feature_importances_: None,
@@ -1171,6 +1371,7 @@ impl ForestClassifierCore {
         let n_classes = classes.len();
         let n_samples = x.rows;
         let n_features = x.cols;
+        let x_cols = transpose_to_col_major(x);
 
         let results: Vec<(ClfTreeNode, Vec<f64>)> = (0..self.n_estimators)
             .into_par_iter()
@@ -1179,7 +1380,7 @@ impl ForestClassifierCore {
                     .wrapping_add((tree_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
                     ^ 0xA5A5_5A5A_1234_5678;
                 let mut rng = SplitMix64::new(seed);
-                let (samples, total_tree_weight) =
+                let (mut samples, total_tree_weight) =
                     build_bootstrap_samples(n_samples, self.bootstrap, &sw, &mut rng);
                 let cfg = ClfBuildCfg {
                     criterion_entropy,
@@ -1189,12 +1390,16 @@ impl ForestClassifierCore {
                     min_samples_leaf: self.min_samples_leaf,
                     max_features: max_feat,
                     n_classes,
+                    n_samples,
+                    n_features,
                     total_tree_weight,
-                    x,
+                    x_cols: &x_cols,
                     class_idx: &class_idx,
                 };
                 let mut imp = vec![0.0; n_features];
-                let root = build_clf_tree(&cfg, &samples, 0, &mut rng, &mut imp);
+                let sorted_cap = if self.extra_trees { 0 } else { samples.len() };
+                let mut scratch = ClfTreeScratch::new(n_features, n_classes, sorted_cap);
+                let root = build_clf_tree(&cfg, &mut samples, 0, &mut rng, &mut imp, &mut scratch);
                 (root, imp)
             })
             .collect();
@@ -1206,7 +1411,11 @@ impl ForestClassifierCore {
             all_imp.push(imp);
         }
 
+        let (flat_nodes, flat_roots, flat_probs) = build_flat_clf_forest(&trees, n_classes);
         self.trees = trees;
+        self.flat_nodes = flat_nodes;
+        self.flat_roots = flat_roots;
+        self.flat_probs = flat_probs;
         self.classes_ = classes;
         self.n_features_in_ = Some(n_features);
         self.feature_importances_ = Some(normalize_and_average_importances(all_imp, n_features));
@@ -1224,23 +1433,54 @@ impl ForestClassifierCore {
             });
         }
         let n_classes = self.classes_.len();
-        let n_trees = self.trees.len() as f64;
+        let inv_trees = 1.0 / (self.trees.len() as f64);
         let mut out = vec![0.0; x.rows * n_classes];
 
-        out.par_chunks_mut(n_classes)
-            .enumerate()
-            .for_each(|(r, dst)| {
+        if x.rows >= 256 {
+            out.par_chunks_mut(256 * n_classes)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base_r = chunk_idx * 256;
+                    for (offset, dst) in chunk.chunks_exact_mut(n_classes).enumerate() {
+                        let r = base_r + offset;
+                        let row = &x.data[r * expected..(r + 1) * expected];
+                        for &root in &self.flat_roots {
+                            let probs = predict_flat_clf_proba(
+                                &self.flat_nodes,
+                                &self.flat_probs,
+                                n_classes,
+                                root,
+                                row,
+                            );
+                            for (d, &p) in dst.iter_mut().zip(probs.iter()) {
+                                *d += p;
+                            }
+                        }
+                        for d in dst.iter_mut() {
+                            *d *= inv_trees;
+                        }
+                    }
+                });
+        } else {
+            for (r, dst) in out.chunks_exact_mut(n_classes).enumerate() {
                 let row = &x.data[r * expected..(r + 1) * expected];
-                for tree in &self.trees {
-                    let probs = tree.predict_proba_row(row);
+                for &root in &self.flat_roots {
+                    let probs = predict_flat_clf_proba(
+                        &self.flat_nodes,
+                        &self.flat_probs,
+                        n_classes,
+                        root,
+                        row,
+                    );
                     for (d, &p) in dst.iter_mut().zip(probs.iter()) {
                         *d += p;
                     }
                 }
                 for d in dst.iter_mut() {
-                    *d /= n_trees;
+                    *d *= inv_trees;
                 }
-            });
+            }
+        }
 
         Matrix::from_vec(x.rows, n_classes, out)
     }
@@ -1318,6 +1558,7 @@ impl ForestClassifierCore {
         for _ in 0..n_trees {
             trees.push(ClfTreeNode::read_from(&mut r)?);
         }
+        let (flat_nodes, flat_roots, flat_probs) = build_flat_clf_forest(&trees, classes_.len());
         let (dev, device_) = resolve_loaded_device(saved_device, n_features_in_.is_some(), device)?;
         Ok(Self {
             extra_trees,
@@ -1332,6 +1573,9 @@ impl ForestClassifierCore {
             device: dev,
             device_,
             trees,
+            flat_nodes,
+            flat_roots,
+            flat_probs,
             classes_,
             n_features_in_,
             feature_importances_,
@@ -1357,6 +1601,8 @@ struct ForestRegressorCore {
     device: DeviceType,
     device_: Option<String>,
     trees: Vec<RegTreeNode>,
+    flat_nodes: Vec<FlatRegNode>,
+    flat_roots: Vec<usize>,
     n_features_in_: Option<usize>,
     feature_importances_: Option<Vec<f64>>,
 }
@@ -1416,6 +1662,8 @@ impl ForestRegressorCore {
             device: dev,
             device_: None,
             trees: Vec::new(),
+            flat_nodes: Vec::new(),
+            flat_roots: Vec::new(),
             n_features_in_: None,
             feature_importances_: None,
         })
@@ -1493,6 +1741,7 @@ impl ForestRegressorCore {
             }
             (trees, all_imp)
         } else {
+            let x_cols = transpose_to_col_major(x);
             let results: Vec<(RegTreeNode, Vec<f64>)> = (0..self.n_estimators)
                 .into_par_iter()
                 .map(|tree_idx| {
@@ -1500,7 +1749,7 @@ impl ForestRegressorCore {
                         .wrapping_add((tree_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
                         ^ 0x5A5A_A5A5_8765_4321;
                     let mut rng = SplitMix64::new(seed);
-                    let (samples, total_tree_weight) =
+                    let (mut samples, total_tree_weight) =
                         build_bootstrap_samples(n_samples, self.bootstrap, &sw, &mut rng);
                     let cfg = RegBuildCfg {
                         extra_trees: self.extra_trees,
@@ -1508,12 +1757,17 @@ impl ForestRegressorCore {
                         min_samples_split: self.min_samples_split,
                         min_samples_leaf: self.min_samples_leaf,
                         max_features: max_feat,
+                        n_samples,
+                        n_features,
                         total_tree_weight,
-                        x,
+                        x_cols: &x_cols,
                         y,
                     };
                     let mut imp = vec![0.0; n_features];
-                    let root = build_reg_tree(&cfg, &samples, 0, &mut rng, &mut imp);
+                    let sorted_cap = if self.extra_trees { 0 } else { samples.len() };
+                    let mut scratch = RegTreeScratch::new(n_features, sorted_cap);
+                    let root =
+                        build_reg_tree(&cfg, &mut samples, 0, &mut rng, &mut imp, &mut scratch);
                     (root, imp)
                 })
                 .collect();
@@ -1527,7 +1781,10 @@ impl ForestRegressorCore {
             (trees, all_imp)
         };
 
+        let (flat_nodes, flat_roots) = build_flat_reg_forest(&trees);
         self.trees = trees;
+        self.flat_nodes = flat_nodes;
+        self.flat_roots = flat_roots;
         self.n_features_in_ = Some(n_features);
         self.feature_importances_ = Some(normalize_and_average_importances(all_imp, n_features));
         self.device_ = Some(self.device.to_string());
@@ -1543,18 +1800,34 @@ impl ForestRegressorCore {
                 expected,
             });
         }
-        let n_trees = self.trees.len() as f64;
-        let preds: Vec<f64> = (0..x.rows)
-            .into_par_iter()
-            .map(|r| {
+        let inv_trees = 1.0 / (self.trees.len() as f64);
+        let mut preds = vec![0.0; x.rows];
+        if x.rows >= 256 {
+            preds
+                .par_chunks_mut(256)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base_r = chunk_idx * 256;
+                    for (offset, dst) in chunk.iter_mut().enumerate() {
+                        let r = base_r + offset;
+                        let row = &x.data[r * expected..(r + 1) * expected];
+                        let mut sum = 0.0;
+                        for &root in &self.flat_roots {
+                            sum += predict_flat_reg_tree(&self.flat_nodes, root, row);
+                        }
+                        *dst = sum * inv_trees;
+                    }
+                });
+        } else {
+            for (r, dst) in preds.iter_mut().enumerate() {
                 let row = &x.data[r * expected..(r + 1) * expected];
                 let mut sum = 0.0;
-                for tree in &self.trees {
-                    sum += tree.predict_row(row);
+                for &root in &self.flat_roots {
+                    sum += predict_flat_reg_tree(&self.flat_nodes, root, row);
                 }
-                sum / n_trees
-            })
-            .collect();
+                *dst = sum * inv_trees;
+            }
+        }
         Ok(preds)
     }
 
@@ -1605,6 +1878,7 @@ impl ForestRegressorCore {
         for _ in 0..n_trees {
             trees.push(RegTreeNode::read_from(&mut r)?);
         }
+        let (flat_nodes, flat_roots) = build_flat_reg_forest(&trees);
         let (dev, device_) = resolve_loaded_device(saved_device, n_features_in_.is_some(), device)?;
         Ok(Self {
             extra_trees,
@@ -1619,6 +1893,8 @@ impl ForestRegressorCore {
             device: dev,
             device_,
             trees,
+            flat_nodes,
+            flat_roots,
             n_features_in_,
             feature_importances_,
         })
@@ -2684,4 +2960,91 @@ pub fn register_py_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyExtraTreesRegressor>()?;
     m.add_class::<PyIsolationForest>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extra_trees_and_rf_fit_predict_dit_roundtrip() {
+        let n = 300usize;
+        let mut data = Vec::with_capacity(n * 4);
+        let mut y_cls = Vec::with_capacity(n);
+        let mut y_reg = Vec::with_capacity(n);
+        for i in 0..n {
+            let x0 = (i as f64) / (n as f64);
+            let x1 = ((i * 7) % 31) as f64 / 31.0;
+            let x2 = ((i * 11) % 19) as f64 / 19.0;
+            let x3 = x0 * 2.0 - x1;
+            data.extend_from_slice(&[x0, x1, x2, x3]);
+            y_cls.push(if x0 >= 0.5 { 1.0 } else { 0.0 });
+            y_reg.push(3.0 * x0 + 0.5 * x1);
+        }
+        let x = Matrix::from_vec(n, 4, data).unwrap();
+
+        let mut etc = ExtraTreesClassifier::new(
+            Some(20),
+            None,
+            Some(8),
+            None,
+            None,
+            None,
+            None,
+            Some(42),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        etc.fit(&x, &y_cls, None).unwrap();
+        assert!(etc.score(&x, &y_cls).unwrap() > 0.95);
+        let etc_loaded = ExtraTreesClassifier::from_bytes(&etc.to_bytes(), None).unwrap();
+        assert_eq!(etc.predict(&x).unwrap(), etc_loaded.predict(&x).unwrap());
+
+        let mut etr = ExtraTreesRegressor::new(
+            Some(20),
+            None,
+            Some(8),
+            None,
+            None,
+            None,
+            None,
+            Some(42),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        etr.fit(&x, &y_reg, None).unwrap();
+        assert!(etr.score(&x, &y_reg).unwrap() > 0.95);
+        let etr_loaded = ExtraTreesRegressor::from_bytes(&etr.to_bytes(), None).unwrap();
+        assert_eq!(etr.predict(&x).unwrap(), etr_loaded.predict(&x).unwrap());
+
+        let mut rfc = RandomForestClassifier::new(
+            Some(10),
+            None,
+            Some(6),
+            None,
+            None,
+            None,
+            None,
+            Some(42),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        rfc.fit(&x, &y_cls, None).unwrap();
+        assert!(rfc.score(&x, &y_cls).unwrap() > 0.95);
+
+        let mut rfr = RandomForestRegressor::new(
+            Some(10),
+            None,
+            Some(6),
+            None,
+            None,
+            None,
+            None,
+            Some(42),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        rfr.fit(&x, &y_reg, None).unwrap();
+        assert!(rfr.score(&x, &y_reg).unwrap() > 0.95);
+    }
 }

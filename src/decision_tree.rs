@@ -26,46 +26,190 @@ pub enum TreeNode {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct FlatTreeNode {
+    pub feature_index: u32,
+    pub left: u32,
+    pub right: u32,
+    pub value_or_threshold: f64,
+}
+
+fn flatten_tree_node(node: &TreeNode, out: &mut Vec<FlatTreeNode>) -> usize {
+    let idx = out.len();
+    match node {
+        TreeNode::Leaf { value, .. } => {
+            out.push(FlatTreeNode {
+                feature_index: 0,
+                left: 0,
+                right: u32::MAX,
+                value_or_threshold: *value,
+            });
+        }
+        TreeNode::Internal {
+            feature_index,
+            threshold,
+            left,
+            right,
+        } => {
+            out.push(FlatTreeNode {
+                feature_index: *feature_index as u32,
+                left: 0,
+                right: 0,
+                value_or_threshold: *threshold,
+            });
+            let left_idx = flatten_tree_node(left, out);
+            let right_idx = flatten_tree_node(right, out);
+            out[idx].left = left_idx as u32;
+            out[idx].right = right_idx as u32;
+        }
+    }
+    idx
+}
+
+#[inline]
+fn predict_flat_tree(nodes: &[FlatTreeNode], row: &[f64]) -> f64 {
+    let mut idx = 0usize;
+    loop {
+        let node = nodes[idx];
+        if node.right == u32::MAX {
+            return node.value_or_threshold;
+        }
+        if row[node.feature_index as usize] <= node.value_or_threshold {
+            idx = node.left as usize;
+        } else {
+            idx = node.right as usize;
+        }
+    }
+}
+
+fn flatten_tree_proba(
+    node: &TreeNode,
+    classes: &[f64],
+    nodes: &mut Vec<FlatTreeNode>,
+    probs_out: &mut Vec<f64>,
+) -> usize {
+    let idx = nodes.len();
+    match node {
+        TreeNode::Leaf { probabilities, .. } => {
+            let offset = probs_out.len() as u32;
+            let start = probs_out.len();
+            probs_out.resize(start + classes.len(), 0.0);
+            for &(cls, p) in probabilities {
+                if let Some(pos) = classes.iter().position(|&c| (c - cls).abs() < 1e-9) {
+                    probs_out[start + pos] = p;
+                }
+            }
+            nodes.push(FlatTreeNode {
+                feature_index: offset,
+                left: 0,
+                right: u32::MAX,
+                value_or_threshold: 0.0,
+            });
+        }
+        TreeNode::Internal {
+            feature_index,
+            threshold,
+            left,
+            right,
+        } => {
+            nodes.push(FlatTreeNode {
+                feature_index: *feature_index as u32,
+                left: 0,
+                right: 0,
+                value_or_threshold: *threshold,
+            });
+            let left_idx = flatten_tree_proba(left, classes, nodes, probs_out);
+            let right_idx = flatten_tree_proba(right, classes, nodes, probs_out);
+            nodes[idx].left = left_idx as u32;
+            nodes[idx].right = right_idx as u32;
+        }
+    }
+    idx
+}
+
+#[inline]
+fn predict_flat_tree_proba<'a>(
+    nodes: &[FlatTreeNode],
+    probs: &'a [f64],
+    n_classes: usize,
+    row: &[f64],
+) -> &'a [f64] {
+    let mut idx = 0usize;
+    loop {
+        let node = nodes[idx];
+        if node.right == u32::MAX {
+            let off = node.feature_index as usize;
+            return &probs[off..off + n_classes];
+        }
+        if row[node.feature_index as usize] <= node.value_or_threshold {
+            idx = node.left as usize;
+        } else {
+            idx = node.right as usize;
+        }
+    }
+}
+
+fn transpose_to_col_major(x: &Matrix) -> Vec<f64> {
+    let n_samples = x.rows;
+    let n_features = x.cols;
+    let mut x_cols = vec![0.0; n_features * n_samples];
+    x_cols
+        .par_chunks_exact_mut(n_samples)
+        .enumerate()
+        .for_each(|(f, col)| {
+            for (r, dst) in col.iter_mut().enumerate() {
+                *dst = x.data[r * n_features + f];
+            }
+        });
+    x_cols
+}
+
 impl TreeNode {
     pub fn predict_row(&self, row: &[f64]) -> f64 {
-        match self {
-            TreeNode::Leaf { value, .. } => *value,
-            TreeNode::Internal {
-                feature_index,
-                threshold,
-                left,
-                right,
-            } => {
-                if row[*feature_index] <= *threshold {
-                    left.predict_row(row)
-                } else {
-                    right.predict_row(row)
+        let mut node = self;
+        loop {
+            match node {
+                TreeNode::Leaf { value, .. } => return *value,
+                TreeNode::Internal {
+                    feature_index,
+                    threshold,
+                    left,
+                    right,
+                } => {
+                    if row[*feature_index] <= *threshold {
+                        node = left;
+                    } else {
+                        node = right;
+                    }
                 }
             }
         }
     }
 
     pub fn predict_proba_row(&self, row: &[f64], classes: &[f64]) -> Vec<f64> {
-        match self {
-            TreeNode::Leaf { probabilities, .. } => {
-                let mut probs = vec![0.0; classes.len()];
-                for &(cls, p) in probabilities {
-                    if let Some(pos) = classes.iter().position(|&c| (c - cls).abs() < 1e-9) {
-                        probs[pos] = p;
+        let mut node = self;
+        loop {
+            match node {
+                TreeNode::Leaf { probabilities, .. } => {
+                    let mut probs = vec![0.0; classes.len()];
+                    for &(cls, p) in probabilities {
+                        if let Some(pos) = classes.iter().position(|&c| (c - cls).abs() < 1e-9) {
+                            probs[pos] = p;
+                        }
                     }
+                    return probs;
                 }
-                probs
-            }
-            TreeNode::Internal {
-                feature_index,
-                threshold,
-                left,
-                right,
-            } => {
-                if row[*feature_index] <= *threshold {
-                    left.predict_proba_row(row, classes)
-                } else {
-                    right.predict_proba_row(row, classes)
+                TreeNode::Internal {
+                    feature_index,
+                    threshold,
+                    left,
+                    right,
+                } => {
+                    if row[*feature_index] <= *threshold {
+                        node = left;
+                    } else {
+                        node = right;
+                    }
                 }
             }
         }
@@ -203,17 +347,23 @@ impl DecisionTreeClassifier {
     }
 
     // Recursively build decision tree structure with O(D * N log N) sliding split search (CPU/TPU)
+    #[allow(clippy::too_many_arguments)]
     fn build_tree(
         &self,
-        x: &Matrix,
+        x_cols: &[f64],
+        n_total: usize,
+        n_features: usize,
         class_indices: &[usize],
-        indices: &[usize],
+        indices: &mut [usize],
         depth: usize,
+        pairs: &mut Vec<(f64, usize)>,
+        left_counts: &mut Vec<usize>,
+        right_counts: &mut Vec<usize>,
     ) -> TreeNode {
         let n_samples = indices.len();
         let n_classes = self.classes_.len();
         let mut total_counts = vec![0usize; n_classes];
-        for &i in indices {
+        for &i in indices.iter() {
             total_counts[class_indices[i]] += 1;
         }
 
@@ -225,77 +375,165 @@ impl DecisionTreeClassifier {
             return self.make_leaf_from_counts(&total_counts, n_samples);
         }
 
-        let mut best_gain = 0.0;
-        let mut best_feature = 0;
-        let mut best_threshold = 0.0;
+        let (best_gain, best_feature, best_threshold) = if n_samples >= 512 && n_features > 1 {
+            (0..n_features)
+                .into_par_iter()
+                .filter_map(|f| {
+                    let col = &x_cols[f * n_total..(f + 1) * n_total];
+                    let mut local_pairs: Vec<(f64, usize)> = Vec::with_capacity(n_samples);
+                    for &i in indices.iter() {
+                        local_pairs.push((col[i], class_indices[i]));
+                    }
+                    local_pairs.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
-        let mut pairs: Vec<(f64, usize)> = Vec::with_capacity(n_samples);
+                    if (local_pairs[n_samples - 1].0 - local_pairs[0].0).abs() < 1e-9 {
+                        return None;
+                    }
 
-        for f in 0..x.cols {
-            pairs.clear();
-            for &i in indices {
-                pairs.push((x.get(i, f), class_indices[i]));
-            }
-            pairs.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                    let mut l_counts = vec![0usize; n_classes];
+                    let mut r_counts = total_counts.clone();
+                    let mut n_left = 0usize;
+                    let mut n_right = n_samples;
+                    let mut f_best_gain = 0.0;
+                    let mut f_best_thresh = 0.0;
 
-            if (pairs[n_samples - 1].0 - pairs[0].0).abs() < 1e-9 {
-                continue;
-            }
+                    for i in 0..(n_samples - 1) {
+                        let cls = local_pairs[i].1;
+                        l_counts[cls] += 1;
+                        r_counts[cls] -= 1;
+                        n_left += 1;
+                        n_right -= 1;
 
-            let mut left_counts = vec![0usize; n_classes];
-            let mut right_counts = total_counts.clone();
-            let mut n_left = 0usize;
-            let mut n_right = n_samples;
+                        let cur_val = local_pairs[i].0;
+                        let next_val = local_pairs[i + 1].0;
+                        if (next_val - cur_val).abs() > 1e-9
+                            && n_left >= self.min_samples_leaf
+                            && n_right >= self.min_samples_leaf
+                        {
+                            let imp_left = self.compute_impurity_from_counts(&l_counts, n_left);
+                            let imp_right = self.compute_impurity_from_counts(&r_counts, n_right);
 
-            for i in 0..(n_samples - 1) {
-                let cls = pairs[i].1;
-                left_counts[cls] += 1;
-                right_counts[cls] -= 1;
-                n_left += 1;
-                n_right -= 1;
+                            let p_left = (n_left as f64) / (n_samples as f64);
+                            let p_right = (n_right as f64) / (n_samples as f64);
 
-                let cur_val = pairs[i].0;
-                let next_val = pairs[i + 1].0;
-                if (next_val - cur_val).abs() > 1e-9
-                    && n_left >= self.min_samples_leaf
-                    && n_right >= self.min_samples_leaf
-                {
-                    let imp_left = self.compute_impurity_from_counts(&left_counts, n_left);
-                    let imp_right = self.compute_impurity_from_counts(&right_counts, n_right);
+                            let gain = current_impurity - (p_left * imp_left + p_right * imp_right);
+                            if gain > f_best_gain {
+                                f_best_gain = gain;
+                                f_best_thresh = (cur_val + next_val) / 2.0;
+                            }
+                        }
+                    }
+                    if f_best_gain > 0.0 {
+                        Some((f_best_gain, f, f_best_thresh))
+                    } else {
+                        None
+                    }
+                })
+                .reduce_with(|a, b| {
+                    if a.0 > b.0 || (a.0 == b.0 && a.1 < b.1) {
+                        a
+                    } else {
+                        b
+                    }
+                })
+                .unwrap_or((0.0, 0, 0.0))
+        } else {
+            let mut best_gain = 0.0;
+            let mut best_feature = 0;
+            let mut best_threshold = 0.0;
 
-                    let p_left = (n_left as f64) / (n_samples as f64);
-                    let p_right = (n_right as f64) / (n_samples as f64);
+            for f in 0..n_features {
+                let col = &x_cols[f * n_total..(f + 1) * n_total];
+                pairs.clear();
+                for &i in indices.iter() {
+                    pairs.push((col[i], class_indices[i]));
+                }
+                pairs.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
-                    let gain = current_impurity - (p_left * imp_left + p_right * imp_right);
-                    if gain > best_gain {
-                        best_gain = gain;
-                        best_feature = f;
-                        best_threshold = (cur_val + next_val) / 2.0;
+                if (pairs[n_samples - 1].0 - pairs[0].0).abs() < 1e-9 {
+                    continue;
+                }
+
+                left_counts.fill(0);
+                right_counts.copy_from_slice(&total_counts);
+                let mut n_left = 0usize;
+                let mut n_right = n_samples;
+
+                for i in 0..(n_samples - 1) {
+                    let cls = pairs[i].1;
+                    left_counts[cls] += 1;
+                    right_counts[cls] -= 1;
+                    n_left += 1;
+                    n_right -= 1;
+
+                    let cur_val = pairs[i].0;
+                    let next_val = pairs[i + 1].0;
+                    if (next_val - cur_val).abs() > 1e-9
+                        && n_left >= self.min_samples_leaf
+                        && n_right >= self.min_samples_leaf
+                    {
+                        let imp_left = self.compute_impurity_from_counts(left_counts, n_left);
+                        let imp_right = self.compute_impurity_from_counts(right_counts, n_right);
+
+                        let p_left = (n_left as f64) / (n_samples as f64);
+                        let p_right = (n_right as f64) / (n_samples as f64);
+
+                        let gain = current_impurity - (p_left * imp_left + p_right * imp_right);
+                        if gain > best_gain {
+                            best_gain = gain;
+                            best_feature = f;
+                            best_threshold = (cur_val + next_val) / 2.0;
+                        }
                     }
                 }
             }
-        }
+            (best_gain, best_feature, best_threshold)
+        };
 
         if best_gain <= 1e-9 {
             return self.make_leaf_from_counts(&total_counts, n_samples);
         }
 
-        let mut best_left = Vec::with_capacity(n_samples / 2);
-        let mut best_right = Vec::with_capacity(n_samples / 2);
-        for &i in indices {
-            if x.get(i, best_feature) <= best_threshold {
-                best_left.push(i);
+        let best_col = &x_cols[best_feature * n_total..(best_feature + 1) * n_total];
+        let mut lo = 0usize;
+        let mut hi = n_samples;
+        while lo < hi {
+            if best_col[indices[lo]] <= best_threshold {
+                lo += 1;
             } else {
-                best_right.push(i);
+                hi -= 1;
+                indices.swap(lo, hi);
             }
         }
+        let left_len = lo;
 
-        if best_left.is_empty() || best_right.is_empty() {
+        if left_len == 0 || left_len == n_samples {
             return self.make_leaf_from_counts(&total_counts, n_samples);
         }
 
-        let left_child = self.build_tree(x, class_indices, &best_left, depth + 1);
-        let right_child = self.build_tree(x, class_indices, &best_right, depth + 1);
+        let (best_left, best_right) = indices.split_at_mut(left_len);
+        let left_child = self.build_tree(
+            x_cols,
+            n_total,
+            n_features,
+            class_indices,
+            best_left,
+            depth + 1,
+            pairs,
+            left_counts,
+            right_counts,
+        );
+        let right_child = self.build_tree(
+            x_cols,
+            n_total,
+            n_features,
+            class_indices,
+            best_right,
+            depth + 1,
+            pairs,
+            left_counts,
+            right_counts,
+        );
 
         TreeNode::Internal {
             feature_index: best_feature,
@@ -515,8 +753,23 @@ impl DecisionTreeClassifier {
             )?;
             self.root = Some(root);
         } else {
-            let indices: Vec<usize> = (0..x.rows).collect();
-            let root = self.build_tree(x, &class_indices, &indices, 0);
+            let x_cols = transpose_to_col_major(x);
+            let mut indices: Vec<usize> = (0..x.rows).collect();
+            let n_classes = self.classes_.len();
+            let mut pairs = Vec::with_capacity(x.rows.min(512));
+            let mut left_counts = vec![0usize; n_classes];
+            let mut right_counts = vec![0usize; n_classes];
+            let root = self.build_tree(
+                &x_cols,
+                x.rows,
+                x.cols,
+                &class_indices,
+                &mut indices,
+                0,
+                &mut pairs,
+                &mut left_counts,
+                &mut right_counts,
+            );
             self.root = Some(root);
         }
 
@@ -539,11 +792,38 @@ impl DecisionTreeClassifier {
             });
         }
 
-        let mut preds = Vec::with_capacity(x.rows);
-        for r in 0..x.rows {
-            let offset = r * x.cols;
-            let row_slice = &x.data[offset..offset + x.cols];
-            preds.push(root.predict_row(row_slice));
+        let cols = x.cols;
+        if x.rows < 64 {
+            let mut preds = Vec::with_capacity(x.rows);
+            for r in 0..x.rows {
+                let offset = r * cols;
+                let row_slice = &x.data[offset..offset + cols];
+                preds.push(root.predict_row(row_slice));
+            }
+            return Ok(preds);
+        }
+
+        let mut flat = Vec::with_capacity(64);
+        flatten_tree_node(root, &mut flat);
+        let mut preds = vec![0.0; x.rows];
+
+        if x.rows >= 4096 {
+            preds
+                .par_chunks_mut(1024)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base_r = chunk_idx * 1024;
+                    for (offset, dst) in chunk.iter_mut().enumerate() {
+                        let r = base_r + offset;
+                        let row_slice = &x.data[r * cols..(r + 1) * cols];
+                        *dst = predict_flat_tree(&flat, row_slice);
+                    }
+                });
+        } else {
+            for (r, dst) in preds.iter_mut().enumerate() {
+                let row_slice = &x.data[r * cols..(r + 1) * cols];
+                *dst = predict_flat_tree(&flat, row_slice);
+            }
         }
         Ok(preds)
     }
@@ -565,11 +845,40 @@ impl DecisionTreeClassifier {
         }
 
         let n_classes = self.classes_.len();
-        let mut data = Vec::with_capacity(x.rows * n_classes);
-        for r in 0..x.rows {
-            let offset = r * x.cols;
-            let row_slice = &x.data[offset..offset + x.cols];
-            data.extend(root.predict_proba_row(row_slice, &self.classes_));
+        let cols = x.cols;
+        if x.rows < 64 {
+            let mut data = Vec::with_capacity(x.rows * n_classes);
+            for r in 0..x.rows {
+                let offset = r * cols;
+                let row_slice = &x.data[offset..offset + cols];
+                data.extend(root.predict_proba_row(row_slice, &self.classes_));
+            }
+            return Matrix::from_vec(x.rows, n_classes, data);
+        }
+
+        let mut flat = Vec::with_capacity(64);
+        let mut probs = Vec::with_capacity(32 * n_classes.max(1));
+        flatten_tree_proba(root, &self.classes_, &mut flat, &mut probs);
+
+        let mut data = vec![0.0; x.rows * n_classes];
+        if x.rows >= 4096 {
+            data.par_chunks_mut(1024 * n_classes)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base_r = chunk_idx * 1024;
+                    for (offset, dst) in chunk.chunks_exact_mut(n_classes).enumerate() {
+                        let r = base_r + offset;
+                        let row_slice = &x.data[r * cols..(r + 1) * cols];
+                        dst.copy_from_slice(predict_flat_tree_proba(
+                            &flat, &probs, n_classes, row_slice,
+                        ));
+                    }
+                });
+        } else {
+            for (r, dst) in data.chunks_exact_mut(n_classes).enumerate() {
+                let row_slice = &x.data[r * cols..(r + 1) * cols];
+                dst.copy_from_slice(predict_flat_tree_proba(&flat, &probs, n_classes, row_slice));
+            }
         }
         Matrix::from_vec(x.rows, n_classes, data)
     }
@@ -633,11 +942,21 @@ impl DecisionTreeRegressor {
     }
 
     // Recursively build regression tree with O(D * N log N) sliding split search and O(1) MSE updates
-    fn build_tree(&self, x: &Matrix, y: &[f64], indices: &[usize], depth: usize) -> TreeNode {
+    #[allow(clippy::too_many_arguments)]
+    fn build_tree(
+        &self,
+        x_cols: &[f64],
+        n_total: usize,
+        n_features: usize,
+        y: &[f64],
+        indices: &mut [usize],
+        depth: usize,
+        pairs: &mut Vec<(f64, f64)>,
+    ) -> TreeNode {
         let n_samples = indices.len();
         let mut total_sum = 0.0;
         let mut total_sum_sq = 0.0;
-        for &i in indices {
+        for &i in indices.iter() {
             let yi = y[i];
             total_sum += yi;
             total_sum_sq += yi * yi;
@@ -666,66 +985,140 @@ impl DecisionTreeRegressor {
             };
         }
 
-        let mut best_gain = 0.0;
-        let mut best_feature = 0;
-        let mut best_threshold = 0.0;
-
-        let mut pairs: Vec<(f64, f64)> = Vec::with_capacity(n_samples);
         let n_total_f = n_samples as f64;
+        let (best_gain, best_feature, best_threshold) = if n_samples >= 512 && n_features > 1 {
+            (0..n_features)
+                .into_par_iter()
+                .filter_map(|f| {
+                    let col = &x_cols[f * n_total..(f + 1) * n_total];
+                    let mut local_pairs: Vec<(f64, f64)> = Vec::with_capacity(n_samples);
+                    for &i in indices.iter() {
+                        local_pairs.push((col[i], y[i]));
+                    }
+                    local_pairs.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
-        for f in 0..x.cols {
-            pairs.clear();
-            for &i in indices {
-                pairs.push((x.get(i, f), y[i]));
-            }
-            pairs.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                    if (local_pairs[n_samples - 1].0 - local_pairs[0].0).abs() < 1e-9 {
+                        return None;
+                    }
 
-            if (pairs[n_samples - 1].0 - pairs[0].0).abs() < 1e-9 {
-                continue;
-            }
+                    let mut sum_left = 0.0;
+                    let mut sum_sq_left = 0.0;
+                    let mut n_left = 0usize;
 
-            let mut sum_left = 0.0;
-            let mut sum_sq_left = 0.0;
-            let mut n_left = 0usize;
+                    let mut sum_right = total_sum;
+                    let mut sum_sq_right = total_sum_sq;
+                    let mut n_right = n_samples;
+                    let mut f_best_gain = 0.0;
+                    let mut f_best_thresh = 0.0;
 
-            let mut sum_right = total_sum;
-            let mut sum_sq_right = total_sum_sq;
-            let mut n_right = n_samples;
+                    for i in 0..(n_samples - 1) {
+                        let val = local_pairs[i].1;
+                        sum_left += val;
+                        sum_sq_left += val * val;
+                        n_left += 1;
 
-            for i in 0..(n_samples - 1) {
-                let val = pairs[i].1;
-                sum_left += val;
-                sum_sq_left += val * val;
-                n_left += 1;
+                        sum_right -= val;
+                        sum_sq_right -= val * val;
+                        n_right -= 1;
 
-                sum_right -= val;
-                sum_sq_right -= val * val;
-                n_right -= 1;
+                        let cur_val = local_pairs[i].0;
+                        let next_val = local_pairs[i + 1].0;
+                        if (next_val - cur_val).abs() > 1e-9
+                            && n_left >= self.min_samples_leaf
+                            && n_right >= self.min_samples_leaf
+                        {
+                            let mean_l = sum_left / (n_left as f64);
+                            let var_l = (sum_sq_left / (n_left as f64) - mean_l * mean_l).max(0.0);
 
-                let cur_val = pairs[i].0;
-                let next_val = pairs[i + 1].0;
-                if (next_val - cur_val).abs() > 1e-9
-                    && n_left >= self.min_samples_leaf
-                    && n_right >= self.min_samples_leaf
-                {
-                    let mean_l = sum_left / (n_left as f64);
-                    let var_l = (sum_sq_left / (n_left as f64) - mean_l * mean_l).max(0.0);
+                            let mean_r = sum_right / (n_right as f64);
+                            let var_r =
+                                (sum_sq_right / (n_right as f64) - mean_r * mean_r).max(0.0);
 
-                    let mean_r = sum_right / (n_right as f64);
-                    let var_r = (sum_sq_right / (n_right as f64) - mean_r * mean_r).max(0.0);
+                            let p_left = (n_left as f64) / n_total_f;
+                            let p_right = (n_right as f64) / n_total_f;
 
-                    let p_left = (n_left as f64) / n_total_f;
-                    let p_right = (n_right as f64) / n_total_f;
+                            let gain = current_variance - (p_left * var_l + p_right * var_r);
+                            if gain > f_best_gain {
+                                f_best_gain = gain;
+                                f_best_thresh = (cur_val + next_val) / 2.0;
+                            }
+                        }
+                    }
+                    if f_best_gain > 0.0 {
+                        Some((f_best_gain, f, f_best_thresh))
+                    } else {
+                        None
+                    }
+                })
+                .reduce_with(|a, b| {
+                    if a.0 > b.0 || (a.0 == b.0 && a.1 < b.1) {
+                        a
+                    } else {
+                        b
+                    }
+                })
+                .unwrap_or((0.0, 0, 0.0))
+        } else {
+            let mut best_gain = 0.0;
+            let mut best_feature = 0;
+            let mut best_threshold = 0.0;
 
-                    let gain = current_variance - (p_left * var_l + p_right * var_r);
-                    if gain > best_gain {
-                        best_gain = gain;
-                        best_feature = f;
-                        best_threshold = (cur_val + next_val) / 2.0;
+            for f in 0..n_features {
+                let col = &x_cols[f * n_total..(f + 1) * n_total];
+                pairs.clear();
+                for &i in indices.iter() {
+                    pairs.push((col[i], y[i]));
+                }
+                pairs.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+
+                if (pairs[n_samples - 1].0 - pairs[0].0).abs() < 1e-9 {
+                    continue;
+                }
+
+                let mut sum_left = 0.0;
+                let mut sum_sq_left = 0.0;
+                let mut n_left = 0usize;
+
+                let mut sum_right = total_sum;
+                let mut sum_sq_right = total_sum_sq;
+                let mut n_right = n_samples;
+
+                for i in 0..(n_samples - 1) {
+                    let val = pairs[i].1;
+                    sum_left += val;
+                    sum_sq_left += val * val;
+                    n_left += 1;
+
+                    sum_right -= val;
+                    sum_sq_right -= val * val;
+                    n_right -= 1;
+
+                    let cur_val = pairs[i].0;
+                    let next_val = pairs[i + 1].0;
+                    if (next_val - cur_val).abs() > 1e-9
+                        && n_left >= self.min_samples_leaf
+                        && n_right >= self.min_samples_leaf
+                    {
+                        let mean_l = sum_left / (n_left as f64);
+                        let var_l = (sum_sq_left / (n_left as f64) - mean_l * mean_l).max(0.0);
+
+                        let mean_r = sum_right / (n_right as f64);
+                        let var_r = (sum_sq_right / (n_right as f64) - mean_r * mean_r).max(0.0);
+
+                        let p_left = (n_left as f64) / n_total_f;
+                        let p_right = (n_right as f64) / n_total_f;
+
+                        let gain = current_variance - (p_left * var_l + p_right * var_r);
+                        if gain > best_gain {
+                            best_gain = gain;
+                            best_feature = f;
+                            best_threshold = (cur_val + next_val) / 2.0;
+                        }
                     }
                 }
             }
-        }
+            (best_gain, best_feature, best_threshold)
+        };
 
         if best_gain <= 1e-9 {
             return TreeNode::Leaf {
@@ -734,25 +1127,31 @@ impl DecisionTreeRegressor {
             };
         }
 
-        let mut best_left = Vec::with_capacity(n_samples / 2);
-        let mut best_right = Vec::with_capacity(n_samples / 2);
-        for &i in indices {
-            if x.get(i, best_feature) <= best_threshold {
-                best_left.push(i);
+        let best_col = &x_cols[best_feature * n_total..(best_feature + 1) * n_total];
+        let mut lo = 0usize;
+        let mut hi = n_samples;
+        while lo < hi {
+            if best_col[indices[lo]] <= best_threshold {
+                lo += 1;
             } else {
-                best_right.push(i);
+                hi -= 1;
+                indices.swap(lo, hi);
             }
         }
+        let left_len = lo;
 
-        if best_left.is_empty() || best_right.is_empty() {
+        if left_len == 0 || left_len == n_samples {
             return TreeNode::Leaf {
                 value: node_mean,
                 probabilities: Vec::new(),
             };
         }
 
-        let left_child = self.build_tree(x, y, &best_left, depth + 1);
-        let right_child = self.build_tree(x, y, &best_right, depth + 1);
+        let (best_left, best_right) = indices.split_at_mut(left_len);
+        let left_child =
+            self.build_tree(x_cols, n_total, n_features, y, best_left, depth + 1, pairs);
+        let right_child =
+            self.build_tree(x_cols, n_total, n_features, y, best_right, depth + 1, pairs);
 
         TreeNode::Internal {
             feature_index: best_feature,
@@ -912,8 +1311,10 @@ impl DecisionTreeRegressor {
             )?;
             self.root = Some(root);
         } else {
-            let indices: Vec<usize> = (0..x.rows).collect();
-            let root = self.build_tree(x, y, &indices, 0);
+            let x_cols = transpose_to_col_major(x);
+            let mut indices: Vec<usize> = (0..x.rows).collect();
+            let mut pairs = Vec::with_capacity(x.rows.min(512));
+            let root = self.build_tree(&x_cols, x.rows, x.cols, y, &mut indices, 0, &mut pairs);
             self.root = Some(root);
         }
 
@@ -936,11 +1337,38 @@ impl DecisionTreeRegressor {
             });
         }
 
-        let mut preds = Vec::with_capacity(x.rows);
-        for r in 0..x.rows {
-            let offset = r * x.cols;
-            let row_slice = &x.data[offset..offset + x.cols];
-            preds.push(root.predict_row(row_slice));
+        let cols = x.cols;
+        if x.rows < 64 {
+            let mut preds = Vec::with_capacity(x.rows);
+            for r in 0..x.rows {
+                let offset = r * cols;
+                let row_slice = &x.data[offset..offset + cols];
+                preds.push(root.predict_row(row_slice));
+            }
+            return Ok(preds);
+        }
+
+        let mut flat = Vec::with_capacity(64);
+        flatten_tree_node(root, &mut flat);
+        let mut preds = vec![0.0; x.rows];
+
+        if x.rows >= 4096 {
+            preds
+                .par_chunks_mut(1024)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base_r = chunk_idx * 1024;
+                    for (offset, dst) in chunk.iter_mut().enumerate() {
+                        let r = base_r + offset;
+                        let row_slice = &x.data[r * cols..(r + 1) * cols];
+                        *dst = predict_flat_tree(&flat, row_slice);
+                    }
+                });
+        } else {
+            for (r, dst) in preds.iter_mut().enumerate() {
+                let row_slice = &x.data[r * cols..(r + 1) * cols];
+                *dst = predict_flat_tree(&flat, row_slice);
+            }
         }
         Ok(preds)
     }
@@ -1044,5 +1472,39 @@ mod tests {
                 .unwrap();
         reg.fit(&x, &y_reg).unwrap();
         assert!(reg.score(&x, &y_reg).unwrap() > 0.98);
+    }
+
+    #[test]
+    fn test_decision_tree_flat_parallel_predict_parity() {
+        let n = 4100usize;
+        let mut data = Vec::with_capacity(n * 2);
+        let mut y_cls = Vec::with_capacity(n);
+        let mut y_reg = Vec::with_capacity(n);
+        for i in 0..n {
+            let x0 = (i as f64) / (n as f64);
+            let x1 = ((i * 13) % 97) as f64 / 97.0;
+            data.push(x0);
+            data.push(x1);
+            y_cls.push(if x0 >= 0.5 { 1.0 } else { 0.0 });
+            y_reg.push(if x0 >= 0.5 { 10.0 } else { 2.0 });
+        }
+        let x = Matrix::from_vec(n, 2, data).unwrap();
+
+        let mut clf = DecisionTreeClassifier::new(None, Some(4), None, None, None).unwrap();
+        clf.fit(&x, &y_cls).unwrap();
+        let preds = clf.predict(&x).unwrap();
+        assert_eq!(preds.len(), n);
+        assert_eq!(preds, y_cls);
+        let proba = clf.predict_proba(&x).unwrap();
+        assert_eq!(proba.rows, n);
+        assert_eq!(proba.cols, 2);
+
+        let mut reg = DecisionTreeRegressor::new(None, Some(4), None, None, None).unwrap();
+        reg.fit(&x, &y_reg).unwrap();
+        let rpreds = reg.predict(&x).unwrap();
+        assert_eq!(rpreds.len(), n);
+        for (p, &t) in rpreds.iter().zip(y_reg.iter()) {
+            assert!((p - t).abs() < 1e-6);
+        }
     }
 }
