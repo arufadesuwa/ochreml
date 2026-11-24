@@ -230,118 +230,165 @@ fn sample_feature_subset(
     pool.truncate(k);
 }
 
-#[derive(Debug, Clone)]
-enum ClfTreeNode {
-    Leaf {
-        probs: Vec<f64>,
-    },
-    Internal {
-        feature: usize,
-        threshold: f64,
-        left: Box<ClfTreeNode>,
-        right: Box<ClfTreeNode>,
-    },
+#[derive(Debug, Clone, Copy)]
+struct FlatClfNode {
+    feature_or_offset: u32,
+    left: u32,
+    right: u32,
+    threshold: f64,
 }
 
-impl ClfTreeNode {
-    fn write_to(&self, buf: &mut Vec<u8>) {
-        match self {
-            ClfTreeNode::Leaf { probs } => {
-                write_u8(buf, 0);
-                write_f64_vec(buf, probs);
-            }
-            ClfTreeNode::Internal {
-                feature,
+#[inline]
+fn push_flat_clf_leaf_probs(
+    probs: &[f64],
+    nodes: &mut Vec<FlatClfNode>,
+    probs_out: &mut Vec<f64>,
+) -> usize {
+    let idx = nodes.len();
+    let offset = probs_out.len() as u32;
+    probs_out.extend_from_slice(probs);
+    nodes.push(FlatClfNode {
+        feature_or_offset: offset,
+        left: 0,
+        right: u32::MAX,
+        threshold: 0.0,
+    });
+    idx
+}
+
+#[inline]
+fn push_flat_clf_leaf_weighted(
+    counts: &[f64],
+    total_w: f64,
+    n_classes: usize,
+    nodes: &mut Vec<FlatClfNode>,
+    probs_out: &mut Vec<f64>,
+) -> usize {
+    let idx = nodes.len();
+    let offset = probs_out.len() as u32;
+    if total_w > 0.0 {
+        let inv_w = 1.0 / total_w;
+        for &c in counts {
+            probs_out.push(c * inv_w);
+        }
+    } else {
+        let uniform = 1.0 / n_classes.max(1) as f64;
+        probs_out.resize(probs_out.len() + n_classes, uniform);
+    }
+    nodes.push(FlatClfNode {
+        feature_or_offset: offset,
+        left: 0,
+        right: u32::MAX,
+        threshold: 0.0,
+    });
+    idx
+}
+
+#[inline]
+fn push_flat_clf_leaf_u32(
+    counts: &[u32],
+    n: usize,
+    n_classes: usize,
+    nodes: &mut Vec<FlatClfNode>,
+    probs_out: &mut Vec<f64>,
+) -> usize {
+    let idx = nodes.len();
+    let offset = probs_out.len() as u32;
+    if n > 0 {
+        let inv_n = 1.0 / (n as f64);
+        for &c in counts {
+            probs_out.push((c as f64) * inv_n);
+        }
+    } else {
+        let uniform = 1.0 / n_classes.max(1) as f64;
+        probs_out.resize(probs_out.len() + n_classes, uniform);
+    }
+    nodes.push(FlatClfNode {
+        feature_or_offset: offset,
+        left: 0,
+        right: u32::MAX,
+        threshold: 0.0,
+    });
+    idx
+}
+
+fn write_flat_clf_node(
+    nodes: &[FlatClfNode],
+    probs: &[f64],
+    n_classes: usize,
+    idx: usize,
+    buf: &mut Vec<u8>,
+) {
+    let node = nodes[idx];
+    if node.right == u32::MAX {
+        write_u8(buf, 0);
+        let off = node.feature_or_offset as usize;
+        write_f64_vec(buf, &probs[off..off + n_classes]);
+    } else {
+        write_u8(buf, 1);
+        write_usize(buf, node.feature_or_offset as usize);
+        write_f64(buf, node.threshold);
+        write_flat_clf_node(nodes, probs, n_classes, node.left as usize, buf);
+        write_flat_clf_node(nodes, probs, n_classes, node.right as usize, buf);
+    }
+}
+
+fn read_flat_clf_node(
+    r: &mut ByteReader<'_>,
+    nodes: &mut Vec<FlatClfNode>,
+    probs_out: &mut Vec<f64>,
+) -> OchreResult<usize> {
+    match r.read_u8()? {
+        0 => {
+            let probs = r.read_f64_vec()?;
+            Ok(push_flat_clf_leaf_probs(&probs, nodes, probs_out))
+        }
+        1 => {
+            let feature = r.read_usize()?;
+            let threshold = r.read_f64()?;
+            let idx = nodes.len();
+            nodes.push(FlatClfNode {
+                feature_or_offset: feature as u32,
+                left: 0,
+                right: 0,
                 threshold,
-                left,
-                right,
-            } => {
-                write_u8(buf, 1);
-                write_usize(buf, *feature);
-                write_f64(buf, *threshold);
-                left.write_to(buf);
-                right.write_to(buf);
-            }
+            });
+            let left_idx = read_flat_clf_node(r, nodes, probs_out)?;
+            let right_idx = read_flat_clf_node(r, nodes, probs_out)?;
+            nodes[idx].left = left_idx as u32;
+            nodes[idx].right = right_idx as u32;
+            Ok(idx)
         }
-    }
-
-    fn read_from(r: &mut ByteReader<'_>) -> OchreResult<Self> {
-        match r.read_u8()? {
-            0 => Ok(ClfTreeNode::Leaf {
-                probs: r.read_f64_vec()?,
-            }),
-            1 => {
-                let feature = r.read_usize()?;
-                let threshold = r.read_f64()?;
-                let left = Box::new(Self::read_from(r)?);
-                let right = Box::new(Self::read_from(r)?);
-                Ok(ClfTreeNode::Internal {
-                    feature,
-                    threshold,
-                    left,
-                    right,
-                })
-            }
-            _ => Err(OchreError::InvalidTreeNodeTag),
-        }
+        _ => Err(OchreError::InvalidTreeNodeTag),
     }
 }
 
-#[derive(Debug, Clone)]
-enum RegTreeNode {
-    Leaf {
-        value: f64,
-    },
-    Internal {
-        feature: usize,
-        threshold: f64,
-        left: Box<RegTreeNode>,
-        right: Box<RegTreeNode>,
-    },
-}
-
-impl RegTreeNode {
-    fn write_to(&self, buf: &mut Vec<u8>) {
-        match self {
-            RegTreeNode::Leaf { value } => {
-                write_u8(buf, 0);
-                write_f64(buf, *value);
-            }
-            RegTreeNode::Internal {
-                feature,
-                threshold,
-                left,
-                right,
-            } => {
-                write_u8(buf, 1);
-                write_usize(buf, *feature);
-                write_f64(buf, *threshold);
-                left.write_to(buf);
-                right.write_to(buf);
+fn merge_flat_clf_trees(
+    per_tree: Vec<(Vec<FlatClfNode>, Vec<f64>, Vec<f64>)>,
+) -> (Vec<FlatClfNode>, Vec<usize>, Vec<f64>, Vec<Vec<f64>>) {
+    let total_nodes: usize = per_tree.iter().map(|(n, _, _)| n.len()).sum();
+    let total_probs: usize = per_tree.iter().map(|(_, p, _)| p.len()).sum();
+    let mut flat_nodes = Vec::with_capacity(total_nodes);
+    let mut flat_roots = Vec::with_capacity(per_tree.len());
+    let mut flat_probs = Vec::with_capacity(total_probs);
+    let mut all_imp = Vec::with_capacity(per_tree.len());
+    for (mut t_nodes, t_probs, imp) in per_tree {
+        let node_base = flat_nodes.len() as u32;
+        let prob_base = flat_probs.len() as u32;
+        flat_roots.push(node_base as usize);
+        for node in &mut t_nodes {
+            if node.right == u32::MAX {
+                node.feature_or_offset += prob_base;
+            } else {
+                node.left += node_base;
+                node.right += node_base;
             }
         }
+        flat_nodes.extend_from_slice(&t_nodes);
+        flat_probs.extend_from_slice(&t_probs);
+        all_imp.push(imp);
     }
-
-    fn read_from(r: &mut ByteReader<'_>) -> OchreResult<Self> {
-        match r.read_u8()? {
-            0 => Ok(RegTreeNode::Leaf {
-                value: r.read_f64()?,
-            }),
-            1 => {
-                let feature = r.read_usize()?;
-                let threshold = r.read_f64()?;
-                let left = Box::new(Self::read_from(r)?);
-                let right = Box::new(Self::read_from(r)?);
-                Ok(RegTreeNode::Internal {
-                    feature,
-                    threshold,
-                    left,
-                    right,
-                })
-            }
-            _ => Err(OchreError::InvalidTreeNodeTag),
-        }
-    }
+    (flat_nodes, flat_roots, flat_probs, all_imp)
 }
 
 fn transpose_to_col_major(x: &Matrix) -> Vec<f64> {
@@ -359,63 +406,56 @@ fn transpose_to_col_major(x: &Matrix) -> Vec<f64> {
     x_cols
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FlatClfNode {
-    feature_or_offset: u32,
-    left: u32,
-    right: u32,
-    threshold: f64,
-}
-
-fn flatten_clf_tree(
-    node: &ClfTreeNode,
-    nodes: &mut Vec<FlatClfNode>,
-    probs_out: &mut Vec<f64>,
-) -> usize {
-    let idx = nodes.len();
-    match node {
-        ClfTreeNode::Leaf { probs } => {
-            let offset = probs_out.len() as u32;
-            probs_out.extend_from_slice(probs);
-            nodes.push(FlatClfNode {
-                feature_or_offset: offset,
-                left: 0,
-                right: u32::MAX,
-                threshold: 0.0,
-            });
+fn compute_root_min_max(x_rows: &[f64], n_samples: usize, p: usize) -> (Vec<f64>, Vec<f64>) {
+    if n_samples >= 4096 {
+        x_rows
+            .par_chunks(4096 * p)
+            .map(|chunk| {
+                let mut mn = vec![f64::INFINITY; p];
+                let mut mx = vec![f64::NEG_INFINITY; p];
+                for row in chunk.chunks_exact(p) {
+                    for f in 0..p {
+                        let v = row[f];
+                        if v < mn[f] {
+                            mn[f] = v;
+                        }
+                        if v > mx[f] {
+                            mx[f] = v;
+                        }
+                    }
+                }
+                (mn, mx)
+            })
+            .reduce(
+                || (vec![f64::INFINITY; p], vec![f64::NEG_INFINITY; p]),
+                |(mut mn_a, mut mx_a), (mn_b, mx_b)| {
+                    for f in 0..p {
+                        if mn_b[f] < mn_a[f] {
+                            mn_a[f] = mn_b[f];
+                        }
+                        if mx_b[f] > mx_a[f] {
+                            mx_a[f] = mx_b[f];
+                        }
+                    }
+                    (mn_a, mx_a)
+                },
+            )
+    } else {
+        let mut mn = vec![f64::INFINITY; p];
+        let mut mx = vec![f64::NEG_INFINITY; p];
+        for row in x_rows.chunks_exact(p) {
+            for f in 0..p {
+                let v = row[f];
+                if v < mn[f] {
+                    mn[f] = v;
+                }
+                if v > mx[f] {
+                    mx[f] = v;
+                }
+            }
         }
-        ClfTreeNode::Internal {
-            feature,
-            threshold,
-            left,
-            right,
-        } => {
-            nodes.push(FlatClfNode {
-                feature_or_offset: *feature as u32,
-                left: 0,
-                right: 0,
-                threshold: *threshold,
-            });
-            let left_idx = flatten_clf_tree(left, nodes, probs_out);
-            let right_idx = flatten_clf_tree(right, nodes, probs_out);
-            nodes[idx].left = left_idx as u32;
-            nodes[idx].right = right_idx as u32;
-        }
+        (mn, mx)
     }
-    idx
-}
-
-fn build_flat_clf_forest(
-    trees: &[ClfTreeNode],
-    n_classes: usize,
-) -> (Vec<FlatClfNode>, Vec<usize>, Vec<f64>) {
-    let mut nodes = Vec::with_capacity(trees.len() * 64);
-    let mut roots = Vec::with_capacity(trees.len());
-    let mut probs = Vec::with_capacity(trees.len() * 32 * n_classes.max(1));
-    for tree in trees {
-        roots.push(flatten_clf_tree(tree, &mut nodes, &mut probs));
-    }
-    (nodes, roots, probs)
 }
 
 #[inline]
@@ -449,45 +489,78 @@ struct FlatRegNode {
     value_or_threshold: f64,
 }
 
-fn flatten_reg_tree(node: &RegTreeNode, nodes: &mut Vec<FlatRegNode>) -> usize {
+#[inline]
+fn push_flat_reg_leaf(value: f64, nodes: &mut Vec<FlatRegNode>) -> usize {
     let idx = nodes.len();
-    match node {
-        RegTreeNode::Leaf { value } => {
-            nodes.push(FlatRegNode {
-                feature: 0,
-                left: 0,
-                right: u32::MAX,
-                value_or_threshold: *value,
-            });
-        }
-        RegTreeNode::Internal {
-            feature,
-            threshold,
-            left,
-            right,
-        } => {
-            nodes.push(FlatRegNode {
-                feature: *feature as u32,
-                left: 0,
-                right: 0,
-                value_or_threshold: *threshold,
-            });
-            let left_idx = flatten_reg_tree(left, nodes);
-            let right_idx = flatten_reg_tree(right, nodes);
-            nodes[idx].left = left_idx as u32;
-            nodes[idx].right = right_idx as u32;
-        }
-    }
+    nodes.push(FlatRegNode {
+        feature: 0,
+        left: 0,
+        right: u32::MAX,
+        value_or_threshold: value,
+    });
     idx
 }
 
-fn build_flat_reg_forest(trees: &[RegTreeNode]) -> (Vec<FlatRegNode>, Vec<usize>) {
-    let mut nodes = Vec::with_capacity(trees.len() * 64);
-    let mut roots = Vec::with_capacity(trees.len());
-    for tree in trees {
-        roots.push(flatten_reg_tree(tree, &mut nodes));
+fn write_flat_reg_node(nodes: &[FlatRegNode], idx: usize, buf: &mut Vec<u8>) {
+    let node = nodes[idx];
+    if node.right == u32::MAX {
+        write_u8(buf, 0);
+        write_f64(buf, node.value_or_threshold);
+    } else {
+        write_u8(buf, 1);
+        write_usize(buf, node.feature as usize);
+        write_f64(buf, node.value_or_threshold);
+        write_flat_reg_node(nodes, node.left as usize, buf);
+        write_flat_reg_node(nodes, node.right as usize, buf);
     }
-    (nodes, roots)
+}
+
+fn read_flat_reg_node(r: &mut ByteReader<'_>, nodes: &mut Vec<FlatRegNode>) -> OchreResult<usize> {
+    match r.read_u8()? {
+        0 => {
+            let value = r.read_f64()?;
+            Ok(push_flat_reg_leaf(value, nodes))
+        }
+        1 => {
+            let feature = r.read_usize()?;
+            let threshold = r.read_f64()?;
+            let idx = nodes.len();
+            nodes.push(FlatRegNode {
+                feature: feature as u32,
+                left: 0,
+                right: 0,
+                value_or_threshold: threshold,
+            });
+            let left_idx = read_flat_reg_node(r, nodes)?;
+            let right_idx = read_flat_reg_node(r, nodes)?;
+            nodes[idx].left = left_idx as u32;
+            nodes[idx].right = right_idx as u32;
+            Ok(idx)
+        }
+        _ => Err(OchreError::InvalidTreeNodeTag),
+    }
+}
+
+fn merge_flat_reg_trees(
+    per_tree: Vec<(Vec<FlatRegNode>, Vec<f64>)>,
+) -> (Vec<FlatRegNode>, Vec<usize>, Vec<Vec<f64>>) {
+    let total_nodes: usize = per_tree.iter().map(|(n, _)| n.len()).sum();
+    let mut flat_nodes = Vec::with_capacity(total_nodes);
+    let mut flat_roots = Vec::with_capacity(per_tree.len());
+    let mut all_imp = Vec::with_capacity(per_tree.len());
+    for (mut t_nodes, imp) in per_tree {
+        let node_base = flat_nodes.len() as u32;
+        flat_roots.push(node_base as usize);
+        for node in &mut t_nodes {
+            if node.right != u32::MAX {
+                node.left += node_base;
+                node.right += node_base;
+            }
+        }
+        flat_nodes.extend_from_slice(&t_nodes);
+        all_imp.push(imp);
+    }
+    (flat_nodes, flat_roots, all_imp)
 }
 
 #[inline]
@@ -504,6 +577,68 @@ fn predict_flat_reg_tree(nodes: &[FlatRegNode], root: usize, row: &[f64]) -> f64
             idx = node.right as usize;
         }
     }
+}
+
+// =========================================================================
+// SHARED EXTRATREES HELPERS (THRESHOLD GENERATION & ORDER-PRESERVING PARTITION)
+// =========================================================================
+
+#[inline]
+fn draw_et_thresholds(
+    feat_pool: &[usize],
+    min_v: &[f64],
+    max_v: &[f64],
+    indexed_by_pool: bool,
+    rng: &mut SplitMix64,
+    active_feats: &mut Vec<usize>,
+    active_thresh: &mut Vec<f64>,
+) {
+    active_feats.clear();
+    active_thresh.clear();
+    for (fi, &f) in feat_pool.iter().enumerate() {
+        let slot = if indexed_by_pool { fi } else { f };
+        let mn = min_v[slot];
+        let mx = max_v[slot];
+        if mx <= mn + 1e-12 {
+            continue;
+        }
+        let thresh = mn + rng.next_f64() * (mx - mn);
+        let thresh = if thresh >= mx {
+            0.5 * (mn + mx)
+        } else {
+            thresh
+        };
+        active_feats.push(f);
+        active_thresh.push(thresh);
+    }
+}
+
+#[inline]
+fn partition_u32_with_buf(
+    x_rows: &[f64],
+    p: usize,
+    best_feat: usize,
+    best_thresh: f64,
+    left_len: usize,
+    samples: &mut [u32],
+    part_buf: &mut Vec<u32>,
+) {
+    let n = samples.len();
+    if part_buf.len() < n {
+        part_buf.resize(n, 0);
+    }
+    let buf = &mut part_buf[..n];
+    let last = n.saturating_sub(1);
+    let mut l_pos = 0usize;
+    let mut r_pos = left_len;
+    for &idx in samples.iter() {
+        let go_left = x_rows[idx as usize * p + best_feat] <= best_thresh;
+        let dst = if go_left { l_pos } else { r_pos };
+        buf[dst.min(last)] = idx;
+        l_pos += usize::from(go_left);
+        r_pos += usize::from(!go_left);
+    }
+    samples.copy_from_slice(buf);
 }
 
 // =========================================================================
@@ -591,6 +726,7 @@ fn impurity_weighted(counts: &[f64], total_w: f64, entropy: bool) -> f64 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_clf_tree(
     cfg: &ClfBuildCfg<'_>,
     samples: &mut [(usize, f64)],
@@ -598,7 +734,9 @@ fn build_clf_tree(
     rng: &mut SplitMix64,
     importances: &mut [f64],
     scratch: &mut ClfTreeScratch,
-) -> ClfTreeNode {
+    nodes: &mut Vec<FlatClfNode>,
+    probs_out: &mut Vec<f64>,
+) -> usize {
     let n = samples.len();
     scratch.counts.fill(0.0);
     let mut total_w = 0.0;
@@ -607,25 +745,28 @@ fn build_clf_tree(
         total_w += w;
     }
 
-    let make_leaf = |counts: &[f64]| {
-        let probs = if total_w > 0.0 {
-            counts.iter().map(|&c| c / total_w).collect()
-        } else {
-            vec![1.0 / cfg.n_classes.max(1) as f64; cfg.n_classes]
-        };
-        ClfTreeNode::Leaf { probs }
-    };
-
     if n < cfg.min_samples_split
         || n < 2 * cfg.min_samples_leaf
         || cfg.max_depth.is_some_and(|d| depth >= d)
     {
-        return make_leaf(&scratch.counts);
+        return push_flat_clf_leaf_weighted(
+            &scratch.counts,
+            total_w,
+            cfg.n_classes,
+            nodes,
+            probs_out,
+        );
     }
 
     let parent_imp = impurity_weighted(&scratch.counts, total_w, cfg.criterion_entropy);
     if parent_imp <= 1e-12 {
-        return make_leaf(&scratch.counts);
+        return push_flat_clf_leaf_weighted(
+            &scratch.counts,
+            total_w,
+            cfg.n_classes,
+            nodes,
+            probs_out,
+        );
     }
 
     sample_feature_subset(
@@ -639,10 +780,10 @@ fn build_clf_tree(
     let mut best_feat = 0usize;
     let mut best_thresh = 0.0;
     let n_samples = cfg.n_samples;
+    let p = cfg.n_features;
 
     if cfg.extra_trees {
         let k = scratch.feat_pool.len();
-        let p = cfg.n_features;
         let n_classes = cfg.n_classes;
         let feat_pool = &scratch.feat_pool[..k];
         let min_v = &mut scratch.et_min[..k];
@@ -663,23 +804,15 @@ fn build_clf_tree(
             }
         }
 
-        scratch.et_active_feats.clear();
-        scratch.et_active_thresh.clear();
-        for fi in 0..k {
-            let mn = min_v[fi];
-            let mx = max_v[fi];
-            if mx <= mn + 1e-12 {
-                continue;
-            }
-            let thresh = mn + rng.next_f64() * (mx - mn);
-            let thresh = if thresh >= mx {
-                0.5 * (mn + mx)
-            } else {
-                thresh
-            };
-            scratch.et_active_feats.push(feat_pool[fi]);
-            scratch.et_active_thresh.push(thresh);
-        }
+        draw_et_thresholds(
+            feat_pool,
+            min_v,
+            max_v,
+            true,
+            rng,
+            &mut scratch.et_active_feats,
+            &mut scratch.et_active_thresh,
+        );
 
         let m = scratch.et_active_feats.len();
         if m > 0 {
@@ -788,55 +921,675 @@ fn build_clf_tree(
     }
 
     if best_gain <= 1e-12 {
-        return make_leaf(&scratch.counts);
+        return push_flat_clf_leaf_weighted(
+            &scratch.counts,
+            total_w,
+            cfg.n_classes,
+            nodes,
+            probs_out,
+        );
     }
 
-    let best_col = &cfg.x_cols[best_feat * n_samples..(best_feat + 1) * n_samples];
     let mut lo = 0usize;
     let mut hi = n;
-    while lo < hi {
-        if best_col[samples[lo].0] <= best_thresh {
-            lo += 1;
-        } else {
+    if cfg.extra_trees {
+        loop {
+            while lo < hi && cfg.x_rows[samples[lo].0 * p + best_feat] <= best_thresh {
+                lo += 1;
+            }
+            while lo < hi && cfg.x_rows[samples[hi - 1].0 * p + best_feat] > best_thresh {
+                hi -= 1;
+            }
+            if lo >= hi {
+                break;
+            }
             hi -= 1;
             samples.swap(lo, hi);
+            lo += 1;
+        }
+    } else {
+        let best_col = &cfg.x_cols[best_feat * n_samples..(best_feat + 1) * n_samples];
+        loop {
+            while lo < hi && best_col[samples[lo].0] <= best_thresh {
+                lo += 1;
+            }
+            while lo < hi && best_col[samples[hi - 1].0] > best_thresh {
+                hi -= 1;
+            }
+            if lo >= hi {
+                break;
+            }
+            hi -= 1;
+            samples.swap(lo, hi);
+            lo += 1;
         }
     }
     let left_len = lo;
     let right_len = n - left_len;
 
     if left_len < cfg.min_samples_leaf || right_len < cfg.min_samples_leaf {
-        return make_leaf(&scratch.counts);
+        return push_flat_clf_leaf_weighted(
+            &scratch.counts,
+            total_w,
+            cfg.n_classes,
+            nodes,
+            probs_out,
+        );
     }
 
     if cfg.total_tree_weight > 0.0 {
         importances[best_feat] += (total_w / cfg.total_tree_weight) * best_gain;
     }
 
+    let node_idx = nodes.len();
+    nodes.push(FlatClfNode {
+        feature_or_offset: best_feat as u32,
+        left: 0,
+        right: 0,
+        threshold: best_thresh,
+    });
     let (left_samples, right_samples) = samples.split_at_mut(left_len);
-    let left = Box::new(build_clf_tree(
+    let left_idx = build_clf_tree(
         cfg,
         left_samples,
         depth + 1,
         rng,
         importances,
         scratch,
-    ));
-    let right = Box::new(build_clf_tree(
+        nodes,
+        probs_out,
+    );
+    let right_idx = build_clf_tree(
         cfg,
         right_samples,
         depth + 1,
         rng,
         importances,
         scratch,
-    ));
+        nodes,
+        probs_out,
+    );
+    nodes[node_idx].left = left_idx as u32;
+    nodes[node_idx].right = right_idx as u32;
+    node_idx
+}
 
-    ClfTreeNode::Internal {
-        feature: best_feat,
-        threshold: best_thresh,
-        left,
-        right,
+// =========================================================================
+// UNWEIGHTED U32 FAST-PATH: EXTRATREES CLASSIFIER
+// =========================================================================
+
+#[derive(Clone, Copy)]
+struct EtClfCfg<'a> {
+    criterion_entropy: bool,
+    max_depth: Option<usize>,
+    min_samples_split: usize,
+    min_samples_leaf: usize,
+    max_features: usize,
+    n_classes: usize,
+    n_samples: usize,
+    n_features: usize,
+    total_tree_weight: f64,
+    x_rows: &'a [f64],
+    class_idx: &'a [u32],
+    root_min: &'a [f64],
+    root_max: &'a [f64],
+    root_counts: &'a [u32],
+}
+
+struct EtClfScratch {
+    feat_pool: Vec<usize>,
+    et_min: Vec<f64>,
+    et_max: Vec<f64>,
+    et_active_feats: Vec<usize>,
+    et_active_thresh: Vec<f64>,
+    et_thresh_by_feat: Vec<f64>,
+    et_left_counts: Vec<u32>,
+    counts_stack: Vec<u32>,
+    part_buf: Vec<u32>,
+}
+
+impl EtClfScratch {
+    fn new(n_features: usize, max_feat: usize, n_classes: usize) -> Self {
+        let thresh_by_feat_cap = if max_feat == n_features {
+            n_features
+        } else {
+            0
+        };
+        Self {
+            feat_pool: Vec::with_capacity(n_features),
+            et_min: vec![0.0; max_feat],
+            et_max: vec![0.0; max_feat],
+            et_active_feats: Vec::with_capacity(max_feat),
+            et_active_thresh: Vec::with_capacity(max_feat),
+            et_thresh_by_feat: vec![0.0; thresh_by_feat_cap],
+            et_left_counts: vec![0; max_feat * n_classes],
+            counts_stack: vec![0; 32 * 2 * n_classes],
+            part_buf: Vec::new(),
+        }
     }
+}
+
+#[inline]
+fn clf_impurity_u32(counts: &[u32], n: usize, entropy: bool) -> (f64, u64) {
+    if n == 0 {
+        return (0.0, 0);
+    }
+    let nf = n as f64;
+    if entropy {
+        let mut sum_c_log = 0.0;
+        for &c in counts {
+            if c > 0 {
+                let cf = c as f64;
+                sum_c_log += cf * cf.log2();
+            }
+        }
+        (nf.log2() - sum_c_log / nf, 0)
+    } else {
+        let mut sum_sq = 0u64;
+        for &c in counts {
+            let cu = c as u64;
+            sum_sq += cu * cu;
+        }
+        (1.0 - (sum_sq as f64) / (nf * nf), sum_sq)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_et_clf_splits_u32(
+    active_feats: &[usize],
+    active_thresh: &[f64],
+    left_counts: &[u32],
+    stride: usize,
+    dense_by_feat: bool,
+    counts: &[u32],
+    n: usize,
+    min_samples_leaf: usize,
+    criterion_entropy: bool,
+    parent_imp: f64,
+    parent_sum_sq: u64,
+) -> Option<(usize, f64, f64, usize, usize)> {
+    let n_classes = counts.len();
+    let nf = n as f64;
+    let mut best_feat = 0usize;
+    let mut best_thresh = 0.0;
+    let mut best_col_idx = 0usize;
+    let mut best_left_n = 0usize;
+    let mut found = false;
+
+    if criterion_entropy {
+        let mut best_gain = 0.0;
+        for (ai, (&feat, &thresh)) in active_feats.iter().zip(active_thresh.iter()).enumerate() {
+            let col_idx = if dense_by_feat { feat } else { ai };
+            let mut ln = 0u32;
+            let mut l_ent_sum = 0.0;
+            let mut r_ent_sum = 0.0;
+            for c in 0..n_classes {
+                let lc = left_counts[c * stride + col_idx];
+                let rc = counts[c] - lc;
+                ln += lc;
+                if lc > 0 {
+                    let lf = lc as f64;
+                    l_ent_sum += lf * lf.log2();
+                }
+                if rc > 0 {
+                    let rf = rc as f64;
+                    r_ent_sum += rf * rf.log2();
+                }
+            }
+            let lnu = ln as usize;
+            let rnu = n - lnu;
+            if lnu < min_samples_leaf || rnu < min_samples_leaf {
+                continue;
+            }
+            let lnf = lnu as f64;
+            let rnf = rnu as f64;
+            let child_ent = (lnf * lnf.log2() - l_ent_sum + rnf * rnf.log2() - r_ent_sum) / nf;
+            let gain = parent_imp - child_ent;
+            if gain > best_gain {
+                best_gain = gain;
+                best_feat = feat;
+                best_thresh = thresh;
+                best_col_idx = col_idx;
+                best_left_n = lnu;
+                found = true;
+            }
+        }
+        if !found || best_gain <= 1e-12 {
+            return None;
+        }
+        Some((best_feat, best_thresh, best_gain, best_col_idx, best_left_n))
+    } else {
+        let mut best_score = f64::NEG_INFINITY;
+        for (ai, (&feat, &thresh)) in active_feats.iter().zip(active_thresh.iter()).enumerate() {
+            let col_idx = if dense_by_feat { feat } else { ai };
+            let mut ln = 0u64;
+            let mut l_sum_sq = 0u64;
+            let mut r_sum_sq = 0u64;
+            for c in 0..n_classes {
+                let lc = left_counts[c * stride + col_idx] as u64;
+                let rc = (counts[c] as u64) - lc;
+                ln += lc;
+                l_sum_sq += lc * lc;
+                r_sum_sq += rc * rc;
+            }
+            let lnu = ln as usize;
+            let rnu = n - lnu;
+            if lnu < min_samples_leaf || rnu < min_samples_leaf {
+                continue;
+            }
+            let score = (l_sum_sq as f64) / (lnu as f64) + (r_sum_sq as f64) / (rnu as f64);
+            if score > best_score {
+                best_score = score;
+                best_feat = feat;
+                best_thresh = thresh;
+                best_col_idx = col_idx;
+                best_left_n = lnu;
+                found = true;
+            }
+        }
+        if !found {
+            return None;
+        }
+        let best_gain = (best_score - (parent_sum_sq as f64) / nf) / nf;
+        if best_gain <= 1e-12 {
+            return None;
+        }
+        Some((best_feat, best_thresh, best_gain, best_col_idx, best_left_n))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_clf_tree_root_et_u32(
+    cfg: &EtClfCfg<'_>,
+    rng: &mut SplitMix64,
+    importances: &mut [f64],
+    scratch: &mut EtClfScratch,
+    nodes: &mut Vec<FlatClfNode>,
+    probs_out: &mut Vec<f64>,
+) -> usize {
+    let n = cfg.n_samples;
+    let p = cfg.n_features;
+    let n_classes = cfg.n_classes;
+    if n < cfg.min_samples_split
+        || n < 2 * cfg.min_samples_leaf
+        || cfg.max_depth.is_some_and(|d| d == 0)
+    {
+        return push_flat_clf_leaf_u32(cfg.root_counts, n, n_classes, nodes, probs_out);
+    }
+
+    let (parent_imp, parent_sum_sq) = clf_impurity_u32(cfg.root_counts, n, cfg.criterion_entropy);
+    if parent_imp <= 1e-12 {
+        return push_flat_clf_leaf_u32(cfg.root_counts, n, n_classes, nodes, probs_out);
+    }
+
+    sample_feature_subset(&mut scratch.feat_pool, p, cfg.max_features, rng);
+    draw_et_thresholds(
+        &scratch.feat_pool,
+        cfg.root_min,
+        cfg.root_max,
+        false,
+        rng,
+        &mut scratch.et_active_feats,
+        &mut scratch.et_active_thresh,
+    );
+
+    let m = scratch.et_active_feats.len();
+    if m == 0 {
+        return push_flat_clf_leaf_u32(cfg.root_counts, n, n_classes, nodes, probs_out);
+    }
+
+    let dense_by_feat = m == p;
+    let stride = if dense_by_feat { p } else { m };
+    let left_counts = &mut scratch.et_left_counts[..n_classes * stride];
+    left_counts.fill(0);
+
+    if dense_by_feat {
+        let thresh_s = &mut scratch.et_thresh_by_feat[..p];
+        for (&f, &t) in scratch
+            .et_active_feats
+            .iter()
+            .zip(scratch.et_active_thresh.iter())
+        {
+            thresh_s[f] = t;
+        }
+        for (row, &c) in cfg.x_rows.chunks_exact(p).zip(cfg.class_idx.iter()) {
+            let cu = c as usize;
+            let lc_c = &mut left_counts[cu * p..cu * p + p];
+            for f in 0..p {
+                lc_c[f] += u32::from(row[f] <= thresh_s[f]);
+            }
+        }
+    } else {
+        let active_feats = &scratch.et_active_feats[..m];
+        let active_thresh = &scratch.et_active_thresh[..m];
+        for (row, &c) in cfg.x_rows.chunks_exact(p).zip(cfg.class_idx.iter()) {
+            let cu = c as usize;
+            let lc_c = &mut left_counts[cu * m..cu * m + m];
+            for ai in 0..m {
+                lc_c[ai] += u32::from(row[active_feats[ai]] <= active_thresh[ai]);
+            }
+        }
+    }
+
+    let Some((best_feat, best_thresh, best_gain, best_col_idx, best_left_n)) =
+        eval_et_clf_splits_u32(
+            &scratch.et_active_feats[..m],
+            &scratch.et_active_thresh[..m],
+            left_counts,
+            stride,
+            dense_by_feat,
+            cfg.root_counts,
+            n,
+            cfg.min_samples_leaf,
+            cfg.criterion_entropy,
+            parent_imp,
+            parent_sum_sq,
+        )
+    else {
+        return push_flat_clf_leaf_u32(cfg.root_counts, n, n_classes, nodes, probs_out);
+    };
+
+    if cfg.total_tree_weight > 0.0 {
+        importances[best_feat] += ((n as f64) / cfg.total_tree_weight) * best_gain;
+    }
+
+    let need = 4 * n_classes;
+    if scratch.counts_stack.len() < need {
+        scratch.counts_stack.resize(need, 0);
+    }
+    let r_off = n_classes;
+    let l_off = 2 * n_classes;
+    for c in 0..n_classes {
+        let lc = left_counts[c * stride + best_col_idx];
+        scratch.counts_stack[l_off + c] = lc;
+        scratch.counts_stack[r_off + c] = cfg.root_counts[c] - lc;
+    }
+
+    let mut samples = vec![0u32; n];
+    let last = n.saturating_sub(1);
+    let mut l_pos = 0usize;
+    let mut r_pos = best_left_n;
+    for (idx, row) in cfg.x_rows.chunks_exact(p).enumerate() {
+        let go_left = row[best_feat] <= best_thresh;
+        let dst = if go_left { l_pos } else { r_pos };
+        samples[dst.min(last)] = idx as u32;
+        l_pos += usize::from(go_left);
+        r_pos += usize::from(!go_left);
+    }
+
+    let node_idx = nodes.len();
+    nodes.push(FlatClfNode {
+        feature_or_offset: best_feat as u32,
+        left: 0,
+        right: 0,
+        threshold: best_thresh,
+    });
+    let (left_samples, right_samples) = samples.split_at_mut(best_left_n);
+    let left_idx = build_clf_tree_et_u32(
+        cfg,
+        left_samples,
+        1,
+        rng,
+        importances,
+        scratch,
+        nodes,
+        probs_out,
+    );
+    scratch
+        .counts_stack
+        .copy_within(r_off..r_off + n_classes, l_off);
+    let right_idx = build_clf_tree_et_u32(
+        cfg,
+        right_samples,
+        1,
+        rng,
+        importances,
+        scratch,
+        nodes,
+        probs_out,
+    );
+    nodes[node_idx].left = left_idx as u32;
+    nodes[node_idx].right = right_idx as u32;
+    node_idx
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_clf_tree_et_u32(
+    cfg: &EtClfCfg<'_>,
+    samples: &mut [u32],
+    depth: usize,
+    rng: &mut SplitMix64,
+    importances: &mut [f64],
+    scratch: &mut EtClfScratch,
+    nodes: &mut Vec<FlatClfNode>,
+    probs_out: &mut Vec<f64>,
+) -> usize {
+    let n = samples.len();
+    let n_classes = cfg.n_classes;
+    let cur_off = depth * 2 * n_classes;
+    if n < cfg.min_samples_split
+        || n < 2 * cfg.min_samples_leaf
+        || cfg.max_depth.is_some_and(|d| depth >= d)
+    {
+        return push_flat_clf_leaf_u32(
+            &scratch.counts_stack[cur_off..cur_off + n_classes],
+            n,
+            n_classes,
+            nodes,
+            probs_out,
+        );
+    }
+
+    let (parent_imp, parent_sum_sq) = clf_impurity_u32(
+        &scratch.counts_stack[cur_off..cur_off + n_classes],
+        n,
+        cfg.criterion_entropy,
+    );
+    if parent_imp <= 1e-12 {
+        return push_flat_clf_leaf_u32(
+            &scratch.counts_stack[cur_off..cur_off + n_classes],
+            n,
+            n_classes,
+            nodes,
+            probs_out,
+        );
+    }
+
+    let p = cfg.n_features;
+    sample_feature_subset(&mut scratch.feat_pool, p, cfg.max_features, rng);
+    let k = scratch.feat_pool.len();
+    let all_feats = k == p;
+
+    if all_feats {
+        let min_v = &mut scratch.et_min[..p];
+        let max_v = &mut scratch.et_max[..p];
+        min_v.fill(f64::INFINITY);
+        max_v.fill(f64::NEG_INFINITY);
+        for &idx in samples.iter() {
+            let uidx = idx as usize;
+            let row = &cfg.x_rows[uidx * p..uidx * p + p];
+            for f in 0..p {
+                let v = row[f];
+                if v < min_v[f] {
+                    min_v[f] = v;
+                }
+                if v > max_v[f] {
+                    max_v[f] = v;
+                }
+            }
+        }
+        draw_et_thresholds(
+            &scratch.feat_pool[..k],
+            min_v,
+            max_v,
+            false,
+            rng,
+            &mut scratch.et_active_feats,
+            &mut scratch.et_active_thresh,
+        );
+    } else {
+        let feat_pool = &scratch.feat_pool[..k];
+        let min_v = &mut scratch.et_min[..k];
+        let max_v = &mut scratch.et_max[..k];
+        min_v.fill(f64::INFINITY);
+        max_v.fill(f64::NEG_INFINITY);
+        for &idx in samples.iter() {
+            let uidx = idx as usize;
+            let row = &cfg.x_rows[uidx * p..uidx * p + p];
+            for fi in 0..k {
+                let v = row[feat_pool[fi]];
+                if v < min_v[fi] {
+                    min_v[fi] = v;
+                }
+                if v > max_v[fi] {
+                    max_v[fi] = v;
+                }
+            }
+        }
+        draw_et_thresholds(
+            feat_pool,
+            min_v,
+            max_v,
+            true,
+            rng,
+            &mut scratch.et_active_feats,
+            &mut scratch.et_active_thresh,
+        );
+    }
+
+    let m = scratch.et_active_feats.len();
+    if m == 0 {
+        return push_flat_clf_leaf_u32(
+            &scratch.counts_stack[cur_off..cur_off + n_classes],
+            n,
+            n_classes,
+            nodes,
+            probs_out,
+        );
+    }
+
+    let dense_by_feat = m == p;
+    let stride = if dense_by_feat { p } else { m };
+    let left_counts = &mut scratch.et_left_counts[..n_classes * stride];
+    left_counts.fill(0);
+
+    if dense_by_feat {
+        let thresh_s = &mut scratch.et_thresh_by_feat[..p];
+        for (&f, &t) in scratch
+            .et_active_feats
+            .iter()
+            .zip(scratch.et_active_thresh.iter())
+        {
+            thresh_s[f] = t;
+        }
+        for &idx in samples.iter() {
+            let uidx = idx as usize;
+            let row = &cfg.x_rows[uidx * p..uidx * p + p];
+            let cu = cfg.class_idx[uidx] as usize;
+            let lc_c = &mut left_counts[cu * p..cu * p + p];
+            for f in 0..p {
+                lc_c[f] += u32::from(row[f] <= thresh_s[f]);
+            }
+        }
+    } else {
+        let active_feats = &scratch.et_active_feats[..m];
+        let active_thresh = &scratch.et_active_thresh[..m];
+        for &idx in samples.iter() {
+            let uidx = idx as usize;
+            let row = &cfg.x_rows[uidx * p..uidx * p + p];
+            let cu = cfg.class_idx[uidx] as usize;
+            let lc_c = &mut left_counts[cu * m..cu * m + m];
+            for ai in 0..m {
+                lc_c[ai] += u32::from(row[active_feats[ai]] <= active_thresh[ai]);
+            }
+        }
+    }
+
+    let Some((best_feat, best_thresh, best_gain, best_col_idx, best_left_n)) =
+        eval_et_clf_splits_u32(
+            &scratch.et_active_feats[..m],
+            &scratch.et_active_thresh[..m],
+            left_counts,
+            stride,
+            dense_by_feat,
+            &scratch.counts_stack[cur_off..cur_off + n_classes],
+            n,
+            cfg.min_samples_leaf,
+            cfg.criterion_entropy,
+            parent_imp,
+            parent_sum_sq,
+        )
+    else {
+        return push_flat_clf_leaf_u32(
+            &scratch.counts_stack[cur_off..cur_off + n_classes],
+            n,
+            n_classes,
+            nodes,
+            probs_out,
+        );
+    };
+
+    if cfg.total_tree_weight > 0.0 {
+        importances[best_feat] += ((n as f64) / cfg.total_tree_weight) * best_gain;
+    }
+
+    let need = (depth + 2) * 2 * n_classes;
+    if scratch.counts_stack.len() < need {
+        scratch.counts_stack.resize(need, 0);
+    }
+    let r_off = cur_off + n_classes;
+    let l_off = (depth + 1) * 2 * n_classes;
+    for c in 0..n_classes {
+        let lc = left_counts[c * stride + best_col_idx];
+        let tot = scratch.counts_stack[cur_off + c];
+        scratch.counts_stack[l_off + c] = lc;
+        scratch.counts_stack[r_off + c] = tot - lc;
+    }
+
+    partition_u32_with_buf(
+        cfg.x_rows,
+        p,
+        best_feat,
+        best_thresh,
+        best_left_n,
+        samples,
+        &mut scratch.part_buf,
+    );
+
+    let node_idx = nodes.len();
+    nodes.push(FlatClfNode {
+        feature_or_offset: best_feat as u32,
+        left: 0,
+        right: 0,
+        threshold: best_thresh,
+    });
+    let (left_samples, right_samples) = samples.split_at_mut(best_left_n);
+    let left_idx = build_clf_tree_et_u32(
+        cfg,
+        left_samples,
+        depth + 1,
+        rng,
+        importances,
+        scratch,
+        nodes,
+        probs_out,
+    );
+    scratch
+        .counts_stack
+        .copy_within(r_off..r_off + n_classes, l_off);
+    let right_idx = build_clf_tree_et_u32(
+        cfg,
+        right_samples,
+        depth + 1,
+        rng,
+        importances,
+        scratch,
+        nodes,
+        probs_out,
+    );
+    nodes[node_idx].left = left_idx as u32;
+    nodes[node_idx].right = right_idx as u32;
+    node_idx
 }
 
 // =========================================================================
@@ -894,7 +1647,8 @@ fn build_reg_tree(
     rng: &mut SplitMix64,
     importances: &mut [f64],
     scratch: &mut RegTreeScratch,
-) -> RegTreeNode {
+    nodes: &mut Vec<FlatRegNode>,
+) -> usize {
     let n = samples.len();
     let mut sum_y = 0.0;
     let mut sum_y2 = 0.0;
@@ -912,12 +1666,12 @@ fn build_reg_tree(
         || cfg.max_depth.is_some_and(|d| depth >= d)
         || total_w <= 0.0
     {
-        return RegTreeNode::Leaf { value: mean_val };
+        return push_flat_reg_leaf(mean_val, nodes);
     }
 
     let parent_var = (sum_y2 / total_w) - mean_val * mean_val;
     if parent_var <= 1e-12 {
-        return RegTreeNode::Leaf { value: mean_val };
+        return push_flat_reg_leaf(mean_val, nodes);
     }
     let parent_score = (sum_y * sum_y) / total_w;
 
@@ -932,10 +1686,10 @@ fn build_reg_tree(
     let mut best_feat = 0usize;
     let mut best_thresh = 0.0;
     let n_samples = cfg.n_samples;
+    let p = cfg.n_features;
 
     if cfg.extra_trees {
         let k = scratch.feat_pool.len();
-        let p = cfg.n_features;
         let feat_pool = &scratch.feat_pool[..k];
         let min_v = &mut scratch.et_min[..k];
         let max_v = &mut scratch.et_max[..k];
@@ -955,23 +1709,15 @@ fn build_reg_tree(
             }
         }
 
-        scratch.et_active_feats.clear();
-        scratch.et_active_thresh.clear();
-        for fi in 0..k {
-            let mn = min_v[fi];
-            let mx = max_v[fi];
-            if mx <= mn + 1e-12 {
-                continue;
-            }
-            let thresh = mn + rng.next_f64() * (mx - mn);
-            let thresh = if thresh >= mx {
-                0.5 * (mn + mx)
-            } else {
-                thresh
-            };
-            scratch.et_active_feats.push(feat_pool[fi]);
-            scratch.et_active_thresh.push(thresh);
-        }
+        draw_et_thresholds(
+            feat_pool,
+            min_v,
+            max_v,
+            true,
+            rng,
+            &mut scratch.et_active_feats,
+            &mut scratch.et_active_thresh,
+        );
 
         let m = scratch.et_active_feats.len();
         if m > 0 {
@@ -1065,55 +1811,506 @@ fn build_reg_tree(
     }
 
     if best_score_gain <= 1e-12 {
-        return RegTreeNode::Leaf { value: mean_val };
+        return push_flat_reg_leaf(mean_val, nodes);
     }
 
-    let best_col = &cfg.x_cols[best_feat * n_samples..(best_feat + 1) * n_samples];
     let mut lo = 0usize;
     let mut hi = n;
-    while lo < hi {
-        if best_col[samples[lo].0] <= best_thresh {
-            lo += 1;
-        } else {
+    if cfg.extra_trees {
+        loop {
+            while lo < hi && cfg.x_rows[samples[lo].0 * p + best_feat] <= best_thresh {
+                lo += 1;
+            }
+            while lo < hi && cfg.x_rows[samples[hi - 1].0 * p + best_feat] > best_thresh {
+                hi -= 1;
+            }
+            if lo >= hi {
+                break;
+            }
             hi -= 1;
             samples.swap(lo, hi);
+            lo += 1;
+        }
+    } else {
+        let best_col = &cfg.x_cols[best_feat * n_samples..(best_feat + 1) * n_samples];
+        loop {
+            while lo < hi && best_col[samples[lo].0] <= best_thresh {
+                lo += 1;
+            }
+            while lo < hi && best_col[samples[hi - 1].0] > best_thresh {
+                hi -= 1;
+            }
+            if lo >= hi {
+                break;
+            }
+            hi -= 1;
+            samples.swap(lo, hi);
+            lo += 1;
         }
     }
     let left_len = lo;
     let right_len = n - left_len;
 
     if left_len < cfg.min_samples_leaf || right_len < cfg.min_samples_leaf {
-        return RegTreeNode::Leaf { value: mean_val };
+        return push_flat_reg_leaf(mean_val, nodes);
     }
 
     if cfg.total_tree_weight > 0.0 {
         importances[best_feat] += best_score_gain / cfg.total_tree_weight;
     }
 
+    let node_idx = nodes.len();
+    nodes.push(FlatRegNode {
+        feature: best_feat as u32,
+        left: 0,
+        right: 0,
+        value_or_threshold: best_thresh,
+    });
     let (left_samples, right_samples) = samples.split_at_mut(left_len);
-    let left = Box::new(build_reg_tree(
+    let left_idx = build_reg_tree(
         cfg,
         left_samples,
         depth + 1,
         rng,
         importances,
         scratch,
-    ));
-    let right = Box::new(build_reg_tree(
+        nodes,
+    );
+    let right_idx = build_reg_tree(
         cfg,
         right_samples,
         depth + 1,
         rng,
         importances,
         scratch,
-    ));
+        nodes,
+    );
+    nodes[node_idx].left = left_idx as u32;
+    nodes[node_idx].right = right_idx as u32;
+    node_idx
+}
 
-    RegTreeNode::Internal {
-        feature: best_feat,
-        threshold: best_thresh,
-        left,
-        right,
+// =========================================================================
+// UNWEIGHTED U32 FAST-PATH: EXTRATREES REGRESSOR
+// =========================================================================
+
+#[derive(Clone, Copy)]
+struct EtRegCfg<'a> {
+    max_depth: Option<usize>,
+    min_samples_split: usize,
+    min_samples_leaf: usize,
+    max_features: usize,
+    n_samples: usize,
+    n_features: usize,
+    total_tree_weight: f64,
+    x_rows: &'a [f64],
+    y: &'a [f64],
+    root_min: &'a [f64],
+    root_max: &'a [f64],
+    root_sum_y: f64,
+    root_sum_y2: f64,
+}
+
+struct EtRegScratch {
+    feat_pool: Vec<usize>,
+    et_min: Vec<f64>,
+    et_max: Vec<f64>,
+    et_active_feats: Vec<usize>,
+    et_active_thresh: Vec<f64>,
+    et_thresh_by_feat: Vec<f64>,
+    et_left_sum: Vec<f64>,
+    et_left_n: Vec<u32>,
+    part_buf: Vec<u32>,
+}
+
+impl EtRegScratch {
+    fn new(n_features: usize, max_feat: usize) -> Self {
+        let thresh_by_feat_cap = if max_feat == n_features {
+            n_features
+        } else {
+            0
+        };
+        Self {
+            feat_pool: Vec::with_capacity(n_features),
+            et_min: vec![0.0; max_feat],
+            et_max: vec![0.0; max_feat],
+            et_active_feats: Vec::with_capacity(max_feat),
+            et_active_thresh: Vec::with_capacity(max_feat),
+            et_thresh_by_feat: vec![0.0; thresh_by_feat_cap],
+            et_left_sum: vec![0.0; max_feat],
+            et_left_n: vec![0; max_feat],
+            part_buf: Vec::new(),
+        }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn eval_et_reg_splits_u32(
+    active_feats: &[usize],
+    active_thresh: &[f64],
+    left_sum: &[f64],
+    left_n: &[u32],
+    dense_by_feat: bool,
+    sum_y: f64,
+    n: usize,
+    min_samples_leaf: usize,
+    parent_score: f64,
+) -> Option<(usize, f64, f64, usize)> {
+    let mut best_score_gain = 0.0;
+    let mut best_feat = 0usize;
+    let mut best_thresh = 0.0;
+    let mut best_left_n = 0usize;
+    let mut found = false;
+
+    for (ai, (&feat, &thresh)) in active_feats.iter().zip(active_thresh.iter()).enumerate() {
+        let col_idx = if dense_by_feat { feat } else { ai };
+        let ln = left_n[col_idx] as usize;
+        let rn = n - ln;
+        if ln < min_samples_leaf || rn < min_samples_leaf {
+            continue;
+        }
+        let ls = left_sum[col_idx];
+        let rs = sum_y - ls;
+        let gain = (ls * ls) / (ln as f64) + (rs * rs) / (rn as f64) - parent_score;
+        if gain > best_score_gain {
+            best_score_gain = gain;
+            best_feat = feat;
+            best_thresh = thresh;
+            best_left_n = ln;
+            found = true;
+        }
+    }
+
+    if !found || best_score_gain <= 1e-12 {
+        None
+    } else {
+        Some((best_feat, best_thresh, best_score_gain, best_left_n))
+    }
+}
+
+fn build_reg_tree_root_et_u32(
+    cfg: &EtRegCfg<'_>,
+    rng: &mut SplitMix64,
+    importances: &mut [f64],
+    scratch: &mut EtRegScratch,
+    nodes: &mut Vec<FlatRegNode>,
+) -> usize {
+    let n = cfg.n_samples;
+    let p = cfg.n_features;
+    let nf = n as f64;
+    let mean_val = if n > 0 { cfg.root_sum_y / nf } else { 0.0 };
+    if n < cfg.min_samples_split
+        || n < 2 * cfg.min_samples_leaf
+        || cfg.max_depth.is_some_and(|d| d == 0)
+    {
+        return push_flat_reg_leaf(mean_val, nodes);
+    }
+
+    let parent_var = (cfg.root_sum_y2 / nf) - mean_val * mean_val;
+    if parent_var <= 1e-12 {
+        return push_flat_reg_leaf(mean_val, nodes);
+    }
+    let parent_score = (cfg.root_sum_y * cfg.root_sum_y) / nf;
+
+    sample_feature_subset(&mut scratch.feat_pool, p, cfg.max_features, rng);
+    draw_et_thresholds(
+        &scratch.feat_pool,
+        cfg.root_min,
+        cfg.root_max,
+        false,
+        rng,
+        &mut scratch.et_active_feats,
+        &mut scratch.et_active_thresh,
+    );
+
+    let m = scratch.et_active_feats.len();
+    if m == 0 {
+        return push_flat_reg_leaf(mean_val, nodes);
+    }
+
+    let dense_by_feat = m == p;
+    let left_sum = &mut scratch.et_left_sum[..m];
+    let left_n = &mut scratch.et_left_n[..m];
+    left_sum.fill(0.0);
+    left_n.fill(0);
+
+    if dense_by_feat {
+        let thresh_s = &mut scratch.et_thresh_by_feat[..p];
+        for (&f, &t) in scratch
+            .et_active_feats
+            .iter()
+            .zip(scratch.et_active_thresh.iter())
+        {
+            thresh_s[f] = t;
+        }
+        for (row, &yi) in cfg.x_rows.chunks_exact(p).zip(cfg.y.iter()) {
+            for f in 0..p {
+                let go_left = row[f] <= thresh_s[f];
+                left_sum[f] += if go_left { yi } else { 0.0 };
+                left_n[f] += u32::from(go_left);
+            }
+        }
+    } else {
+        let active_feats = &scratch.et_active_feats[..m];
+        let active_thresh = &scratch.et_active_thresh[..m];
+        for (row, &yi) in cfg.x_rows.chunks_exact(p).zip(cfg.y.iter()) {
+            for ai in 0..m {
+                let go_left = row[active_feats[ai]] <= active_thresh[ai];
+                left_sum[ai] += if go_left { yi } else { 0.0 };
+                left_n[ai] += u32::from(go_left);
+            }
+        }
+    }
+
+    let Some((best_feat, best_thresh, best_score_gain, best_left_n)) = eval_et_reg_splits_u32(
+        &scratch.et_active_feats[..m],
+        &scratch.et_active_thresh[..m],
+        left_sum,
+        left_n,
+        dense_by_feat,
+        cfg.root_sum_y,
+        n,
+        cfg.min_samples_leaf,
+        parent_score,
+    ) else {
+        return push_flat_reg_leaf(mean_val, nodes);
+    };
+
+    if cfg.total_tree_weight > 0.0 {
+        importances[best_feat] += best_score_gain / cfg.total_tree_weight;
+    }
+
+    let mut samples = vec![0u32; n];
+    let last = n.saturating_sub(1);
+    let mut l_pos = 0usize;
+    let mut r_pos = best_left_n;
+    for (idx, row) in cfg.x_rows.chunks_exact(p).enumerate() {
+        let go_left = row[best_feat] <= best_thresh;
+        let dst = if go_left { l_pos } else { r_pos };
+        samples[dst.min(last)] = idx as u32;
+        l_pos += usize::from(go_left);
+        r_pos += usize::from(!go_left);
+    }
+
+    let node_idx = nodes.len();
+    nodes.push(FlatRegNode {
+        feature: best_feat as u32,
+        left: 0,
+        right: 0,
+        value_or_threshold: best_thresh,
+    });
+    let (left_samples, right_samples) = samples.split_at_mut(best_left_n);
+    let left_idx = build_reg_tree_et_u32(cfg, left_samples, 1, rng, importances, scratch, nodes);
+    let right_idx = build_reg_tree_et_u32(cfg, right_samples, 1, rng, importances, scratch, nodes);
+    nodes[node_idx].left = left_idx as u32;
+    nodes[node_idx].right = right_idx as u32;
+    node_idx
+}
+
+fn build_reg_tree_et_u32(
+    cfg: &EtRegCfg<'_>,
+    samples: &mut [u32],
+    depth: usize,
+    rng: &mut SplitMix64,
+    importances: &mut [f64],
+    scratch: &mut EtRegScratch,
+    nodes: &mut Vec<FlatRegNode>,
+) -> usize {
+    let n = samples.len();
+    if n == 1 {
+        return push_flat_reg_leaf(cfg.y[samples[0] as usize], nodes);
+    }
+    if n < cfg.min_samples_split
+        || n < 2 * cfg.min_samples_leaf
+        || cfg.max_depth.is_some_and(|d| depth >= d)
+    {
+        let mut sum_y = 0.0;
+        for &idx in samples.iter() {
+            sum_y += cfg.y[idx as usize];
+        }
+        return push_flat_reg_leaf(sum_y / (n as f64), nodes);
+    }
+
+    let mut sum_y = 0.0;
+    let mut sum_y2 = 0.0;
+    for &idx in samples.iter() {
+        let yi = cfg.y[idx as usize];
+        sum_y += yi;
+        sum_y2 += yi * yi;
+    }
+    let nf = n as f64;
+    let mean_val = sum_y / nf;
+    let parent_var = (sum_y2 / nf) - mean_val * mean_val;
+    if parent_var <= 1e-12 {
+        return push_flat_reg_leaf(mean_val, nodes);
+    }
+    let parent_score = (sum_y * sum_y) / nf;
+
+    let p = cfg.n_features;
+    sample_feature_subset(&mut scratch.feat_pool, p, cfg.max_features, rng);
+    let k = scratch.feat_pool.len();
+    let all_feats = k == p;
+
+    if all_feats {
+        let min_v = &mut scratch.et_min[..p];
+        let max_v = &mut scratch.et_max[..p];
+        min_v.fill(f64::INFINITY);
+        max_v.fill(f64::NEG_INFINITY);
+        for &idx in samples.iter() {
+            let uidx = idx as usize;
+            let row = &cfg.x_rows[uidx * p..uidx * p + p];
+            for f in 0..p {
+                let v = row[f];
+                if v < min_v[f] {
+                    min_v[f] = v;
+                }
+                if v > max_v[f] {
+                    max_v[f] = v;
+                }
+            }
+        }
+        draw_et_thresholds(
+            &scratch.feat_pool[..k],
+            min_v,
+            max_v,
+            false,
+            rng,
+            &mut scratch.et_active_feats,
+            &mut scratch.et_active_thresh,
+        );
+    } else {
+        let feat_pool = &scratch.feat_pool[..k];
+        let min_v = &mut scratch.et_min[..k];
+        let max_v = &mut scratch.et_max[..k];
+        min_v.fill(f64::INFINITY);
+        max_v.fill(f64::NEG_INFINITY);
+        for &idx in samples.iter() {
+            let uidx = idx as usize;
+            let row = &cfg.x_rows[uidx * p..uidx * p + p];
+            for fi in 0..k {
+                let v = row[feat_pool[fi]];
+                if v < min_v[fi] {
+                    min_v[fi] = v;
+                }
+                if v > max_v[fi] {
+                    max_v[fi] = v;
+                }
+            }
+        }
+        draw_et_thresholds(
+            feat_pool,
+            min_v,
+            max_v,
+            true,
+            rng,
+            &mut scratch.et_active_feats,
+            &mut scratch.et_active_thresh,
+        );
+    }
+
+    let m = scratch.et_active_feats.len();
+    if m == 0 {
+        return push_flat_reg_leaf(mean_val, nodes);
+    }
+
+    let dense_by_feat = m == p;
+    let left_sum = &mut scratch.et_left_sum[..m];
+    let left_n = &mut scratch.et_left_n[..m];
+    left_sum.fill(0.0);
+    left_n.fill(0);
+
+    if dense_by_feat {
+        let thresh_s = &mut scratch.et_thresh_by_feat[..p];
+        for (&f, &t) in scratch
+            .et_active_feats
+            .iter()
+            .zip(scratch.et_active_thresh.iter())
+        {
+            thresh_s[f] = t;
+        }
+        for &idx in samples.iter() {
+            let uidx = idx as usize;
+            let row = &cfg.x_rows[uidx * p..uidx * p + p];
+            let yi = cfg.y[uidx];
+            for f in 0..p {
+                let go_left = row[f] <= thresh_s[f];
+                left_sum[f] += if go_left { yi } else { 0.0 };
+                left_n[f] += u32::from(go_left);
+            }
+        }
+    } else {
+        let active_feats = &scratch.et_active_feats[..m];
+        let active_thresh = &scratch.et_active_thresh[..m];
+        for &idx in samples.iter() {
+            let uidx = idx as usize;
+            let row = &cfg.x_rows[uidx * p..uidx * p + p];
+            let yi = cfg.y[uidx];
+            for ai in 0..m {
+                let go_left = row[active_feats[ai]] <= active_thresh[ai];
+                left_sum[ai] += if go_left { yi } else { 0.0 };
+                left_n[ai] += u32::from(go_left);
+            }
+        }
+    }
+
+    let Some((best_feat, best_thresh, best_score_gain, best_left_n)) = eval_et_reg_splits_u32(
+        &scratch.et_active_feats[..m],
+        &scratch.et_active_thresh[..m],
+        left_sum,
+        left_n,
+        dense_by_feat,
+        sum_y,
+        n,
+        cfg.min_samples_leaf,
+        parent_score,
+    ) else {
+        return push_flat_reg_leaf(mean_val, nodes);
+    };
+
+    if cfg.total_tree_weight > 0.0 {
+        importances[best_feat] += best_score_gain / cfg.total_tree_weight;
+    }
+
+    partition_u32_with_buf(
+        cfg.x_rows,
+        p,
+        best_feat,
+        best_thresh,
+        best_left_n,
+        samples,
+        &mut scratch.part_buf,
+    );
+
+    let node_idx = nodes.len();
+    nodes.push(FlatRegNode {
+        feature: best_feat as u32,
+        left: 0,
+        right: 0,
+        value_or_threshold: best_thresh,
+    });
+    let (left_samples, right_samples) = samples.split_at_mut(best_left_n);
+    let left_idx = build_reg_tree_et_u32(
+        cfg,
+        left_samples,
+        depth + 1,
+        rng,
+        importances,
+        scratch,
+        nodes,
+    );
+    let right_idx = build_reg_tree_et_u32(
+        cfg,
+        right_samples,
+        depth + 1,
+        rng,
+        importances,
+        scratch,
+        nodes,
+    );
+    nodes[node_idx].left = left_idx as u32;
+    nodes[node_idx].right = right_idx as u32;
+    node_idx
 }
 
 /// N6 Hardware-Accelerated Histogram Regression Tree Builder for CUDA / wgpu.
@@ -1133,7 +2330,8 @@ fn build_reg_tree_n6(
     total_tree_weight: f64,
     rng: &mut SplitMix64,
     importances: &mut [f64],
-) -> OchreResult<RegTreeNode> {
+    nodes: &mut Vec<FlatRegNode>,
+) -> OchreResult<usize> {
     let n = sample_indices.len();
     let mut sum_g = 0.0;
     let mut sum_h = 0.0;
@@ -1149,7 +2347,7 @@ fn build_reg_tree_n6(
         || max_depth.is_some_and(|d| depth >= d)
         || sum_h <= 0.0
     {
-        return Ok(RegTreeNode::Leaf { value: leaf_val });
+        return Ok(push_flat_reg_leaf(leaf_val, nodes));
     }
 
     // Use N6 find_best_histogram_split when all features are considered, or feature-subsampled scan
@@ -1206,10 +2404,10 @@ fn build_reg_tree_n6(
     };
 
     let Some(split) = best_split else {
-        return Ok(RegTreeNode::Leaf { value: leaf_val });
+        return Ok(push_flat_reg_leaf(leaf_val, nodes));
     };
     if split.gain <= 1e-12 {
-        return Ok(RegTreeNode::Leaf { value: leaf_val });
+        return Ok(push_flat_reg_leaf(leaf_val, nodes));
     }
 
     let mut left_idx = Vec::with_capacity(n / 2);
@@ -1230,7 +2428,7 @@ fn build_reg_tree_n6(
     }
 
     if left_idx.len() < min_samples_leaf || right_idx.len() < min_samples_leaf {
-        return Ok(RegTreeNode::Leaf { value: leaf_val });
+        return Ok(push_flat_reg_leaf(leaf_val, nodes));
     }
 
     if total_tree_weight > 0.0 {
@@ -1248,7 +2446,14 @@ fn build_reg_tree_n6(
         (lh, rh)
     };
 
-    let left = Box::new(build_reg_tree_n6(
+    let node_idx = nodes.len();
+    nodes.push(FlatRegNode {
+        feature: f as u32,
+        left: 0,
+        right: 0,
+        value_or_threshold: split.threshold,
+    });
+    let left_node = build_reg_tree_n6(
         backend,
         binned,
         grad,
@@ -1263,8 +2468,9 @@ fn build_reg_tree_n6(
         total_tree_weight,
         rng,
         importances,
-    )?);
-    let right = Box::new(build_reg_tree_n6(
+        nodes,
+    )?;
+    let right_node = build_reg_tree_n6(
         backend,
         binned,
         grad,
@@ -1279,14 +2485,11 @@ fn build_reg_tree_n6(
         total_tree_weight,
         rng,
         importances,
-    )?);
-
-    Ok(RegTreeNode::Internal {
-        feature: f,
-        threshold: split.threshold,
-        left,
-        right,
-    })
+        nodes,
+    )?;
+    nodes[node_idx].left = left_node as u32;
+    nodes[node_idx].right = right_node as u32;
+    Ok(node_idx)
 }
 
 fn build_bootstrap_samples(
@@ -1367,7 +2570,6 @@ struct ForestClassifierCore {
     random_state: Option<u64>,
     device: DeviceType,
     device_: Option<String>,
-    trees: Vec<ClfTreeNode>,
     flat_nodes: Vec<FlatClfNode>,
     flat_roots: Vec<usize>,
     flat_probs: Vec<f64>,
@@ -1430,7 +2632,6 @@ impl ForestClassifierCore {
             random_state,
             device: dev,
             device_: None,
-            trees: Vec::new(),
             flat_nodes: Vec::new(),
             flat_roots: Vec::new(),
             flat_probs: Vec::new(),
@@ -1452,22 +2653,11 @@ impl ForestClassifierCore {
     fn fit(&mut self, x: &Matrix, y: &[f64], sample_weight: Option<&[f64]>) -> OchreResult<()> {
         validate_x_finite(x)?;
         validate_y_finite(y, x.rows)?;
-        let sw = validate_sample_weight(sample_weight, x.rows)?;
         let max_feat = resolve_max_features(self.max_features.as_deref(), x.cols, true)?;
 
         let mut classes = y.to_vec();
         classes.sort_by(|a, b| a.total_cmp(b));
         classes.dedup_by(|a, b| (*a - *b).abs() <= 1e-12);
-
-        let class_idx: Vec<usize> = y
-            .iter()
-            .map(|&val| {
-                classes
-                    .iter()
-                    .position(|&c| (c - val).abs() <= 1e-12)
-                    .unwrap_or(0)
-            })
-            .collect();
 
         // Check backend availability; CPU/TPU uses Rayon parallel tree building
         let _backend = get_backend(&self.device);
@@ -1477,55 +2667,135 @@ impl ForestClassifierCore {
         let n_classes = classes.len();
         let n_samples = x.rows;
         let n_features = x.cols;
-        let x_cols = transpose_to_col_major(x);
 
-        let results: Vec<(ClfTreeNode, Vec<f64>)> = (0..self.n_estimators)
-            .into_par_iter()
-            .map(|tree_idx| {
-                let seed = base_seed
-                    .wrapping_add((tree_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-                    ^ 0xA5A5_5A5A_1234_5678;
-                let mut rng = SplitMix64::new(seed);
-                let (mut samples, total_tree_weight) =
-                    build_bootstrap_samples(n_samples, self.bootstrap, &sw, &mut rng);
-                let cfg = ClfBuildCfg {
-                    criterion_entropy,
-                    extra_trees: self.extra_trees,
-                    max_depth: self.max_depth,
-                    min_samples_split: self.min_samples_split,
-                    min_samples_leaf: self.min_samples_leaf,
-                    max_features: max_feat,
-                    n_classes,
-                    n_samples,
-                    n_features,
-                    total_tree_weight,
-                    x_rows: &x.data,
-                    x_cols: &x_cols,
-                    class_idx: &class_idx,
-                };
-                let mut imp = vec![0.0; n_features];
-                let sorted_cap = if self.extra_trees { 0 } else { samples.len() };
-                let mut scratch = ClfTreeScratch::new(
-                    n_features,
-                    max_feat,
-                    n_classes,
-                    sorted_cap,
-                    self.extra_trees,
-                );
-                let root = build_clf_tree(&cfg, &mut samples, 0, &mut rng, &mut imp, &mut scratch);
-                (root, imp)
-            })
-            .collect();
+        let use_et_u32 = self.extra_trees
+            && !self.bootstrap
+            && sample_weight.is_none()
+            && n_samples <= u32::MAX as usize;
 
-        let mut trees = Vec::with_capacity(self.n_estimators);
-        let mut all_imp = Vec::with_capacity(self.n_estimators);
-        for (t, imp) in results {
-            trees.push(t);
-            all_imp.push(imp);
-        }
+        let (flat_nodes, flat_roots, flat_probs, all_imp) = if use_et_u32 {
+            let mut root_counts = vec![0u32; n_classes];
+            let class_idx_u32: Vec<u32> = y
+                .iter()
+                .map(|&val| {
+                    let c = classes
+                        .iter()
+                        .position(|&cls| (cls - val).abs() <= 1e-12)
+                        .unwrap_or(0);
+                    root_counts[c] += 1;
+                    c as u32
+                })
+                .collect();
+            let (root_min, root_max) = compute_root_min_max(&x.data, n_samples, n_features);
+            let total_tree_weight = n_samples as f64;
+            let cfg = EtClfCfg {
+                criterion_entropy,
+                max_depth: self.max_depth,
+                min_samples_split: self.min_samples_split,
+                min_samples_leaf: self.min_samples_leaf,
+                max_features: max_feat,
+                n_classes,
+                n_samples,
+                n_features,
+                total_tree_weight,
+                x_rows: &x.data,
+                class_idx: &class_idx_u32,
+                root_min: &root_min,
+                root_max: &root_max,
+                root_counts: &root_counts,
+            };
 
-        let (flat_nodes, flat_roots, flat_probs) = build_flat_clf_forest(&trees, n_classes);
-        self.trees = trees;
+            let results: Vec<(Vec<FlatClfNode>, Vec<f64>, Vec<f64>)> = (0..self.n_estimators)
+                .into_par_iter()
+                .map(|tree_idx| {
+                    let seed = base_seed
+                        .wrapping_add((tree_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                        ^ 0xA5A5_5A5A_1234_5678;
+                    let mut rng = SplitMix64::new(seed);
+                    let mut imp = vec![0.0; n_features];
+                    let mut scratch = EtClfScratch::new(n_features, max_feat, n_classes);
+                    let mut t_nodes = Vec::with_capacity(256);
+                    let mut t_probs = Vec::with_capacity(128 * n_classes);
+                    build_clf_tree_root_et_u32(
+                        &cfg,
+                        &mut rng,
+                        &mut imp,
+                        &mut scratch,
+                        &mut t_nodes,
+                        &mut t_probs,
+                    );
+                    (t_nodes, t_probs, imp)
+                })
+                .collect();
+            merge_flat_clf_trees(results)
+        } else {
+            let sw = validate_sample_weight(sample_weight, x.rows)?;
+            let class_idx: Vec<usize> = y
+                .iter()
+                .map(|&val| {
+                    classes
+                        .iter()
+                        .position(|&c| (c - val).abs() <= 1e-12)
+                        .unwrap_or(0)
+                })
+                .collect();
+            let x_cols = if self.extra_trees {
+                Vec::new()
+            } else {
+                transpose_to_col_major(x)
+            };
+
+            let results: Vec<(Vec<FlatClfNode>, Vec<f64>, Vec<f64>)> = (0..self.n_estimators)
+                .into_par_iter()
+                .map(|tree_idx| {
+                    let seed = base_seed
+                        .wrapping_add((tree_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                        ^ 0xA5A5_5A5A_1234_5678;
+                    let mut rng = SplitMix64::new(seed);
+                    let (mut samples, total_tree_weight) =
+                        build_bootstrap_samples(n_samples, self.bootstrap, &sw, &mut rng);
+                    let cfg = ClfBuildCfg {
+                        criterion_entropy,
+                        extra_trees: self.extra_trees,
+                        max_depth: self.max_depth,
+                        min_samples_split: self.min_samples_split,
+                        min_samples_leaf: self.min_samples_leaf,
+                        max_features: max_feat,
+                        n_classes,
+                        n_samples,
+                        n_features,
+                        total_tree_weight,
+                        x_rows: &x.data,
+                        x_cols: &x_cols,
+                        class_idx: &class_idx,
+                    };
+                    let mut imp = vec![0.0; n_features];
+                    let sorted_cap = if self.extra_trees { 0 } else { samples.len() };
+                    let mut scratch = ClfTreeScratch::new(
+                        n_features,
+                        max_feat,
+                        n_classes,
+                        sorted_cap,
+                        self.extra_trees,
+                    );
+                    let mut t_nodes = Vec::with_capacity(256);
+                    let mut t_probs = Vec::with_capacity(128 * n_classes);
+                    build_clf_tree(
+                        &cfg,
+                        &mut samples,
+                        0,
+                        &mut rng,
+                        &mut imp,
+                        &mut scratch,
+                        &mut t_nodes,
+                        &mut t_probs,
+                    );
+                    (t_nodes, t_probs, imp)
+                })
+                .collect();
+            merge_flat_clf_trees(results)
+        };
+
         self.flat_nodes = flat_nodes;
         self.flat_roots = flat_roots;
         self.flat_probs = flat_probs;
@@ -1546,7 +2816,7 @@ impl ForestClassifierCore {
             });
         }
         let n_classes = self.classes_.len();
-        let inv_trees = 1.0 / (self.trees.len() as f64);
+        let inv_trees = 1.0 / (self.flat_roots.len() as f64);
         let mut out = vec![0.0; x.rows * n_classes];
 
         if x.rows >= 256 {
@@ -1643,9 +2913,16 @@ impl ForestClassifierCore {
         write_f64_vec(&mut buf, &self.classes_);
         write_opt_usize(&mut buf, self.n_features_in_);
         write_opt_f64_vec(&mut buf, &self.feature_importances_);
-        write_usize(&mut buf, self.trees.len());
-        for tree in &self.trees {
-            tree.write_to(&mut buf);
+        let n_classes = self.classes_.len();
+        write_usize(&mut buf, self.flat_roots.len());
+        for &root in &self.flat_roots {
+            write_flat_clf_node(
+                &self.flat_nodes,
+                &self.flat_probs,
+                n_classes,
+                root,
+                &mut buf,
+            );
         }
         buf
     }
@@ -1667,11 +2944,16 @@ impl ForestClassifierCore {
         let n_features_in_ = r.read_opt_usize()?;
         let feature_importances_ = r.read_opt_f64_vec()?;
         let n_trees = r.read_usize()?;
-        let mut trees = Vec::with_capacity(n_trees);
+        let mut flat_nodes = Vec::with_capacity(n_trees * 64);
+        let mut flat_roots = Vec::with_capacity(n_trees);
+        let mut flat_probs = Vec::with_capacity(n_trees * 32 * classes_.len().max(1));
         for _ in 0..n_trees {
-            trees.push(ClfTreeNode::read_from(&mut r)?);
+            flat_roots.push(read_flat_clf_node(
+                &mut r,
+                &mut flat_nodes,
+                &mut flat_probs,
+            )?);
         }
-        let (flat_nodes, flat_roots, flat_probs) = build_flat_clf_forest(&trees, classes_.len());
         let (dev, device_) = resolve_loaded_device(saved_device, n_features_in_.is_some(), device)?;
         Ok(Self {
             extra_trees,
@@ -1685,7 +2967,6 @@ impl ForestClassifierCore {
             random_state,
             device: dev,
             device_,
-            trees,
             flat_nodes,
             flat_roots,
             flat_probs,
@@ -1713,7 +2994,6 @@ struct ForestRegressorCore {
     random_state: Option<u64>,
     device: DeviceType,
     device_: Option<String>,
-    trees: Vec<RegTreeNode>,
     flat_nodes: Vec<FlatRegNode>,
     flat_roots: Vec<usize>,
     n_features_in_: Option<usize>,
@@ -1774,7 +3054,6 @@ impl ForestRegressorCore {
             random_state,
             device: dev,
             device_: None,
-            trees: Vec::new(),
             flat_nodes: Vec::new(),
             flat_roots: Vec::new(),
             n_features_in_: None,
@@ -1794,7 +3073,6 @@ impl ForestRegressorCore {
     fn fit(&mut self, x: &Matrix, y: &[f64], sample_weight: Option<&[f64]>) -> OchreResult<()> {
         validate_x_finite(x)?;
         validate_y_finite(y, x.rows)?;
-        let sw = validate_sample_weight(sample_weight, x.rows)?;
         let max_feat = resolve_max_features(self.max_features.as_deref(), x.cols, false)?;
 
         let backend = get_backend(&self.device);
@@ -1809,10 +3087,15 @@ impl ForestRegressorCore {
                 Backend::CudaSingle(_) | Backend::CudaMulti(_) | Backend::Wgpu
             );
 
-        let (trees, all_imp) = if use_n6_gpu {
+        let use_et_u32 = self.extra_trees
+            && !self.bootstrap
+            && sample_weight.is_none()
+            && n_samples <= u32::MAX as usize;
+
+        let (flat_nodes, flat_roots, all_imp) = if use_n6_gpu {
+            let sw = validate_sample_weight(sample_weight, x.rows)?;
             let binned = backend.quantize_features(x, 256)?;
-            let mut trees = Vec::with_capacity(self.n_estimators);
-            let mut all_imp = Vec::with_capacity(self.n_estimators);
+            let mut per_tree = Vec::with_capacity(self.n_estimators);
             for tree_idx in 0..self.n_estimators {
                 let seed = base_seed
                     .wrapping_add((tree_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
@@ -1833,7 +3116,8 @@ impl ForestRegressorCore {
                 let root_hist =
                     backend.batched_histogram_grad(&binned, &active_indices, &grad, &hess)?;
                 let mut imp = vec![0.0; n_features];
-                let tree = build_reg_tree_n6(
+                let mut t_nodes = Vec::with_capacity(256);
+                build_reg_tree_n6(
                     &backend,
                     &binned,
                     &grad,
@@ -1848,14 +3132,80 @@ impl ForestRegressorCore {
                     total_tree_weight,
                     &mut rng,
                     &mut imp,
+                    &mut t_nodes,
                 )?;
-                trees.push(tree);
-                all_imp.push(imp);
+                per_tree.push((t_nodes, imp));
             }
-            (trees, all_imp)
+            merge_flat_reg_trees(per_tree)
+        } else if use_et_u32 {
+            let (root_sum_y, root_sum_y2) = if n_samples >= 4096 {
+                y.par_chunks(4096)
+                    .map(|chunk| {
+                        let mut sy = 0.0;
+                        let mut sy2 = 0.0;
+                        for &yi in chunk {
+                            sy += yi;
+                            sy2 += yi * yi;
+                        }
+                        (sy, sy2)
+                    })
+                    .reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1))
+            } else {
+                let mut sy = 0.0;
+                let mut sy2 = 0.0;
+                for &yi in y {
+                    sy += yi;
+                    sy2 += yi * yi;
+                }
+                (sy, sy2)
+            };
+            let (root_min, root_max) = compute_root_min_max(&x.data, n_samples, n_features);
+            let total_tree_weight = n_samples as f64;
+            let cfg = EtRegCfg {
+                max_depth: self.max_depth,
+                min_samples_split: self.min_samples_split,
+                min_samples_leaf: self.min_samples_leaf,
+                max_features: max_feat,
+                n_samples,
+                n_features,
+                total_tree_weight,
+                x_rows: &x.data,
+                y,
+                root_min: &root_min,
+                root_max: &root_max,
+                root_sum_y,
+                root_sum_y2,
+            };
+
+            let results: Vec<(Vec<FlatRegNode>, Vec<f64>)> = (0..self.n_estimators)
+                .into_par_iter()
+                .map(|tree_idx| {
+                    let seed = base_seed
+                        .wrapping_add((tree_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                        ^ 0x5A5A_A5A5_8765_4321;
+                    let mut rng = SplitMix64::new(seed);
+                    let mut imp = vec![0.0; n_features];
+                    let mut scratch = EtRegScratch::new(n_features, max_feat);
+                    let mut t_nodes = Vec::with_capacity(256);
+                    build_reg_tree_root_et_u32(
+                        &cfg,
+                        &mut rng,
+                        &mut imp,
+                        &mut scratch,
+                        &mut t_nodes,
+                    );
+                    (t_nodes, imp)
+                })
+                .collect();
+            merge_flat_reg_trees(results)
         } else {
-            let x_cols = transpose_to_col_major(x);
-            let results: Vec<(RegTreeNode, Vec<f64>)> = (0..self.n_estimators)
+            let sw = validate_sample_weight(sample_weight, x.rows)?;
+            let x_cols = if self.extra_trees {
+                Vec::new()
+            } else {
+                transpose_to_col_major(x)
+            };
+            let results: Vec<(Vec<FlatRegNode>, Vec<f64>)> = (0..self.n_estimators)
                 .into_par_iter()
                 .map(|tree_idx| {
                     let seed = base_seed
@@ -1881,23 +3231,22 @@ impl ForestRegressorCore {
                     let sorted_cap = if self.extra_trees { 0 } else { samples.len() };
                     let mut scratch =
                         RegTreeScratch::new(n_features, max_feat, sorted_cap, self.extra_trees);
-                    let root =
-                        build_reg_tree(&cfg, &mut samples, 0, &mut rng, &mut imp, &mut scratch);
-                    (root, imp)
+                    let mut t_nodes = Vec::with_capacity(256);
+                    build_reg_tree(
+                        &cfg,
+                        &mut samples,
+                        0,
+                        &mut rng,
+                        &mut imp,
+                        &mut scratch,
+                        &mut t_nodes,
+                    );
+                    (t_nodes, imp)
                 })
                 .collect();
-
-            let mut trees = Vec::with_capacity(self.n_estimators);
-            let mut all_imp = Vec::with_capacity(self.n_estimators);
-            for (t, imp) in results {
-                trees.push(t);
-                all_imp.push(imp);
-            }
-            (trees, all_imp)
+            merge_flat_reg_trees(results)
         };
 
-        let (flat_nodes, flat_roots) = build_flat_reg_forest(&trees);
-        self.trees = trees;
         self.flat_nodes = flat_nodes;
         self.flat_roots = flat_roots;
         self.n_features_in_ = Some(n_features);
@@ -1915,7 +3264,7 @@ impl ForestRegressorCore {
                 expected,
             });
         }
-        let inv_trees = 1.0 / (self.trees.len() as f64);
+        let inv_trees = 1.0 / (self.flat_roots.len() as f64);
         let mut preds = vec![0.0; x.rows];
         if x.rows >= 256 {
             preds
@@ -1966,9 +3315,9 @@ impl ForestRegressorCore {
         write_opt_str(&mut buf, &self.device_);
         write_opt_usize(&mut buf, self.n_features_in_);
         write_opt_f64_vec(&mut buf, &self.feature_importances_);
-        write_usize(&mut buf, self.trees.len());
-        for tree in &self.trees {
-            tree.write_to(&mut buf);
+        write_usize(&mut buf, self.flat_roots.len());
+        for &root in &self.flat_roots {
+            write_flat_reg_node(&self.flat_nodes, root, &mut buf);
         }
         buf
     }
@@ -1989,11 +3338,11 @@ impl ForestRegressorCore {
         let n_features_in_ = r.read_opt_usize()?;
         let feature_importances_ = r.read_opt_f64_vec()?;
         let n_trees = r.read_usize()?;
-        let mut trees = Vec::with_capacity(n_trees);
+        let mut flat_nodes = Vec::with_capacity(n_trees * 64);
+        let mut flat_roots = Vec::with_capacity(n_trees);
         for _ in 0..n_trees {
-            trees.push(RegTreeNode::read_from(&mut r)?);
+            flat_roots.push(read_flat_reg_node(&mut r, &mut flat_nodes)?);
         }
-        let (flat_nodes, flat_roots) = build_flat_reg_forest(&trees);
         let (dev, device_) = resolve_loaded_device(saved_device, n_features_in_.is_some(), device)?;
         Ok(Self {
             extra_trees,
@@ -2007,7 +3356,6 @@ impl ForestRegressorCore {
             random_state,
             device: dev,
             device_,
-            trees,
             flat_nodes,
             flat_roots,
             n_features_in_,
@@ -3161,5 +4509,172 @@ mod tests {
         .unwrap();
         rfr.fit(&x, &y_reg, None).unwrap();
         assert!(rfr.score(&x, &y_reg).unwrap() > 0.95);
+    }
+
+    #[test]
+    fn test_extra_trees_u32_fast_path_parity_and_edge_cases() {
+        let n = 5000usize;
+        let p = 8usize;
+        let mut rng = SplitMix64::new(0xDEAD_BEEF_CAFE_BABE);
+        let mut data = Vec::with_capacity(n * p);
+        let mut y_cls = Vec::with_capacity(n);
+        let mut y_reg = Vec::with_capacity(n);
+        for _ in 0..n {
+            let x0 = rng.next_f64();
+            let x1 = rng.next_f64();
+            let x2 = 3.5; // constant feature to verify constant-feature skipping
+            let x3 = rng.next_f64();
+            let x4 = x0 - 0.5 * x1;
+            let x5 = rng.next_f64();
+            let x6 = rng.next_f64();
+            let x7 = x3 * x5;
+            data.extend_from_slice(&[x0, x1, x2, x3, x4, x5, x6, x7]);
+            let cls = if x0 + x1 < 0.7 {
+                0.0
+            } else if x0 + x1 < 1.3 {
+                1.0
+            } else {
+                2.0
+            };
+            y_cls.push(cls);
+            y_reg.push(2.0 * x0 - 1.5 * x1 + 0.8 * x3 + 0.4 * x7);
+        }
+        let x = Matrix::from_vec(n, p, data).unwrap();
+        let unit_w = vec![1.0; n];
+
+        // Classifier parity: unweighted u32 fast-path vs unit-weighted fallback (gini & entropy, sqrt & all)
+        for crit in ["gini", "entropy"] {
+            for mf in [None, Some("all".to_string())] {
+                let mut etc_fast = ExtraTreesClassifier::new(
+                    Some(12),
+                    Some(crit.to_string()),
+                    Some(7),
+                    Some(4),
+                    Some(2),
+                    mf.clone(),
+                    Some(false),
+                    Some(123),
+                    Some("cpu".to_string()),
+                )
+                .unwrap();
+                etc_fast.fit(&x, &y_cls, None).unwrap();
+
+                let mut etc_ref = ExtraTreesClassifier::new(
+                    Some(12),
+                    Some(crit.to_string()),
+                    Some(7),
+                    Some(4),
+                    Some(2),
+                    mf,
+                    Some(false),
+                    Some(123),
+                    Some("cpu".to_string()),
+                )
+                .unwrap();
+                etc_ref.fit(&x, &y_cls, Some(&unit_w)).unwrap();
+
+                let p_fast = etc_fast.predict_proba(&x).unwrap();
+                let p_ref = etc_ref.predict_proba(&x).unwrap();
+                for (a, b) in p_fast.data.iter().zip(p_ref.data.iter()) {
+                    assert!(
+                        (a - b).abs() < 1e-12,
+                        "clf proba mismatch ({crit}): {a} vs {b}"
+                    );
+                }
+                assert_eq!(etc_fast.predict(&x).unwrap(), etc_ref.predict(&x).unwrap());
+                let imp_fast = etc_fast.core.feature_importances_.as_ref().unwrap();
+                let imp_ref = etc_ref.core.feature_importances_.as_ref().unwrap();
+                for (a, b) in imp_fast.iter().zip(imp_ref.iter()) {
+                    assert!(
+                        (a - b).abs() < 1e-12,
+                        "clf imp mismatch ({crit}): {a} vs {b}"
+                    );
+                }
+                let roundtrip =
+                    ExtraTreesClassifier::from_bytes(&etc_fast.to_bytes(), None).unwrap();
+                assert_eq!(
+                    etc_fast.predict(&x).unwrap(),
+                    roundtrip.predict(&x).unwrap()
+                );
+            }
+        }
+
+        // Regressor parity: unweighted u32 fast-path vs unit-weighted fallback (all & sqrt)
+        for mf in [None, Some("sqrt".to_string())] {
+            let mut etr_fast = ExtraTreesRegressor::new(
+                Some(12),
+                None,
+                Some(7),
+                Some(4),
+                Some(2),
+                mf.clone(),
+                Some(false),
+                Some(123),
+                Some("cpu".to_string()),
+            )
+            .unwrap();
+            etr_fast.fit(&x, &y_reg, None).unwrap();
+
+            let mut etr_ref = ExtraTreesRegressor::new(
+                Some(12),
+                None,
+                Some(7),
+                Some(4),
+                Some(2),
+                mf,
+                Some(false),
+                Some(123),
+                Some("cpu".to_string()),
+            )
+            .unwrap();
+            etr_ref.fit(&x, &y_reg, Some(&unit_w)).unwrap();
+
+            let y_fast = etr_fast.predict(&x).unwrap();
+            let y_ref = etr_ref.predict(&x).unwrap();
+            for (a, b) in y_fast.iter().zip(y_ref.iter()) {
+                assert!((a - b).abs() < 1e-10, "reg pred mismatch: {a} vs {b}");
+            }
+            let imp_fast = etr_fast.core.feature_importances_.as_ref().unwrap();
+            let imp_ref = etr_ref.core.feature_importances_.as_ref().unwrap();
+            for (a, b) in imp_fast.iter().zip(imp_ref.iter()) {
+                assert!((a - b).abs() < 1e-10, "reg imp mismatch: {a} vs {b}");
+            }
+            let roundtrip = ExtraTreesRegressor::from_bytes(&etr_fast.to_bytes(), None).unwrap();
+            assert_eq!(
+                etr_fast.predict(&x).unwrap(),
+                roundtrip.predict(&x).unwrap()
+            );
+        }
+
+        // Bootstrapped ExtraTrees with skipped x_cols must also work cleanly
+        let mut etc_boot = ExtraTreesClassifier::new(
+            Some(10),
+            None,
+            Some(6),
+            None,
+            None,
+            None,
+            Some(true),
+            Some(7),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        etc_boot.fit(&x, &y_cls, None).unwrap();
+        assert!(etc_boot.score(&x, &y_cls).unwrap() > 0.85);
+
+        let mut etr_boot = ExtraTreesRegressor::new(
+            Some(10),
+            None,
+            Some(6),
+            None,
+            None,
+            None,
+            Some(true),
+            Some(7),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        etr_boot.fit(&x, &y_reg, None).unwrap();
+        assert!(etr_boot.score(&x, &y_reg).unwrap() > 0.85);
     }
 }
