@@ -1045,13 +1045,18 @@ impl SpectralClustering {
         let m_mat = Matrix::from_vec(n, n, m_data)?;
 
         // 3. Top k eigenvectors of D^{-1/2} W D^{-1/2} (smallest eigenvectors of L_sym) via N5
-        let eig = backend.small_sym_eig_svd(&m_mat)?;
         let k = self.n_clusters;
+        let eig = if n <= 48 || k.saturating_mul(3) >= n {
+            backend.small_sym_eig_svd(&m_mat)?
+        } else {
+            crate::primitives::eig_svd::cpu_top_k_sym_eig(&m_mat, k)?
+        };
+        let eig_cols = eig.eigenvectors.cols;
         let mut u_data = vec![0.0; n * k];
         for i in 0..n {
             let mut norm_sq = 0.0;
             for c in 0..k {
-                let val = eig.eigenvectors.data[i * n + c];
+                let val = eig.eigenvectors.data[i * eig_cols + c];
                 u_data[i * k + c] = val;
                 norm_sq += val * val;
             }
@@ -1065,7 +1070,12 @@ impl SpectralClustering {
         }
         let u_mat = Matrix::from_vec(n, k, u_data)?;
 
-        // 4. Cluster rows of U with KMeans
+        // 4. Cluster rows of U with KMeans (stay on CPU for small n * k to avoid GPU launch overhead)
+        let kmeans_device = if n.saturating_mul(k) < 131_072 {
+            Some("cpu".to_string())
+        } else {
+            self.device_.clone()
+        };
         let mut kmeans = KMeans::new(
             k,
             "k-means++".to_string(),
@@ -1073,7 +1083,7 @@ impl SpectralClustering {
             300,
             1e-4,
             self.random_state,
-            self.device_.clone(),
+            kmeans_device,
         )?;
         kmeans.fit(&u_mat, None)?;
 
@@ -2299,6 +2309,43 @@ mod tests {
         assert_eq!(labels[0], labels[1]);
         assert_eq!(labels[4], labels[5]);
         assert_ne!(labels[0], labels[4]);
+    }
+
+    #[test]
+    fn test_spectral_topk_eig_large_blobs() {
+        let n = 120usize;
+        let k = 3usize;
+        let mut data = Vec::with_capacity(n * 3);
+        for i in 0..n {
+            let c = i % k;
+            let offset = (c as f64) * 10.0;
+            let jitter = ((i % 7) as f64 - 3.0) * 0.05;
+            data.push(offset + jitter);
+            data.push(offset - jitter);
+            data.push(jitter);
+        }
+        let x = Matrix::from_vec(n, 3, data).expect("valid");
+        let mut sp = SpectralClustering::new(
+            k,
+            "rbf".to_string(),
+            0.5,
+            5,
+            5,
+            Some(42),
+            Some("auto".to_string()),
+        )
+        .expect("ok");
+        let labels = sp.fit_predict(&x).expect("fit_predict");
+        assert_eq!(labels.len(), n);
+        for c in 0..k {
+            let expected = labels[c];
+            for i in (c..n).step_by(k) {
+                assert_eq!(labels[i], expected);
+            }
+        }
+        assert_ne!(labels[0], labels[1]);
+        assert_ne!(labels[0], labels[2]);
+        assert_ne!(labels[1], labels[2]);
     }
 
     #[test]
