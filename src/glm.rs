@@ -259,7 +259,9 @@ fn validate_fit_inputs(x: &Matrix, y: &[f64], sample_weight: Option<&[f64]>) -> 
     Ok(())
 }
 
-fn validate_predict_inputs(x: &Matrix, expected_features: Option<usize>) -> OchreResult<()> {
+const PREDICT_GPU_THRESHOLD: usize = 2_000_000;
+
+fn validate_predict_shape(x: &Matrix, expected_features: Option<usize>) -> OchreResult<()> {
     let expected = expected_features.ok_or(OchreError::NotFitted)?;
     if x.rows == 0 || x.cols == 0 {
         return Err(OchreError::EmptyData);
@@ -270,14 +272,182 @@ fn validate_predict_inputs(x: &Matrix, expected_features: Option<usize>) -> Ochr
             expected,
         });
     }
-    for &v in &x.data {
-        if !v.is_finite() {
+    Ok(())
+}
+
+#[inline(always)]
+fn dot_4rows_unrolled(
+    r0: &[f64],
+    r1: &[f64],
+    r2: &[f64],
+    r3: &[f64],
+    w: &[f64],
+) -> (f64, f64, f64, f64) {
+    let d = w.len();
+    let (w_chunks, w_tail) = w.as_chunks::<4>();
+    let (r0_chunks, r0_tail) = r0[..d].as_chunks::<4>();
+    let (r1_chunks, r1_tail) = r1[..d].as_chunks::<4>();
+    let (r2_chunks, r2_tail) = r2[..d].as_chunks::<4>();
+    let (r3_chunks, r3_tail) = r3[..d].as_chunks::<4>();
+
+    let mut acc0 = [0.0f64; 4];
+    let mut acc1 = [0.0f64; 4];
+    let mut acc2 = [0.0f64; 4];
+    let mut acc3 = [0.0f64; 4];
+
+    for ((((&wc, &c0), &c1), &c2), &c3) in w_chunks
+        .iter()
+        .zip(r0_chunks.iter())
+        .zip(r1_chunks.iter())
+        .zip(r2_chunks.iter())
+        .zip(r3_chunks.iter())
+    {
+        for lane in 0..4 {
+            acc0[lane] += c0[lane] * wc[lane];
+            acc1[lane] += c1[lane] * wc[lane];
+            acc2[lane] += c2[lane] * wc[lane];
+            acc3[lane] += c3[lane] * wc[lane];
+        }
+    }
+
+    let mut t0 = 0.0;
+    let mut t1 = 0.0;
+    let mut t2 = 0.0;
+    let mut t3 = 0.0;
+    for j in 0..w_tail.len() {
+        let wv = w_tail[j];
+        t0 += r0_tail[j] * wv;
+        t1 += r1_tail[j] * wv;
+        t2 += r2_tail[j] * wv;
+        t3 += r3_tail[j] * wv;
+    }
+
+    (
+        (acc0[0] + acc0[1]) + (acc0[2] + acc0[3]) + t0,
+        (acc1[0] + acc1[1]) + (acc1[2] + acc1[3]) + t1,
+        (acc2[0] + acc2[1]) + (acc2[2] + acc2[3]) + t2,
+        (acc3[0] + acc3[1]) + (acc3[2] + acc3[3]) + t3,
+    )
+}
+
+#[inline]
+fn predict_chunk_cpu(
+    x_chunk: &[f64],
+    w: &[f64],
+    b: f64,
+    apply_exp: bool,
+    out_chunk: &mut [f64],
+) -> bool {
+    let d = w.len();
+    let rows = out_chunk.len();
+    let mut r = 0usize;
+    while r + 4 <= rows {
+        let base = r * d;
+        let (d0, d1, d2, d3) = dot_4rows_unrolled(
+            &x_chunk[base..base + d],
+            &x_chunk[base + d..base + 2 * d],
+            &x_chunk[base + 2 * d..base + 3 * d],
+            &x_chunk[base + 3 * d..base + 4 * d],
+            w,
+        );
+        let e0 = b + d0;
+        let e1 = b + d1;
+        let e2 = b + d2;
+        let e3 = b + d3;
+        // Fused NaN/Inf check: for finite weights, any non-finite X entry yields NaN or Inf here.
+        if !e0.is_finite() || !e1.is_finite() || !e2.is_finite() || !e3.is_finite() {
+            return false;
+        }
+        if apply_exp {
+            out_chunk[r] = e0.exp();
+            out_chunk[r + 1] = e1.exp();
+            out_chunk[r + 2] = e2.exp();
+            out_chunk[r + 3] = e3.exp();
+        } else {
+            out_chunk[r] = e0;
+            out_chunk[r + 1] = e1;
+            out_chunk[r + 2] = e2;
+            out_chunk[r + 3] = e3;
+        }
+        r += 4;
+    }
+    while r < rows {
+        let row = &x_chunk[r * d..(r + 1) * d];
+        let e = b + dot_unrolled(row, w);
+        if !e.is_finite() {
+            return false;
+        }
+        out_chunk[r] = if apply_exp { e.exp() } else { e };
+        r += 1;
+    }
+    true
+}
+
+fn predict_glm_fused(
+    device: &DeviceType,
+    x: &Matrix,
+    coef: &[f64],
+    intercept: f64,
+    apply_exp: bool,
+) -> OchreResult<Vec<f64>> {
+    let n = x.rows;
+    let d = x.cols;
+    if d != coef.len() {
+        return Err(OchreError::FeatureCountMismatch {
+            features: d,
+            expected: coef.len(),
+        });
+    }
+
+    let backend = if n.saturating_mul(d) < PREDICT_GPU_THRESHOLD {
+        Backend::Cpu
+    } else {
+        get_backend(device)
+    };
+
+    if matches!(backend, Backend::Cpu) {
+        let mut out = vec![0.0; n];
+        if n >= 1024 && n.saturating_mul(d) >= 8_192 {
+            let ok = std::sync::atomic::AtomicBool::new(true);
+            out.par_chunks_mut(512)
+                .zip(x.data.par_chunks(512 * d))
+                .for_each(|(out_c, x_c)| {
+                    if ok.load(std::sync::atomic::Ordering::Relaxed)
+                        && !predict_chunk_cpu(x_c, coef, intercept, apply_exp, out_c)
+                    {
+                        ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+            if !ok.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(OchreError::InvalidParameter(
+                    "Input feature matrix X contains NaN or Inf".to_string(),
+                ));
+            }
+        } else if !predict_chunk_cpu(&x.data, coef, intercept, apply_exp, &mut out) {
             return Err(OchreError::InvalidParameter(
                 "Input feature matrix X contains NaN or Inf".to_string(),
             ));
         }
+        return Ok(out);
     }
-    Ok(())
+
+    if x.data.par_iter().any(|v| !v.is_finite()) {
+        return Err(OchreError::InvalidParameter(
+            "Input feature matrix X contains NaN or Inf".to_string(),
+        ));
+    }
+    let eta = compute_linear_eta(&backend, x, coef, intercept)?;
+    if !apply_exp {
+        return Ok(eta);
+    }
+    if n >= SMALL_VEC_GPU_THRESHOLD {
+        let eta_mat = Matrix::from_vec(n, 1, eta)?;
+        Ok(backend.elementwise_op(&eta_mat, ElementwiseOp::Exp)?.data)
+    } else {
+        let mut out = eta;
+        out.par_iter_mut().for_each(|v| *v = v.exp());
+        Ok(out)
+    }
 }
 
 fn validate_alpha(alpha: f64) -> OchreResult<()> {
@@ -1011,10 +1181,9 @@ impl HuberRegressor {
     }
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
-        validate_predict_inputs(x, self.n_features_in_)?;
+        validate_predict_shape(x, self.n_features_in_)?;
         let coef = self.coef_.as_ref().ok_or(OchreError::NotFitted)?;
-        let backend = effective_backend(&self.parsed_device, x.rows, x.cols);
-        compute_linear_eta(&backend, x, coef, self.intercept_)
+        predict_glm_fused(&self.parsed_device, x, coef, self.intercept_, false)
     }
 
     pub fn score(&self, x: &Matrix, y: &[f64], sample_weight: Option<&[f64]>) -> OchreResult<f64> {
@@ -1954,10 +2123,9 @@ impl QuantileRegressor {
     }
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
-        validate_predict_inputs(x, self.n_features_in_)?;
+        validate_predict_shape(x, self.n_features_in_)?;
         let coef = self.coef_.as_ref().ok_or(OchreError::NotFitted)?;
-        let backend = effective_backend(&self.parsed_device, x.rows, x.cols);
-        compute_linear_eta(&backend, x, coef, self.intercept_)
+        predict_glm_fused(&self.parsed_device, x, coef, self.intercept_, false)
     }
 
     pub fn score(&self, x: &Matrix, y: &[f64], sample_weight: Option<&[f64]>) -> OchreResult<f64> {
@@ -2252,11 +2420,13 @@ fn tweedie_d2_score(
 enum TweediePowerKind {
     Normal,
     Poisson,
+    Half3,
     Gamma,
     General {
-        power: f64,
         one_m_p: f64,
         two_m_p: f64,
+        inv_one_m_p: f64,
+        inv_two_m_p: f64,
     },
 }
 
@@ -2266,144 +2436,426 @@ impl TweediePowerKind {
             Self::Normal
         } else if (power - 1.0).abs() < 1e-12 {
             Self::Poisson
+        } else if (power - 1.5).abs() < 1e-12 {
+            Self::Half3
         } else if (power - 2.0).abs() < 1e-12 {
             Self::Gamma
         } else {
+            let one_m_p = 1.0 - power;
+            let two_m_p = 2.0 - power;
             Self::General {
-                power,
-                one_m_p: 1.0 - power,
-                two_m_p: 2.0 - power,
+                one_m_p,
+                two_m_p,
+                inv_one_m_p: 1.0 / one_m_p,
+                inv_two_m_p: 1.0 / two_m_p,
             }
         }
     }
 
+    // Data-independent deviance constant (sum_i w_i * f(y_i)) computed once per fit
+    // to eliminate redundant per-row .ln() / .powf() calls on y during optimization.
+    fn precompute_loss_const(self, y: &[f64], sw_slice: Option<&[f64]>, inv_n: f64) -> f64 {
+        let chunk_const = |yc: &[f64], base: usize| -> f64 {
+            let mut acc = 0.0_f64;
+            match self {
+                Self::Normal => 0.0,
+                Self::Poisson => {
+                    for (i, &yi) in yc.iter().enumerate() {
+                        if yi > 0.0 {
+                            let wi = sw_slice.map_or(inv_n, |s| s[base + i]);
+                            acc += wi * yi * (yi.ln() - 1.0);
+                        }
+                    }
+                    acc
+                }
+                Self::Half3 => {
+                    for (i, &yi) in yc.iter().enumerate() {
+                        if yi > 0.0 {
+                            let wi = sw_slice.map_or(inv_n, |s| s[base + i]);
+                            acc += wi * (-4.0 * yi.sqrt());
+                        }
+                    }
+                    acc
+                }
+                Self::Gamma => {
+                    for (i, &yi) in yc.iter().enumerate() {
+                        let wi = sw_slice.map_or(inv_n, |s| s[base + i]);
+                        acc -= wi * (yi.ln() + 1.0);
+                    }
+                    acc
+                }
+                Self::General {
+                    two_m_p,
+                    inv_one_m_p,
+                    inv_two_m_p,
+                    ..
+                } => {
+                    let coeff = inv_one_m_p * inv_two_m_p;
+                    for (i, &yi) in yc.iter().enumerate() {
+                        if yi > 0.0 {
+                            let wi = sw_slice.map_or(inv_n, |s| s[base + i]);
+                            acc += wi * yi.powf(two_m_p) * coeff;
+                        }
+                    }
+                    acc
+                }
+            }
+        };
+
+        if matches!(self, Self::Normal) {
+            return 0.0;
+        }
+        if y.len() >= FUSED_PAR_THRESHOLD {
+            y.par_chunks(FUSED_CHUNK_ROWS)
+                .enumerate()
+                .map(|(c_idx, yc)| chunk_const(yc, c_idx * FUSED_CHUNK_ROWS))
+                .sum()
+        } else {
+            chunk_const(y, 0)
+        }
+    }
+
     #[inline(always)]
-    fn loss_and_grad(self, eff_link: GlmLink, yi: f64, mui: f64, wi: f64) -> (f64, f64) {
+    fn loss_and_grad_mu(
+        self,
+        eff_link: GlmLink,
+        yi: f64,
+        mui: f64,
+        eta_c: f64,
+        wi: f64,
+    ) -> (f64, f64) {
         match self {
             Self::Normal => {
                 let d = mui - yi;
-                let loss = 0.5 * wi * d * d;
+                let loss_var = 0.5 * wi * d * d;
                 let g = match eff_link {
                     GlmLink::Identity => wi * d,
                     GlmLink::Log => wi * d * mui,
                 };
-                (loss, g)
+                (loss_var, g)
             }
-            Self::Poisson => {
-                let term = if yi > 0.0 { yi * (yi / mui).ln() } else { 0.0 };
-                let loss = wi * (term - yi + mui);
+            Self::Poisson => match eff_link {
+                GlmLink::Identity => {
+                    let loss_var = if yi > 0.0 {
+                        wi * (mui - yi * mui.ln())
+                    } else {
+                        wi * mui
+                    };
+                    (loss_var, wi * (mui - yi) / mui)
+                }
+                GlmLink::Log => (wi * (mui - yi * eta_c), wi * (mui - yi)),
+            },
+            Self::Half3 => {
+                let sqrt_mu = mui.sqrt();
+                let inv_sqrt_mu = 1.0 / sqrt_mu;
+                let loss_var = wi * 2.0 * (yi * inv_sqrt_mu + sqrt_mu);
                 let g = match eff_link {
-                    GlmLink::Identity => wi * (mui - yi) / mui,
-                    GlmLink::Log => wi * (mui - yi),
+                    GlmLink::Identity => wi * (mui - yi) * (inv_sqrt_mu / mui),
+                    GlmLink::Log => wi * (mui - yi) * inv_sqrt_mu,
                 };
-                (loss, g)
+                (loss_var, g)
             }
             Self::Gamma => {
-                let loss = wi * ((mui / yi).ln() + yi / mui - 1.0);
-                let g = match eff_link {
-                    GlmLink::Identity => wi * (mui - yi) / (mui * mui),
-                    GlmLink::Log => wi * (mui - yi) / mui,
-                };
-                (loss, g)
-            }
-            Self::General {
-                power,
-                one_m_p,
-                two_m_p,
-            } => {
-                let y_term = if yi > 0.0 {
-                    yi.powf(two_m_p) / (one_m_p * two_m_p)
-                } else {
-                    0.0
-                };
-                let mu_1mp = mui.powf(one_m_p);
-                let mu_2mp = mu_1mp * mui;
-                let loss = wi * (y_term - yi * mu_1mp / one_m_p + mu_2mp / two_m_p);
-                let g = match eff_link {
-                    GlmLink::Identity => wi * (mui - yi) * mui.powf(-power),
-                    GlmLink::Log => wi * (mui - yi) * mu_1mp,
-                };
-                (loss, g)
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn loss_only(self, yi: f64, mui: f64, wi: f64) -> f64 {
-        match self {
-            Self::Normal => {
-                let d = mui - yi;
-                0.5 * wi * d * d
-            }
-            Self::Poisson => {
-                let term = if yi > 0.0 { yi * (yi / mui).ln() } else { 0.0 };
-                wi * (term - yi + mui)
-            }
-            Self::Gamma => wi * ((mui / yi).ln() + yi / mui - 1.0),
-            Self::General {
-                one_m_p, two_m_p, ..
-            } => {
-                let y_term = if yi > 0.0 {
-                    yi.powf(two_m_p) / (one_m_p * two_m_p)
-                } else {
-                    0.0
-                };
-                let mu_1mp = mui.powf(one_m_p);
-                let mu_2mp = mu_1mp * mui;
-                wi * (y_term - yi * mu_1mp / one_m_p + mu_2mp / two_m_p)
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn loss_grad_fisher(self, eff_link: GlmLink, yi: f64, mui: f64, wi: f64) -> (f64, f64, f64) {
-        match self {
-            Self::Normal => {
-                let d = mui - yi;
-                let loss = 0.5 * wi * d * d;
-                match eff_link {
-                    GlmLink::Identity => (loss, wi * d, wi),
-                    GlmLink::Log => (loss, wi * d * mui, wi * mui * mui),
-                }
-            }
-            Self::Poisson => {
-                let term = if yi > 0.0 { yi * (yi / mui).ln() } else { 0.0 };
-                let loss = wi * (term - yi + mui);
-                match eff_link {
-                    GlmLink::Identity => (loss, wi * (mui - yi) / mui, wi / mui),
-                    GlmLink::Log => (loss, wi * (mui - yi), wi * mui),
-                }
-            }
-            Self::Gamma => {
-                let loss = wi * ((mui / yi).ln() + yi / mui - 1.0);
                 let inv_mu = 1.0 / mui;
                 match eff_link {
-                    GlmLink::Identity => {
-                        let inv_mu2 = inv_mu * inv_mu;
-                        (loss, wi * (mui - yi) * inv_mu2, wi * inv_mu2)
+                    GlmLink::Identity => (
+                        wi * (mui.ln() + yi * inv_mu),
+                        wi * (mui - yi) * (inv_mu * inv_mu),
+                    ),
+                    GlmLink::Log => {
+                        let ratio = yi * inv_mu;
+                        (wi * (eta_c + ratio), wi * (1.0 - ratio))
                     }
-                    GlmLink::Log => (loss, wi * (mui - yi) * inv_mu, wi),
                 }
             }
             Self::General {
-                one_m_p, two_m_p, ..
+                one_m_p,
+                inv_one_m_p,
+                inv_two_m_p,
+                ..
             } => {
-                let y_term = if yi > 0.0 {
-                    yi.powf(two_m_p) / (one_m_p * two_m_p)
-                } else {
-                    0.0
+                let mu_1mp = match eff_link {
+                    GlmLink::Identity => mui.powf(one_m_p),
+                    GlmLink::Log => (one_m_p * eta_c).exp(),
                 };
-                let mu_1mp = mui.powf(one_m_p);
                 let mu_2mp = mu_1mp * mui;
-                let loss = wi * (y_term - yi * mu_1mp / one_m_p + mu_2mp / two_m_p);
-                match eff_link {
-                    GlmLink::Identity => {
-                        let mu_mp = mu_1mp / mui;
-                        (loss, wi * (mui - yi) * mu_mp, wi * mu_mp)
+                let loss_var = wi * (mu_2mp * inv_two_m_p - yi * mu_1mp * inv_one_m_p);
+                let g = match eff_link {
+                    GlmLink::Identity => wi * (mui - yi) * (mu_1mp / mui),
+                    GlmLink::Log => wi * (mui - yi) * mu_1mp,
+                };
+                (loss_var, g)
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn loss_and_grad_eta(
+        self,
+        eff_link: GlmLink,
+        yi: f64,
+        eta: f64,
+        wi: f64,
+        check_pos_mu: bool,
+    ) -> Option<(f64, f64)> {
+        let res = match eff_link {
+            GlmLink::Identity => {
+                let mui = eta;
+                if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
+                    return None;
+                }
+                self.loss_and_grad_mu(GlmLink::Identity, yi, mui, eta, wi)
+            }
+            GlmLink::Log => {
+                let eta_c = eta.clamp(-50.0, 50.0);
+                if !eta_c.is_finite() {
+                    return None;
+                }
+                match self {
+                    Self::Normal => {
+                        let mui = eta_c.exp();
+                        let d = mui - yi;
+                        (0.5 * wi * d * d, wi * d * mui)
                     }
-                    GlmLink::Log => (loss, wi * (mui - yi) * mu_1mp, wi * mu_2mp),
+                    Self::Poisson => {
+                        let mui = eta_c.exp();
+                        (wi * (mui - yi * eta_c), wi * (mui - yi))
+                    }
+                    Self::Half3 => {
+                        let mui = eta_c.exp();
+                        let sqrt_mu = mui.sqrt();
+                        let inv_sqrt_mu = 1.0 / sqrt_mu;
+                        (
+                            wi * 2.0 * (yi * inv_sqrt_mu + sqrt_mu),
+                            wi * (mui - yi) * inv_sqrt_mu,
+                        )
+                    }
+                    Self::Gamma => {
+                        let inv_mu = (-eta_c).exp();
+                        let ratio = yi * inv_mu;
+                        (wi * (eta_c + ratio), wi * (1.0 - ratio))
+                    }
+                    Self::General {
+                        one_m_p,
+                        inv_one_m_p,
+                        inv_two_m_p,
+                        ..
+                    } => {
+                        let mui = eta_c.exp();
+                        let mu_1mp = (one_m_p * eta_c).exp();
+                        let mu_2mp = mu_1mp * mui;
+                        (
+                            wi * (mu_2mp * inv_two_m_p - yi * mu_1mp * inv_one_m_p),
+                            wi * (mui - yi) * mu_1mp,
+                        )
+                    }
                 }
             }
+        };
+        if res.0.is_finite() && res.1.is_finite() {
+            Some(res)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn loss_only_eta(
+        self,
+        eff_link: GlmLink,
+        yi: f64,
+        eta: f64,
+        wi: f64,
+        check_pos_mu: bool,
+    ) -> Option<f64> {
+        let loss_var = match eff_link {
+            GlmLink::Identity => {
+                let mui = eta;
+                if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
+                    return None;
+                }
+                match self {
+                    Self::Normal => {
+                        let d = mui - yi;
+                        0.5 * wi * d * d
+                    }
+                    Self::Poisson => {
+                        if yi > 0.0 {
+                            wi * (mui - yi * mui.ln())
+                        } else {
+                            wi * mui
+                        }
+                    }
+                    Self::Half3 => {
+                        let sqrt_mu = mui.sqrt();
+                        let inv_sqrt_mu = 1.0 / sqrt_mu;
+                        wi * 2.0 * (yi * inv_sqrt_mu + sqrt_mu)
+                    }
+                    Self::Gamma => wi * (mui.ln() + yi / mui),
+                    Self::General {
+                        one_m_p,
+                        inv_one_m_p,
+                        inv_two_m_p,
+                        ..
+                    } => {
+                        let mu_1mp = mui.powf(one_m_p);
+                        let mu_2mp = mu_1mp * mui;
+                        wi * (mu_2mp * inv_two_m_p - yi * mu_1mp * inv_one_m_p)
+                    }
+                }
+            }
+            GlmLink::Log => {
+                let eta_c = eta.clamp(-50.0, 50.0);
+                if !eta_c.is_finite() {
+                    return None;
+                }
+                match self {
+                    Self::Normal => {
+                        let mui = eta_c.exp();
+                        let d = mui - yi;
+                        0.5 * wi * d * d
+                    }
+                    Self::Poisson => {
+                        let mui = eta_c.exp();
+                        wi * (mui - yi * eta_c)
+                    }
+                    Self::Half3 => {
+                        let sqrt_mu = (0.5 * eta_c).exp();
+                        let inv_sqrt_mu = 1.0 / sqrt_mu;
+                        wi * 2.0 * (yi * inv_sqrt_mu + sqrt_mu)
+                    }
+                    Self::Gamma => {
+                        let inv_mu = (-eta_c).exp();
+                        wi * (eta_c + yi * inv_mu)
+                    }
+                    Self::General {
+                        one_m_p,
+                        inv_one_m_p,
+                        inv_two_m_p,
+                        ..
+                    } => {
+                        let mui = eta_c.exp();
+                        let mu_1mp = (one_m_p * eta_c).exp();
+                        let mu_2mp = mu_1mp * mui;
+                        wi * (mu_2mp * inv_two_m_p - yi * mu_1mp * inv_one_m_p)
+                    }
+                }
+            }
+        };
+        if loss_var.is_finite() {
+            Some(loss_var)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn loss_grad_fisher_eta(
+        self,
+        eff_link: GlmLink,
+        yi: f64,
+        eta: f64,
+        wi: f64,
+        check_pos_mu: bool,
+    ) -> Option<(f64, f64, f64)> {
+        let res = match eff_link {
+            GlmLink::Identity => {
+                let mui = eta;
+                if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
+                    return None;
+                }
+                match self {
+                    Self::Normal => {
+                        let d = mui - yi;
+                        (0.5 * wi * d * d, wi * d, wi)
+                    }
+                    Self::Poisson => {
+                        let loss_var = if yi > 0.0 {
+                            wi * (mui - yi * mui.ln())
+                        } else {
+                            wi * mui
+                        };
+                        (loss_var, wi * (mui - yi) / mui, wi / mui)
+                    }
+                    Self::Half3 => {
+                        let sqrt_mu = mui.sqrt();
+                        let inv_sqrt_mu = 1.0 / sqrt_mu;
+                        let loss_var = wi * 2.0 * (yi * inv_sqrt_mu + sqrt_mu);
+                        let mu_mp = inv_sqrt_mu / mui;
+                        (loss_var, wi * (mui - yi) * mu_mp, wi * mu_mp)
+                    }
+                    Self::Gamma => {
+                        let inv_mu = 1.0 / mui;
+                        let inv_mu2 = inv_mu * inv_mu;
+                        (
+                            wi * (mui.ln() + yi * inv_mu),
+                            wi * (mui - yi) * inv_mu2,
+                            wi * inv_mu2,
+                        )
+                    }
+                    Self::General {
+                        one_m_p,
+                        inv_one_m_p,
+                        inv_two_m_p,
+                        ..
+                    } => {
+                        let mu_1mp = mui.powf(one_m_p);
+                        let mu_2mp = mu_1mp * mui;
+                        let loss_var = wi * (mu_2mp * inv_two_m_p - yi * mu_1mp * inv_one_m_p);
+                        let mu_mp = mu_1mp / mui;
+                        (loss_var, wi * (mui - yi) * mu_mp, wi * mu_mp)
+                    }
+                }
+            }
+            GlmLink::Log => {
+                let eta_c = eta.clamp(-50.0, 50.0);
+                if !eta_c.is_finite() {
+                    return None;
+                }
+                match self {
+                    Self::Normal => {
+                        let mui = eta_c.exp();
+                        let d = mui - yi;
+                        (0.5 * wi * d * d, wi * d * mui, wi * mui * mui)
+                    }
+                    Self::Poisson => {
+                        let mui = eta_c.exp();
+                        (wi * (mui - yi * eta_c), wi * (mui - yi), wi * mui)
+                    }
+                    Self::Half3 => {
+                        let mui = eta_c.exp();
+                        let sqrt_mu = mui.sqrt();
+                        let inv_sqrt_mu = 1.0 / sqrt_mu;
+                        (
+                            wi * 2.0 * (yi * inv_sqrt_mu + sqrt_mu),
+                            wi * (mui - yi) * inv_sqrt_mu,
+                            wi * sqrt_mu,
+                        )
+                    }
+                    Self::Gamma => {
+                        let inv_mu = (-eta_c).exp();
+                        let ratio = yi * inv_mu;
+                        (wi * (eta_c + ratio), wi * (1.0 - ratio), wi)
+                    }
+                    Self::General {
+                        one_m_p,
+                        inv_one_m_p,
+                        inv_two_m_p,
+                        ..
+                    } => {
+                        let mui = eta_c.exp();
+                        let mu_1mp = (one_m_p * eta_c).exp();
+                        let mu_2mp = mu_1mp * mui;
+                        let loss_var = wi * (mu_2mp * inv_two_m_p - yi * mu_1mp * inv_one_m_p);
+                        (loss_var, wi * (mui - yi) * mu_1mp, wi * mu_2mp)
+                    }
+                }
+            }
+        };
+        if res.0.is_finite() && res.1.is_finite() && res.2.is_finite() {
+            Some(res)
+        } else {
+            None
         }
     }
 }
@@ -2442,18 +2894,12 @@ fn accumulate_tweedie_irls_chunk(
         for (b, i) in (row_start..row_end).enumerate() {
             let row = &x_data[i * p..(i + 1) * p];
             let eta = dot_unrolled(row, w) + b_intercept;
-            let mui = match eff_link {
-                GlmLink::Identity => eta,
-                GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
-            };
-            if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
-                return (f64::INFINITY, true);
-            }
             let wi = sw_slice.map_or(inv_n, |s| s[i]);
-            let (l_i, g_i, fisher_i) = power_kind.loss_grad_fisher(eff_link, y_data[i], mui, wi);
-            if !l_i.is_finite() || !g_i.is_finite() || !fisher_i.is_finite() {
+            let Some((l_i, g_i, fisher_i)) =
+                power_kind.loss_grad_fisher_eta(eff_link, y_data[i], eta, wi, check_pos_mu)
+            else {
                 return (f64::INFINITY, true);
-            }
+            };
             dl += l_i;
             axpy_add_unrolled(&mut grad[..p], row, g_i);
             if fit_intercept {
@@ -2602,6 +3048,7 @@ fn tweedie_loss_only_cpu(
     power_kind: TweediePowerKind,
     check_pos_mu: bool,
     alpha: f64,
+    loss_const: f64,
 ) -> f64 {
     let n = x.rows;
     let p = x.cols;
@@ -2624,16 +3071,14 @@ fn tweedie_loss_only_cpu(
                     for i in 0..yc.len() {
                         let row = &xc[i * p..(i + 1) * p];
                         let eta = dot_unrolled(row, w) + b;
-                        let mui = match eff_link {
-                            GlmLink::Identity => eta,
-                            GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
-                        };
-                        if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
+                        let wi = sw_slice.map_or(inv_n, |s| s[base + i]);
+                        let Some(l_i) =
+                            power_kind.loss_only_eta(eff_link, yc[i], eta, wi, check_pos_mu)
+                        else {
                             inv = true;
                             break;
-                        }
-                        let wi = sw_slice.map_or(inv_n, |s| s[base + i]);
-                        dl += power_kind.loss_only(yc[i], mui, wi);
+                        };
+                        dl += l_i;
                     }
                     (dl, inv)
                 },
@@ -2657,15 +3102,11 @@ fn tweedie_loss_only_cpu(
         for i in 0..n {
             let row = &x.data[i * p..(i + 1) * p];
             let eta = dot_unrolled(row, w) + b;
-            let mui = match eff_link {
-                GlmLink::Identity => eta,
-                GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
-            };
-            if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
-                return f64::INFINITY;
-            }
             let wi = sw_slice.map_or(inv_n, |s| s[i]);
-            dl += power_kind.loss_only(y[i], mui, wi);
+            let Some(l_i) = power_kind.loss_only_eta(eff_link, y[i], eta, wi, check_pos_mu) else {
+                return f64::INFINITY;
+            };
+            dl += l_i;
         }
         dl
     };
@@ -2674,7 +3115,7 @@ fn tweedie_loss_only_cpu(
     for &wj in w {
         reg_loss += wj * wj;
     }
-    data_loss + 0.5 * alpha * reg_loss
+    data_loss + loss_const + 0.5 * alpha * reg_loss
 }
 
 #[derive(Debug, Clone)]
@@ -2773,15 +3214,18 @@ impl TweedieRegressor {
         let is_cpu = matches!(backend, Backend::Cpu);
         let check_pos_mu = eff_link == GlmLink::Identity && power > 0.0;
 
+        let loss_const = power_kind.precompute_loss_const(y, sw_slice, inv_n);
         let mut irls_iters = 0usize;
         let mut irls_converged = false;
-        let use_irls = p <= 256 && (is_cpu || n.saturating_mul(p) < 524_288);
+        let use_irls = p <= 256 && (is_cpu || n.saturating_mul(p) <= 1_048_576);
 
         if use_irls {
             let irls_max_iters = self.max_iter.min(25);
             let mut grad = vec![0.0; dim];
+            let mut cand_grad = vec![0.0; dim];
             let mut neg_grad = vec![0.0; dim];
             let mut hess_data = vec![0.0; dim * dim];
+            let mut cand_hess_data = vec![0.0; dim * dim];
             let mut cand_theta = vec![0.0; dim];
             let mut u_t = if n >= 1024 && n * dim >= 16_384 {
                 Vec::new()
@@ -2789,65 +3233,67 @@ impl TweedieRegressor {
                 vec![[0.0f64; GLM_TILE_ROWS]; dim]
             };
 
-            for _ in 0..irls_max_iters {
-                let (data_loss, invalid) = tweedie_irls_fused_cpu_pass(
-                    x,
-                    y,
-                    sw_slice,
-                    inv_n,
-                    &init_theta,
-                    fit_intercept,
-                    eff_link,
-                    power_kind,
-                    check_pos_mu,
-                    &mut grad,
-                    &mut hess_data,
-                    &mut u_t,
-                );
-                if invalid || !data_loss.is_finite() {
-                    break;
-                }
-
-                let mut reg_loss = 0.0;
-                for j in 0..p {
-                    let wj = init_theta[j];
-                    reg_loss += wj * wj;
-                    grad[j] += alpha * wj;
-                    hess_data[j * dim + j] += alpha;
-                }
-                let loss = data_loss + 0.5 * alpha * reg_loss;
-
-                let g_inf = grad.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-                if g_inf <= self.tol {
-                    irls_converged = true;
-                    break;
-                }
-
-                for d in 0..dim {
-                    neg_grad[d] = -grad[d];
-                }
-                let hess_mat = Matrix::from_vec(dim, dim, std::mem::take(&mut hess_data))?;
-                let delta_res = solve_cholesky(&hess_mat, &neg_grad);
-                hess_data = hess_mat.data;
-                let Ok(delta) = delta_res else {
-                    break;
-                };
-                if !delta.iter().all(|v| v.is_finite()) {
-                    break;
-                }
-                let dg = dot_unrolled(&grad, &delta);
-                if !dg.is_finite() || dg >= 0.0 {
-                    break;
-                }
-
-                let mut step = 1.0_f64;
-                let c1 = 1e-4_f64;
-                let mut accepted = false;
-                for _ in 0..20 {
-                    for d in 0..dim {
-                        cand_theta[d] = init_theta[d] + step * delta[d];
+            let add_reg_and_const =
+                |theta: &[f64], data_loss: f64, g: &mut [f64], h: &mut [f64]| -> f64 {
+                    let mut reg_loss = 0.0;
+                    for j in 0..p {
+                        let wj = theta[j];
+                        reg_loss += wj * wj;
+                        g[j] += alpha * wj;
+                        h[j * dim + j] += alpha;
                     }
-                    let cand_loss = tweedie_loss_only_cpu(
+                    data_loss + loss_const + 0.5 * alpha * reg_loss
+                };
+
+            let (init_data_loss, init_invalid) = tweedie_irls_fused_cpu_pass(
+                x,
+                y,
+                sw_slice,
+                inv_n,
+                &init_theta,
+                fit_intercept,
+                eff_link,
+                power_kind,
+                check_pos_mu,
+                &mut grad,
+                &mut hess_data,
+                &mut u_t,
+            );
+            if !init_invalid && init_data_loss.is_finite() {
+                let mut loss =
+                    add_reg_and_const(&init_theta, init_data_loss, &mut grad, &mut hess_data);
+                let mut grad_valid = true;
+                let c1 = 1e-4_f64;
+
+                for _ in 0..irls_max_iters {
+                    let g_inf = grad.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                    if g_inf <= self.tol {
+                        irls_converged = true;
+                        break;
+                    }
+
+                    for d in 0..dim {
+                        neg_grad[d] = -grad[d];
+                    }
+                    let hess_mat = Matrix::from_vec(dim, dim, std::mem::take(&mut hess_data))?;
+                    let delta_res = solve_cholesky(&hess_mat, &neg_grad);
+                    hess_data = hess_mat.data;
+                    let Ok(delta) = delta_res else {
+                        break;
+                    };
+                    if !delta.iter().all(|v| v.is_finite()) {
+                        break;
+                    }
+                    let dg = dot_unrolled(&grad, &delta);
+                    if !dg.is_finite() || dg >= 0.0 {
+                        break;
+                    }
+
+                    // Optimistic full Newton step (step = 1.0): compute loss, grad, and Hessian in one pass.
+                    for d in 0..dim {
+                        cand_theta[d] = init_theta[d] + delta[d];
+                    }
+                    let (cand_data_loss, cand_invalid) = tweedie_irls_fused_cpu_pass(
                         x,
                         y,
                         sw_slice,
@@ -2857,19 +3303,99 @@ impl TweedieRegressor {
                         eff_link,
                         power_kind,
                         check_pos_mu,
-                        alpha,
+                        &mut cand_grad,
+                        &mut cand_hess_data,
+                        &mut u_t,
                     );
-                    if cand_loss.is_finite() && cand_loss <= loss + c1 * step * dg {
+                    let cand_loss = if !cand_invalid && cand_data_loss.is_finite() {
+                        add_reg_and_const(
+                            &cand_theta,
+                            cand_data_loss,
+                            &mut cand_grad,
+                            &mut cand_hess_data,
+                        )
+                    } else {
+                        f64::INFINITY
+                    };
+
+                    if cand_loss.is_finite() && cand_loss <= loss + c1 * dg {
                         init_theta.copy_from_slice(&cand_theta);
-                        accepted = true;
+                        std::mem::swap(&mut grad, &mut cand_grad);
+                        std::mem::swap(&mut hess_data, &mut cand_hess_data);
+                        loss = cand_loss;
+                        grad_valid = true;
+                        irls_iters += 1;
+                        continue;
+                    }
+
+                    // Step = 1.0 rejected: fall back to loss-only Armijo backtracking.
+                    let mut step = 0.5_f64;
+                    let mut accepted = false;
+                    for _ in 1..20 {
+                        for d in 0..dim {
+                            cand_theta[d] = init_theta[d] + step * delta[d];
+                        }
+                        let bt_loss = tweedie_loss_only_cpu(
+                            x,
+                            y,
+                            sw_slice,
+                            inv_n,
+                            &cand_theta,
+                            fit_intercept,
+                            eff_link,
+                            power_kind,
+                            check_pos_mu,
+                            alpha,
+                            loss_const,
+                        );
+                        if bt_loss.is_finite() && bt_loss <= loss + c1 * step * dg {
+                            init_theta.copy_from_slice(&cand_theta);
+                            accepted = true;
+                            break;
+                        }
+                        step *= 0.5;
+                    }
+                    if !accepted {
                         break;
                     }
-                    step *= 0.5;
+                    irls_iters += 1;
+                    if irls_iters < irls_max_iters {
+                        let (next_data_loss, next_invalid) = tweedie_irls_fused_cpu_pass(
+                            x,
+                            y,
+                            sw_slice,
+                            inv_n,
+                            &init_theta,
+                            fit_intercept,
+                            eff_link,
+                            power_kind,
+                            check_pos_mu,
+                            &mut grad,
+                            &mut hess_data,
+                            &mut u_t,
+                        );
+                        if next_invalid || !next_data_loss.is_finite() {
+                            grad_valid = false;
+                            break;
+                        }
+                        loss = add_reg_and_const(
+                            &init_theta,
+                            next_data_loss,
+                            &mut grad,
+                            &mut hess_data,
+                        );
+                        grad_valid = true;
+                    } else {
+                        grad_valid = false;
+                    }
                 }
-                if !accepted {
-                    break;
+
+                if !irls_converged
+                    && grad_valid
+                    && grad.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())) <= self.tol
+                {
+                    irls_converged = true;
                 }
-                irls_iters += 1;
             }
         }
 
@@ -2902,17 +3428,17 @@ impl TweedieRegressor {
                                         for i in 0..yc.len() {
                                             let row = &xc[i * p..(i + 1) * p];
                                             let eta = dot_unrolled(row, w) + b;
-                                            let mui = match eff_link {
-                                                GlmLink::Identity => eta,
-                                                GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
-                                            };
-                                            if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
+                                            let wi = sw_slice.map_or(inv_n, |s| s[base + i]);
+                                            let Some((l_i, g)) = power_kind.loss_and_grad_eta(
+                                                eff_link,
+                                                yc[i],
+                                                eta,
+                                                wi,
+                                                check_pos_mu,
+                                            ) else {
                                                 inv = true;
                                                 break;
-                                            }
-                                            let wi = sw_slice.map_or(inv_n, |s| s[base + i]);
-                                            let (l_i, g) =
-                                                power_kind.loss_and_grad(eff_link, yc[i], mui, wi);
+                                            };
                                             dl += l_i;
                                             gb += g;
                                             axpy_add_unrolled(&mut gw, row, g);
@@ -2936,7 +3462,7 @@ impl TweedieRegressor {
                                 return Ok(f64::INFINITY);
                             }
                             grad_out[..p].copy_from_slice(&gw);
-                            (dl, gb)
+                            (dl + loss_const, gb)
                         } else {
                             grad_out[..p].fill(0.0);
                             let mut dl = 0.0;
@@ -2944,34 +3470,38 @@ impl TweedieRegressor {
                             for i in 0..n {
                                 let row = &x.data[i * p..(i + 1) * p];
                                 let eta = dot_unrolled(row, w) + b;
-                                let mui = match eff_link {
-                                    GlmLink::Identity => eta,
-                                    GlmLink::Log => eta.clamp(-50.0, 50.0).exp(),
-                                };
-                                if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
-                                    return Ok(f64::INFINITY);
-                                }
                                 let wi = sw_slice.map_or(inv_n, |s| s[i]);
-                                let (l_i, g) = power_kind.loss_and_grad(eff_link, y[i], mui, wi);
+                                let Some((l_i, g)) = power_kind.loss_and_grad_eta(
+                                    eff_link,
+                                    y[i],
+                                    eta,
+                                    wi,
+                                    check_pos_mu,
+                                ) else {
+                                    return Ok(f64::INFINITY);
+                                };
                                 dl += l_i;
                                 gb += g;
                                 axpy_add_unrolled(&mut grad_out[..p], row, g);
                             }
-                            (dl, gb)
+                            (dl + loss_const, gb)
                         }
                     } else {
                         let eta = compute_linear_eta(&backend, x, w, b)?;
+                        let mut eta_opt: Option<Vec<f64>> = None;
                         let mu: Vec<f64> = match eff_link {
                             GlmLink::Identity => eta,
                             GlmLink::Log => {
-                                if n >= SMALL_VEC_GPU_THRESHOLD {
+                                let m = if n >= SMALL_VEC_GPU_THRESHOLD {
                                     let clamped: Vec<f64> =
                                         eta.iter().map(|&v| v.clamp(-50.0, 50.0)).collect();
                                     let eta_mat = Matrix::from_vec(n, 1, clamped)?;
                                     backend.elementwise_op(&eta_mat, ElementwiseOp::Exp)?.data
                                 } else {
                                     eta.iter().map(|&v| v.clamp(-50.0, 50.0).exp()).collect()
-                                }
+                                };
+                                eta_opt = Some(eta);
+                                m
                             }
                         };
 
@@ -2983,15 +3513,20 @@ impl TweedieRegressor {
                             if (check_pos_mu && mui <= 1e-15) || !mui.is_finite() {
                                 return Ok(f64::INFINITY);
                             }
+                            let eta_c = eta_opt.as_deref().map_or(0.0, |e| e[i].clamp(-50.0, 50.0));
                             let wi = sw_slice.map_or(inv_n, |s| s[i]);
-                            let (l_i, g) = power_kind.loss_and_grad(eff_link, y[i], mui, wi);
+                            let (l_i, g) =
+                                power_kind.loss_and_grad_mu(eff_link, y[i], mui, eta_c, wi);
+                            if !l_i.is_finite() || !g.is_finite() {
+                                return Ok(f64::INFINITY);
+                            }
                             dl += l_i;
                             grad_eta[i] = g;
                             gb += g;
                         }
                         let grad_w = compute_xt_r(&backend, x, &grad_eta)?;
                         grad_out[..p].copy_from_slice(&grad_w);
-                        (dl, gb)
+                        (dl + loss_const, gb)
                     };
 
                     let mut reg_loss = 0.0;
@@ -3018,27 +3553,16 @@ impl TweedieRegressor {
     }
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
-        validate_predict_inputs(x, self.n_features_in_)?;
+        validate_predict_shape(x, self.n_features_in_)?;
         let coef = self.coef_.as_ref().ok_or(OchreError::NotFitted)?;
         let eff_link = resolve_glm_link(&self.link, self.power)?;
-        let backend = effective_backend(&self.parsed_device, x.rows, x.cols);
-        let eta = compute_linear_eta(&backend, x, coef, self.intercept_)?;
-
-        match eff_link {
-            GlmLink::Identity => Ok(eta),
-            GlmLink::Log => {
-                if x.rows >= SMALL_VEC_GPU_THRESHOLD && !matches!(backend, Backend::Cpu) {
-                    let eta_mat = Matrix::from_vec(x.rows, 1, eta)?;
-                    Ok(backend.elementwise_op(&eta_mat, ElementwiseOp::Exp)?.data)
-                } else {
-                    let mut out = eta;
-                    for v in &mut out {
-                        *v = v.exp();
-                    }
-                    Ok(out)
-                }
-            }
-        }
+        predict_glm_fused(
+            &self.parsed_device,
+            x,
+            coef,
+            self.intercept_,
+            eff_link == GlmLink::Log,
+        )
     }
 
     pub fn score(&self, x: &Matrix, y: &[f64], sample_weight: Option<&[f64]>) -> OchreResult<f64> {
@@ -3736,5 +4260,73 @@ mod tests {
             QuantileRegressor::new(0.5, 0.0, false, 200, 1e-6, Some("cpu".to_string())).unwrap();
         quant_no_int.fit(&x_centered, &y_no_int, None).unwrap();
         assert!(quant_no_int.score(&x_centered, &y_no_int, None).unwrap() > 0.95);
+    }
+
+    #[test]
+    fn test_fused_predict_nonfinite_and_tweedie_variants() {
+        // Test general Tweedie power=2.5 (uses General variant with Log link)
+        let n = 1500;
+        let p = 5;
+        let mut x_data = Vec::with_capacity(n * p);
+        let mut y_pos = Vec::with_capacity(n);
+        let mut state: u64 = 0x5555_6666_7777_8888;
+        let mut next_f64 = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
+        };
+        for _ in 0..n {
+            let mut eta = 0.3;
+            for j in 0..p {
+                let v = next_f64();
+                x_data.push(v);
+                eta += 0.2 * ((j + 1) as f64) * v;
+            }
+            y_pos.push(eta.exp());
+        }
+        let x = Matrix::from_vec(n, p, x_data.clone()).unwrap();
+
+        let mut tw_gen = TweedieRegressor::new(
+            2.5,
+            1e-4,
+            true,
+            "log".to_string(),
+            100,
+            1e-6,
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        tw_gen.fit(&x, &y_pos, None).unwrap();
+        assert!(tw_gen.score(&x, &y_pos, None).unwrap() > 0.99);
+
+        // NaN and Inf rejection in fused parallel predict (including last tail row)
+        let mut x_nan = x_data.clone();
+        x_nan[(n - 1) * p + (p - 1)] = f64::NAN;
+        let mat_nan = Matrix::from_vec(n, p, x_nan).unwrap();
+        assert!(matches!(
+            tw_gen.predict(&mat_nan),
+            Err(OchreError::InvalidParameter(_))
+        ));
+
+        let mut x_inf = x_data;
+        x_inf[7 * p + 2] = f64::INFINITY;
+        let mat_inf = Matrix::from_vec(n, p, x_inf).unwrap();
+        assert!(matches!(
+            tw_gen.predict(&mat_inf),
+            Err(OchreError::InvalidParameter(_))
+        ));
+
+        // Zero-coefficient model must still reject NaN/Inf in X
+        let mut gamma = GammaRegressor::new(1e4, true, 50, 1e-4, Some("cpu".to_string())).unwrap();
+        gamma.inner.coef_ = Some(vec![0.0; p]);
+        gamma.inner.intercept_ = 1.0;
+        gamma.inner.n_features_in_ = Some(p);
+        assert!(matches!(
+            gamma.predict(&mat_nan),
+            Err(OchreError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            gamma.predict(&mat_inf),
+            Err(OchreError::InvalidParameter(_))
+        ));
     }
 }

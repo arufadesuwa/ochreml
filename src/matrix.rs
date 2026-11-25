@@ -348,7 +348,129 @@ fn dot64_2x4(
     )
 }
 
-// Accumulate upper triangle of left_t * right_t^T into xt_x (stride p) using 2x4 SIMD micro-kernel.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn dot64_4x4(
+    a0: &[f64; NORMAL_EQ_TILE],
+    a1: &[f64; NORMAL_EQ_TILE],
+    a2: &[f64; NORMAL_EQ_TILE],
+    a3: &[f64; NORMAL_EQ_TILE],
+    b0: &[f64; NORMAL_EQ_TILE],
+    b1: &[f64; NORMAL_EQ_TILE],
+    b2: &[f64; NORMAL_EQ_TILE],
+    b3: &[f64; NORMAL_EQ_TILE],
+) -> [[f64; 4]; 4] {
+    let mut acc00 = [0.0f64; 4];
+    let mut acc01 = [0.0f64; 4];
+    let mut acc02 = [0.0f64; 4];
+    let mut acc03 = [0.0f64; 4];
+    let mut acc10 = [0.0f64; 4];
+    let mut acc11 = [0.0f64; 4];
+    let mut acc12 = [0.0f64; 4];
+    let mut acc13 = [0.0f64; 4];
+    let mut acc20 = [0.0f64; 4];
+    let mut acc21 = [0.0f64; 4];
+    let mut acc22 = [0.0f64; 4];
+    let mut acc23 = [0.0f64; 4];
+    let mut acc30 = [0.0f64; 4];
+    let mut acc31 = [0.0f64; 4];
+    let mut acc32 = [0.0f64; 4];
+    let mut acc33 = [0.0f64; 4];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        for lane in 0..4 {
+            let v_a0 = a0[base + lane];
+            let v_a1 = a1[base + lane];
+            let v_a2 = a2[base + lane];
+            let v_a3 = a3[base + lane];
+            let v_b0 = b0[base + lane];
+            let v_b1 = b1[base + lane];
+            let v_b2 = b2[base + lane];
+            let v_b3 = b3[base + lane];
+            acc00[lane] += v_a0 * v_b0;
+            acc01[lane] += v_a0 * v_b1;
+            acc02[lane] += v_a0 * v_b2;
+            acc03[lane] += v_a0 * v_b3;
+            acc10[lane] += v_a1 * v_b0;
+            acc11[lane] += v_a1 * v_b1;
+            acc12[lane] += v_a1 * v_b2;
+            acc13[lane] += v_a1 * v_b3;
+            acc20[lane] += v_a2 * v_b0;
+            acc21[lane] += v_a2 * v_b1;
+            acc22[lane] += v_a2 * v_b2;
+            acc23[lane] += v_a2 * v_b3;
+            acc30[lane] += v_a3 * v_b0;
+            acc31[lane] += v_a3 * v_b1;
+            acc32[lane] += v_a3 * v_b2;
+            acc33[lane] += v_a3 * v_b3;
+        }
+    }
+    let sum4 = |v: [f64; 4]| (v[0] + v[1]) + (v[2] + v[3]);
+    [
+        [sum4(acc00), sum4(acc01), sum4(acc02), sum4(acc03)],
+        [sum4(acc10), sum4(acc11), sum4(acc12), sum4(acc13)],
+        [sum4(acc20), sum4(acc21), sum4(acc22), sum4(acc23)],
+        [sum4(acc30), sum4(acc31), sum4(acc32), sum4(acc33)],
+    ]
+}
+
+#[inline(always)]
+fn dot64_and_sum64_4(
+    x0: &[f64; NORMAL_EQ_TILE],
+    x1: &[f64; NORMAL_EQ_TILE],
+    x2: &[f64; NORMAL_EQ_TILE],
+    x3: &[f64; NORMAL_EQ_TILE],
+    y: &[f64; NORMAL_EQ_TILE],
+) -> ((f64, f64, f64, f64), (f64, f64, f64, f64)) {
+    let mut d0 = [0.0f64; 4];
+    let mut d1 = [0.0f64; 4];
+    let mut d2 = [0.0f64; 4];
+    let mut d3 = [0.0f64; 4];
+    let mut s0 = [0.0f64; 4];
+    let mut s1 = [0.0f64; 4];
+    let mut s2 = [0.0f64; 4];
+    let mut s3 = [0.0f64; 4];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        for lane in 0..4 {
+            let yv = y[base + lane];
+            let v0 = x0[base + lane];
+            let v1 = x1[base + lane];
+            let v2 = x2[base + lane];
+            let v3 = x3[base + lane];
+            d0[lane] += v0 * yv;
+            d1[lane] += v1 * yv;
+            d2[lane] += v2 * yv;
+            d3[lane] += v3 * yv;
+            s0[lane] += v0;
+            s1[lane] += v1;
+            s2[lane] += v2;
+            s3[lane] += v3;
+        }
+    }
+    let sum4 = |v: [f64; 4]| (v[0] + v[1]) + (v[2] + v[3]);
+    (
+        (sum4(d0), sum4(d1), sum4(d2), sum4(d3)),
+        (sum4(s0), sum4(s1), sum4(s2), sum4(s3)),
+    )
+}
+
+#[inline(always)]
+fn dot64_and_sum64(a: &[f64; NORMAL_EQ_TILE], y: &[f64; NORMAL_EQ_TILE]) -> (f64, f64) {
+    let mut d = [0.0f64; 4];
+    let mut s = [0.0f64; 4];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        for lane in 0..4 {
+            let av = a[base + lane];
+            d[lane] += av * y[base + lane];
+            s[lane] += av;
+        }
+    }
+    ((d[0] + d[1]) + (d[2] + d[3]), (s[0] + s[1]) + (s[2] + s[3]))
+}
+
+// Accumulate upper triangle of left_t * right_t^T into xt_x (stride p) using 4x4 SIMD micro-kernel.
 #[inline]
 fn accumulate_gram_upper_tile(
     left_t: &[[f64; NORMAL_EQ_TILE]],
@@ -358,6 +480,62 @@ fn accumulate_gram_upper_tile(
 ) {
     let d = left_t.len();
     let mut j = 0;
+    while j + 4 <= d {
+        let lj0 = &left_t[j];
+        let lj1 = &left_t[j + 1];
+        let lj2 = &left_t[j + 2];
+        let lj3 = &left_t[j + 3];
+        let rj0 = &right_t[j];
+        let rj1 = &right_t[j + 1];
+        let rj2 = &right_t[j + 2];
+        let rj3 = &right_t[j + 3];
+        let off0 = j * p;
+        let off1 = (j + 1) * p;
+        let off2 = (j + 2) * p;
+        let off3 = (j + 3) * p;
+
+        let (d00, d01, d02, d03) = dot64_1x4(lj0, rj0, rj1, rj2, rj3);
+        xt_x.data[off0 + j] += d00;
+        xt_x.data[off0 + j + 1] += d01;
+        xt_x.data[off0 + j + 2] += d02;
+        xt_x.data[off0 + j + 3] += d03;
+        xt_x.data[off1 + j + 1] += dot64(lj1, rj1);
+        xt_x.data[off1 + j + 2] += dot64(lj1, rj2);
+        xt_x.data[off1 + j + 3] += dot64(lj1, rj3);
+        xt_x.data[off2 + j + 2] += dot64(lj2, rj2);
+        xt_x.data[off2 + j + 3] += dot64(lj2, rj3);
+        xt_x.data[off3 + j + 3] += dot64(lj3, rj3);
+
+        let mut k = j + 4;
+        while k + 4 <= d {
+            let res = dot64_4x4(
+                lj0,
+                lj1,
+                lj2,
+                lj3,
+                &right_t[k],
+                &right_t[k + 1],
+                &right_t[k + 2],
+                &right_t[k + 3],
+            );
+            for c in 0..4 {
+                xt_x.data[off0 + k + c] += res[0][c];
+                xt_x.data[off1 + k + c] += res[1][c];
+                xt_x.data[off2 + k + c] += res[2][c];
+                xt_x.data[off3 + k + c] += res[3][c];
+            }
+            k += 4;
+        }
+        while k < d {
+            let (s0, s1, s2, s3) = dot64_1x4(&right_t[k], lj0, lj1, lj2, lj3);
+            xt_x.data[off0 + k] += s0;
+            xt_x.data[off1 + k] += s1;
+            xt_x.data[off2 + k] += s2;
+            xt_x.data[off3 + k] += s3;
+            k += 1;
+        }
+        j += 4;
+    }
     while j + 2 <= d {
         let lj0 = &left_t[j];
         let lj1 = &left_t[j + 1];
@@ -442,6 +620,11 @@ pub fn compute_normal_equation_range(
     let p = if fit_intercept { d + 1 } else { d };
     let mut xt_x = Matrix::zeros(p, p);
     let mut xt_y = vec![0.0; p];
+    let mut sum_x = if fit_intercept {
+        vec![0.0; d]
+    } else {
+        Vec::new()
+    };
     let mut x_t = vec![[0.0f64; NORMAL_EQ_TILE]; d];
     let mut y_t = [0.0f64; NORMAL_EQ_TILE];
 
@@ -464,7 +647,7 @@ pub fn compute_normal_equation_range(
             let row1 = &x.data[(r0 + d)..(r0 + 2 * d)];
             let row2 = &x.data[(r0 + 2 * d)..(r0 + 3 * d)];
             let row3 = &x.data[(r0 + 3 * d)..(r0 + 4 * d)];
-            for (j, col) in x_t.iter_mut().enumerate().take(d) {
+            for (j, col) in x_t.iter_mut().enumerate() {
                 col[b] = row0[j];
                 col[b + 1] = row1[j];
                 col[b + 2] = row2[j];
@@ -481,19 +664,50 @@ pub fn compute_normal_equation_range(
         }
 
         accumulate_gram_upper_tile(&x_t, &x_t, &mut xt_x, p);
-        for (j, col) in x_t.iter().enumerate().take(d) {
-            xt_y[j] += dot64(col, &y_t);
-            if fit_intercept {
-                xt_x.data[j * p + d] += sum64(col);
-            }
-        }
+        let mut j = 0;
         if fit_intercept {
+            while j + 4 <= d {
+                let ((d0, d1, d2, d3), (s0, s1, s2, s3)) =
+                    dot64_and_sum64_4(&x_t[j], &x_t[j + 1], &x_t[j + 2], &x_t[j + 3], &y_t);
+                xt_y[j] += d0;
+                xt_y[j + 1] += d1;
+                xt_y[j + 2] += d2;
+                xt_y[j + 3] += d3;
+                sum_x[j] += s0;
+                sum_x[j + 1] += s1;
+                sum_x[j + 2] += s2;
+                sum_x[j + 3] += s3;
+                j += 4;
+            }
+            while j < d {
+                let (dj, sj) = dot64_and_sum64(&x_t[j], &y_t);
+                xt_y[j] += dj;
+                sum_x[j] += sj;
+                j += 1;
+            }
             xt_y[d] += sum64(&y_t);
+        } else {
+            while j + 4 <= d {
+                let (d0, d1, d2, d3) =
+                    dot64_1x4(&y_t, &x_t[j], &x_t[j + 1], &x_t[j + 2], &x_t[j + 3]);
+                xt_y[j] += d0;
+                xt_y[j + 1] += d1;
+                xt_y[j + 2] += d2;
+                xt_y[j + 3] += d3;
+                j += 4;
+            }
+            while j < d {
+                xt_y[j] += dot64(&x_t[j], &y_t);
+                j += 1;
+            }
         }
         r_block = block_end;
     }
 
     if fit_intercept {
+        for (j, &sx) in sum_x.iter().enumerate() {
+            xt_x.data[j * p + d] = sx;
+        }
         xt_x.data[d * p + d] = (end_row.saturating_sub(start_row)) as f64;
     }
     mirror_upper_to_lower(&mut xt_x, p);
@@ -664,38 +878,122 @@ pub fn compute_normal_equation_multi_range(
 #[inline(always)]
 pub(crate) fn dot_slice_unrolled(a: &[f64], b: &[f64]) -> f64 {
     let n = a.len().min(b.len());
-    let a = &a[..n];
-    let b = &b[..n];
-    let chunks = n / 4;
-    let mut s0 = 0.0;
-    let mut s1 = 0.0;
-    let mut s2 = 0.0;
-    let mut s3 = 0.0;
-    let mut idx = 0;
-    for _ in 0..chunks {
-        s0 += a[idx] * b[idx];
-        s1 += a[idx + 1] * b[idx + 1];
-        s2 += a[idx + 2] * b[idx + 2];
-        s3 += a[idx + 3] * b[idx + 3];
-        idx += 4;
+    let (a_chunks, a_rem) = a[..n].as_chunks::<4>();
+    let (b_chunks, b_rem) = b[..n].as_chunks::<4>();
+    let mut acc = [0.0f64; 4];
+    for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
+        for lane in 0..4 {
+            acc[lane] += ac[lane] * bc[lane];
+        }
     }
-    let mut sum = (s0 + s1) + (s2 + s3);
-    while idx < n {
-        sum += a[idx] * b[idx];
-        idx += 1;
+    let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    for (&av, &bv) in a_rem.iter().zip(b_rem.iter()) {
+        sum += av * bv;
     }
     sum
 }
 
-/// 4x4 register-blocked right-looking Cholesky factorization into preallocated `l` (`n x n`).
-/// Reads only the lower triangle (`j <= i`) of `a`, adds `lambda` to the diagonal, and writes
-/// lower-triangular `L` such that `L * L^T = A + lambda * I` (upper triangle of `l` is zeroed).
-pub(crate) fn cholesky_lower_with_diag_shift_into(
+#[inline(always)]
+fn dot4_4rows(a0: &[f64], a1: &[f64], a2: &[f64], a3: &[f64], b: &[f64]) -> (f64, f64, f64, f64) {
+    let (b_chunks, b_rem) = b.as_chunks::<4>();
+    let (a0_chunks, a0_rem) = a0.as_chunks::<4>();
+    let (a1_chunks, a1_rem) = a1.as_chunks::<4>();
+    let (a2_chunks, a2_rem) = a2.as_chunks::<4>();
+    let (a3_chunks, a3_rem) = a3.as_chunks::<4>();
+    let mut s0 = [0.0f64; 4];
+    let mut s1 = [0.0f64; 4];
+    let mut s2 = [0.0f64; 4];
+    let mut s3 = [0.0f64; 4];
+    for ((((&bc, &c0), &c1), &c2), &c3) in b_chunks
+        .iter()
+        .zip(a0_chunks.iter())
+        .zip(a1_chunks.iter())
+        .zip(a2_chunks.iter())
+        .zip(a3_chunks.iter())
+    {
+        for lane in 0..4 {
+            let bv = bc[lane];
+            s0[lane] += c0[lane] * bv;
+            s1[lane] += c1[lane] * bv;
+            s2[lane] += c2[lane] * bv;
+            s3[lane] += c3[lane] * bv;
+        }
+    }
+    let mut r0 = (s0[0] + s0[1]) + (s0[2] + s0[3]);
+    let mut r1 = (s1[0] + s1[1]) + (s1[2] + s1[3]);
+    let mut r2 = (s2[0] + s2[1]) + (s2[2] + s2[3]);
+    let mut r3 = (s3[0] + s3[1]) + (s3[2] + s3[3]);
+    for j in 0..b_rem.len() {
+        let bv = b_rem[j];
+        r0 += a0_rem[j] * bv;
+        r1 += a1_rem[j] * bv;
+        r2 += a2_rem[j] * bv;
+        r3 += a3_rem[j] * bv;
+    }
+    (r0, r1, r2, r3)
+}
+
+struct CholeskyScratch {
+    l_data: Vec<f64>,
+    panel: Vec<f64>,
+}
+
+const MAX_CHOLESKY_SCRATCH_F64: usize = 2048 * 2048;
+
+thread_local! {
+    static CHOLESKY_SCRATCH: std::cell::RefCell<Option<CholeskyScratch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct CholeskyScratchGuard {
+    scratch: Option<CholeskyScratch>,
+}
+
+impl CholeskyScratchGuard {
+    fn acquire(n: usize) -> Self {
+        let taken = CHOLESKY_SCRATCH
+            .try_with(|cell| cell.try_borrow_mut().ok().and_then(|mut opt| opt.take()))
+            .ok()
+            .flatten();
+        let mut scratch = taken.unwrap_or_else(|| CholeskyScratch {
+            l_data: Vec::new(),
+            panel: Vec::new(),
+        });
+        let need_l = n * n;
+        if scratch.l_data.len() < need_l {
+            scratch.l_data.resize(need_l, 0.0);
+        }
+        let need_p = 4 * n;
+        if scratch.panel.len() < need_p {
+            scratch.panel.resize(need_p, 0.0);
+        }
+        Self {
+            scratch: Some(scratch),
+        }
+    }
+}
+
+impl Drop for CholeskyScratchGuard {
+    fn drop(&mut self) {
+        if let Some(scratch) = self.scratch.take()
+            && scratch.l_data.capacity() <= MAX_CHOLESKY_SCRATCH_F64
+        {
+            let _ = CHOLESKY_SCRATCH.try_with(|cell| {
+                if let Ok(mut opt) = cell.try_borrow_mut() {
+                    *opt = Some(scratch);
+                }
+            });
+        }
+    }
+}
+
+fn cholesky_lower_with_diag_shift_core(
     a: &Matrix,
     lambda: f64,
     diag_tol: f64,
     l: &mut Matrix,
     panel_buf: &mut Vec<f64>,
+    zero_upper: bool,
 ) -> bool {
     let n = a.rows;
     if n == 0 {
@@ -715,7 +1013,9 @@ pub(crate) fn cholesky_lower_with_diag_shift_into(
         let dst_row = &mut l.data[row_off..row_off + n];
         dst_row[..=i].copy_from_slice(&src_row[..=i]);
         dst_row[i] += lambda;
-        dst_row[i + 1..].fill(0.0);
+        if zero_upper {
+            dst_row[i + 1..].fill(0.0);
+        }
     }
 
     let mut k = 0;
@@ -806,7 +1106,7 @@ pub(crate) fn cholesky_lower_with_diag_shift_into(
                 p3[idx] = x3;
             }
 
-            let trailing = &mut l.data[rem_start * n..];
+            let trailing = &mut l.data[rem_start * n..n * n];
             let update_chunk = |(chunk_idx, rows_slice): (usize, &mut [f64])| {
                 let base_idx = chunk_idx * 4;
                 let n_rows_chunk = rows_slice.len() / n;
@@ -832,24 +1132,45 @@ pub(crate) fn cholesky_lower_with_diag_shift_into(
                     let x32 = p2[base_idx + 3];
                     let x33 = p3[base_idx + 3];
 
-                    let r0_rect = &mut row0[rem_start..rem_start + base_idx];
-                    let r1_rect = &mut row1[rem_start..rem_start + base_idx];
-                    let r2_rect = &mut row2[rem_start..rem_start + base_idx];
-                    let r3_rect = &mut row3[rem_start..rem_start + base_idx];
-                    let p0_rect = &p0[..base_idx];
-                    let p1_rect = &p1[..base_idx];
-                    let p2_rect = &p2[..base_idx];
-                    let p3_rect = &p3[..base_idx];
+                    let (r0_c, r0_r) = row0[rem_start..rem_start + base_idx].as_chunks_mut::<4>();
+                    let (r1_c, r1_r) = row1[rem_start..rem_start + base_idx].as_chunks_mut::<4>();
+                    let (r2_c, r2_r) = row2[rem_start..rem_start + base_idx].as_chunks_mut::<4>();
+                    let (r3_c, r3_r) = row3[rem_start..rem_start + base_idx].as_chunks_mut::<4>();
+                    let (p0_c, p0_r) = p0[..base_idx].as_chunks::<4>();
+                    let (p1_c, p1_r) = p1[..base_idx].as_chunks::<4>();
+                    let (p2_c, p2_r) = p2[..base_idx].as_chunks::<4>();
+                    let (p3_c, p3_r) = p3[..base_idx].as_chunks::<4>();
 
-                    for j in 0..base_idx {
-                        let c0 = p0_rect[j];
-                        let c1 = p1_rect[j];
-                        let c2 = p2_rect[j];
-                        let c3 = p3_rect[j];
-                        r0_rect[j] -= x00 * c0 + x01 * c1 + x02 * c2 + x03 * c3;
-                        r1_rect[j] -= x10 * c0 + x11 * c1 + x12 * c2 + x13 * c3;
-                        r2_rect[j] -= x20 * c0 + x21 * c1 + x22 * c2 + x23 * c3;
-                        r3_rect[j] -= x30 * c0 + x31 * c1 + x32 * c2 + x33 * c3;
+                    for (((((((rc0, rc1), rc2), rc3), pc0), pc1), pc2), pc3) in r0_c
+                        .iter_mut()
+                        .zip(r1_c.iter_mut())
+                        .zip(r2_c.iter_mut())
+                        .zip(r3_c.iter_mut())
+                        .zip(p0_c.iter())
+                        .zip(p1_c.iter())
+                        .zip(p2_c.iter())
+                        .zip(p3_c.iter())
+                    {
+                        for lane in 0..4 {
+                            let c0 = pc0[lane];
+                            let c1 = pc1[lane];
+                            let c2 = pc2[lane];
+                            let c3 = pc3[lane];
+                            rc0[lane] -= x00 * c0 + x01 * c1 + x02 * c2 + x03 * c3;
+                            rc1[lane] -= x10 * c0 + x11 * c1 + x12 * c2 + x13 * c3;
+                            rc2[lane] -= x20 * c0 + x21 * c1 + x22 * c2 + x23 * c3;
+                            rc3[lane] -= x30 * c0 + x31 * c1 + x32 * c2 + x33 * c3;
+                        }
+                    }
+                    for j in 0..r0_r.len() {
+                        let c0 = p0_r[j];
+                        let c1 = p1_r[j];
+                        let c2 = p2_r[j];
+                        let c3 = p3_r[j];
+                        r0_r[j] -= x00 * c0 + x01 * c1 + x02 * c2 + x03 * c3;
+                        r1_r[j] -= x10 * c0 + x11 * c1 + x12 * c2 + x13 * c3;
+                        r2_r[j] -= x20 * c0 + x21 * c1 + x22 * c2 + x23 * c3;
+                        r3_r[j] -= x30 * c0 + x31 * c1 + x32 * c2 + x33 * c3;
                     }
 
                     let d_off = rem_start + base_idx;
@@ -870,16 +1191,36 @@ pub(crate) fn cholesky_lower_with_diag_shift_into(
                         let xr1 = p1[idx];
                         let xr2 = p2[idx];
                         let xr3 = p3[idx];
-                        let row = &mut rows_slice
-                            [r_local * n + rem_start..r_local * n + rem_start + idx + 1];
-                        for j in 0..=idx {
-                            row[j] -= xr0 * p0[j] + xr1 * p1[j] + xr2 * p2[j] + xr3 * p3[j];
+                        let (row_c, row_r) = rows_slice
+                            [r_local * n + rem_start..r_local * n + rem_start + idx + 1]
+                            .as_chunks_mut::<4>();
+                        let (p0_c, p0_r) = p0[..=idx].as_chunks::<4>();
+                        let (p1_c, p1_r) = p1[..=idx].as_chunks::<4>();
+                        let (p2_c, p2_r) = p2[..=idx].as_chunks::<4>();
+                        let (p3_c, p3_r) = p3[..=idx].as_chunks::<4>();
+                        for ((((rc, c0), c1), c2), c3) in row_c
+                            .iter_mut()
+                            .zip(p0_c.iter())
+                            .zip(p1_c.iter())
+                            .zip(p2_c.iter())
+                            .zip(p3_c.iter())
+                        {
+                            for lane in 0..4 {
+                                rc[lane] -= xr0 * c0[lane]
+                                    + xr1 * c1[lane]
+                                    + xr2 * c2[lane]
+                                    + xr3 * c3[lane];
+                            }
+                        }
+                        for j in 0..row_r.len() {
+                            row_r[j] -=
+                                xr0 * p0_r[j] + xr1 * p1_r[j] + xr2 * p2_r[j] + xr3 * p3_r[j];
                         }
                     }
                 }
             };
 
-            if n >= 192 && rem >= 96 {
+            if n >= 512 && rem >= 256 {
                 trailing
                     .par_chunks_mut(4 * n)
                     .enumerate()
@@ -897,10 +1238,7 @@ pub(crate) fn cholesky_lower_with_diag_shift_into(
     for i in k..n {
         let r_i = i * n;
         for j in k..=i {
-            let mut sum = 0.0;
-            for m in k..j {
-                sum += l.data[r_i + m] * l.data[j * n + m];
-            }
+            let sum = dot_slice_unrolled(&l.data[r_i + k..r_i + j], &l.data[j * n + k..j * n + j]);
             if i == j {
                 let diag = l.data[r_i + i] - sum;
                 if !diag.is_finite() || diag <= diag_tol {
@@ -920,6 +1258,19 @@ pub(crate) fn cholesky_lower_with_diag_shift_into(
     true
 }
 
+/// 4x4 register-blocked right-looking Cholesky factorization into preallocated `l` (`n x n`).
+/// Reads only the lower triangle (`j <= i`) of `a`, adds `lambda` to the diagonal, and writes
+/// lower-triangular `L` such that `L * L^T = A + lambda * I` (upper triangle of `l` is zeroed).
+pub(crate) fn cholesky_lower_with_diag_shift_into(
+    a: &Matrix,
+    lambda: f64,
+    diag_tol: f64,
+    l: &mut Matrix,
+    panel_buf: &mut Vec<f64>,
+) -> bool {
+    cholesky_lower_with_diag_shift_core(a, lambda, diag_tol, l, panel_buf, true)
+}
+
 /// 4-row register-blocked forward substitution: solve `L * z = b`.
 #[inline]
 pub(crate) fn solve_lower_triangular_4row_into(l: &Matrix, b: &[f64], z: &mut [f64]) {
@@ -930,26 +1281,15 @@ pub(crate) fn solve_lower_triangular_4row_into(l: &Matrix, b: &[f64], z: &mut [f
         let l1 = &l.data[(i + 1) * n..(i + 2) * n];
         let l2 = &l.data[(i + 2) * n..(i + 3) * n];
         let l3 = &l.data[(i + 3) * n..(i + 4) * n];
-        let mut s0 = 0.0;
-        let mut s1 = 0.0;
-        let mut s2 = 0.0;
-        let mut s3 = 0.0;
-        let z_prefix = &z[..i];
-        let l0_p = &l0[..i];
-        let l1_p = &l1[..i];
-        let l2_p = &l2[..i];
-        let l3_p = &l3[..i];
-        for k in 0..i {
-            let zk = z_prefix[k];
-            s0 += l0_p[k] * zk;
-            s1 += l1_p[k] * zk;
-            s2 += l2_p[k] * zk;
-            s3 += l3_p[k] * zk;
-        }
-        let z0 = (b[i] - s0) / l0[i];
-        let z1 = (b[i + 1] - s1 - l1[i] * z0) / l1[i + 1];
-        let z2 = (b[i + 2] - s2 - l2[i] * z0 - l2[i + 1] * z1) / l2[i + 2];
-        let z3 = (b[i + 3] - s3 - l3[i] * z0 - l3[i + 1] * z1 - l3[i + 2] * z2) / l3[i + 3];
+        let (s0, s1, s2, s3) = dot4_4rows(&l0[..i], &l1[..i], &l2[..i], &l3[..i], &z[..i]);
+        let inv0 = 1.0 / l0[i];
+        let inv1 = 1.0 / l1[i + 1];
+        let inv2 = 1.0 / l2[i + 2];
+        let inv3 = 1.0 / l3[i + 3];
+        let z0 = (b[i] - s0) * inv0;
+        let z1 = (b[i + 1] - s1 - l1[i] * z0) * inv1;
+        let z2 = (b[i + 2] - s2 - l2[i] * z0 - l2[i + 1] * z1) * inv2;
+        let z3 = (b[i + 3] - s3 - l3[i] * z0 - l3[i + 1] * z1 - l3[i + 2] * z2) * inv3;
         z[i] = z0;
         z[i + 1] = z1;
         z[i + 2] = z2;
@@ -964,11 +1304,10 @@ pub(crate) fn solve_lower_triangular_4row_into(l: &Matrix, b: &[f64], z: &mut [f
     }
 }
 
-/// 4-row register-blocked backward substitution: solve `L^T * x = z` (row-major scatter-subtract).
+/// 4-row register-blocked backward substitution in-place: solve `L^T * x = z`.
 #[inline]
-pub(crate) fn solve_upper_triangular_t_4row_into(l: &Matrix, z: &[f64], x: &mut [f64]) {
+fn solve_upper_triangular_t_4row_inplace(l: &Matrix, x: &mut [f64]) {
     let n = l.rows;
-    x[..n].copy_from_slice(&z[..n]);
     let mut rem = n;
     while rem >= 4 {
         let i = rem - 4;
@@ -977,22 +1316,38 @@ pub(crate) fn solve_upper_triangular_t_4row_into(l: &Matrix, z: &[f64], x: &mut 
         let l2 = &l.data[(i + 2) * n..(i + 3) * n];
         let l3 = &l.data[(i + 3) * n..(i + 4) * n];
 
-        let x3 = x[i + 3] / l3[i + 3];
-        let x2 = (x[i + 2] - l3[i + 2] * x3) / l2[i + 2];
-        let x1 = (x[i + 1] - l3[i + 1] * x3 - l2[i + 1] * x2) / l1[i + 1];
-        let x0 = (x[i] - l3[i] * x3 - l2[i] * x2 - l1[i] * x1) / l0[i];
+        let inv0 = 1.0 / l0[i];
+        let inv1 = 1.0 / l1[i + 1];
+        let inv2 = 1.0 / l2[i + 2];
+        let inv3 = 1.0 / l3[i + 3];
+
+        let x3 = x[i + 3] * inv3;
+        let x2 = (x[i + 2] - l3[i + 2] * x3) * inv2;
+        let x1 = (x[i + 1] - l3[i + 1] * x3 - l2[i + 1] * x2) * inv1;
+        let x0 = (x[i] - l3[i] * x3 - l2[i] * x2 - l1[i] * x1) * inv0;
         x[i] = x0;
         x[i + 1] = x1;
         x[i + 2] = x2;
         x[i + 3] = x3;
 
-        let x_prefix = &mut x[..i];
-        let l0_p = &l0[..i];
-        let l1_p = &l1[..i];
-        let l2_p = &l2[..i];
-        let l3_p = &l3[..i];
-        for k in 0..i {
-            x_prefix[k] -= l0_p[k] * x0 + l1_p[k] * x1 + l2_p[k] * x2 + l3_p[k] * x3;
+        let (x_chunks, x_rem) = x[..i].as_chunks_mut::<4>();
+        let (l0_c, l0_r) = l0[..i].as_chunks::<4>();
+        let (l1_c, l1_r) = l1[..i].as_chunks::<4>();
+        let (l2_c, l2_r) = l2[..i].as_chunks::<4>();
+        let (l3_c, l3_r) = l3[..i].as_chunks::<4>();
+        for ((((xc, c0), c1), c2), c3) in x_chunks
+            .iter_mut()
+            .zip(l0_c.iter())
+            .zip(l1_c.iter())
+            .zip(l2_c.iter())
+            .zip(l3_c.iter())
+        {
+            for lane in 0..4 {
+                xc[lane] -= c0[lane] * x0 + c1[lane] * x1 + c2[lane] * x2 + c3[lane] * x3;
+            }
+        }
+        for k in 0..x_rem.len() {
+            x_rem[k] -= l0_r[k] * x0 + l1_r[k] * x1 + l2_r[k] * x2 + l3_r[k] * x3;
         }
         rem = i;
     }
@@ -1001,13 +1356,27 @@ pub(crate) fn solve_upper_triangular_t_4row_into(l: &Matrix, z: &[f64], x: &mut 
         let row_off = i * n;
         let xi = x[i] / l.data[row_off + i];
         x[i] = xi;
-        let row_i = &l.data[row_off..row_off + i];
-        let x_prefix = &mut x[..i];
-        for k in 0..i {
-            x_prefix[k] -= row_i[k] * xi;
+        let (x_chunks, x_rem) = x[..i].as_chunks_mut::<4>();
+        let (r_chunks, r_rem) = l.data[row_off..row_off + i].as_chunks::<4>();
+        for (xc, rc) in x_chunks.iter_mut().zip(r_chunks.iter()) {
+            for lane in 0..4 {
+                xc[lane] -= rc[lane] * xi;
+            }
+        }
+        for (xp, &rk) in x_rem.iter_mut().zip(r_rem.iter()) {
+            *xp -= rk * xi;
         }
         rem = i;
     }
+}
+
+/// 4-row register-blocked backward substitution: solve `L^T * x = z` (row-major scatter-subtract).
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn solve_upper_triangular_t_4row_into(l: &Matrix, z: &[f64], x: &mut [f64]) {
+    let n = l.rows;
+    x[..n].copy_from_slice(&z[..n]);
+    solve_upper_triangular_t_4row_inplace(l, x);
 }
 
 /// 4-row x 4-column register-blocked forward triangular solve `L * V = B` in-place on `v_block`
@@ -1200,18 +1569,18 @@ fn solve_upper_triangular_t_4col_4row_inplace(l: &Matrix, v_block: &mut [f64], n
 pub(crate) fn solve_cholesky_multi_from_l(l: &Matrix, b: &Matrix) -> Matrix {
     let n = l.rows;
     let k_targets = b.cols;
-    let mut theta = Matrix::zeros(n, k_targets);
     if n == 0 || k_targets == 0 {
-        return theta;
+        return Matrix::zeros(n, k_targets);
     }
 
     if k_targets == 1 {
-        let mut z = vec![0.0; n];
-        solve_lower_triangular_4row_into(l, &b.data, &mut z);
-        solve_upper_triangular_t_4row_into(l, &z, &mut theta.data);
+        let mut theta = Matrix::zeros(n, 1);
+        solve_lower_triangular_4row_into(l, &b.data, &mut theta.data);
+        solve_upper_triangular_t_4row_inplace(l, &mut theta.data);
         return theta;
     }
 
+    let mut theta = Matrix::zeros(n, k_targets);
     let n_blocks = k_targets.div_ceil(4);
     let solve_block = |blk: usize, v_block: &mut [f64]| {
         let t_start = blk * 4;
@@ -1279,14 +1648,38 @@ pub fn solve_cholesky(a: &Matrix, b: &[f64]) -> OchreResult<Vec<f64>> {
         return Ok(Vec::new());
     }
 
-    let mut l = Matrix::zeros(n, n);
-    let mut panel_buf = Vec::new();
-    for &lambda in &[0.0, 1e-12, 1e-9, 1e-6, 1e-3] {
-        if cholesky_lower_with_diag_shift_into(a, lambda, 1e-14, &mut l, &mut panel_buf) {
-            let mut z = vec![0.0; n];
-            solve_lower_triangular_4row_into(&l, b, &mut z);
+    let mut guard = CholeskyScratchGuard::acquire(n);
+    if let Some(scratch) = guard.scratch.as_mut() {
+        let l_data = std::mem::take(&mut scratch.l_data);
+        let mut l = Matrix {
+            rows: n,
+            cols: n,
+            data: l_data,
+        };
+        let mut solved = false;
+        for &lambda in &[0.0, 1e-12, 1e-9, 1e-6, 1e-3] {
+            if cholesky_lower_with_diag_shift_core(
+                a,
+                lambda,
+                1e-14,
+                &mut l,
+                &mut scratch.panel,
+                false,
+            ) {
+                solved = true;
+                break;
+            }
+        }
+        let res = if solved {
             let mut theta = vec![0.0; n];
-            solve_upper_triangular_t_4row_into(&l, &z, &mut theta);
+            solve_lower_triangular_4row_into(&l, b, &mut theta);
+            solve_upper_triangular_t_4row_inplace(&l, &mut theta);
+            Some(theta)
+        } else {
+            None
+        };
+        scratch.l_data = std::mem::take(&mut l.data);
+        if let Some(theta) = res {
             return Ok(theta);
         }
     }
@@ -1310,11 +1703,36 @@ pub fn solve_cholesky_multi(a: &Matrix, b: &Matrix) -> OchreResult<Matrix> {
         return Ok(Matrix::zeros(n, k_targets));
     }
 
-    let mut l = Matrix::zeros(n, n);
-    let mut panel_buf = Vec::new();
-    for &lambda in &[0.0, 1e-12, 1e-9, 1e-6, 1e-3] {
-        if cholesky_lower_with_diag_shift_into(a, lambda, 1e-14, &mut l, &mut panel_buf) {
-            return Ok(solve_cholesky_multi_from_l(&l, b));
+    let mut guard = CholeskyScratchGuard::acquire(n);
+    if let Some(scratch) = guard.scratch.as_mut() {
+        let l_data = std::mem::take(&mut scratch.l_data);
+        let mut l = Matrix {
+            rows: n,
+            cols: n,
+            data: l_data,
+        };
+        let mut solved = false;
+        for &lambda in &[0.0, 1e-12, 1e-9, 1e-6, 1e-3] {
+            if cholesky_lower_with_diag_shift_core(
+                a,
+                lambda,
+                1e-14,
+                &mut l,
+                &mut scratch.panel,
+                false,
+            ) {
+                solved = true;
+                break;
+            }
+        }
+        let res = if solved {
+            Some(solve_cholesky_multi_from_l(&l, b))
+        } else {
+            None
+        };
+        scratch.l_data = std::mem::take(&mut l.data);
+        if let Some(theta) = res {
+            return Ok(theta);
         }
     }
 

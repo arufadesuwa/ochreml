@@ -913,6 +913,17 @@ pub fn cuda_compute_normal_equation(
     y: &[f64],
     fit_intercept: bool,
 ) -> Option<OchreResult<(Matrix, Vec<f64>)>> {
+    if x.cols <= 48 && x.rows >= 250_000 {
+        // Tall-narrow matrices: PCIe host->device copy of X outweighs O(n p^2) CPU compute
+        return Some(crate::backend::cpu_normal_equation_1d_slice(
+            x,
+            y,
+            fit_intercept,
+            0,
+            x.rows,
+        ));
+    }
+
     let driver = get_driver()?;
     if gpu_ids.is_empty() {
         return None;
@@ -921,7 +932,13 @@ pub fn cuda_compute_normal_equation(
     let total_elems = x.rows.saturating_mul(x.cols);
     // Small/medium tall-skinny matrices (< 2 MB) finish in ~1ms on CPU L2/L3 cache without PCIe/cuBLAS overhead
     if total_elems <= 262_144 && x.cols <= 64 {
-        return None;
+        return Some(crate::backend::cpu_normal_equation_1d_slice(
+            x,
+            y,
+            fit_intercept,
+            0,
+            x.rows,
+        ));
     }
     if gpu_ids.len() == 1 || x.rows < gpu_ids.len() || total_elems < MULTI_GPU_MIN_ELEMENTS {
         return Some(cuda_normal_eq_1d_chunk(
@@ -1203,6 +1220,18 @@ pub fn cuda_compute_normal_equation_multi(
     sample_weight: Option<&[f64]>,
     fit_intercept: bool,
 ) -> Option<OchreResult<(Matrix, Matrix)>> {
+    if x.cols <= 48 && x.rows >= 250_000 && y.cols <= 16 {
+        // Tall-narrow matrices: PCIe host->device copy of X outweighs O(n p^2) CPU compute
+        return Some(crate::backend::cpu_normal_equation_multi_slice(
+            x,
+            y,
+            sample_weight,
+            fit_intercept,
+            0,
+            x.rows,
+        ));
+    }
+
     let driver = get_driver()?;
     if gpu_ids.is_empty() {
         return None;
@@ -1215,7 +1244,14 @@ pub fn cuda_compute_normal_equation_multi(
     let total_elems = x.rows.saturating_mul(x.cols);
     // Small/medium tall-skinny matrices (< 2 MB) finish in ~1ms on CPU L2/L3 cache without PCIe/cuBLAS overhead
     if total_elems <= 262_144 && x.cols <= 64 {
-        return None;
+        return Some(crate::backend::cpu_normal_equation_multi_slice(
+            x,
+            y,
+            sample_weight,
+            fit_intercept,
+            0,
+            x.rows,
+        ));
     }
     if gpu_ids.len() == 1 || x.rows < gpu_ids.len() || total_elems < MULTI_GPU_MIN_ELEMENTS {
         return Some(cuda_normal_eq_multi_chunk(

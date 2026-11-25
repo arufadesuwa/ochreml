@@ -33,6 +33,8 @@ pub const TAG_GP_CLASSIFIER: u8 = 84;
 const LOG_BOUND_MIN: f64 = -11.512925464970229; // ln(1e-5)
 const LOG_BOUND_MAX: f64 = 11.512925464970229; // ln(1e5)
 const GPU_MIN_ELEMS: usize = 524_288;
+const CPU_PAR_THRESHOLD: usize = 512;
+const CPU_PAR_ELEMS: usize = 262_144;
 
 #[inline]
 fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
@@ -156,6 +158,488 @@ impl SplitMix64 {
     }
 }
 
+#[inline(always)]
+fn row_sq_norm_unrolled(row: &[f64]) -> f64 {
+    let cols = row.len();
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    let mut c = 0;
+    while c + 4 <= cols {
+        let v0 = row[c];
+        let v1 = row[c + 1];
+        let v2 = row[c + 2];
+        let v3 = row[c + 3];
+        s0 += v0 * v0;
+        s1 += v1 * v1;
+        s2 += v2 * v2;
+        s3 += v3 * v3;
+        c += 4;
+    }
+    let mut sum = (s0 + s1) + (s2 + s3);
+    while c < cols {
+        sum += row[c] * row[c];
+        c += 1;
+    }
+    sum
+}
+
+#[inline(always)]
+fn direct_l2_sq_1x1(a: &[f64], b: &[f64]) -> f64 {
+    let mut sum = 0.0;
+    for c in 0..a.len() {
+        let d = a[c] - b[c];
+        sum += d * d;
+    }
+    sum
+}
+
+#[inline(always)]
+fn direct_l2_sq_4x4(a: [&[f64]; 4], b: [&[f64]; 4]) -> [[f64; 4]; 4] {
+    let mut d = [[0.0f64; 4]; 4];
+    for c in 0..a[0].len() {
+        let av0 = a[0][c];
+        let av1 = a[1][c];
+        let av2 = a[2][c];
+        let av3 = a[3][c];
+        let bv0 = b[0][c];
+        let bv1 = b[1][c];
+        let bv2 = b[2][c];
+        let bv3 = b[3][c];
+
+        let t00 = av0 - bv0;
+        let t01 = av0 - bv1;
+        let t02 = av0 - bv2;
+        let t03 = av0 - bv3;
+        d[0][0] += t00 * t00;
+        d[0][1] += t01 * t01;
+        d[0][2] += t02 * t02;
+        d[0][3] += t03 * t03;
+
+        let t10 = av1 - bv0;
+        let t11 = av1 - bv1;
+        let t12 = av1 - bv2;
+        let t13 = av1 - bv3;
+        d[1][0] += t10 * t10;
+        d[1][1] += t11 * t11;
+        d[1][2] += t12 * t12;
+        d[1][3] += t13 * t13;
+
+        let t20 = av2 - bv0;
+        let t21 = av2 - bv1;
+        let t22 = av2 - bv2;
+        let t23 = av2 - bv3;
+        d[2][0] += t20 * t20;
+        d[2][1] += t21 * t21;
+        d[2][2] += t22 * t22;
+        d[2][3] += t23 * t23;
+
+        let t30 = av3 - bv0;
+        let t31 = av3 - bv1;
+        let t32 = av3 - bv2;
+        let t33 = av3 - bv3;
+        d[3][0] += t30 * t30;
+        d[3][1] += t31 * t31;
+        d[3][2] += t32 * t32;
+        d[3][3] += t33 * t33;
+    }
+    d
+}
+
+#[inline(always)]
+fn dot_4x4(a: [&[f64]; 4], b: [&[f64]; 4]) -> [[f64; 4]; 4] {
+    let mut s = [[0.0f64; 4]; 4];
+    for c in 0..a[0].len() {
+        let av0 = a[0][c];
+        let av1 = a[1][c];
+        let av2 = a[2][c];
+        let av3 = a[3][c];
+        let bv0 = b[0][c];
+        let bv1 = b[1][c];
+        let bv2 = b[2][c];
+        let bv3 = b[3][c];
+
+        s[0][0] += av0 * bv0;
+        s[0][1] += av0 * bv1;
+        s[0][2] += av0 * bv2;
+        s[0][3] += av0 * bv3;
+
+        s[1][0] += av1 * bv0;
+        s[1][1] += av1 * bv1;
+        s[1][2] += av1 * bv2;
+        s[1][3] += av1 * bv3;
+
+        s[2][0] += av2 * bv0;
+        s[2][1] += av2 * bv1;
+        s[2][2] += av2 * bv2;
+        s[2][3] += av2 * bv3;
+
+        s[3][0] += av3 * bv0;
+        s[3][1] += av3 * bv1;
+        s[3][2] += av3 * bv2;
+        s[3][3] += av3 * bv3;
+    }
+    s
+}
+
+/// Sequential 4x4 register-blocked pairwise squared L2 distance matrix on CPU
+/// for medium/small matrices (`n_a * n_b < CPU_PAR_ELEMS`), avoiding Rayon wakeups.
+fn compute_pairwise_l2_sq_seq(a: &Matrix, b: &Matrix, is_self: bool) -> Matrix {
+    let na = a.rows;
+    let nb = b.rows;
+    let cols = a.cols;
+    let mut d2 = Matrix::zeros(na, nb);
+    let use_direct = cols <= 16;
+
+    if is_self && na == nb {
+        let norms = if use_direct {
+            Vec::new()
+        } else {
+            a.data
+                .chunks_exact(cols)
+                .map(row_sq_norm_unrolled)
+                .collect()
+        };
+        let mut i = 0;
+        while i + 4 <= na {
+            let x0 = &a.data[i * cols..(i + 1) * cols];
+            let x1 = &a.data[(i + 1) * cols..(i + 2) * cols];
+            let x2 = &a.data[(i + 2) * cols..(i + 3) * cols];
+            let x3 = &a.data[(i + 3) * cols..(i + 4) * cols];
+
+            let mut j = 0;
+            if use_direct {
+                while j + 4 <= i {
+                    let y0 = &a.data[j * cols..(j + 1) * cols];
+                    let y1 = &a.data[(j + 1) * cols..(j + 2) * cols];
+                    let y2 = &a.data[(j + 2) * cols..(j + 3) * cols];
+                    let y3 = &a.data[(j + 3) * cols..(j + 4) * cols];
+                    let d = direct_l2_sq_4x4([x0, x1, x2, x3], [y0, y1, y2, y3]);
+                    for c in 0..4 {
+                        d2.data[i * nb + j + c] = d[0][c];
+                        d2.data[(i + 1) * nb + j + c] = d[1][c];
+                        d2.data[(i + 2) * nb + j + c] = d[2][c];
+                        d2.data[(i + 3) * nb + j + c] = d[3][c];
+                    }
+                    j += 4;
+                }
+                d2.data[(i + 1) * nb + i] = direct_l2_sq_1x1(x1, x0);
+                d2.data[(i + 2) * nb + i] = direct_l2_sq_1x1(x2, x0);
+                d2.data[(i + 2) * nb + i + 1] = direct_l2_sq_1x1(x2, x1);
+                d2.data[(i + 3) * nb + i] = direct_l2_sq_1x1(x3, x0);
+                d2.data[(i + 3) * nb + i + 1] = direct_l2_sq_1x1(x3, x1);
+                d2.data[(i + 3) * nb + i + 2] = direct_l2_sq_1x1(x3, x2);
+            } else {
+                let ni0 = norms[i];
+                let ni1 = norms[i + 1];
+                let ni2 = norms[i + 2];
+                let ni3 = norms[i + 3];
+                while j + 4 <= i {
+                    let y0 = &a.data[j * cols..(j + 1) * cols];
+                    let y1 = &a.data[(j + 1) * cols..(j + 2) * cols];
+                    let y2 = &a.data[(j + 2) * cols..(j + 3) * cols];
+                    let y3 = &a.data[(j + 3) * cols..(j + 4) * cols];
+                    let dots = dot_4x4([x0, x1, x2, x3], [y0, y1, y2, y3]);
+                    for c in 0..4 {
+                        let nj = norms[j + c];
+                        d2.data[i * nb + j + c] = (ni0 + nj - 2.0 * dots[0][c]).max(0.0);
+                        d2.data[(i + 1) * nb + j + c] = (ni1 + nj - 2.0 * dots[1][c]).max(0.0);
+                        d2.data[(i + 2) * nb + j + c] = (ni2 + nj - 2.0 * dots[2][c]).max(0.0);
+                        d2.data[(i + 3) * nb + j + c] = (ni3 + nj - 2.0 * dots[3][c]).max(0.0);
+                    }
+                    j += 4;
+                }
+                d2.data[(i + 1) * nb + i] = (ni1 + ni0 - 2.0 * dot_slice_unrolled(x1, x0)).max(0.0);
+                d2.data[(i + 2) * nb + i] = (ni2 + ni0 - 2.0 * dot_slice_unrolled(x2, x0)).max(0.0);
+                d2.data[(i + 2) * nb + i + 1] =
+                    (ni2 + ni1 - 2.0 * dot_slice_unrolled(x2, x1)).max(0.0);
+                d2.data[(i + 3) * nb + i] = (ni3 + ni0 - 2.0 * dot_slice_unrolled(x3, x0)).max(0.0);
+                d2.data[(i + 3) * nb + i + 1] =
+                    (ni3 + ni1 - 2.0 * dot_slice_unrolled(x3, x1)).max(0.0);
+                d2.data[(i + 3) * nb + i + 2] =
+                    (ni3 + ni2 - 2.0 * dot_slice_unrolled(x3, x2)).max(0.0);
+            }
+            i += 4;
+        }
+        while i < na {
+            let xi = &a.data[i * cols..(i + 1) * cols];
+            for j in 0..i {
+                let xj = &a.data[j * cols..(j + 1) * cols];
+                d2.data[i * nb + j] = if use_direct {
+                    direct_l2_sq_1x1(xi, xj)
+                } else {
+                    (norms[i] + norms[j] - 2.0 * dot_slice_unrolled(xi, xj)).max(0.0)
+                };
+            }
+            i += 1;
+        }
+        mirror_lower_to_upper(&mut d2);
+        return d2;
+    }
+
+    let (a_norms, b_norms) = if use_direct {
+        (Vec::new(), Vec::new())
+    } else {
+        (
+            a.data
+                .chunks_exact(cols)
+                .map(row_sq_norm_unrolled)
+                .collect(),
+            b.data
+                .chunks_exact(cols)
+                .map(row_sq_norm_unrolled)
+                .collect(),
+        )
+    };
+
+    let mut i = 0;
+    while i + 4 <= na {
+        let x0 = &a.data[i * cols..(i + 1) * cols];
+        let x1 = &a.data[(i + 1) * cols..(i + 2) * cols];
+        let x2 = &a.data[(i + 2) * cols..(i + 3) * cols];
+        let x3 = &a.data[(i + 3) * cols..(i + 4) * cols];
+        let mut j = 0;
+        if use_direct {
+            while j + 4 <= nb {
+                let y0 = &b.data[j * cols..(j + 1) * cols];
+                let y1 = &b.data[(j + 1) * cols..(j + 2) * cols];
+                let y2 = &b.data[(j + 2) * cols..(j + 3) * cols];
+                let y3 = &b.data[(j + 3) * cols..(j + 4) * cols];
+                let d = direct_l2_sq_4x4([x0, x1, x2, x3], [y0, y1, y2, y3]);
+                for c in 0..4 {
+                    d2.data[i * nb + j + c] = d[0][c];
+                    d2.data[(i + 1) * nb + j + c] = d[1][c];
+                    d2.data[(i + 2) * nb + j + c] = d[2][c];
+                    d2.data[(i + 3) * nb + j + c] = d[3][c];
+                }
+                j += 4;
+            }
+            while j < nb {
+                let yj = &b.data[j * cols..(j + 1) * cols];
+                d2.data[i * nb + j] = direct_l2_sq_1x1(x0, yj);
+                d2.data[(i + 1) * nb + j] = direct_l2_sq_1x1(x1, yj);
+                d2.data[(i + 2) * nb + j] = direct_l2_sq_1x1(x2, yj);
+                d2.data[(i + 3) * nb + j] = direct_l2_sq_1x1(x3, yj);
+                j += 1;
+            }
+        } else {
+            let ni0 = a_norms[i];
+            let ni1 = a_norms[i + 1];
+            let ni2 = a_norms[i + 2];
+            let ni3 = a_norms[i + 3];
+            while j + 4 <= nb {
+                let y0 = &b.data[j * cols..(j + 1) * cols];
+                let y1 = &b.data[(j + 1) * cols..(j + 2) * cols];
+                let y2 = &b.data[(j + 2) * cols..(j + 3) * cols];
+                let y3 = &b.data[(j + 3) * cols..(j + 4) * cols];
+                let dots = dot_4x4([x0, x1, x2, x3], [y0, y1, y2, y3]);
+                for c in 0..4 {
+                    let nj = b_norms[j + c];
+                    d2.data[i * nb + j + c] = (ni0 + nj - 2.0 * dots[0][c]).max(0.0);
+                    d2.data[(i + 1) * nb + j + c] = (ni1 + nj - 2.0 * dots[1][c]).max(0.0);
+                    d2.data[(i + 2) * nb + j + c] = (ni2 + nj - 2.0 * dots[2][c]).max(0.0);
+                    d2.data[(i + 3) * nb + j + c] = (ni3 + nj - 2.0 * dots[3][c]).max(0.0);
+                }
+                j += 4;
+            }
+            while j < nb {
+                let yj = &b.data[j * cols..(j + 1) * cols];
+                let nj = b_norms[j];
+                d2.data[i * nb + j] = (ni0 + nj - 2.0 * dot_slice_unrolled(x0, yj)).max(0.0);
+                d2.data[(i + 1) * nb + j] = (ni1 + nj - 2.0 * dot_slice_unrolled(x1, yj)).max(0.0);
+                d2.data[(i + 2) * nb + j] = (ni2 + nj - 2.0 * dot_slice_unrolled(x2, yj)).max(0.0);
+                d2.data[(i + 3) * nb + j] = (ni3 + nj - 2.0 * dot_slice_unrolled(x3, yj)).max(0.0);
+                j += 1;
+            }
+        }
+        i += 4;
+    }
+    while i < na {
+        let xi = &a.data[i * cols..(i + 1) * cols];
+        for j in 0..nb {
+            let yj = &b.data[j * cols..(j + 1) * cols];
+            d2.data[i * nb + j] = if use_direct {
+                direct_l2_sq_1x1(xi, yj)
+            } else {
+                (a_norms[i] + b_norms[j] - 2.0 * dot_slice_unrolled(xi, yj)).max(0.0)
+            };
+        }
+        i += 1;
+    }
+    d2
+}
+
+fn compute_pairwise_l2_sq_fast(
+    backend: &Backend<'_>,
+    a: &Matrix,
+    b: &Matrix,
+    is_self: bool,
+) -> OchreResult<Matrix> {
+    if a.cols != b.cols {
+        return Err(OchreError::FeatureCountMismatch {
+            features: b.cols,
+            expected: a.cols,
+        });
+    }
+    if a.rows == 0 || b.rows == 0 {
+        return Err(OchreError::EmptyData);
+    }
+    if a.rows.saturating_mul(b.rows) < CPU_PAR_ELEMS {
+        return Ok(compute_pairwise_l2_sq_seq(a, b, is_self));
+    }
+    backend.pairwise_l2_sq(a, b)
+}
+
+/// Fill full kernel matrix `k_out` (`rows x cols`) from precomputed `d2` (and `d_sqrt` for Matern).
+fn fill_kernel_matrix_from_d2_into(
+    d2: Option<&Matrix>,
+    d_sqrt: Option<&Matrix>,
+    rows: usize,
+    cols: usize,
+    params: &KernelParams,
+    is_self: bool,
+    k_out: &mut Matrix,
+) {
+    if params.kind == KernelKind::White {
+        k_out.data.fill(0.0);
+        if is_self {
+            for i in 0..rows.min(cols) {
+                k_out.set(i, i, params.noise_level);
+            }
+        }
+        return;
+    }
+
+    let c = params.constant_value;
+    let ls = params.length_scale;
+    let ls_sq = ls * ls;
+    let use_par = rows.saturating_mul(cols) >= CPU_PAR_ELEMS;
+
+    match params.kind {
+        KernelKind::Rbf | KernelKind::RbfWhite => {
+            if let Some(d2_mat) = d2 {
+                let inv_two_ls_sq = -0.5 / ls_sq;
+                if use_par {
+                    k_out
+                        .data
+                        .par_iter_mut()
+                        .zip(d2_mat.data.par_iter())
+                        .for_each(|(dst, &d)| {
+                            *dst = c * (d.max(0.0) * inv_two_ls_sq).exp();
+                        });
+                } else {
+                    for (dst, &d) in k_out.data.iter_mut().zip(d2_mat.data.iter()) {
+                        *dst = c * (d.max(0.0) * inv_two_ls_sq).exp();
+                    }
+                }
+            }
+        }
+        KernelKind::Matern => {
+            let nu = params.nu;
+            if let Some(ds_mat) = d_sqrt {
+                if (nu - 0.5).abs() <= 1e-12 {
+                    let inv_ls = 1.0 / ls;
+                    if use_par {
+                        k_out
+                            .data
+                            .par_iter_mut()
+                            .zip(ds_mat.data.par_iter())
+                            .for_each(|(dst, &r)| *dst = c * (-(r * inv_ls)).exp());
+                    } else {
+                        for (dst, &r) in k_out.data.iter_mut().zip(ds_mat.data.iter()) {
+                            *dst = c * (-(r * inv_ls)).exp();
+                        }
+                    }
+                } else if (nu - 1.5).abs() <= 1e-12 {
+                    let s3 = 3.0_f64.sqrt() / ls;
+                    if use_par {
+                        k_out
+                            .data
+                            .par_iter_mut()
+                            .zip(ds_mat.data.par_iter())
+                            .for_each(|(dst, &d)| {
+                                let r = d * s3;
+                                *dst = c * (1.0 + r) * (-r).exp();
+                            });
+                    } else {
+                        for (dst, &d) in k_out.data.iter_mut().zip(ds_mat.data.iter()) {
+                            let r = d * s3;
+                            *dst = c * (1.0 + r) * (-r).exp();
+                        }
+                    }
+                } else {
+                    let s5 = 5.0_f64.sqrt() / ls;
+                    if use_par {
+                        k_out
+                            .data
+                            .par_iter_mut()
+                            .zip(ds_mat.data.par_iter())
+                            .for_each(|(dst, &d)| {
+                                let r = d * s5;
+                                *dst = c * (1.0 + r + (r * r) / 3.0) * (-r).exp();
+                            });
+                    } else {
+                        for (dst, &d) in k_out.data.iter_mut().zip(ds_mat.data.iter()) {
+                            let r = d * s5;
+                            *dst = c * (1.0 + r + (r * r) / 3.0) * (-r).exp();
+                        }
+                    }
+                }
+            } else if let Some(d2_mat) = d2 {
+                if (nu - 0.5).abs() <= 1e-12 {
+                    let inv_ls = 1.0 / ls;
+                    for (dst, &d) in k_out.data.iter_mut().zip(d2_mat.data.iter()) {
+                        let r = d.max(0.0).sqrt() * inv_ls;
+                        *dst = c * (-r).exp();
+                    }
+                } else if (nu - 1.5).abs() <= 1e-12 {
+                    let s3 = 3.0_f64.sqrt() / ls;
+                    for (dst, &d) in k_out.data.iter_mut().zip(d2_mat.data.iter()) {
+                        let r = d.max(0.0).sqrt() * s3;
+                        *dst = c * (1.0 + r) * (-r).exp();
+                    }
+                } else {
+                    let s5 = 5.0_f64.sqrt() / ls;
+                    for (dst, &d) in k_out.data.iter_mut().zip(d2_mat.data.iter()) {
+                        let r = d.max(0.0).sqrt() * s5;
+                        *dst = c * (1.0 + r + (r * r) / 3.0) * (-r).exp();
+                    }
+                }
+            }
+        }
+        KernelKind::RationalQuadratic => {
+            if let Some(d2_mat) = d2 {
+                let alpha = params.rq_alpha;
+                let denom = 2.0 * alpha * ls_sq;
+                if use_par {
+                    k_out
+                        .data
+                        .par_iter_mut()
+                        .zip(d2_mat.data.par_iter())
+                        .for_each(|(dst, &d)| {
+                            let base = 1.0 + d.max(0.0) / denom;
+                            *dst = c * base.powf(-alpha);
+                        });
+                } else {
+                    for (dst, &d) in k_out.data.iter_mut().zip(d2_mat.data.iter()) {
+                        let base = 1.0 + d.max(0.0) / denom;
+                        *dst = c * base.powf(-alpha);
+                    }
+                }
+            }
+        }
+        KernelKind::White => {}
+    }
+
+    if is_self {
+        let diag = kernel_diag_value(params);
+        for i in 0..rows.min(cols) {
+            k_out.set(i, i, diag);
+        }
+    }
+}
+
 /// Compute kernel matrix K(a, b) using Backend N3 (pairwise_l2_sq) and N2 (elementwise_op).
 /// When `is_self` is true (a == b, square symmetric), white-noise diagonal is added for
 /// White and RbfWhite kernels.
@@ -180,15 +664,16 @@ fn compute_kernel_matrix(
     }
 
     // N3: Squared Euclidean distance matrix D[i, j] = ||a_i - b_j||^2
-    let mut k = backend.pairwise_l2_sq(a, b)?;
+    let mut k = compute_pairwise_l2_sq_fast(backend, a, b, is_self)?;
     let ls = params.length_scale;
     let ls_sq = ls * ls;
     let c = params.constant_value;
+    let use_par = k.data.len() >= CPU_PAR_ELEMS;
 
     match params.kind {
         KernelKind::Rbf | KernelKind::RbfWhite => {
             let inv_two_ls_sq = -0.5 / ls_sq;
-            if k.data.len() >= 131_072 {
+            if use_par {
                 k.data.par_iter_mut().for_each(|d| {
                     *d = d.max(0.0) * inv_two_ls_sq;
                 });
@@ -216,7 +701,6 @@ fn compute_kernel_matrix(
         }
         KernelKind::Matern => {
             let nu = params.nu;
-            let use_par = k.data.len() >= 131_072;
             if (nu - 0.5).abs() <= 1e-12 {
                 if use_par {
                     k.data.par_iter_mut().for_each(|d| {
@@ -260,7 +744,7 @@ fn compute_kernel_matrix(
         KernelKind::RationalQuadratic => {
             let alpha = params.rq_alpha;
             let denom = 2.0 * alpha * ls_sq;
-            if k.data.len() >= 131_072 {
+            if use_par {
                 k.data.par_iter_mut().for_each(|d| {
                     let base = 1.0 + d.max(0.0) / denom;
                     *d = c * base.powf(-alpha);
@@ -303,10 +787,142 @@ fn dot_unrolled(a: &[f64], b: &[f64]) -> f64 {
     dot_slice_unrolled(a, b)
 }
 
+/// Sequential 4-row lower-triangular Cholesky factorization into preallocated `l` (`n x n`).
+/// Unrolls 4 rows at a time sharing `L[j, 0..j]` loads in L1 cache and avoids Rayon spawns
+/// for `n < CPU_PAR_THRESHOLD` (512).
+fn cholesky_in_place_lower_4row(
+    a: &Matrix,
+    diag_tol: f64,
+    l: &mut Matrix,
+    inv_diag_buf: &mut Vec<f64>,
+) -> bool {
+    let n = a.rows;
+    if n == 0 {
+        return true;
+    }
+    if inv_diag_buf.len() < n {
+        inv_diag_buf.resize(n, 0.0);
+    }
+    let inv_diag = &mut inv_diag_buf[..n];
+
+    for i in 0..n {
+        let row_off = i * n;
+        let src_row = &a.data[row_off..row_off + n];
+        let dst_row = &mut l.data[row_off..row_off + n];
+        dst_row[..=i].copy_from_slice(&src_row[..=i]);
+        dst_row[i + 1..].fill(0.0);
+    }
+
+    let mut i = 0;
+    while i + 4 <= n {
+        let (top, bot) = l.data.split_at_mut(i * n);
+        let (r0, rest) = bot.split_at_mut(n);
+        let (r1, rest) = rest.split_at_mut(n);
+        let (r2, rest) = rest.split_at_mut(n);
+        let r3 = &mut rest[..n];
+
+        for j in 0..i {
+            let lj = &top[j * n..j * n + j];
+            let mut s0 = 0.0;
+            let mut s1 = 0.0;
+            let mut s2 = 0.0;
+            let mut s3 = 0.0;
+            for m in 0..j {
+                let lm = lj[m];
+                s0 += r0[m] * lm;
+                s1 += r1[m] * lm;
+                s2 += r2[m] * lm;
+                s3 += r3[m] * lm;
+            }
+            let inv_j = inv_diag[j];
+            r0[j] = (r0[j] - s0) * inv_j;
+            r1[j] = (r1[j] - s1) * inv_j;
+            r2[j] = (r2[j] - s2) * inv_j;
+            r3[j] = (r3[j] - s3) * inv_j;
+        }
+
+        let d0 = r0[i] - dot_slice_unrolled(&r0[..i], &r0[..i]);
+        if !d0.is_finite() || d0 <= diag_tol {
+            return false;
+        }
+        let l00 = d0.sqrt();
+        let inv0 = 1.0 / l00;
+        r0[i] = l00;
+        inv_diag[i] = inv0;
+
+        let l10 = (r1[i] - dot_slice_unrolled(&r1[..i], &r0[..i])) * inv0;
+        let l20 = (r2[i] - dot_slice_unrolled(&r2[..i], &r0[..i])) * inv0;
+        let l30 = (r3[i] - dot_slice_unrolled(&r3[..i], &r0[..i])) * inv0;
+        r1[i] = l10;
+        r2[i] = l20;
+        r3[i] = l30;
+
+        let d1 = r1[i + 1] - dot_slice_unrolled(&r1[..i + 1], &r1[..i + 1]);
+        if !d1.is_finite() || d1 <= diag_tol {
+            return false;
+        }
+        let l11 = d1.sqrt();
+        let inv1 = 1.0 / l11;
+        r1[i + 1] = l11;
+        inv_diag[i + 1] = inv1;
+
+        let l21 = (r2[i + 1] - dot_slice_unrolled(&r2[..i + 1], &r1[..i + 1])) * inv1;
+        let l31 = (r3[i + 1] - dot_slice_unrolled(&r3[..i + 1], &r1[..i + 1])) * inv1;
+        r2[i + 1] = l21;
+        r3[i + 1] = l31;
+
+        let d2 = r2[i + 2] - dot_slice_unrolled(&r2[..i + 2], &r2[..i + 2]);
+        if !d2.is_finite() || d2 <= diag_tol {
+            return false;
+        }
+        let l22 = d2.sqrt();
+        let inv2 = 1.0 / l22;
+        r2[i + 2] = l22;
+        inv_diag[i + 2] = inv2;
+
+        let l32 = (r3[i + 2] - dot_slice_unrolled(&r3[..i + 2], &r2[..i + 2])) * inv2;
+        r3[i + 2] = l32;
+
+        let d3 = r3[i + 3] - dot_slice_unrolled(&r3[..i + 3], &r3[..i + 3]);
+        if !d3.is_finite() || d3 <= diag_tol {
+            return false;
+        }
+        let l33 = d3.sqrt();
+        r3[i + 3] = l33;
+        inv_diag[i + 3] = 1.0 / l33;
+
+        i += 4;
+    }
+
+    while i < n {
+        let (top, bot) = l.data.split_at_mut(i * n);
+        let ri = &mut bot[..n];
+        for j in 0..i {
+            let lj = &top[j * n..j * n + j];
+            ri[j] = (ri[j] - dot_slice_unrolled(&ri[..j], lj)) * inv_diag[j];
+        }
+        let diag = ri[i] - dot_slice_unrolled(&ri[..i], &ri[..i]);
+        if !diag.is_finite() || diag <= diag_tol {
+            return false;
+        }
+        let lii = diag.sqrt();
+        ri[i] = lii;
+        inv_diag[i] = 1.0 / lii;
+        i += 1;
+    }
+
+    true
+}
+
 /// Lower-triangular Cholesky factorization into preallocated `l` and `panel_buf`.
 #[inline]
 fn cholesky_lower_into(a: &Matrix, l: &mut Matrix, panel_buf: &mut Vec<f64>) -> OchreResult<()> {
-    if !cholesky_lower_with_diag_shift_into(a, 0.0, 1e-15, l, panel_buf) {
+    let ok = if a.rows < CPU_PAR_THRESHOLD {
+        cholesky_in_place_lower_4row(a, 1e-15, l, panel_buf)
+    } else {
+        cholesky_lower_with_diag_shift_into(a, 0.0, 1e-15, l, panel_buf)
+    };
+    if !ok {
         return Err(OchreError::SingularMatrix(
             "Kernel matrix is not positive definite; consider increasing alpha or noise_level"
                 .to_string(),
@@ -329,7 +945,7 @@ fn solve_cholesky_from_l_into(l: &Matrix, b: &[f64], z: &mut [f64], x: &mut [f64
 }
 
 /// Compute `(L^{-1})^T` into preallocated `m_t` (`n * n`), zeroing `m_t[i, 0..i]`.
-/// Each row `i` of `M^T` depends only on `L` and itself, so rows run in parallel when `n >= 128`.
+/// Each row `i` of `M^T` depends only on `L` and itself, so rows run in parallel when `n >= CPU_PAR_THRESHOLD`.
 fn invert_lower_triangular_t_into(l: &Matrix, m_t: &mut [f64]) {
     let n = l.rows;
     let fill_row = |(i, mi_row): (usize, &mut [f64])| {
@@ -341,7 +957,7 @@ fn invert_lower_triangular_t_into(l: &Matrix, m_t: &mut [f64]) {
             mi_row[k] = -sum / l.data[lk_off + k];
         }
     };
-    if n >= 128 {
+    if n >= CPU_PAR_THRESHOLD {
         m_t.par_chunks_mut(n).enumerate().for_each(fill_row);
     } else {
         m_t.chunks_exact_mut(n).enumerate().for_each(fill_row);
@@ -352,7 +968,7 @@ fn invert_lower_triangular_t_into(l: &Matrix, m_t: &mut [f64]) {
 #[inline]
 fn matvec_into(mat: &Matrix, v: &[f64], out: &mut [f64]) {
     let cols = mat.cols;
-    if mat.rows >= 128 && mat.rows.saturating_mul(cols) >= 131_072 {
+    if mat.rows >= CPU_PAR_THRESHOLD && mat.rows.saturating_mul(cols) >= CPU_PAR_ELEMS {
         out.par_iter_mut()
             .zip(mat.data.par_chunks(cols))
             .for_each(|(dst, row)| {
@@ -368,7 +984,7 @@ fn matvec_into(mat: &Matrix, v: &[f64], out: &mut [f64]) {
 /// Precompute Euclidean distance matrix `D = sqrt(max(D2, 0))` once for Matern optimization.
 fn compute_d_sqrt(d2: &Matrix) -> Matrix {
     let mut out = Matrix::zeros(d2.rows, d2.cols);
-    if d2.data.len() >= 131_072 {
+    if d2.data.len() >= CPU_PAR_ELEMS {
         out.data
             .par_iter_mut()
             .zip(d2.data.par_iter())
@@ -418,7 +1034,7 @@ fn fill_kernel_lower_into(
                     }
                     k_row[i] = diag_val;
                 };
-                if n >= 128 {
+                if n >= CPU_PAR_THRESHOLD {
                     k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
                 } else {
                     k_out
@@ -441,7 +1057,7 @@ fn fill_kernel_lower_into(
                         }
                         k_row[i] = diag_val;
                     };
-                    if n >= 128 {
+                    if n >= CPU_PAR_THRESHOLD {
                         k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
                     } else {
                         k_out
@@ -460,7 +1076,7 @@ fn fill_kernel_lower_into(
                         }
                         k_row[i] = diag_val;
                     };
-                    if n >= 128 {
+                    if n >= CPU_PAR_THRESHOLD {
                         k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
                     } else {
                         k_out
@@ -479,7 +1095,7 @@ fn fill_kernel_lower_into(
                         }
                         k_row[i] = diag_val;
                     };
-                    if n >= 128 {
+                    if n >= CPU_PAR_THRESHOLD {
                         k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
                     } else {
                         k_out
@@ -499,7 +1115,7 @@ fn fill_kernel_lower_into(
                         }
                         k_row[i] = diag_val;
                     };
-                    if n >= 128 {
+                    if n >= CPU_PAR_THRESHOLD {
                         k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
                     } else {
                         k_out
@@ -518,7 +1134,7 @@ fn fill_kernel_lower_into(
                         }
                         k_row[i] = diag_val;
                     };
-                    if n >= 128 {
+                    if n >= CPU_PAR_THRESHOLD {
                         k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
                     } else {
                         k_out
@@ -537,7 +1153,7 @@ fn fill_kernel_lower_into(
                         }
                         k_row[i] = diag_val;
                     };
-                    if n >= 128 {
+                    if n >= CPU_PAR_THRESHOLD {
                         k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
                     } else {
                         k_out
@@ -560,7 +1176,7 @@ fn fill_kernel_lower_into(
                     }
                     k_row[i] = diag_val;
                 };
-                if n >= 128 {
+                if n >= CPU_PAR_THRESHOLD {
                     k_out.data.par_chunks_mut(n).enumerate().for_each(fill_row);
                 } else {
                     k_out
@@ -1450,7 +2066,7 @@ impl GaussianProcessRegressor {
         };
 
         let n_blocks = n.div_ceil(4);
-        let (g_log_c, g_log_ls, g_log_noise) = if n >= 128 {
+        let (g_log_c, g_log_ls, g_log_noise) = if n >= CPU_PAR_THRESHOLD {
             (0..n_blocks)
                 .into_par_iter()
                 .map(accum_block_row)
@@ -1507,7 +2123,7 @@ impl GaussianProcessRegressor {
         let d2 = if base_params.kind == KernelKind::White {
             None
         } else {
-            Some(backend.pairwise_l2_sq(x, x)?)
+            Some(compute_pairwise_l2_sq_fast(&backend, x, x, true)?)
         };
         let d_sqrt = if base_params.kind == KernelKind::Matern {
             d2.as_ref().map(compute_d_sqrt)
@@ -1624,7 +2240,13 @@ impl GaussianProcessRegressor {
         let k_trans = compute_kernel_matrix(&backend, x, x_train, &params, false)?;
 
         // y_mean = y_std * (K_trans @ alpha_) + y_mean
-        let raw_mean = backend.matvec(&k_trans, alpha_vec)?;
+        let raw_mean = if matches!(backend, Backend::Cpu) {
+            let mut out = vec![0.0; n_test];
+            matvec_into(&k_trans, alpha_vec, &mut out);
+            out
+        } else {
+            backend.matvec(&k_trans, alpha_vec)?
+        };
         let y_mean: Vec<f64> = raw_mean
             .into_iter()
             .map(|v| v * self.y_train_std_ + self.y_train_mean_)
@@ -1638,7 +2260,7 @@ impl GaussianProcessRegressor {
 
         if return_std {
             let k_diag = kernel_diag_value(&params);
-            let y_std: Vec<f64> = if n_test <= 256 {
+            let y_std: Vec<f64> = if n_test < CPU_PAR_THRESHOLD && elems < CPU_PAR_ELEMS {
                 let mut v = vec![0.0; n_train];
                 let mut out = Vec::with_capacity(n_test);
                 for i in 0..n_test {
@@ -1681,7 +2303,7 @@ impl GaussianProcessRegressor {
             }
             solve_lower_triangular_4col_4row_into(l, v_block, n_train);
         };
-        if n_test > 64 {
+        if n_test >= 256 && n_test.saturating_mul(n_train) >= 65_536 {
             let solved_blocks: Vec<(usize, Vec<f64>)> = (0..n_blocks)
                 .into_par_iter()
                 .map(|blk| {
@@ -2120,7 +2742,7 @@ impl GpcScratch {
             }
             b_row[i] = 1.0 + wsi * k_row[i] * wsi;
         };
-        if n >= 128 {
+        if n >= CPU_PAR_THRESHOLD {
             self.b_mat
                 .data
                 .par_chunks_mut(n)
@@ -2351,7 +2973,7 @@ impl BinaryLaplaceGP {
                     }
                 }
             };
-            if n >= 128 {
+            if n >= CPU_PAR_THRESHOLD {
                 scratch
                     .r_mat
                     .data
@@ -2411,7 +3033,7 @@ impl BinaryLaplaceGP {
                     *s2_out = -0.5 * post_var_i * dw_df;
                 }
             };
-            if n >= 128 {
+            if n >= CPU_PAR_THRESHOLD {
                 scratch.s2.par_chunks_mut(4).enumerate().for_each_init(
                     || vec![0.0; n * 4],
                     |v_block, (blk, chunk)| compute_s2_chunk(v_block, (blk, chunk)),
@@ -2465,7 +3087,7 @@ impl BinaryLaplaceGP {
             (gc, gl, gn)
         };
 
-        let (g_log_c, g_log_ls, g_log_noise) = if n >= 128 {
+        let (g_log_c, g_log_ls, g_log_noise) = if n >= CPU_PAR_THRESHOLD {
             (0..n)
                 .into_par_iter()
                 .map(accum_row)
@@ -2549,30 +3171,30 @@ impl BinaryLaplaceGP {
         }
     }
 
-    fn predict_pos_proba(
+    #[allow(clippy::too_many_arguments)]
+    fn predict_pos_proba_from_d2_into(
         &self,
         backend: &Backend<'_>,
-        x_train: &Matrix,
-        x_test: &Matrix,
+        d2: Option<&Matrix>,
+        d_sqrt: Option<&Matrix>,
+        n_test: usize,
+        n_train: usize,
+        k_star: &mut Matrix,
+        f_star: &mut [f64],
+        v_block: &mut [f64],
     ) -> OchreResult<Vec<f64>> {
-        let k_star = compute_kernel_matrix(backend, x_test, x_train, &self.params, false)?;
-        let f_star = backend.matvec(&k_star, &self.y_train_minus_pi)?;
-        let n_test = x_test.rows;
-        let n_train = x_train.rows;
+        fill_kernel_matrix_from_d2_into(d2, d_sqrt, n_test, n_train, &self.params, false, k_star);
+        if matches!(backend, Backend::Cpu) || n_test.saturating_mul(n_train) < CPU_PAR_ELEMS {
+            matvec_into(k_star, &self.y_train_minus_pi, f_star);
+        } else {
+            let f_vec = backend.matvec(k_star, &self.y_train_minus_pi)?;
+            f_star.copy_from_slice(&f_vec);
+        }
         let k_diag = kernel_diag_value(&self.params);
 
         let mut probs = vec![0.0; n_test];
-        if n_test <= 512 {
-            let mut v_block = vec![0.0; n_train * 4];
-            self.predict_pos_proba_range(
-                &k_star,
-                &f_star,
-                n_train,
-                k_diag,
-                0,
-                &mut v_block,
-                &mut probs,
-            );
+        if n_test <= CPU_PAR_THRESHOLD || n_test.saturating_mul(n_train) < CPU_PAR_ELEMS {
+            self.predict_pos_proba_range(k_star, f_star, n_train, k_diag, 0, v_block, &mut probs);
         } else {
             const PAR_CHUNK_TEST: usize = 64;
             probs
@@ -2580,14 +3202,14 @@ impl BinaryLaplaceGP {
                 .enumerate()
                 .for_each_init(
                     || vec![0.0; n_train * 4],
-                    |v_block, (chunk_idx, out_chunk)| {
+                    |par_v_block, (chunk_idx, out_chunk)| {
                         self.predict_pos_proba_range(
-                            &k_star,
-                            &f_star,
+                            k_star,
+                            f_star,
                             n_train,
                             k_diag,
                             chunk_idx * PAR_CHUNK_TEST,
-                            v_block,
+                            par_v_block,
                             out_chunk,
                         );
                     },
@@ -2595,6 +3217,42 @@ impl BinaryLaplaceGP {
         }
 
         Ok(probs)
+    }
+
+    #[allow(dead_code)]
+    fn predict_pos_proba(
+        &self,
+        backend: &Backend<'_>,
+        x_train: &Matrix,
+        x_test: &Matrix,
+    ) -> OchreResult<Vec<f64>> {
+        let n_test = x_test.rows;
+        let n_train = x_train.rows;
+        let d2 = if self.params.kind == KernelKind::White {
+            None
+        } else {
+            Some(compute_pairwise_l2_sq_fast(
+                backend, x_test, x_train, false,
+            )?)
+        };
+        let d_sqrt = if self.params.kind == KernelKind::Matern {
+            d2.as_ref().map(compute_d_sqrt)
+        } else {
+            None
+        };
+        let mut k_star = Matrix::zeros(n_test, n_train);
+        let mut f_star = vec![0.0; n_test];
+        let mut v_block = vec![0.0; n_train * 4];
+        self.predict_pos_proba_from_d2_into(
+            backend,
+            d2.as_ref(),
+            d_sqrt.as_ref(),
+            n_test,
+            n_train,
+            &mut k_star,
+            &mut f_star,
+            &mut v_block,
+        )
     }
 
     fn write_to(&self, buf: &mut Vec<u8>) {
@@ -2750,7 +3408,7 @@ impl GaussianProcessClassifier {
         let d2 = if base_params.kind == KernelKind::White {
             None
         } else {
-            Some(backend.pairwise_l2_sq(x, x)?)
+            Some(compute_pairwise_l2_sq_fast(&backend, x, x, true)?)
         };
 
         let d_sqrt = if base_params.kind == KernelKind::Matern {
@@ -2871,12 +3529,45 @@ impl GaussianProcessClassifier {
         }
 
         let n_test = x.rows;
-        let backend = effective_backend(&self.parsed_device, n_test.saturating_mul(x_train.rows));
+        let n_train = x_train.rows;
+        let elems = n_test.saturating_mul(n_train);
+        // Keep n_test * n_train < 262_144 on CPU so small/medium batches never hit GPU or Rayon overhead.
+        let backend = if elems < CPU_PAR_ELEMS {
+            Backend::Cpu
+        } else {
+            effective_backend(&self.parsed_device, elems)
+        };
         let n_classes = classes.len();
         let mut proba = Matrix::zeros(n_test, n_classes);
 
+        // Precompute d2(X_test, X_train) ONCE and share it across all OvR estimators.
+        let kind = KernelKind::from_str(&self.kernel)?;
+        let d2 = if kind == KernelKind::White {
+            None
+        } else {
+            Some(compute_pairwise_l2_sq_fast(&backend, x, x_train, false)?)
+        };
+        let d_sqrt = if kind == KernelKind::Matern {
+            d2.as_ref().map(compute_d_sqrt)
+        } else {
+            None
+        };
+
+        let mut k_star = Matrix::zeros(n_test, n_train);
+        let mut f_star = vec![0.0; n_test];
+        let mut v_block = vec![0.0; n_train * 4];
+
         if n_classes == 2 {
-            let p1 = self.estimators_[0].predict_pos_proba(&backend, x_train, x)?;
+            let p1 = self.estimators_[0].predict_pos_proba_from_d2_into(
+                &backend,
+                d2.as_ref(),
+                d_sqrt.as_ref(),
+                n_test,
+                n_train,
+                &mut k_star,
+                &mut f_star,
+                &mut v_block,
+            )?;
             for (i, &p1i) in p1.iter().enumerate().take(n_test) {
                 let prob1 = p1i.clamp(0.0, 1.0);
                 proba.set(i, 0, 1.0 - prob1);
@@ -2885,7 +3576,16 @@ impl GaussianProcessClassifier {
         } else {
             let mut class_probs = Vec::with_capacity(n_classes);
             for est in &self.estimators_ {
-                class_probs.push(est.predict_pos_proba(&backend, x_train, x)?);
+                class_probs.push(est.predict_pos_proba_from_d2_into(
+                    &backend,
+                    d2.as_ref(),
+                    d_sqrt.as_ref(),
+                    n_test,
+                    n_train,
+                    &mut k_star,
+                    &mut f_star,
+                    &mut v_block,
+                )?);
             }
             for i in 0..n_test {
                 let mut row_sum = 0.0;
@@ -3593,6 +4293,103 @@ mod tests {
             gpc.fit(&x, &y_cls).expect("fit gpc");
             let acc = gpc.score(&x, &y_cls).expect("score gpc");
             assert!(acc >= 0.95, "GPC 280 {kernel} acc={acc}");
+        }
+    }
+
+    #[test]
+    fn test_gpc_ovr_70x280_shared_d2_and_cholesky_4row_parity() {
+        let n_train = 280usize;
+        let n_test = 70usize;
+        let p = 6usize;
+        let mut x_tr = Vec::with_capacity(n_train * p);
+        let mut y_tr = Vec::with_capacity(n_train);
+        for i in 0..n_train {
+            let cls = (i % 3) as f64;
+            let angle = 2.0 * PI * cls / 3.0 + ((i / 3) as f64) * 0.01;
+            for c in 0..p {
+                let v = if c == 0 {
+                    2.0 * angle.cos()
+                } else if c == 1 {
+                    2.0 * angle.sin()
+                } else {
+                    (((i * 7 + c * 13) % 19) as f64 - 9.0) * 0.05
+                };
+                x_tr.push(v);
+            }
+            y_tr.push(cls);
+        }
+        let x_train = Matrix::from_vec(n_train, p, x_tr).expect("x_train");
+        let x_test =
+            Matrix::from_vec(n_test, p, x_train.data[..n_test * p].to_vec()).expect("x_test");
+
+        let mut gpc = GaussianProcessClassifier::new(
+            "rbf".to_string(),
+            1.0,
+            1.0,
+            1.5,
+            1.0,
+            1.0,
+            50,
+            true,
+            0,
+            Some(42),
+            None,
+        )
+        .expect("new gpc");
+        gpc.fit(&x_train, &y_tr).expect("fit ovr gpc");
+        let proba = gpc.predict_proba(&x_test).expect("predict_proba");
+        assert_eq!(proba.rows, n_test);
+        assert_eq!(proba.cols, 3);
+
+        // Compare shared-d2 predict_proba against per-estimator explicit predict_pos_proba
+        let mut est_probs = Vec::new();
+        for est in &gpc.estimators_ {
+            est_probs.push(
+                est.predict_pos_proba(&Backend::Cpu, &x_train, &x_test)
+                    .expect("per-estimator"),
+            );
+        }
+        for i in 0..n_test {
+            let sum = est_probs[0][i] + est_probs[1][i] + est_probs[2][i];
+            for c in 0..3 {
+                let expected = est_probs[c][i] / sum;
+                assert!(
+                    (proba.get(i, c) - expected).abs() < 1e-12,
+                    "OvR mismatch at ({i}, {c}): {} vs {expected}",
+                    proba.get(i, c)
+                );
+            }
+        }
+        let acc = gpc.score(&x_train, &y_tr).expect("score");
+        assert!(acc >= 0.95, "OvR 280x6 acc={acc}");
+
+        // Verify 4-row sequential Cholesky matches matrix::cholesky_lower_with_diag_shift_into
+        let d2 = compute_pairwise_l2_sq_seq(&x_train, &x_train, true);
+        let mut k = Matrix::zeros(n_train, n_train);
+        let params = KernelParams {
+            kind: KernelKind::Rbf,
+            length_scale: 1.2,
+            constant_value: 1.5,
+            nu: 1.5,
+            noise_level: 1e-3,
+            rq_alpha: 1.0,
+        };
+        fill_kernel_lower_into(Some(&d2), None, n_train, &params, 1e-3, &mut k);
+        let mut l_fast = Matrix::zeros(n_train, n_train);
+        let mut l_ref = Matrix::zeros(n_train, n_train);
+        let mut buf1 = Vec::new();
+        let mut buf2 = Vec::new();
+        assert!(cholesky_in_place_lower_4row(
+            &k,
+            1e-15,
+            &mut l_fast,
+            &mut buf1
+        ));
+        assert!(cholesky_lower_with_diag_shift_into(
+            &k, 0.0, 1e-15, &mut l_ref, &mut buf2
+        ));
+        for idx in 0..l_fast.data.len() {
+            assert!((l_fast.data[idx] - l_ref.data[idx]).abs() < 1e-11);
         }
     }
 }

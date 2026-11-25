@@ -19,13 +19,38 @@ use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use rayon::prelude::*;
+use std::borrow::Cow;
 
 pub const TAG_PCA: u8 = 43;
 pub const TAG_TRUNCATED_SVD: u8 = 44;
 
 const PARALLEL_ROW_THRESHOLD: usize = 512;
 const TRANSFORM_GPU_THRESHOLD: usize = 2_000_000;
-const PROJECT_CHUNK_ROWS: usize = 64;
+
+#[inline]
+fn compute_project_chunk_rows(n: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    (n / (threads * 2)).clamp(256, 2048).next_multiple_of(4)
+}
+
+#[inline(always)]
+fn slice_is_finite(data: &[f64]) -> bool {
+    let (chunks, rem) = data.as_chunks::<8>();
+    for c in chunks {
+        let ok = c[0].is_finite()
+            & c[1].is_finite()
+            & c[2].is_finite()
+            & c[3].is_finite()
+            & c[4].is_finite()
+            & c[5].is_finite()
+            & c[6].is_finite()
+            & c[7].is_finite();
+        if !ok {
+            return false;
+        }
+    }
+    rem.iter().all(|v| v.is_finite())
+}
 
 #[inline]
 fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
@@ -108,7 +133,7 @@ fn pack_components_4(comp_data: &[f64], k: usize, p: usize) -> Vec<f64> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn project_4x4_chunk(
+fn project_4x4_chunk<const CHECK_FINITE: bool>(
     x_chunk: &[f64],
     n_rows: usize,
     p: usize,
@@ -118,12 +143,15 @@ fn project_4x4_chunk(
     offset: Option<&[f64]>,
     scales: Option<&[f64]>,
     out_chunk: &mut [f64],
-) {
+) -> bool {
     let n_blocks = k / 4;
     let k_rem_start = n_blocks * 4;
     let mut r = 0usize;
 
     while r + 4 <= n_rows {
+        if CHECK_FINITE && !slice_is_finite(&x_chunk[r * p..(r + 4) * p]) {
+            return false;
+        }
         let x0 = &x_chunk[r * p..(r + 1) * p];
         let x1 = &x_chunk[(r + 1) * p..(r + 2) * p];
         let x2 = &x_chunk[(r + 2) * p..(r + 3) * p];
@@ -204,6 +232,9 @@ fn project_4x4_chunk(
 
     while r < n_rows {
         let x_row = &x_chunk[r * p..(r + 1) * p];
+        if CHECK_FINITE && !slice_is_finite(x_row) {
+            return false;
+        }
         let dst = &mut out_chunk[r * k..(r + 1) * k];
         for j in 0..k {
             let mut val = dot_unrolled(x_row, &comp_data[j * p..(j + 1) * p]);
@@ -217,51 +248,59 @@ fn project_4x4_chunk(
         }
         r += 1;
     }
+    true
 }
 
-fn project_cpu_matrix(
+fn project_cpu_matrix_cached(
     x: &Matrix,
-    components: &Matrix,
+    comp_packed: &[f64],
+    comp_data: &[f64],
+    k: usize,
     offset: Option<&[f64]>,
     scales: Option<&[f64]>,
 ) -> OchreResult<Matrix> {
     let n = x.rows;
     let p = x.cols;
-    let k = components.rows;
-    let comp_data = &components.data;
-    let comp_packed = pack_components_4(comp_data, k, p);
     let mut out_data = vec![0.0; n * k];
 
     if n >= PARALLEL_ROW_THRESHOLD {
+        let chunk_rows = compute_project_chunk_rows(n);
         out_data
-            .par_chunks_mut(PROJECT_CHUNK_ROWS * k)
-            .zip(x.data.par_chunks(PROJECT_CHUNK_ROWS * p))
-            .for_each(|(out_chunk, x_chunk)| {
+            .par_chunks_mut(chunk_rows * k)
+            .zip(x.data.par_chunks(chunk_rows * p))
+            .try_for_each(|(out_chunk, x_chunk)| -> OchreResult<()> {
                 let n_rows = out_chunk.len() / k;
-                project_4x4_chunk(
+                if !project_4x4_chunk::<true>(
                     x_chunk,
                     n_rows,
                     p,
-                    &comp_packed,
+                    comp_packed,
                     comp_data,
                     k,
                     offset,
                     scales,
                     out_chunk,
-                );
-            });
-    } else {
-        project_4x4_chunk(
-            &x.data,
-            n,
-            p,
-            &comp_packed,
-            comp_data,
-            k,
-            offset,
-            scales,
-            &mut out_data,
-        );
+                ) {
+                    return Err(OchreError::InvalidParameter(
+                        "Input X contains NaN or Inf ( >_< )".to_string(),
+                    ));
+                }
+                Ok(())
+            })?;
+    } else if !project_4x4_chunk::<true>(
+        &x.data,
+        n,
+        p,
+        comp_packed,
+        comp_data,
+        k,
+        offset,
+        scales,
+        &mut out_data,
+    ) {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN or Inf ( >_< )".to_string(),
+        ));
     }
     Matrix::from_vec(n, k, out_data)
 }
@@ -440,6 +479,12 @@ pub struct PCA {
     pub n_features_in_: Option<usize>,
     pub n_samples_: Option<usize>,
     pub noise_variance_: Option<f64>,
+    comp_packed_: Option<Vec<f64>>,
+    proj_mean_: Option<Vec<f64>>,
+    inv_stds_: Option<Vec<f64>>,
+    neg_mean_: Option<Vec<f64>>,
+    comp_t_inv_: Option<Matrix>,
+    comp_t_inv_packed_: Option<Vec<f64>>,
 }
 
 impl PCA {
@@ -486,7 +531,76 @@ impl PCA {
             n_features_in_: None,
             n_samples_: None,
             noise_variance_: None,
+            comp_packed_: None,
+            proj_mean_: None,
+            inv_stds_: None,
+            neg_mean_: None,
+            comp_t_inv_: None,
+            comp_t_inv_packed_: None,
         })
+    }
+
+    fn rebuild_transform_cache(&mut self) -> OchreResult<()> {
+        let (Some(components), Some(mean), Some(exp_var)) = (
+            self.components_.as_ref(),
+            self.mean_.as_ref(),
+            self.explained_variance_.as_ref(),
+        ) else {
+            self.comp_packed_ = None;
+            self.proj_mean_ = None;
+            self.inv_stds_ = None;
+            self.neg_mean_ = None;
+            self.comp_t_inv_ = None;
+            self.comp_t_inv_packed_ = None;
+            return Ok(());
+        };
+        let k = components.rows;
+        let p = components.cols;
+        self.comp_packed_ = Some(pack_components_4(&components.data, k, p));
+
+        let mut proj_mean = Vec::with_capacity(k);
+        for j in 0..k {
+            let comp_row = &components.data[j * p..(j + 1) * p];
+            proj_mean.push(dot_unrolled(mean, comp_row));
+        }
+        self.proj_mean_ = Some(proj_mean);
+
+        self.inv_stds_ = if self.whiten {
+            Some(
+                exp_var
+                    .iter()
+                    .take(k)
+                    .map(|&v| if v > 1e-12 { 1.0 / v.sqrt() } else { 0.0 })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        self.neg_mean_ = Some(mean.iter().map(|&m| -m).collect());
+
+        let mut comp_t_data = vec![0.0; p * k];
+        if self.whiten {
+            let stds: Vec<f64> = exp_var.iter().take(k).map(|&v| v.max(0.0).sqrt()).collect();
+            for j in 0..k {
+                let s = stds[j];
+                let comp_row = &components.data[j * p..(j + 1) * p];
+                for f in 0..p {
+                    comp_t_data[f * k + j] = comp_row[f] * s;
+                }
+            }
+        } else {
+            for j in 0..k {
+                let comp_row = &components.data[j * p..(j + 1) * p];
+                for f in 0..p {
+                    comp_t_data[f * k + j] = comp_row[f];
+                }
+            }
+        }
+        let comp_t_inv = Matrix::from_vec(p, k, comp_t_data)?;
+        self.comp_t_inv_packed_ = Some(pack_components_4(&comp_t_inv.data, p, k));
+        self.comp_t_inv_ = Some(comp_t_inv);
+        Ok(())
     }
 
     pub fn set_device(&mut self, device: Option<String>) -> OchreResult<()> {
@@ -576,12 +690,15 @@ impl PCA {
         self.n_samples_ = Some(n);
         self.noise_variance_ = Some(noise_variance);
         self.device_ = Some(self.device.to_string());
+        self.rebuild_transform_cache()?;
         Ok(())
     }
 
     pub fn transform(&self, x: &Matrix) -> OchreResult<Matrix> {
-        validate_finite_matrix(x)?;
         let expected = self.n_features_in_.ok_or(OchreError::NotFitted)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         if x.cols != expected {
             return Err(OchreError::FeatureCountMismatch {
                 features: x.cols,
@@ -599,29 +716,77 @@ impl PCA {
         let p = expected;
         let k = components.rows;
 
-        // Precompute proj_mean = mean @ components^T (length k) to avoid allocating full X_c
-        let mut proj_mean = Vec::with_capacity(k);
-        for j in 0..k {
-            let comp_row = &components.data[j * p..(j + 1) * p];
-            proj_mean.push(dot_unrolled(mean, comp_row));
+        let backend = effective_transform_backend(&self.device, n.saturating_mul(p));
+        if matches!(backend, Backend::Cpu) {
+            let packed_owned;
+            let comp_packed = match self.comp_packed_.as_deref() {
+                Some(cp) => cp,
+                None => {
+                    packed_owned = pack_components_4(&components.data, k, p);
+                    &packed_owned
+                }
+            };
+            let proj_mean_owned;
+            let proj_mean = match self.proj_mean_.as_deref() {
+                Some(pm) => pm,
+                None => {
+                    let mut pm = Vec::with_capacity(k);
+                    for j in 0..k {
+                        pm.push(dot_unrolled(mean, &components.data[j * p..(j + 1) * p]));
+                    }
+                    proj_mean_owned = pm;
+                    &proj_mean_owned
+                }
+            };
+            let inv_stds_owned: Vec<f64>;
+            let inv_stds: Option<&[f64]> = if self.whiten {
+                match self.inv_stds_.as_deref() {
+                    Some(s) => Some(s),
+                    None => {
+                        inv_stds_owned = exp_var
+                            .iter()
+                            .take(k)
+                            .map(|&v| if v > 1e-12 { 1.0 / v.sqrt() } else { 0.0 })
+                            .collect();
+                        Some(&inv_stds_owned)
+                    }
+                }
+            } else {
+                None
+            };
+            return project_cpu_matrix_cached(
+                x,
+                comp_packed,
+                &components.data,
+                k,
+                Some(proj_mean),
+                inv_stds,
+            );
         }
 
-        let inv_stds: Option<Vec<f64>> = if self.whiten {
-            Some(
-                exp_var
-                    .iter()
-                    .take(k)
-                    .map(|&v| if v > 1e-12 { 1.0 / v.sqrt() } else { 0.0 })
+        validate_finite_matrix(x)?;
+        let proj_mean = match self.proj_mean_.as_deref() {
+            Some(pm) => Cow::Borrowed(pm),
+            None => Cow::Owned(
+                (0..k)
+                    .map(|j| dot_unrolled(mean, &components.data[j * p..(j + 1) * p]))
                     .collect(),
-            )
+            ),
+        };
+        let inv_stds: Option<Cow<'_, [f64]>> = if self.whiten {
+            Some(match self.inv_stds_.as_deref() {
+                Some(s) => Cow::Borrowed(s),
+                None => Cow::Owned(
+                    exp_var
+                        .iter()
+                        .take(k)
+                        .map(|&v| if v > 1e-12 { 1.0 / v.sqrt() } else { 0.0 })
+                        .collect(),
+                ),
+            })
         } else {
             None
         };
-
-        let backend = effective_transform_backend(&self.device, n * p);
-        if matches!(backend, Backend::Cpu) {
-            return project_cpu_matrix(x, components, Some(&proj_mean), inv_stds.as_deref());
-        }
 
         // Large GPU path: compute X @ components^T directly and subtract proj_mean in-place
         let comp_t = components.transpose();
@@ -650,8 +815,10 @@ impl PCA {
     }
 
     pub fn inverse_transform(&self, x: &Matrix) -> OchreResult<Matrix> {
-        validate_finite_matrix(x)?;
         let k = self.n_components_.ok_or(OchreError::NotFitted)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         if x.cols != k {
             return Err(OchreError::FeatureCountMismatch {
                 features: x.cols,
@@ -665,7 +832,63 @@ impl PCA {
             .as_ref()
             .ok_or(OchreError::NotFitted)?;
 
-        let backend = effective_backend(&self.device, x.rows * components.cols);
+        let p = components.cols;
+        let backend = effective_transform_backend(&self.device, x.rows.saturating_mul(p));
+        if matches!(backend, Backend::Cpu) {
+            let comp_t_owned;
+            let comp_t = match self.comp_t_inv_.as_ref() {
+                Some(ct) => ct,
+                None => {
+                    let mut comp_t_data = vec![0.0; p * k];
+                    if self.whiten {
+                        let stds: Vec<f64> =
+                            exp_var.iter().take(k).map(|&v| v.max(0.0).sqrt()).collect();
+                        for j in 0..k {
+                            let s = stds[j];
+                            let comp_row = &components.data[j * p..(j + 1) * p];
+                            for f in 0..p {
+                                comp_t_data[f * k + j] = comp_row[f] * s;
+                            }
+                        }
+                    } else {
+                        for j in 0..k {
+                            let comp_row = &components.data[j * p..(j + 1) * p];
+                            for f in 0..p {
+                                comp_t_data[f * k + j] = comp_row[f];
+                            }
+                        }
+                    }
+                    comp_t_owned = Matrix::from_vec(p, k, comp_t_data)?;
+                    &comp_t_owned
+                }
+            };
+            let comp_t_packed_owned;
+            let comp_t_packed = match self.comp_t_inv_packed_.as_deref() {
+                Some(cp) => cp,
+                None => {
+                    comp_t_packed_owned = pack_components_4(&comp_t.data, p, k);
+                    &comp_t_packed_owned
+                }
+            };
+            let neg_mean_owned: Vec<f64>;
+            let neg_mean = match self.neg_mean_.as_deref() {
+                Some(nm) => nm,
+                None => {
+                    neg_mean_owned = mean.iter().map(|&m| -m).collect();
+                    &neg_mean_owned
+                }
+            };
+            return project_cpu_matrix_cached(
+                x,
+                comp_t_packed,
+                &comp_t.data,
+                p,
+                Some(neg_mean),
+                None,
+            );
+        }
+
+        validate_finite_matrix(x)?;
         let x_rec = if self.whiten {
             let stds: Vec<f64> = exp_var.iter().map(|&v| v.max(0.0).sqrt()).collect();
             let mut scaled = x.clone();
@@ -680,7 +903,6 @@ impl PCA {
             backend.matmul(x, components)?
         };
 
-        let p = components.cols;
         let ones = vec![1.0; p];
         let neg_mean: Vec<f64> = mean.iter().map(|&m| -m).collect();
         backend.col_scale_shift(&x_rec, &ones, &neg_mean)
@@ -797,7 +1019,7 @@ impl PCA {
 
         let (dev, device_) = resolve_loaded_device(saved_device, n_features_in_.is_some(), device)?;
 
-        Ok(Self {
+        let mut pca = Self {
             n_components,
             explained_variance_ratio_target,
             whiten,
@@ -812,7 +1034,15 @@ impl PCA {
             n_features_in_,
             n_samples_,
             noise_variance_,
-        })
+            comp_packed_: None,
+            proj_mean_: None,
+            inv_stds_: None,
+            neg_mean_: None,
+            comp_t_inv_: None,
+            comp_t_inv_packed_: None,
+        };
+        pca.rebuild_transform_cache()?;
+        Ok(pca)
     }
 }
 
@@ -970,6 +1200,9 @@ pub struct TruncatedSVD {
     pub explained_variance_ratio_: Option<Vec<f64>>,
     pub singular_values_: Option<Vec<f64>>,
     pub n_features_in_: Option<usize>,
+    comp_packed_: Option<Vec<f64>>,
+    comp_t_: Option<Matrix>,
+    comp_t_packed_: Option<Vec<f64>>,
 }
 
 impl TruncatedSVD {
@@ -1004,7 +1237,25 @@ impl TruncatedSVD {
             explained_variance_ratio_: None,
             singular_values_: None,
             n_features_in_: None,
+            comp_packed_: None,
+            comp_t_: None,
+            comp_t_packed_: None,
         })
+    }
+
+    fn rebuild_transform_cache(&mut self) {
+        let Some(components) = self.components_.as_ref() else {
+            self.comp_packed_ = None;
+            self.comp_t_ = None;
+            self.comp_t_packed_ = None;
+            return;
+        };
+        let k = components.rows;
+        let p = components.cols;
+        self.comp_packed_ = Some(pack_components_4(&components.data, k, p));
+        let comp_t = components.transpose();
+        self.comp_t_packed_ = Some(pack_components_4(&comp_t.data, p, k));
+        self.comp_t_ = Some(comp_t);
     }
 
     pub fn set_device(&mut self, device: Option<String>) -> OchreResult<()> {
@@ -1112,12 +1363,12 @@ impl TruncatedSVD {
         // Explained variance (ddof=0) matching sklearn.decomposition.TruncatedSVD
         let full_stats = backend.col_reduce_stats(x, None)?;
         let total_var: f64 = full_stats.var.iter().sum();
+        let comp_packed = pack_components_4(&components.data, k, p);
         let exp_var = if matches!(
             effective_transform_backend(&self.device, n * p),
             Backend::Cpu
         ) {
             let comp_data = &components.data;
-            let comp_packed = pack_components_4(comp_data, k, p);
             let mut anchor_t = vec![0.0; k];
             let first_row = &x.data[..p];
             for j in 0..k {
@@ -1127,7 +1378,7 @@ impl TruncatedSVD {
                 |x_chunk: &[f64], buf: &mut Vec<f64>, sum_t: &mut [f64], sum_sq_t: &mut [f64]| {
                     let m = x_chunk.len() / p;
                     buf.resize(m * k, 0.0);
-                    project_4x4_chunk(
+                    project_4x4_chunk::<false>(
                         x_chunk,
                         m,
                         p,
@@ -1147,12 +1398,13 @@ impl TruncatedSVD {
                     }
                 };
             let (sum_t, sum_sq_t) = if n >= PARALLEL_ROW_THRESHOLD {
+                let chunk_rows = compute_project_chunk_rows(n);
                 x.data
-                    .par_chunks(PROJECT_CHUNK_ROWS * p)
+                    .par_chunks(chunk_rows * p)
                     .fold(
                         || {
                             (
-                                Vec::with_capacity(PROJECT_CHUNK_ROWS * k),
+                                Vec::with_capacity(chunk_rows * k),
                                 vec![0.0; k],
                                 vec![0.0; k],
                             )
@@ -1203,12 +1455,15 @@ impl TruncatedSVD {
         self.singular_values_ = Some(singular_values);
         self.n_features_in_ = Some(p);
         self.device_ = Some(self.device.to_string());
+        self.rebuild_transform_cache();
         Ok(())
     }
 
     pub fn transform(&self, x: &Matrix) -> OchreResult<Matrix> {
-        validate_finite_matrix(x)?;
         let expected = self.n_features_in_.ok_or(OchreError::NotFitted)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         if x.cols != expected {
             return Err(OchreError::FeatureCountMismatch {
                 features: x.cols,
@@ -1216,12 +1471,27 @@ impl TruncatedSVD {
             });
         }
         let components = self.components_.as_ref().ok_or(OchreError::NotFitted)?;
-        let backend = effective_transform_backend(&self.device, x.rows * expected);
+        let backend = effective_transform_backend(&self.device, x.rows.saturating_mul(expected));
         if matches!(backend, Backend::Cpu) {
-            return project_cpu_matrix(x, components, None, None);
+            let k = components.rows;
+            let packed_owned;
+            let comp_packed = match self.comp_packed_.as_deref() {
+                Some(cp) => cp,
+                None => {
+                    packed_owned = pack_components_4(&components.data, k, expected);
+                    &packed_owned
+                }
+            };
+            return project_cpu_matrix_cached(x, comp_packed, &components.data, k, None, None);
         }
-        let comp_t = components.transpose();
-        backend.matmul(x, &comp_t)
+        validate_finite_matrix(x)?;
+        match self.comp_t_.as_ref() {
+            Some(comp_t) => backend.matmul(x, comp_t),
+            None => {
+                let comp_t = components.transpose();
+                backend.matmul(x, &comp_t)
+            }
+        }
     }
 
     pub fn fit_transform(&mut self, x: &Matrix) -> OchreResult<Matrix> {
@@ -1230,8 +1500,10 @@ impl TruncatedSVD {
     }
 
     pub fn inverse_transform(&self, x: &Matrix) -> OchreResult<Matrix> {
-        validate_finite_matrix(x)?;
         let components = self.components_.as_ref().ok_or(OchreError::NotFitted)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         let k = components.rows;
         if x.cols != k {
             return Err(OchreError::FeatureCountMismatch {
@@ -1239,7 +1511,29 @@ impl TruncatedSVD {
                 expected: k,
             });
         }
-        effective_backend(&self.device, x.rows * components.cols).matmul(x, components)
+        let p = components.cols;
+        let backend = effective_transform_backend(&self.device, x.rows.saturating_mul(p));
+        if matches!(backend, Backend::Cpu) {
+            let comp_t_owned;
+            let comp_t = match self.comp_t_.as_ref() {
+                Some(ct) => ct,
+                None => {
+                    comp_t_owned = components.transpose();
+                    &comp_t_owned
+                }
+            };
+            let comp_t_packed_owned;
+            let comp_t_packed = match self.comp_t_packed_.as_deref() {
+                Some(cp) => cp,
+                None => {
+                    comp_t_packed_owned = pack_components_4(&comp_t.data, p, k);
+                    &comp_t_packed_owned
+                }
+            };
+            return project_cpu_matrix_cached(x, comp_t_packed, &comp_t.data, p, None, None);
+        }
+        validate_finite_matrix(x)?;
+        backend.matmul(x, components)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -1273,7 +1567,7 @@ impl TruncatedSVD {
 
         let (dev, device_) = resolve_loaded_device(saved_device, n_features_in_.is_some(), device)?;
 
-        Ok(Self {
+        let mut svd = Self {
             n_components,
             n_iter,
             random_state,
@@ -1285,7 +1579,12 @@ impl TruncatedSVD {
             explained_variance_ratio_,
             singular_values_,
             n_features_in_,
-        })
+            comp_packed_: None,
+            comp_t_: None,
+            comp_t_packed_: None,
+        };
+        svd.rebuild_transform_cache();
+        Ok(svd)
     }
 }
 
@@ -1464,5 +1763,60 @@ mod tests {
                 );
             }
         }
+
+        // Verify inverse_transform parity + .dit round-trip
+        let svd_bytes = svd.to_bytes();
+        let svd_loaded = TruncatedSVD::from_bytes(&svd_bytes, Some("cpu")).unwrap();
+        let rec_svd = svd_loaded.inverse_transform(&z_svd).unwrap();
+        assert_eq!(rec_svd.rows, n);
+        assert_eq!(rec_svd.cols, p);
+        for r in [0, 3, 4, 511, 512, 650] {
+            for f in 0..p {
+                let mut ref_val = 0.0;
+                for c in 0..k {
+                    ref_val += z_svd[(r, c)] * comps[(c, f)];
+                }
+                assert!(
+                    (rec_svd[(r, f)] - ref_val).abs() < 1e-10,
+                    "SVD inverse mismatch at ({r}, {f})"
+                );
+            }
+        }
+
+        for whiten in [false, true] {
+            let mut pca = PCA::new(Some(k), None, whiten, Some("cpu".to_string())).unwrap();
+            let z_pca = pca.fit_transform(&x).unwrap();
+            let pca_loaded = PCA::from_bytes(&pca.to_bytes(), Some("cpu")).unwrap();
+            let z_pca_loaded = pca_loaded.transform(&x).unwrap();
+            let rec_pca = pca_loaded.inverse_transform(&z_pca).unwrap();
+            let comps_p = pca.components_.as_ref().unwrap();
+            let mean_p = pca.mean_.as_ref().unwrap();
+            let ev_p = pca.explained_variance_.as_ref().unwrap();
+            for r in [0, 3, 4, 511, 512, 650] {
+                for c in 0..k {
+                    assert!((z_pca[(r, c)] - z_pca_loaded[(r, c)]).abs() < 1e-10);
+                }
+                for f in 0..p {
+                    let mut ref_val = mean_p[f];
+                    for c in 0..k {
+                        let scale = if whiten { ev_p[c].sqrt() } else { 1.0 };
+                        ref_val += z_pca[(r, c)] * scale * comps_p[(c, f)];
+                    }
+                    assert!(
+                        (rec_pca[(r, f)] - ref_val).abs() < 1e-10,
+                        "PCA inverse mismatch (whiten={whiten}) at ({r}, {f})"
+                    );
+                }
+            }
+        }
+
+        // Verify fused NaN / Inf detection in parallel transform and inverse_transform
+        let mut x_nan = x.clone();
+        x_nan[(513, 7)] = f64::NAN;
+        assert!(svd.transform(&x_nan).is_err());
+
+        let mut z_inf = z_svd.clone();
+        z_inf[(514, 2)] = f64::INFINITY;
+        assert!(svd.inverse_transform(&z_inf).is_err());
     }
 }

@@ -29,10 +29,11 @@ pub const TAG_ONE_CLASS_SVM: u8 = 78;
 pub const TAG_KERNEL_RIDGE: u8 = 79;
 pub const TAG_KERNEL_PCA: u8 = 80;
 
-const LARGE_ELEMENTWISE_THRESHOLD: usize = 16_384;
+const LARGE_ELEMENTWISE_THRESHOLD: usize = 131_072;
 const LARGE_MATMUL_THRESHOLD: usize = 4_096;
 const GPU_MIN_ELEMS: usize = 131_072;
 const KRR_GPU_MIN_ELEMS: usize = 524_288;
+const FUSED_PREDICT_MAX_ELEMS: usize = 65_536;
 
 #[inline]
 fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
@@ -427,7 +428,7 @@ fn fused_rbf_symmetric_cpu(x: &Matrix, gamma: f64) -> Matrix {
     let use_direct = cols <= 16;
     let norms = if use_direct {
         Vec::new()
-    } else if n >= 128 {
+    } else if n >= 384 {
         x.data.par_chunks(cols).map(row_sq_norm_unrolled).collect()
     } else {
         x.data
@@ -539,7 +540,7 @@ fn fused_rbf_symmetric_cpu(x: &Matrix, gamma: f64) -> Matrix {
         }
     };
 
-    if n >= 64 {
+    if n >= 384 {
         k.data
             .par_chunks_mut(4 * n)
             .enumerate()
@@ -569,7 +570,7 @@ fn fused_rbf_cross_cpu(a: &Matrix, b: &Matrix, gamma: f64) -> Matrix {
     let (a_norms, b_norms) = if use_direct {
         (Vec::new(), Vec::new())
     } else {
-        let an = if na >= 128 {
+        let an = if na >= 384 {
             a.data.par_chunks(cols).map(row_sq_norm_unrolled).collect()
         } else {
             a.data
@@ -577,7 +578,7 @@ fn fused_rbf_cross_cpu(a: &Matrix, b: &Matrix, gamma: f64) -> Matrix {
                 .map(row_sq_norm_unrolled)
                 .collect()
         };
-        let bn = if nb >= 128 {
+        let bn = if nb >= 384 {
             b.data.par_chunks(cols).map(row_sq_norm_unrolled).collect()
         } else {
             b.data
@@ -678,7 +679,7 @@ fn fused_rbf_cross_cpu(a: &Matrix, b: &Matrix, gamma: f64) -> Matrix {
         }
     };
 
-    if na * nb >= 16_384 && na >= 16 {
+    if na * nb >= 131_072 && na >= 32 {
         k.data
             .par_chunks_mut(4 * nb)
             .enumerate()
@@ -687,6 +688,421 @@ fn fused_rbf_cross_cpu(a: &Matrix, b: &Matrix, gamma: f64) -> Matrix {
         k.data.chunks_mut(4 * nb).enumerate().for_each(fill_chunk);
     }
     k
+}
+
+#[inline(always)]
+fn validate_row_finite(row: &[f64]) -> OchreResult<()> {
+    let mut ok = true;
+    for &v in row {
+        ok &= v.is_finite();
+    }
+    if !ok {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN or Inf values ( >_< )".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn validate_and_sq_norm(row: &[f64]) -> OchreResult<f64> {
+    let mut ok = true;
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    let mut c = 0;
+    while c + 4 <= row.len() {
+        let v0 = row[c];
+        let v1 = row[c + 1];
+        let v2 = row[c + 2];
+        let v3 = row[c + 3];
+        ok &= v0.is_finite() & v1.is_finite() & v2.is_finite() & v3.is_finite();
+        s0 += v0 * v0;
+        s1 += v1 * v1;
+        s2 += v2 * v2;
+        s3 += v3 * v3;
+        c += 4;
+    }
+    let mut sum = (s0 + s1) + (s2 + s3);
+    while c < row.len() {
+        let v = row[c];
+        ok &= v.is_finite();
+        sum += v * v;
+        c += 1;
+    }
+    if !ok {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN or Inf values ( >_< )".to_string(),
+        ));
+    }
+    Ok(sum)
+}
+
+/// Fused zero-allocation CPU RBF prediction for 1D dual coefficients (`offset + sum_j K(x_i, sv_j) * coef_j`).
+/// Fuses finite validation into the test-row loops and avoids allocating an `(n_test x n_sv)` matrix.
+fn fused_rbf_1d_cpu(
+    x: &Matrix,
+    sv: &Matrix,
+    coef: &[f64],
+    gamma: f64,
+    offset: f64,
+) -> OchreResult<Vec<f64>> {
+    let n_test = x.rows;
+    let n_sv = sv.rows;
+    let cols = x.cols;
+    let neg_gamma = -gamma;
+    let use_direct = cols <= 16;
+    let sv_norms = if use_direct {
+        Vec::new()
+    } else {
+        sv.data
+            .chunks_exact(cols)
+            .map(row_sq_norm_unrolled)
+            .collect()
+    };
+
+    let mut out = vec![offset; n_test];
+    let mut i = 0;
+    while i + 4 <= n_test {
+        let x0 = &x.data[i * cols..(i + 1) * cols];
+        let x1 = &x.data[(i + 1) * cols..(i + 2) * cols];
+        let x2 = &x.data[(i + 2) * cols..(i + 3) * cols];
+        let x3 = &x.data[(i + 3) * cols..(i + 4) * cols];
+
+        let mut acc0 = offset;
+        let mut acc1 = offset;
+        let mut acc2 = offset;
+        let mut acc3 = offset;
+
+        if use_direct {
+            validate_row_finite(x0)?;
+            validate_row_finite(x1)?;
+            validate_row_finite(x2)?;
+            validate_row_finite(x3)?;
+
+            let mut j = 0;
+            while j + 4 <= n_sv {
+                let y0 = &sv.data[j * cols..(j + 1) * cols];
+                let y1 = &sv.data[(j + 1) * cols..(j + 2) * cols];
+                let y2 = &sv.data[(j + 2) * cols..(j + 3) * cols];
+                let y3 = &sv.data[(j + 3) * cols..(j + 4) * cols];
+                let d = direct_l2_sq_4x4([x0, x1, x2, x3], [y0, y1, y2, y3]);
+                let c0 = coef[j];
+                let c1 = coef[j + 1];
+                let c2 = coef[j + 2];
+                let c3 = coef[j + 3];
+                acc0 += (neg_gamma * d[0][0]).exp() * c0
+                    + (neg_gamma * d[0][1]).exp() * c1
+                    + (neg_gamma * d[0][2]).exp() * c2
+                    + (neg_gamma * d[0][3]).exp() * c3;
+                acc1 += (neg_gamma * d[1][0]).exp() * c0
+                    + (neg_gamma * d[1][1]).exp() * c1
+                    + (neg_gamma * d[1][2]).exp() * c2
+                    + (neg_gamma * d[1][3]).exp() * c3;
+                acc2 += (neg_gamma * d[2][0]).exp() * c0
+                    + (neg_gamma * d[2][1]).exp() * c1
+                    + (neg_gamma * d[2][2]).exp() * c2
+                    + (neg_gamma * d[2][3]).exp() * c3;
+                acc3 += (neg_gamma * d[3][0]).exp() * c0
+                    + (neg_gamma * d[3][1]).exp() * c1
+                    + (neg_gamma * d[3][2]).exp() * c2
+                    + (neg_gamma * d[3][3]).exp() * c3;
+                j += 4;
+            }
+            while j < n_sv {
+                let yj = &sv.data[j * cols..(j + 1) * cols];
+                let cj = coef[j];
+                acc0 += (neg_gamma * direct_l2_sq_1x1(x0, yj)).exp() * cj;
+                acc1 += (neg_gamma * direct_l2_sq_1x1(x1, yj)).exp() * cj;
+                acc2 += (neg_gamma * direct_l2_sq_1x1(x2, yj)).exp() * cj;
+                acc3 += (neg_gamma * direct_l2_sq_1x1(x3, yj)).exp() * cj;
+                j += 1;
+            }
+        } else {
+            let ni0 = validate_and_sq_norm(x0)?;
+            let ni1 = validate_and_sq_norm(x1)?;
+            let ni2 = validate_and_sq_norm(x2)?;
+            let ni3 = validate_and_sq_norm(x3)?;
+
+            let mut j = 0;
+            while j + 4 <= n_sv {
+                let y0 = &sv.data[j * cols..(j + 1) * cols];
+                let y1 = &sv.data[(j + 1) * cols..(j + 2) * cols];
+                let y2 = &sv.data[(j + 2) * cols..(j + 3) * cols];
+                let y3 = &sv.data[(j + 3) * cols..(j + 4) * cols];
+                let dots = dot_4x4([x0, x1, x2, x3], [y0, y1, y2, y3]);
+                let nj0 = sv_norms[j];
+                let nj1 = sv_norms[j + 1];
+                let nj2 = sv_norms[j + 2];
+                let nj3 = sv_norms[j + 3];
+                let c0 = coef[j];
+                let c1 = coef[j + 1];
+                let c2 = coef[j + 2];
+                let c3 = coef[j + 3];
+                acc0 += (neg_gamma * (ni0 + nj0 - 2.0 * dots[0][0]).max(0.0)).exp() * c0
+                    + (neg_gamma * (ni0 + nj1 - 2.0 * dots[0][1]).max(0.0)).exp() * c1
+                    + (neg_gamma * (ni0 + nj2 - 2.0 * dots[0][2]).max(0.0)).exp() * c2
+                    + (neg_gamma * (ni0 + nj3 - 2.0 * dots[0][3]).max(0.0)).exp() * c3;
+                acc1 += (neg_gamma * (ni1 + nj0 - 2.0 * dots[1][0]).max(0.0)).exp() * c0
+                    + (neg_gamma * (ni1 + nj1 - 2.0 * dots[1][1]).max(0.0)).exp() * c1
+                    + (neg_gamma * (ni1 + nj2 - 2.0 * dots[1][2]).max(0.0)).exp() * c2
+                    + (neg_gamma * (ni1 + nj3 - 2.0 * dots[1][3]).max(0.0)).exp() * c3;
+                acc2 += (neg_gamma * (ni2 + nj0 - 2.0 * dots[2][0]).max(0.0)).exp() * c0
+                    + (neg_gamma * (ni2 + nj1 - 2.0 * dots[2][1]).max(0.0)).exp() * c1
+                    + (neg_gamma * (ni2 + nj2 - 2.0 * dots[2][2]).max(0.0)).exp() * c2
+                    + (neg_gamma * (ni2 + nj3 - 2.0 * dots[2][3]).max(0.0)).exp() * c3;
+                acc3 += (neg_gamma * (ni3 + nj0 - 2.0 * dots[3][0]).max(0.0)).exp() * c0
+                    + (neg_gamma * (ni3 + nj1 - 2.0 * dots[3][1]).max(0.0)).exp() * c1
+                    + (neg_gamma * (ni3 + nj2 - 2.0 * dots[3][2]).max(0.0)).exp() * c2
+                    + (neg_gamma * (ni3 + nj3 - 2.0 * dots[3][3]).max(0.0)).exp() * c3;
+                j += 4;
+            }
+            while j < n_sv {
+                let yj = &sv.data[j * cols..(j + 1) * cols];
+                let nj = sv_norms[j];
+                let cj = coef[j];
+                acc0 += (neg_gamma * (ni0 + nj - 2.0 * dot_1x1(x0, yj)).max(0.0)).exp() * cj;
+                acc1 += (neg_gamma * (ni1 + nj - 2.0 * dot_1x1(x1, yj)).max(0.0)).exp() * cj;
+                acc2 += (neg_gamma * (ni2 + nj - 2.0 * dot_1x1(x2, yj)).max(0.0)).exp() * cj;
+                acc3 += (neg_gamma * (ni3 + nj - 2.0 * dot_1x1(x3, yj)).max(0.0)).exp() * cj;
+                j += 1;
+            }
+        }
+
+        out[i] = acc0;
+        out[i + 1] = acc1;
+        out[i + 2] = acc2;
+        out[i + 3] = acc3;
+        i += 4;
+    }
+
+    while i < n_test {
+        let xi = &x.data[i * cols..(i + 1) * cols];
+        let mut acc = offset;
+        if use_direct {
+            validate_row_finite(xi)?;
+            for j in 0..n_sv {
+                let yj = &sv.data[j * cols..(j + 1) * cols];
+                acc += (neg_gamma * direct_l2_sq_1x1(xi, yj)).exp() * coef[j];
+            }
+        } else {
+            let ni = validate_and_sq_norm(xi)?;
+            for j in 0..n_sv {
+                let yj = &sv.data[j * cols..(j + 1) * cols];
+                let d2 = (ni + sv_norms[j] - 2.0 * dot_1x1(xi, yj)).max(0.0);
+                acc += (neg_gamma * d2).exp() * coef[j];
+            }
+        }
+        out[i] = acc;
+        i += 1;
+    }
+
+    Ok(out)
+}
+
+/// Fused zero-allocation CPU RBF prediction for multi-output `dual_coef` (`n_sv x n_out`).
+fn fused_rbf_multi_cpu(
+    x: &Matrix,
+    sv: &Matrix,
+    dual_coef: &Matrix,
+    gamma: f64,
+) -> OchreResult<Matrix> {
+    let n_test = x.rows;
+    let n_sv = sv.rows;
+    let cols = x.cols;
+    let n_out = dual_coef.cols;
+    let neg_gamma = -gamma;
+    let use_direct = cols <= 16;
+    let sv_norms = if use_direct {
+        Vec::new()
+    } else {
+        sv.data
+            .chunks_exact(cols)
+            .map(row_sq_norm_unrolled)
+            .collect()
+    };
+
+    let mut out = Matrix::zeros(n_test, n_out);
+    for i in 0..n_test {
+        let xi = &x.data[i * cols..(i + 1) * cols];
+        let out_row = &mut out.data[i * n_out..(i + 1) * n_out];
+        if use_direct {
+            validate_row_finite(xi)?;
+            for j in 0..n_sv {
+                let yj = &sv.data[j * cols..(j + 1) * cols];
+                let kv = (neg_gamma * direct_l2_sq_1x1(xi, yj)).exp();
+                let dc_row = &dual_coef.data[j * n_out..(j + 1) * n_out];
+                for o in 0..n_out {
+                    out_row[o] += kv * dc_row[o];
+                }
+            }
+        } else {
+            let ni = validate_and_sq_norm(xi)?;
+            for j in 0..n_sv {
+                let yj = &sv.data[j * cols..(j + 1) * cols];
+                let d2 = (ni + sv_norms[j] - 2.0 * dot_1x1(xi, yj)).max(0.0);
+                let kv = (neg_gamma * d2).exp();
+                let dc_row = &dual_coef.data[j * n_out..(j + 1) * n_out];
+                for o in 0..n_out {
+                    out_row[o] += kv * dc_row[o];
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Sequential 4-row lower-triangular Cholesky + solve for `n < 512`, avoiding Rayon overhead
+/// from `matrix::cholesky_lower_with_diag_shift_into` on medium matrices (e.g., `280 x 280`).
+fn try_cholesky_lower_seq(a: &Matrix, lambda: f64, l: &mut Matrix, inv_diag: &mut [f64]) -> bool {
+    let n = a.rows;
+    let diag_tol = 1e-14;
+    for i in 0..n {
+        let row_off = i * n;
+        let src_row = &a.data[row_off..row_off + n];
+        let dst_row = &mut l.data[row_off..row_off + n];
+        dst_row[..=i].copy_from_slice(&src_row[..=i]);
+        dst_row[i] += lambda;
+        dst_row[i + 1..].fill(0.0);
+    }
+
+    let mut i = 0;
+    while i + 4 <= n {
+        let (top, bot) = l.data.split_at_mut(i * n);
+        let (r0, rest) = bot.split_at_mut(n);
+        let (r1, rest) = rest.split_at_mut(n);
+        let (r2, rest) = rest.split_at_mut(n);
+        let r3 = &mut rest[..n];
+
+        for j in 0..i {
+            let lj = &top[j * n..j * n + j];
+            let mut s0 = 0.0;
+            let mut s1 = 0.0;
+            let mut s2 = 0.0;
+            let mut s3 = 0.0;
+            for m in 0..j {
+                let lm = lj[m];
+                s0 += r0[m] * lm;
+                s1 += r1[m] * lm;
+                s2 += r2[m] * lm;
+                s3 += r3[m] * lm;
+            }
+            let inv_j = inv_diag[j];
+            r0[j] = (r0[j] - s0) * inv_j;
+            r1[j] = (r1[j] - s1) * inv_j;
+            r2[j] = (r2[j] - s2) * inv_j;
+            r3[j] = (r3[j] - s3) * inv_j;
+        }
+
+        let d0 = r0[i] - dot_1x1(&r0[..i], &r0[..i]);
+        if !d0.is_finite() || d0 <= diag_tol {
+            return false;
+        }
+        let l00 = d0.sqrt();
+        let inv0 = 1.0 / l00;
+        r0[i] = l00;
+        inv_diag[i] = inv0;
+
+        let l10 = (r1[i] - dot_1x1(&r1[..i], &r0[..i])) * inv0;
+        let l20 = (r2[i] - dot_1x1(&r2[..i], &r0[..i])) * inv0;
+        let l30 = (r3[i] - dot_1x1(&r3[..i], &r0[..i])) * inv0;
+        r1[i] = l10;
+        r2[i] = l20;
+        r3[i] = l30;
+
+        let d1 = r1[i + 1] - dot_1x1(&r1[..i + 1], &r1[..i + 1]);
+        if !d1.is_finite() || d1 <= diag_tol {
+            return false;
+        }
+        let l11 = d1.sqrt();
+        let inv1 = 1.0 / l11;
+        r1[i + 1] = l11;
+        inv_diag[i + 1] = inv1;
+
+        let l21 = (r2[i + 1] - dot_1x1(&r2[..i + 1], &r1[..i + 1])) * inv1;
+        let l31 = (r3[i + 1] - dot_1x1(&r3[..i + 1], &r1[..i + 1])) * inv1;
+        r2[i + 1] = l21;
+        r3[i + 1] = l31;
+
+        let d2 = r2[i + 2] - dot_1x1(&r2[..i + 2], &r2[..i + 2]);
+        if !d2.is_finite() || d2 <= diag_tol {
+            return false;
+        }
+        let l22 = d2.sqrt();
+        let inv2 = 1.0 / l22;
+        r2[i + 2] = l22;
+        inv_diag[i + 2] = inv2;
+
+        let l32 = (r3[i + 2] - dot_1x1(&r3[..i + 2], &r2[..i + 2])) * inv2;
+        r3[i + 2] = l32;
+
+        let d3 = r3[i + 3] - dot_1x1(&r3[..i + 3], &r3[..i + 3]);
+        if !d3.is_finite() || d3 <= diag_tol {
+            return false;
+        }
+        let l33 = d3.sqrt();
+        r3[i + 3] = l33;
+        inv_diag[i + 3] = 1.0 / l33;
+
+        i += 4;
+    }
+
+    while i < n {
+        let (top, bot) = l.data.split_at_mut(i * n);
+        let ri = &mut bot[..n];
+        for j in 0..i {
+            let lj = &top[j * n..j * n + j];
+            ri[j] = (ri[j] - dot_1x1(&ri[..j], lj)) * inv_diag[j];
+        }
+        let diag = ri[i] - dot_1x1(&ri[..i], &ri[..i]);
+        if !diag.is_finite() || diag <= diag_tol {
+            return false;
+        }
+        let lii = diag.sqrt();
+        ri[i] = lii;
+        inv_diag[i] = 1.0 / lii;
+        i += 1;
+    }
+
+    true
+}
+
+fn solve_cholesky_multi_fast(a: &Matrix, b: &Matrix) -> OchreResult<Matrix> {
+    let n = a.rows;
+    if n >= 512 || n == 0 || b.cols == 0 {
+        return solve_cholesky_multi(a, b);
+    }
+    let mut l = Matrix::zeros(n, n);
+    let mut inv_diag = vec![0.0; n];
+    for &lambda in &[0.0, 1e-12, 1e-9, 1e-6, 1e-3] {
+        if try_cholesky_lower_seq(a, lambda, &mut l, &mut inv_diag) {
+            let k_targets = b.cols;
+            let mut theta = Matrix::zeros(n, k_targets);
+            let mut z = vec![0.0; n];
+            let mut x = vec![0.0; n];
+            for col in 0..k_targets {
+                for r in 0..n {
+                    let row = &l.data[r * n..r * n + r];
+                    z[r] = (b.data[r * k_targets + col] - dot_1x1(row, &z[..r])) * inv_diag[r];
+                }
+                x.copy_from_slice(&z);
+                for r in (0..n).rev() {
+                    let xr = x[r] * inv_diag[r];
+                    x[r] = xr;
+                    let row = &l.data[r * n..r * n + r];
+                    for m in 0..r {
+                        x[m] -= row[m] * xr;
+                    }
+                }
+                for r in 0..n {
+                    theta.data[r * k_targets + col] = x[r];
+                }
+            }
+            return Ok(theta);
+        }
+    }
+    solve_cholesky_multi(a, b)
 }
 
 fn compute_kernel_matrix(
@@ -936,7 +1352,7 @@ impl KernelRidge {
                     y_scaled.data[i * y_scaled.cols + c] *= swi;
                 }
             }
-            let mut c_tilde = solve_cholesky_multi(&k_mat, &y_scaled)?;
+            let mut c_tilde = solve_cholesky_multi_fast(&k_mat, &y_scaled)?;
             for (i, &swi) in sqrt_w.iter().enumerate().take(n) {
                 for c in 0..c_tilde.cols {
                     c_tilde.data[i * c_tilde.cols + c] *= swi;
@@ -947,7 +1363,7 @@ impl KernelRidge {
             for i in 0..n {
                 k_mat.data[i * n + i] += self.alpha;
             }
-            solve_cholesky_multi(&k_mat, y)?
+            solve_cholesky_multi_fast(&k_mat, y)?
         };
 
         self.dual_coef_ = Some(dual_coef);
@@ -965,15 +1381,36 @@ impl KernelRidge {
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Matrix> {
         let dual_coef = self.dual_coef_.as_ref().ok_or(OchreError::NotFitted)?;
-        validate_finite_matrix(x)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         let k_kind = KernelKind::parse(&self.kernel)?;
+        let gamma_val = self.gamma_.unwrap_or(1.0);
+
+        if k_kind == KernelKind::Rbf
+            && x.rows.saturating_mul(self.n_samples_fit_) < FUSED_PREDICT_MAX_ELEMS
+        {
+            let x_fit = self.x_fit_.as_ref().ok_or(OchreError::NotFitted)?;
+            if x.cols != self.n_features_in_ {
+                return Err(OchreError::FeatureCountMismatch {
+                    features: x.cols,
+                    expected: self.n_features_in_,
+                });
+            }
+            if dual_coef.cols == 1 {
+                let preds = fused_rbf_1d_cpu(x, x_fit, &dual_coef.data, gamma_val, 0.0)?;
+                return Matrix::from_vec(x.rows, 1, preds);
+            }
+            return fused_rbf_multi_cpu(x, x_fit, dual_coef, gamma_val);
+        }
+
+        validate_finite_matrix(x)?;
         let dev = self.device_type()?;
         let backend = effective_backend_krr(
             &dev,
             x.rows
                 .saturating_mul(self.n_samples_fit_.max(dual_coef.cols)),
         );
-        let gamma_val = self.gamma_.unwrap_or(1.0);
 
         let k_test = if k_kind == KernelKind::Precomputed {
             if x.cols != self.n_samples_fit_ {
@@ -3095,15 +3532,35 @@ impl OneClassSVM {
         Ok(())
     }
 
-    pub fn score_samples(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
+    fn eval_scores_with_offset(&self, x: &Matrix, offset: f64) -> OchreResult<Vec<f64>> {
         let support = self.support_.as_ref().ok_or(OchreError::NotFitted)?;
         let dual_coef = self.dual_coef_.as_ref().ok_or(OchreError::NotFitted)?;
-        validate_finite_matrix(x)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
 
         let k_kind = KernelKind::parse(&self.kernel)?;
+        let gamma_val = self.gamma_.unwrap_or(1.0);
+
+        if k_kind == KernelKind::Rbf
+            && x.rows.saturating_mul(support.len()) < FUSED_PREDICT_MAX_ELEMS
+        {
+            let sv = self
+                .support_vectors_
+                .as_ref()
+                .ok_or(OchreError::NotFitted)?;
+            if x.cols != self.n_features_in_ {
+                return Err(OchreError::FeatureCountMismatch {
+                    features: x.cols,
+                    expected: self.n_features_in_,
+                });
+            }
+            return fused_rbf_1d_cpu(x, sv, &dual_coef.data, gamma_val, offset);
+        }
+
+        validate_finite_matrix(x)?;
         let dev = self.device_type()?;
         let backend = effective_backend(&dev, x.rows.saturating_mul(support.len()));
-        let gamma_val = self.gamma_.unwrap_or(1.0);
 
         let k_sv = if k_kind == KernelKind::Precomputed {
             if x.cols != self.n_samples_fit_ {
@@ -3131,7 +3588,7 @@ impl OneClassSVM {
         let mut scores = Vec::with_capacity(x.rows);
         for r in 0..x.rows {
             let k_row = &k_sv.data[r * total_sv..(r + 1) * total_sv];
-            let mut sum = 0.0;
+            let mut sum = offset;
             for (c, &kv) in k_row.iter().enumerate().take(total_sv) {
                 sum += dual_coef.data[c] * kv;
             }
@@ -3140,20 +3597,20 @@ impl OneClassSVM {
         Ok(scores)
     }
 
+    pub fn score_samples(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
+        self.eval_scores_with_offset(x, 0.0)
+    }
+
     pub fn decision_function(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
-        let mut scores = self.score_samples(x)?;
-        for s in &mut scores {
-            *s += self.offset_;
-        }
-        Ok(scores)
+        self.eval_scores_with_offset(x, self.offset_)
     }
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
-        let dec = self.decision_function(x)?;
-        Ok(dec
-            .into_iter()
-            .map(|d| if d >= 0.0 { 1.0 } else { -1.0 })
-            .collect())
+        let mut dec = self.decision_function(x)?;
+        for d in &mut dec {
+            *d = if *d >= 0.0 { 1.0 } else { -1.0 };
+        }
+        Ok(dec)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -3954,6 +4411,56 @@ mod tests {
             krr.fit(&x, &y, None).unwrap();
             let r2 = krr.score(&x, &y, None).unwrap();
             assert!(r2 > 0.95, "KRR 280x{cols} R2 = {r2}");
+
+            // Verify fused predict parity against explicit kernel matrix * dual_coef
+            let x_test = Matrix::from_vec(70, cols, x.data[..70 * cols].to_vec()).unwrap();
+            let pred_fused = krr.predict(&x_test).unwrap();
+            let k_ref = fused_rbf_cross_cpu(&x_test, krr.x_fit_.as_ref().unwrap(), gamma);
+            let pred_ref = k_ref.matmul(krr.dual_coef_.as_ref().unwrap()).unwrap();
+            for idx in 0..pred_fused.data.len() {
+                assert!(
+                    (pred_fused.data[idx] - pred_ref.data[idx]).abs() < 1e-11,
+                    "KRR fused predict mismatch at {idx}: {} vs {}",
+                    pred_fused.data[idx],
+                    pred_ref.data[idx]
+                );
+            }
+
+            // Verify OneClassSVM fused score_samples / decision_function / predict parity
+            let mut ocsvm = OneClassSVM::new(
+                "rbf".to_string(),
+                3,
+                "scale".to_string(),
+                Some(gamma),
+                0.0,
+                1e-3,
+                0.2,
+                None,
+                None,
+            )
+            .unwrap();
+            ocsvm.fit(&x).unwrap();
+            let scores = ocsvm.score_samples(&x_test).unwrap();
+            let dec = ocsvm.decision_function(&x_test).unwrap();
+            let preds = ocsvm.predict(&x_test).unwrap();
+            let sv = ocsvm.support_vectors_.as_ref().unwrap();
+            let dc = ocsvm.dual_coef_.as_ref().unwrap();
+            let k_oc = fused_rbf_cross_cpu(&x_test, sv, gamma);
+            for r in 0..x_test.rows {
+                let mut ref_s = 0.0;
+                for c in 0..sv.rows {
+                    ref_s += k_oc[(r, c)] * dc[(0, c)];
+                }
+                assert!((scores[r] - ref_s).abs() < 1e-11);
+                assert!((dec[r] - (ref_s + ocsvm.offset_)).abs() < 1e-11);
+                assert_eq!(preds[r], if dec[r] >= 0.0 { 1.0 } else { -1.0 });
+            }
+
+            // Verify NaN rejection in fused predict paths
+            let mut bad_x = x_test.clone();
+            bad_x.data[cols + 1] = f64::NAN;
+            assert!(krr.predict(&bad_x).is_err());
+            assert!(ocsvm.decision_function(&bad_x).is_err());
         }
     }
 }

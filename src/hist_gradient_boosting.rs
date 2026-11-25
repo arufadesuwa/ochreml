@@ -3,7 +3,6 @@
 // accelerated by Backend Primitive N6 (quantize_features, batched_histogram_grad,
 // subtract_histogram, find_best_histogram_split).
 
-use crate::backend::{Backend, get_backend};
 use crate::device::{DeviceType, parse_device, resolve_loaded_device};
 use crate::dit_io::{
     ByteReader, check_magic_and_tag, write_f64, write_f64_vec, write_header, write_opt_str,
@@ -15,10 +14,11 @@ use crate::preprocessing::py_helpers::{
     buffer_to_f64_1d, buffer_to_pooled_matrix, f64_slice_to_pybytes, matrix_to_pybytes,
 };
 use crate::primitives::histogram::{
-    cpu_batched_histogram_gh_into, cpu_batched_histogram_unit_hess_into,
-    cpu_quantize_features_col_only, subtract_histogram_inplace,
+    GhHistSoa, UnitHistSoa, cpu_batched_histogram_gh_f32_into, cpu_batched_histogram_unit_f32_into,
+    cpu_quantize_features_col_only_checked, find_best_gh_histogram_split,
+    find_best_unit_histogram_split, subtract_gh_hist_inplace, subtract_unit_hist_inplace,
 };
-use crate::primitives::{BinnedMatrix, GradHessBin, HistogramSplit};
+use crate::primitives::{BinnedMatrix, HistogramSplit};
 use crate::pymethods_with_dit;
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
@@ -212,32 +212,32 @@ fn predict_flat_hgb_tree(nodes: &[FlatHgbNode], root: usize, row: &[f64]) -> f64
     }
 }
 
-struct SplitCandidate {
+struct SplitCandidate<H> {
     node_idx: usize,
     depth: usize,
     start: usize,
     end: usize,
-    hist: Vec<GradHessBin>,
+    hist: H,
     sum_grad: f64,
     sum_hess: f64,
     split: HistogramSplit,
 }
 
-impl PartialEq for SplitCandidate {
+impl<H> PartialEq for SplitCandidate<H> {
     fn eq(&self, other: &Self) -> bool {
         self.node_idx == other.node_idx && self.split.gain == other.split.gain
     }
 }
 
-impl Eq for SplitCandidate {}
+impl<H> Eq for SplitCandidate<H> {}
 
-impl PartialOrd for SplitCandidate {
+impl<H> PartialOrd for SplitCandidate<H> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for SplitCandidate {
+impl<H> Ord for SplitCandidate<H> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.split
             .gain
@@ -254,6 +254,20 @@ fn newton_leaf_value(sum_grad: f64, sum_hess: f64, l2_reg: f64, learning_rate: f
     } else {
         (-learning_rate * (sum_grad / denom)).clamp(-1e6, 1e6)
     }
+}
+
+fn unweighted_median_inplace(values: &mut [f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mid = (values.len() - 1) / 2;
+    let (_, median, _) = values.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    *median
+}
+
+fn unweighted_median(values: &[f64]) -> f64 {
+    let mut buf = values.to_vec();
+    unweighted_median_inplace(&mut buf)
 }
 
 fn weighted_median(values: &[f64], weights: &[f64]) -> f64 {
@@ -337,54 +351,52 @@ fn validate_common_params(
     Ok(())
 }
 
-fn validate_fit_inputs(
-    x: &Matrix,
+fn validate_fit_inputs_no_x(
+    x_rows: usize,
+    x_cols: usize,
     y: &[f64],
     sample_weight: Option<&[f64]>,
-) -> OchreResult<Vec<f64>> {
-    if x.rows == 0 || x.cols == 0 {
+) -> OchreResult<Option<f64>> {
+    if x_rows == 0 || x_cols == 0 {
         return Err(OchreError::EmptyData);
     }
-    if x.rows != y.len() {
+    if x_rows != y.len() {
         return Err(OchreError::LengthMismatch {
-            features: x.rows,
+            features: x_rows,
             targets: y.len(),
         });
     }
-    let is_non_finite = if x.data.len() >= 65_536 {
-        x.data
-            .par_chunks(16_384)
+    let y_non_finite = if y.len() >= 32_768 {
+        y.par_chunks(8192)
             .any(|chunk| chunk.iter().any(|v| !v.is_finite()))
     } else {
-        x.data.iter().any(|v| !v.is_finite())
+        y.iter().any(|v| !v.is_finite())
     };
-    if is_non_finite {
-        return Err(OchreError::InvalidParameter(
-            "Input X contains NaN or Inf ( >_< )".to_string(),
-        ));
-    }
-    if y.iter().any(|v| !v.is_finite()) {
+    if y_non_finite {
         return Err(OchreError::InvalidParameter(
             "Target y contains NaN or Inf ( >_< )".to_string(),
         ));
     }
     if let Some(sw) = sample_weight {
-        if sw.len() != x.rows {
+        if sw.len() != x_rows {
             return Err(OchreError::WeightLengthMismatch {
                 weights: sw.len(),
-                samples: x.rows,
+                samples: x_rows,
             });
         }
-        if sw.iter().any(|&w| !w.is_finite() || w < 0.0) {
-            return Err(OchreError::InvalidWeights);
+        let mut sum_w = 0.0;
+        for &w in sw {
+            if !w.is_finite() || w < 0.0 {
+                return Err(OchreError::InvalidWeights);
+            }
+            sum_w += w;
         }
-        let sum_w: f64 = sw.iter().sum();
         if sum_w <= 0.0 {
             return Err(OchreError::NonPositiveWeightSum);
         }
-        Ok(sw.to_vec())
+        Ok(Some(sum_w))
     } else {
-        Ok(vec![1.0; x.rows])
+        Ok(None)
     }
 }
 
@@ -422,22 +434,27 @@ struct TreeBuildConfig {
     l2_regularization: f64,
 }
 
-struct HgbWorkspace {
-    gh: Vec<(f64, f64)>,
-    grad_only: Vec<f64>,
+struct TreeScratch {
     sample_indices: Vec<u32>,
     scratch_indices: Vec<u32>,
-    hist_pool: Vec<Vec<GradHessBin>>,
     left_counts: Vec<usize>,
     abs_resids: Vec<f64>,
     abs_weights: Vec<f64>,
 }
 
+struct HgbWorkspace {
+    gh32: Vec<(f32, f32)>,
+    grad_only: Vec<f32>,
+    unit_hist_pool: Vec<UnitHistSoa>,
+    gh_hist_pool: Vec<GhHistSoa>,
+    tree: TreeScratch,
+}
+
 impl HgbWorkspace {
     fn new(n_rows: usize, unit_hess: bool) -> Self {
-        let scratch_len = if n_rows >= 16_384 { n_rows } else { 0 };
+        let scratch_len = if n_rows >= 32_768 { n_rows } else { 0 };
         Self {
-            gh: if unit_hess {
+            gh32: if unit_hess {
                 Vec::new()
             } else {
                 vec![(0.0, 0.0); n_rows]
@@ -447,30 +464,16 @@ impl HgbWorkspace {
             } else {
                 Vec::new()
             },
-            sample_indices: vec![0u32; n_rows],
-            scratch_indices: vec![0u32; scratch_len],
-            hist_pool: Vec::with_capacity(64),
-            left_counts: Vec::with_capacity(128),
-            abs_resids: Vec::new(),
-            abs_weights: Vec::new(),
+            unit_hist_pool: Vec::with_capacity(64),
+            gh_hist_pool: Vec::with_capacity(64),
+            tree: TreeScratch {
+                sample_indices: vec![0u32; n_rows],
+                scratch_indices: vec![0u32; scratch_len],
+                left_counts: Vec::with_capacity(128),
+                abs_resids: Vec::new(),
+                abs_weights: Vec::new(),
+            },
         }
-    }
-
-    #[inline]
-    fn take_hist(&mut self, hist_len: usize) -> Vec<GradHessBin> {
-        if let Some(mut buf) = self.hist_pool.pop() {
-            if buf.len() != hist_len {
-                buf.resize(hist_len, GradHessBin::default());
-            }
-            buf
-        } else {
-            vec![GradHessBin::default(); hist_len]
-        }
-    }
-
-    #[inline]
-    fn return_hist(&mut self, buf: Vec<GradHessBin>) {
-        self.hist_pool.push(buf);
     }
 }
 
@@ -499,23 +502,31 @@ fn partition_samples(
     scratch_indices: &mut Vec<u32>,
     left_counts: &mut Vec<usize>,
 ) -> usize {
-    const PAR_THRESHOLD: usize = 16_384;
-    const BLOCK_SIZE: usize = 4096;
+    const PAR_THRESHOLD: usize = 32_768;
 
     let n = slice.len();
     if n < PAR_THRESHOLD {
         let mut lo = 0usize;
         let mut hi = n;
-        while lo < hi {
-            if col[slice[lo] as usize] <= bin_thresh {
+        loop {
+            while lo < hi && col[slice[lo] as usize] <= bin_thresh {
                 lo += 1;
-            } else {
-                hi -= 1;
-                slice.swap(lo, hi);
             }
+            while lo < hi && col[slice[hi - 1] as usize] > bin_thresh {
+                hi -= 1;
+            }
+            if lo >= hi {
+                break;
+            }
+            hi -= 1;
+            slice.swap(lo, hi);
+            lo += 1;
         }
         return lo;
     }
+
+    let n_blocks = (rayon::current_num_threads() * 2).max(4);
+    let block_size = n.div_ceil(n_blocks).max(4096);
 
     if scratch_indices.len() < n {
         scratch_indices.resize(n, 0);
@@ -524,7 +535,7 @@ fn partition_samples(
 
     left_counts.clear();
     slice
-        .par_chunks(BLOCK_SIZE)
+        .par_chunks(block_size)
         .map(|chunk| {
             let mut count = 0usize;
             for &idx in chunk {
@@ -543,7 +554,7 @@ fn partition_samples(
     let mut rem_left = scratch_left;
     let mut rem_right = scratch_right;
     let mut tasks = Vec::with_capacity(left_counts.len());
-    for (src_chunk, &lc) in slice.chunks(BLOCK_SIZE).zip(left_counts.iter()) {
+    for (src_chunk, &lc) in slice.chunks(block_size).zip(left_counts.iter()) {
         let rc = src_chunk.len() - lc;
         let (dst_l, next_l) = rem_left.split_at_mut(lc);
         let (dst_r, next_r) = rem_right.split_at_mut(rc);
@@ -567,8 +578,8 @@ fn partition_samples(
     });
 
     slice
-        .par_chunks_mut(BLOCK_SIZE)
-        .zip(scratch.par_chunks(BLOCK_SIZE))
+        .par_chunks_mut(block_size)
+        .zip(scratch.par_chunks(block_size))
         .for_each(|(dst, src)| dst.copy_from_slice(src));
 
     left_len
@@ -576,6 +587,9 @@ fn partition_samples(
 
 #[inline]
 fn add_leaf_val_to_raw(raw: &mut [f64], indices: &[u32], leaf_val: f64) {
+    if leaf_val == 0.0 {
+        return;
+    }
     let n_raw = raw.len();
     let (chunks, rem) = indices.as_chunks::<4>();
     for &idx4 in chunks {
@@ -598,18 +612,173 @@ fn add_leaf_val_to_raw(raw: &mut [f64], indices: &[u32], leaf_val: f64) {
     }
 }
 
+trait HgbHistOps {
+    type Hist: Send;
+    fn take_hist(pool: &mut Vec<Self::Hist>, cols: usize, num_bins: usize) -> Self::Hist;
+    fn return_hist(pool: &mut Vec<Self::Hist>, hist: Self::Hist);
+    fn accum_root(&self, binned: &BinnedMatrix, hist: &mut Self::Hist) -> OchreResult<(f64, f64)>;
+    fn accum_child(
+        &self,
+        binned: &BinnedMatrix,
+        indices: &[u32],
+        hist: &mut Self::Hist,
+    ) -> OchreResult<()>;
+    fn sum_totals(&self, n_rows: usize) -> (f64, f64);
+    fn subtract_inplace(parent: &mut Self::Hist, child: &Self::Hist) -> OchreResult<()>;
+    fn find_best_split(
+        binned: &BinnedMatrix,
+        hist: &Self::Hist,
+        l2_reg: f64,
+        min_samples_leaf: u32,
+    ) -> OchreResult<Option<HistogramSplit>>;
+}
+
+struct UnitHistOps<'a>(&'a [f32]);
+
+impl HgbHistOps for UnitHistOps<'_> {
+    type Hist = UnitHistSoa;
+
+    #[inline]
+    fn take_hist(pool: &mut Vec<UnitHistSoa>, cols: usize, num_bins: usize) -> UnitHistSoa {
+        if let Some(mut buf) = pool.pop() {
+            buf.resize(cols, num_bins);
+            buf
+        } else {
+            UnitHistSoa::new(cols, num_bins)
+        }
+    }
+
+    #[inline]
+    fn return_hist(pool: &mut Vec<UnitHistSoa>, hist: UnitHistSoa) {
+        pool.push(hist);
+    }
+
+    #[inline]
+    fn accum_root(&self, binned: &BinnedMatrix, hist: &mut UnitHistSoa) -> OchreResult<(f64, f64)> {
+        cpu_batched_histogram_unit_f32_into(binned, None, self.0, hist)?;
+        let active_bins = (binned.bin_edges[0].len() + 1).min(binned.num_bins);
+        let sg: f64 = hist.sum_grad[..active_bins].iter().map(|&g| g as f64).sum();
+        Ok((sg, binned.rows as f64))
+    }
+
+    #[inline]
+    fn accum_child(
+        &self,
+        binned: &BinnedMatrix,
+        indices: &[u32],
+        hist: &mut UnitHistSoa,
+    ) -> OchreResult<()> {
+        cpu_batched_histogram_unit_f32_into(binned, Some(indices), self.0, hist)
+    }
+
+    #[inline]
+    fn sum_totals(&self, n_rows: usize) -> (f64, f64) {
+        let sg: f64 = self.0.iter().map(|&g| g as f64).sum();
+        (sg, n_rows as f64)
+    }
+
+    #[inline]
+    fn subtract_inplace(parent: &mut UnitHistSoa, child: &UnitHistSoa) -> OchreResult<()> {
+        subtract_unit_hist_inplace(parent, child)
+    }
+
+    #[inline]
+    fn find_best_split(
+        binned: &BinnedMatrix,
+        hist: &UnitHistSoa,
+        l2_reg: f64,
+        min_samples_leaf: u32,
+    ) -> OchreResult<Option<HistogramSplit>> {
+        find_best_unit_histogram_split(binned, hist, l2_reg, min_samples_leaf)
+    }
+}
+
+struct GhHistOps<'a>(&'a [(f32, f32)]);
+
+impl HgbHistOps for GhHistOps<'_> {
+    type Hist = GhHistSoa;
+
+    #[inline]
+    fn take_hist(pool: &mut Vec<GhHistSoa>, cols: usize, num_bins: usize) -> GhHistSoa {
+        if let Some(mut buf) = pool.pop() {
+            buf.resize(cols, num_bins);
+            buf
+        } else {
+            GhHistSoa::new(cols, num_bins)
+        }
+    }
+
+    #[inline]
+    fn return_hist(pool: &mut Vec<GhHistSoa>, hist: GhHistSoa) {
+        pool.push(hist);
+    }
+
+    #[inline]
+    fn accum_root(&self, binned: &BinnedMatrix, hist: &mut GhHistSoa) -> OchreResult<(f64, f64)> {
+        cpu_batched_histogram_gh_f32_into(binned, None, self.0, hist)?;
+        let active_bins = (binned.bin_edges[0].len() + 1).min(binned.num_bins);
+        let mut sg = 0.0;
+        let mut sh = 0.0;
+        for (&g, &h) in hist.sum_grad[..active_bins]
+            .iter()
+            .zip(hist.sum_hess[..active_bins].iter())
+        {
+            sg += g as f64;
+            sh += h as f64;
+        }
+        Ok((sg, sh))
+    }
+
+    #[inline]
+    fn accum_child(
+        &self,
+        binned: &BinnedMatrix,
+        indices: &[u32],
+        hist: &mut GhHistSoa,
+    ) -> OchreResult<()> {
+        cpu_batched_histogram_gh_f32_into(binned, Some(indices), self.0, hist)
+    }
+
+    #[inline]
+    fn sum_totals(&self, _n_rows: usize) -> (f64, f64) {
+        let mut sg = 0.0;
+        let mut sh = 0.0;
+        for &(g, h) in self.0 {
+            sg += g as f64;
+            sh += h as f64;
+        }
+        (sg, sh)
+    }
+
+    #[inline]
+    fn subtract_inplace(parent: &mut GhHistSoa, child: &GhHistSoa) -> OchreResult<()> {
+        subtract_gh_hist_inplace(parent, child)
+    }
+
+    #[inline]
+    fn find_best_split(
+        binned: &BinnedMatrix,
+        hist: &GhHistSoa,
+        l2_reg: f64,
+        min_samples_leaf: u32,
+    ) -> OchreResult<Option<HistogramSplit>> {
+        find_best_gh_histogram_split(binned, hist, l2_reg, min_samples_leaf)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn build_hgb_tree(
-    backend: &Backend<'_>,
+fn build_hgb_tree_impl<O: HgbHistOps>(
+    ops: &O,
     binned: &BinnedMatrix,
     cfg: &TreeBuildConfig,
     raw: &mut [f64],
-    ws: &mut HgbWorkspace,
-    abs_loss_targets: Option<(&[f64], &[f64])>,
-    unit_hess: bool,
+    hist_pool: &mut Vec<O::Hist>,
+    tree: &mut TreeScratch,
+    abs_loss_targets: Option<(&[f64], Option<&[f64]>)>,
 ) -> OchreResult<HgbNode> {
     let n_rows = binned.rows;
-    let hist_len = binned.cols * binned.num_bins;
+    let cols = binned.cols;
+    let num_bins = binned.num_bins;
 
     let can_split_root = cfg.max_leaf_nodes.is_none_or(|m| 1 < m)
         && cfg.max_depth.is_none_or(|d| d > 0)
@@ -617,36 +786,18 @@ fn build_hgb_tree(
 
     let mut root_hist_opt = None;
     let (root_sum_g, root_sum_h) = if can_split_root {
-        let mut root_hist = ws.take_hist(hist_len);
-        if unit_hess {
-            cpu_batched_histogram_unit_hess_into(binned, None, &ws.grad_only, &mut root_hist)?;
-            let active_bins = (binned.bin_edges[0].len() + 1).min(binned.num_bins);
-            let sg: f64 = root_hist[..active_bins].iter().map(|b| b.sum_grad).sum();
-            root_hist_opt = Some(root_hist);
-            (sg, n_rows as f64)
-        } else {
-            cpu_batched_histogram_gh_into(binned, None, &ws.gh, &mut root_hist)?;
-            let active_bins = (binned.bin_edges[0].len() + 1).min(binned.num_bins);
-            let mut sg = 0.0;
-            let mut sh = 0.0;
-            for bin in &root_hist[..active_bins] {
-                sg += bin.sum_grad;
-                sh += bin.sum_hess;
+        let mut root_hist = O::take_hist(hist_pool, cols, num_bins);
+        let totals = match ops.accum_root(binned, &mut root_hist) {
+            Ok(totals) => totals,
+            Err(e) => {
+                O::return_hist(hist_pool, root_hist);
+                return Err(e);
             }
-            root_hist_opt = Some(root_hist);
-            (sg, sh)
-        }
-    } else if unit_hess {
-        let sg: f64 = ws.grad_only.iter().sum();
-        (sg, n_rows as f64)
+        };
+        root_hist_opt = Some(root_hist);
+        totals
     } else {
-        let mut sg = 0.0;
-        let mut sh = 0.0;
-        for &(g, h) in &ws.gh {
-            sg += g;
-            sh += h;
-        }
-        (sg, sh)
+        ops.sum_totals(n_rows)
     };
 
     let root_val = newton_leaf_value(
@@ -660,14 +811,14 @@ fn build_hgb_tree(
     let mut n_leaves = 1usize;
 
     if let Some(root_hist) = root_hist_opt {
-        if let Some(root_split) = backend.find_best_histogram_split(
+        if let Some(root_split) = O::find_best_split(
             binned,
             &root_hist,
             cfg.l2_regularization,
             cfg.min_samples_leaf as u32,
         )? && root_split.gain > 1e-12
         {
-            init_sample_indices(&mut ws.sample_indices);
+            init_sample_indices(&mut tree.sample_indices);
             let mut heap = BinaryHeap::new();
             heap.push(SplitCandidate {
                 node_idx: 0,
@@ -685,54 +836,44 @@ fn build_hgb_tree(
                     break;
                 };
                 if cand.split.gain <= 1e-12 {
-                    ws.return_hist(cand.hist);
+                    O::return_hist(hist_pool, cand.hist);
                     break;
                 }
 
                 let feat = cand.split.feature_idx;
                 let bin_thresh = cand.split.bin_idx as u8;
                 let col = &binned.col_data[feat * n_rows..(feat + 1) * n_rows];
-                let slice = &mut ws.sample_indices[cand.start..cand.end];
+                let slice = &mut tree.sample_indices[cand.start..cand.end];
                 let left_len = partition_samples(
                     col,
                     bin_thresh,
                     slice,
-                    &mut ws.scratch_indices,
-                    &mut ws.left_counts,
+                    &mut tree.scratch_indices,
+                    &mut tree.left_counts,
                 );
                 let right_len = slice.len() - left_len;
 
                 if left_len < cfg.min_samples_leaf || right_len < cfg.min_samples_leaf {
-                    ws.return_hist(cand.hist);
+                    O::return_hist(hist_pool, cand.hist);
                     continue;
                 }
 
                 let mid = cand.start + left_len;
                 let left_is_smaller = left_len <= right_len;
-                let mut small_hist = ws.take_hist(hist_len);
+                let mut small_hist = O::take_hist(hist_pool, cols, num_bins);
                 let small_idx = if left_is_smaller {
-                    &ws.sample_indices[cand.start..mid]
+                    &tree.sample_indices[cand.start..mid]
                 } else {
-                    &ws.sample_indices[mid..cand.end]
+                    &tree.sample_indices[mid..cand.end]
                 };
-                let hist_res = if unit_hess {
-                    cpu_batched_histogram_unit_hess_into(
-                        binned,
-                        Some(small_idx),
-                        &ws.grad_only,
-                        &mut small_hist,
-                    )
-                } else {
-                    cpu_batched_histogram_gh_into(binned, Some(small_idx), &ws.gh, &mut small_hist)
-                };
-                if let Err(e) = hist_res {
-                    ws.return_hist(small_hist);
-                    ws.return_hist(cand.hist);
+                if let Err(e) = ops.accum_child(binned, small_idx, &mut small_hist) {
+                    O::return_hist(hist_pool, small_hist);
+                    O::return_hist(hist_pool, cand.hist);
                     return Err(e);
                 }
-                if let Err(e) = subtract_histogram_inplace(&mut cand.hist, &small_hist) {
-                    ws.return_hist(small_hist);
-                    ws.return_hist(cand.hist);
+                if let Err(e) = O::subtract_inplace(&mut cand.hist, &small_hist) {
+                    O::return_hist(hist_pool, small_hist);
+                    O::return_hist(hist_pool, cand.hist);
                     return Err(e);
                 }
                 let large_hist = cand.hist;
@@ -775,7 +916,7 @@ fn build_hgb_tree(
                 let right_can_split = can_expand_depth && right_len >= 2 * cfg.min_samples_leaf;
 
                 if left_can_split
-                    && let Some(lsplit) = backend.find_best_histogram_split(
+                    && let Some(lsplit) = O::find_best_split(
                         binned,
                         &left_hist,
                         cfg.l2_regularization,
@@ -794,11 +935,11 @@ fn build_hgb_tree(
                         split: lsplit,
                     });
                 } else {
-                    ws.return_hist(left_hist);
+                    O::return_hist(hist_pool, left_hist);
                 }
 
                 if right_can_split
-                    && let Some(rsplit) = backend.find_best_histogram_split(
+                    && let Some(rsplit) = O::find_best_split(
                         binned,
                         &right_hist,
                         cfg.l2_regularization,
@@ -817,39 +958,45 @@ fn build_hgb_tree(
                         split: rsplit,
                     });
                 } else {
-                    ws.return_hist(right_hist);
+                    O::return_hist(hist_pool, right_hist);
                 }
 
                 n_leaves += 1;
             }
 
             for leftover in heap.into_vec() {
-                ws.return_hist(leftover.hist);
+                O::return_hist(hist_pool, leftover.hist);
             }
         } else {
-            ws.return_hist(root_hist);
+            O::return_hist(hist_pool, root_hist);
         }
     }
 
     if n_leaves == 1 {
-        let leaf_val = if let Some((y, weights)) = abs_loss_targets {
-            ws.abs_resids.clear();
-            ws.abs_resids.reserve(n_rows);
+        let leaf_val = if let Some((y, maybe_weights)) = abs_loss_targets {
+            tree.abs_resids.clear();
+            tree.abs_resids.reserve(n_rows);
             for (&yi, &ri) in y.iter().zip(raw.iter()) {
-                ws.abs_resids.push(yi - ri);
+                tree.abs_resids.push(yi - ri);
             }
-            let val = cfg.learning_rate * weighted_median(&ws.abs_resids, weights);
+            let median = match maybe_weights {
+                Some(weights) => weighted_median(&tree.abs_resids, weights),
+                None => unweighted_median_inplace(&mut tree.abs_resids),
+            };
+            let val = cfg.learning_rate * median;
             arena[0] = ArenaNode::Leaf { value: val };
             val
         } else {
             root_val
         };
-        if n_rows >= 16_384 {
-            raw.par_chunks_mut(4096)
-                .for_each(|chunk| chunk.iter_mut().for_each(|v| *v += leaf_val));
-        } else {
-            for v in raw.iter_mut() {
-                *v += leaf_val;
+        if leaf_val != 0.0 {
+            if n_rows >= 16_384 {
+                raw.par_chunks_mut(4096)
+                    .for_each(|chunk| chunk.iter_mut().for_each(|v| *v += leaf_val));
+            } else {
+                for v in raw.iter_mut() {
+                    *v += leaf_val;
+                }
             }
         }
     } else {
@@ -857,18 +1004,27 @@ fn build_hgb_tree(
             let Some((start, end)) = maybe_range else {
                 continue;
             };
-            let indices = &ws.sample_indices[start..end];
-            let leaf_val = if let Some((y, weights)) = abs_loss_targets {
-                ws.abs_resids.clear();
-                ws.abs_weights.clear();
-                ws.abs_resids.reserve(indices.len());
-                ws.abs_weights.reserve(indices.len());
-                for &idx in indices {
-                    let r = idx as usize;
-                    ws.abs_resids.push(y[r] - raw[r]);
-                    ws.abs_weights.push(weights[r]);
-                }
-                let val = cfg.learning_rate * weighted_median(&ws.abs_resids, &ws.abs_weights);
+            let indices = &tree.sample_indices[start..end];
+            let leaf_val = if let Some((y, maybe_weights)) = abs_loss_targets {
+                tree.abs_resids.clear();
+                tree.abs_resids.reserve(indices.len());
+                let median = if let Some(weights) = maybe_weights {
+                    tree.abs_weights.clear();
+                    tree.abs_weights.reserve(indices.len());
+                    for &idx in indices {
+                        let r = idx as usize;
+                        tree.abs_resids.push(y[r] - raw[r]);
+                        tree.abs_weights.push(weights[r]);
+                    }
+                    weighted_median(&tree.abs_resids, &tree.abs_weights)
+                } else {
+                    for &idx in indices {
+                        let r = idx as usize;
+                        tree.abs_resids.push(y[r] - raw[r]);
+                    }
+                    unweighted_median_inplace(&mut tree.abs_resids)
+                };
+                let val = cfg.learning_rate * median;
                 arena[node_idx] = ArenaNode::Leaf { value: val };
                 val
             } else if let ArenaNode::Leaf { value } = arena[node_idx] {
@@ -881,6 +1037,43 @@ fn build_hgb_tree(
     }
 
     Ok(ArenaNode::into_hgb_node(&arena, 0))
+}
+
+fn build_hgb_tree_unit(
+    binned: &BinnedMatrix,
+    cfg: &TreeBuildConfig,
+    raw: &mut [f64],
+    ws: &mut HgbWorkspace,
+) -> OchreResult<HgbNode> {
+    let ops = UnitHistOps(&ws.grad_only);
+    build_hgb_tree_impl(
+        &ops,
+        binned,
+        cfg,
+        raw,
+        &mut ws.unit_hist_pool,
+        &mut ws.tree,
+        None,
+    )
+}
+
+fn build_hgb_tree_gh(
+    binned: &BinnedMatrix,
+    cfg: &TreeBuildConfig,
+    raw: &mut [f64],
+    ws: &mut HgbWorkspace,
+    abs_loss_targets: Option<(&[f64], Option<&[f64]>)>,
+) -> OchreResult<HgbNode> {
+    let ops = GhHistOps(&ws.gh32);
+    build_hgb_tree_impl(
+        &ops,
+        binned,
+        cfg,
+        raw,
+        &mut ws.gh_hist_pool,
+        &mut ws.tree,
+        abs_loss_targets,
+    )
 }
 
 fn predict_flat_trees_sum(
@@ -1006,21 +1199,21 @@ impl HistGradientBoostingRegressor {
     }
 
     pub fn fit(&mut self, x: &Matrix, y: &[f64], sample_weight: Option<&[f64]>) -> OchreResult<()> {
-        let weights = validate_fit_inputs(x, y, sample_weight)?;
-        let backend = get_backend(&self.device);
-        let binned = if matches!(backend, Backend::Cpu) {
-            cpu_quantize_features_col_only(x, self.max_bins)?
-        } else {
-            backend.quantize_features(x, self.max_bins)?
-        };
+        let sum_w_opt = validate_fit_inputs_no_x(x.rows, x.cols, y, sample_weight)?;
+        let binned = cpu_quantize_features_col_only_checked(x, self.max_bins)?;
 
         let is_abs = self.loss == "absolute_error";
         let baseline = if is_abs {
-            weighted_median(y, &weights)
-        } else {
-            let sum_wy: f64 = y.iter().zip(weights.iter()).map(|(&yi, &wi)| yi * wi).sum();
-            let sum_w: f64 = weights.iter().sum();
+            match sample_weight {
+                Some(sw) => weighted_median(y, sw),
+                None => unweighted_median(y),
+            }
+        } else if let (Some(sw), Some(sum_w)) = (sample_weight, sum_w_opt) {
+            let sum_wy: f64 = y.iter().zip(sw.iter()).map(|(&yi, &wi)| yi * wi).sum();
             sum_wy / sum_w
+        } else {
+            let sum_y: f64 = y.iter().sum();
+            sum_y / (x.rows as f64)
         };
 
         let mut raw = vec![baseline; x.rows];
@@ -1032,7 +1225,7 @@ impl HistGradientBoostingRegressor {
             l2_regularization: self.l2_regularization,
         };
 
-        let unit_hess = !is_abs && sample_weight.is_none() && matches!(backend, Backend::Cpu);
+        let unit_hess = !is_abs && sample_weight.is_none();
         let mut trees = Vec::with_capacity(self.max_iter);
         let mut ws = HgbWorkspace::new(x.rows, unit_hess);
         for _ in 0..self.max_iter {
@@ -1046,17 +1239,22 @@ impl HistGradientBoostingRegressor {
                             for ((dst, &ri), &yi) in
                                 dst_c.iter_mut().zip(r_c.iter()).zip(y_c.iter())
                             {
-                                *dst = ri - yi;
+                                *dst = (ri - yi) as f32;
                             }
                         });
                 } else {
                     for ((dst, &ri), &yi) in ws.grad_only.iter_mut().zip(raw.iter()).zip(y.iter()) {
-                        *dst = ri - yi;
+                        *dst = (ri - yi) as f32;
                     }
                 }
-            } else if is_abs {
+                let tree = build_hgb_tree_unit(&binned, &cfg, &mut raw, &mut ws)?;
+                trees.push(tree);
+                continue;
+            }
+
+            if is_abs {
                 if x.rows >= 16_384 {
-                    ws.gh
+                    ws.gh32
                         .par_chunks_mut(4096)
                         .enumerate()
                         .for_each(|(chunk_idx, gh_chunk)| {
@@ -1064,7 +1262,7 @@ impl HistGradientBoostingRegressor {
                             for (off, dst) in gh_chunk.iter_mut().enumerate() {
                                 let i = base + off;
                                 let diff = raw[i] - y[i];
-                                let w = weights[i];
+                                let w = sample_weight.map_or(1.0f32, |sw| sw[i] as f32);
                                 let g = if diff > 0.0 {
                                     w
                                 } else if diff < 0.0 {
@@ -1078,7 +1276,7 @@ impl HistGradientBoostingRegressor {
                 } else {
                     for i in 0..x.rows {
                         let diff = raw[i] - y[i];
-                        let w = weights[i];
+                        let w = sample_weight.map_or(1.0f32, |sw| sw[i] as f32);
                         let g = if diff > 0.0 {
                             w
                         } else if diff < 0.0 {
@@ -1086,36 +1284,40 @@ impl HistGradientBoostingRegressor {
                         } else {
                             0.0
                         };
-                        ws.gh[i] = (g, w);
+                        ws.gh32[i] = (g, w);
                     }
                 }
-            } else if x.rows >= 16_384 {
-                ws.gh
-                    .par_chunks_mut(4096)
-                    .enumerate()
-                    .for_each(|(chunk_idx, gh_chunk)| {
-                        let base = chunk_idx * 4096;
-                        for (off, dst) in gh_chunk.iter_mut().enumerate() {
-                            let i = base + off;
-                            let w = weights[i];
-                            *dst = (w * (raw[i] - y[i]), w);
-                        }
-                    });
-            } else {
-                for i in 0..x.rows {
-                    let w = weights[i];
-                    ws.gh[i] = (w * (raw[i] - y[i]), w);
+            } else if let Some(sw) = sample_weight {
+                if x.rows >= 16_384 {
+                    ws.gh32
+                        .par_chunks_mut(4096)
+                        .enumerate()
+                        .for_each(|(chunk_idx, gh_chunk)| {
+                            let base = chunk_idx * 4096;
+                            for (off, dst) in gh_chunk.iter_mut().enumerate() {
+                                let i = base + off;
+                                let w = sw[i];
+                                *dst = ((w * (raw[i] - y[i])) as f32, w as f32);
+                            }
+                        });
+                } else {
+                    for i in 0..x.rows {
+                        let w = sw[i];
+                        ws.gh32[i] = ((w * (raw[i] - y[i])) as f32, w as f32);
+                    }
                 }
             }
 
-            let tree = build_hgb_tree(
-                &backend,
+            let tree = build_hgb_tree_gh(
                 &binned,
                 &cfg,
                 &mut raw,
                 &mut ws,
-                if is_abs { Some((y, &weights)) } else { None },
-                unit_hess,
+                if is_abs {
+                    Some((y, sample_weight))
+                } else {
+                    None
+                },
             )?;
             trees.push(tree);
         }
@@ -1246,6 +1448,111 @@ pub struct HistGradientBoostingClassifier {
     flat_roots_: Vec<usize>,
 }
 
+fn fill_binary_gh32(
+    gh32: &mut [(f32, f32)],
+    raw: &[f64],
+    class_indices: &[u32],
+    sample_weight: Option<&[f64]>,
+) {
+    let set_slot = |i: usize, dst: &mut (f32, f32)| {
+        let p = 1.0 / (1.0 + (-raw[i]).exp());
+        let yi = if class_indices[i] == 1 { 1.0 } else { 0.0 };
+        let h = (p * (1.0 - p)).max(1e-15);
+        if let Some(sw) = sample_weight {
+            let w = sw[i];
+            *dst = ((w * (p - yi)) as f32, (w * h) as f32);
+        } else {
+            *dst = ((p - yi) as f32, h as f32);
+        }
+    };
+    if raw.len() >= 8192 {
+        gh32.par_chunks_mut(2048)
+            .enumerate()
+            .for_each(|(chunk_idx, gh_chunk)| {
+                let base = chunk_idx * 2048;
+                for (off, dst) in gh_chunk.iter_mut().enumerate() {
+                    set_slot(base + off, dst);
+                }
+            });
+    } else {
+        for (i, dst) in gh32.iter_mut().enumerate() {
+            set_slot(i, dst);
+        }
+    }
+}
+
+fn fill_multiclass_gh32(
+    gh32: &mut [(f32, f32)],
+    probs: &[f64],
+    class_indices: &[u32],
+    sample_weight: Option<&[f64]>,
+    k: usize,
+    n_classes: usize,
+) {
+    let k_u32 = k as u32;
+    let set_slot = |i: usize, dst: &mut (f32, f32)| {
+        let p = probs[i * n_classes + k];
+        let yk = if class_indices[i] == k_u32 { 1.0 } else { 0.0 };
+        let h = (p * (1.0 - p)).max(1e-15);
+        if let Some(sw) = sample_weight {
+            let w = sw[i];
+            *dst = ((w * (p - yk)) as f32, (w * h) as f32);
+        } else {
+            *dst = ((p - yk) as f32, h as f32);
+        }
+    };
+    if class_indices.len() >= 8192 {
+        gh32.par_chunks_mut(2048)
+            .enumerate()
+            .for_each(|(chunk_idx, gh_chunk)| {
+                let base = chunk_idx * 2048;
+                for (off, dst) in gh_chunk.iter_mut().enumerate() {
+                    set_slot(base + off, dst);
+                }
+            });
+    } else {
+        for (i, dst) in gh32.iter_mut().enumerate() {
+            set_slot(i, dst);
+        }
+    }
+}
+
+fn compute_multiclass_probs(probs: &mut [f64], raws: &[Vec<f64>], n_rows: usize, n_classes: usize) {
+    let fill_row = |i: usize, row_p: &mut [f64]| {
+        let mut max_r = f64::NEG_INFINITY;
+        for raw_k in raws.iter().take(n_classes) {
+            if raw_k[i] > max_r {
+                max_r = raw_k[i];
+            }
+        }
+        let mut sum_exp = 0.0;
+        for (k, slot) in row_p.iter_mut().enumerate() {
+            let e = (raws[k][i] - max_r).exp();
+            *slot = e;
+            sum_exp += e;
+        }
+        let inv = 1.0 / sum_exp;
+        for v in row_p.iter_mut() {
+            *v *= inv;
+        }
+    };
+    if n_rows >= 8192 {
+        probs
+            .par_chunks_mut(2048 * n_classes)
+            .enumerate()
+            .for_each(|(chunk_idx, p_chunk)| {
+                let base = chunk_idx * 2048;
+                for (off, row_p) in p_chunk.chunks_exact_mut(n_classes).enumerate() {
+                    fill_row(base + off, row_p);
+                }
+            });
+    } else {
+        for (i, row_p) in probs.chunks_exact_mut(n_classes).enumerate() {
+            fill_row(i, row_p);
+        }
+    }
+}
+
 impl HistGradientBoostingClassifier {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1298,7 +1605,8 @@ impl HistGradientBoostingClassifier {
     }
 
     pub fn fit(&mut self, x: &Matrix, y: &[f64], sample_weight: Option<&[f64]>) -> OchreResult<()> {
-        let weights = validate_fit_inputs(x, y, sample_weight)?;
+        let sum_w_opt = validate_fit_inputs_no_x(x.rows, x.cols, y, sample_weight)?;
+        let binned = cpu_quantize_features_col_only_checked(x, self.max_bins)?;
 
         let mut classes = y.to_vec();
         classes.sort_by(|a, b| a.total_cmp(b));
@@ -1307,22 +1615,22 @@ impl HistGradientBoostingClassifier {
             return Err(OchreError::InsufficientClasses(classes.len()));
         }
 
-        let class_indices: Vec<usize> = y
-            .iter()
-            .map(|&val| {
-                classes
-                    .iter()
-                    .position(|&c| (c - val).abs() < 1e-9)
-                    .unwrap_or(0)
-            })
-            .collect();
-
-        let backend = get_backend(&self.device);
-        let binned = if matches!(backend, Backend::Cpu) {
-            cpu_quantize_features_col_only(x, self.max_bins)?
+        let class_indices: Vec<u32> = if classes.len() == 2 {
+            let c0 = classes[0];
+            y.iter()
+                .map(|&val| u32::from((c0 - val).abs() >= 1e-9))
+                .collect()
         } else {
-            backend.quantize_features(x, self.max_bins)?
+            y.iter()
+                .map(|&val| {
+                    classes
+                        .iter()
+                        .position(|&c| (c - val).abs() < 1e-9)
+                        .unwrap_or(0) as u32
+                })
+                .collect()
         };
+
         let cfg = TreeBuildConfig {
             learning_rate: self.learning_rate,
             max_leaf_nodes: self.max_leaf_nodes,
@@ -1332,16 +1640,21 @@ impl HistGradientBoostingClassifier {
         };
 
         let n_classes = classes.len();
-        let total_w: f64 = weights.iter().sum();
+        let total_w = sum_w_opt.unwrap_or(x.rows as f64);
 
         let mut ws = HgbWorkspace::new(x.rows, false);
         if n_classes == 2 {
-            let mut w_pos = 0.0;
-            for i in 0..x.rows {
-                if class_indices[i] == 1 {
-                    w_pos += weights[i];
+            let w_pos = if let Some(sw) = sample_weight {
+                let mut sum = 0.0;
+                for i in 0..x.rows {
+                    if class_indices[i] == 1 {
+                        sum += sw[i];
+                    }
                 }
-            }
+                sum
+            } else {
+                class_indices.iter().filter(|&&c| c == 1).count() as f64
+            };
             let p1 = (w_pos / total_w).clamp(1e-15, 1.0 - 1e-15);
             let baseline_val = (p1 / (1.0 - p1)).ln();
 
@@ -1349,29 +1662,8 @@ impl HistGradientBoostingClassifier {
             let mut trees = Vec::with_capacity(self.max_iter);
 
             for _ in 0..self.max_iter {
-                if x.rows >= 8192 {
-                    ws.gh
-                        .par_chunks_mut(2048)
-                        .enumerate()
-                        .for_each(|(chunk_idx, gh_chunk)| {
-                            let base = chunk_idx * 2048;
-                            for (off, dst) in gh_chunk.iter_mut().enumerate() {
-                                let i = base + off;
-                                let p = 1.0 / (1.0 + (-raw[i]).exp());
-                                let yi = if class_indices[i] == 1 { 1.0 } else { 0.0 };
-                                let w = weights[i];
-                                *dst = (w * (p - yi), w * (p * (1.0 - p)).max(1e-15));
-                            }
-                        });
-                } else {
-                    for i in 0..x.rows {
-                        let p = 1.0 / (1.0 + (-raw[i]).exp());
-                        let yi = if class_indices[i] == 1 { 1.0 } else { 0.0 };
-                        let w = weights[i];
-                        ws.gh[i] = (w * (p - yi), w * (p * (1.0 - p)).max(1e-15));
-                    }
-                }
-                let tree = build_hgb_tree(&backend, &binned, &cfg, &mut raw, &mut ws, None, false)?;
+                fill_binary_gh32(&mut ws.gh32, &raw, &class_indices, sample_weight);
+                let tree = build_hgb_tree_gh(&binned, &cfg, &mut raw, &mut ws, None)?;
                 trees.push(tree);
             }
 
@@ -1382,8 +1674,14 @@ impl HistGradientBoostingClassifier {
             self.flat_roots_ = flat_roots;
         } else {
             let mut class_w = vec![0.0; n_classes];
-            for i in 0..x.rows {
-                class_w[class_indices[i]] += weights[i];
+            if let Some(sw) = sample_weight {
+                for i in 0..x.rows {
+                    class_w[class_indices[i] as usize] += sw[i];
+                }
+            } else {
+                for &ci in &class_indices {
+                    class_w[ci as usize] += 1.0;
+                }
             }
             let baseline: Vec<f64> = class_w
                 .iter()
@@ -1395,77 +1693,17 @@ impl HistGradientBoostingClassifier {
             let mut trees = Vec::with_capacity(self.max_iter * n_classes);
 
             for _ in 0..self.max_iter {
-                if x.rows >= 8192 {
-                    probs.par_chunks_mut(2048 * n_classes).enumerate().for_each(
-                        |(chunk_idx, p_chunk)| {
-                            let base = chunk_idx * 2048;
-                            for (off, row_p) in p_chunk.chunks_exact_mut(n_classes).enumerate() {
-                                let i = base + off;
-                                let mut max_r = f64::NEG_INFINITY;
-                                for raw_k in raws.iter().take(n_classes) {
-                                    if raw_k[i] > max_r {
-                                        max_r = raw_k[i];
-                                    }
-                                }
-                                let mut sum_exp = 0.0;
-                                for k in 0..n_classes {
-                                    let e = (raws[k][i] - max_r).exp();
-                                    row_p[k] = e;
-                                    sum_exp += e;
-                                }
-                                let inv = 1.0 / sum_exp;
-                                for v in row_p.iter_mut() {
-                                    *v *= inv;
-                                }
-                            }
-                        },
-                    );
-                } else {
-                    for i in 0..x.rows {
-                        let mut max_r = f64::NEG_INFINITY;
-                        for raw_k in raws.iter().take(n_classes) {
-                            if raw_k[i] > max_r {
-                                max_r = raw_k[i];
-                            }
-                        }
-                        let mut sum_exp = 0.0;
-                        for k in 0..n_classes {
-                            let e = (raws[k][i] - max_r).exp();
-                            probs[i * n_classes + k] = e;
-                            sum_exp += e;
-                        }
-                        let inv = 1.0 / sum_exp;
-                        for k in 0..n_classes {
-                            probs[i * n_classes + k] *= inv;
-                        }
-                    }
-                }
-
+                compute_multiclass_probs(&mut probs, &raws, x.rows, n_classes);
                 for (k, raw_k) in raws.iter_mut().enumerate().take(n_classes) {
-                    if x.rows >= 8192 {
-                        ws.gh
-                            .par_chunks_mut(2048)
-                            .enumerate()
-                            .for_each(|(chunk_idx, gh_chunk)| {
-                                let base = chunk_idx * 2048;
-                                for (off, dst) in gh_chunk.iter_mut().enumerate() {
-                                    let i = base + off;
-                                    let p = probs[i * n_classes + k];
-                                    let yk = if class_indices[i] == k { 1.0 } else { 0.0 };
-                                    let w = weights[i];
-                                    *dst = (w * (p - yk), w * (p * (1.0 - p)).max(1e-15));
-                                }
-                            });
-                    } else {
-                        for i in 0..x.rows {
-                            let p = probs[i * n_classes + k];
-                            let yk = if class_indices[i] == k { 1.0 } else { 0.0 };
-                            let w = weights[i];
-                            ws.gh[i] = (w * (p - yk), w * (p * (1.0 - p)).max(1e-15));
-                        }
-                    }
-                    let tree =
-                        build_hgb_tree(&backend, &binned, &cfg, raw_k, &mut ws, None, false)?;
+                    fill_multiclass_gh32(
+                        &mut ws.gh32,
+                        &probs,
+                        &class_indices,
+                        sample_weight,
+                        k,
+                        n_classes,
+                    );
+                    let tree = build_hgb_tree_gh(&binned, &cfg, raw_k, &mut ws, None)?;
                     trees.push(tree);
                 }
             }
@@ -2212,5 +2450,69 @@ mod tests {
         .unwrap();
         clf.fit(&x, &y_cls, None).unwrap();
         assert!(clf.score(&x, &y_cls).unwrap() > 0.93);
+    }
+
+    #[test]
+    fn test_hgb_parallel_partition_over_32k_and_auto_device() {
+        let n = 40_000usize;
+        let col: Vec<u8> = (0..n).map(|i| ((i * 37) % 256) as u8).collect();
+        let mut slice: Vec<u32> = (0..n as u32).collect();
+        let mut scratch = Vec::with_capacity(n);
+        let mut left_counts = Vec::with_capacity(64);
+        let left_len = partition_samples(&col, 127, &mut slice, &mut scratch, &mut left_counts);
+        assert!(left_len > 15_000 && left_len < 25_000);
+        for &idx in &slice[..left_len] {
+            assert!(col[idx as usize] <= 127);
+        }
+        for &idx in &slice[left_len..] {
+            assert!(col[idx as usize] > 127);
+        }
+        let mut sorted = slice.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..n as u32).collect::<Vec<u32>>());
+
+        let mut data = Vec::with_capacity(n * 4);
+        let mut y_reg = Vec::with_capacity(n);
+        let mut y_cls = Vec::with_capacity(n);
+        for i in 0..n {
+            let x0 = ((i * 19) % 1009) as f64 / 1009.0;
+            let x1 = ((i * 31) % 997) as f64 / 997.0;
+            let x2 = ((i * 43) % 503) as f64 / 503.0;
+            let x3 = x0 - 0.5 * x1;
+            data.extend_from_slice(&[x0, x1, x2, x3]);
+            y_reg.push(2.0 * x0 - 1.5 * x1);
+            y_cls.push(if x0 + x1 > 1.0 { 1.0 } else { 0.0 });
+        }
+        let x = Matrix::from_vec(n, 4, data).unwrap();
+        let mut reg = HistGradientBoostingRegressor::new(
+            None,
+            Some(0.15),
+            Some(12),
+            Some(31),
+            None,
+            Some(20),
+            Some(0.0),
+            Some(255),
+            Some(42),
+            Some("auto".to_string()),
+        )
+        .unwrap();
+        reg.fit(&x, &y_reg, None).unwrap();
+        assert!(reg.score(&x, &y_reg).unwrap() > 0.94);
+
+        let mut clf = HistGradientBoostingClassifier::new(
+            Some(0.15),
+            Some(12),
+            Some(31),
+            None,
+            Some(20),
+            Some(0.0),
+            Some(255),
+            Some(42),
+            Some("auto".to_string()),
+        )
+        .unwrap();
+        clf.fit(&x, &y_cls, None).unwrap();
+        assert!(clf.score(&x, &y_cls).unwrap() > 0.92);
     }
 }

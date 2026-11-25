@@ -8,6 +8,7 @@ use crate::error::{OchreError, OchreResult};
 use crate::matrix::{Matrix, r2_score};
 use crate::primitives::{BinnedMatrix, GradHessBin, subtract_histogram};
 use rayon::prelude::*;
+use std::borrow::Cow;
 
 const N6_MAX_BINS: usize = 256;
 const N6_MIN_ROWS: usize = 64;
@@ -26,19 +27,57 @@ pub enum TreeNode {
     },
 }
 
+/// Contiguous flat node for `DecisionTreeClassifier` inference.
 #[derive(Debug, Clone, Copy)]
-pub struct FlatTreeNode {
+pub struct FlatClfNode {
+    pub feature_or_offset: u32,
+    pub left: u32,
+    pub right: u32,
+    pub value_or_threshold: f64,
+}
+
+/// Contiguous flat node for `DecisionTreeRegressor` inference.
+#[derive(Debug, Clone, Copy)]
+pub struct FlatRegNode {
     pub feature_index: u32,
     pub left: u32,
     pub right: u32,
     pub value_or_threshold: f64,
 }
 
-fn flatten_tree_node(node: &TreeNode, out: &mut Vec<FlatTreeNode>) -> usize {
+#[inline]
+fn validate_row_finite(row: &[f64]) -> OchreResult<()> {
+    let mut ok = true;
+    for &v in row {
+        ok &= v.is_finite();
+    }
+    if !ok {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN or Inf ( >_< )".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn validate_4rows_finite(r0: &[f64], r1: &[f64], r2: &[f64], r3: &[f64]) -> OchreResult<()> {
+    let mut ok = true;
+    for (((&a, &b), &c), &d) in r0.iter().zip(r1.iter()).zip(r2.iter()).zip(r3.iter()) {
+        ok &= a.is_finite() & b.is_finite() & c.is_finite() & d.is_finite();
+    }
+    if !ok {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN or Inf ( >_< )".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn flatten_reg_tree(node: &TreeNode, out: &mut Vec<FlatRegNode>) -> usize {
     let idx = out.len();
     match node {
         TreeNode::Leaf { value, .. } => {
-            out.push(FlatTreeNode {
+            out.push(FlatRegNode {
                 feature_index: 0,
                 left: 0,
                 right: u32::MAX,
@@ -51,14 +90,14 @@ fn flatten_tree_node(node: &TreeNode, out: &mut Vec<FlatTreeNode>) -> usize {
             left,
             right,
         } => {
-            out.push(FlatTreeNode {
+            out.push(FlatRegNode {
                 feature_index: *feature_index as u32,
                 left: 0,
                 right: 0,
                 value_or_threshold: *threshold,
             });
-            let left_idx = flatten_tree_node(left, out);
-            let right_idx = flatten_tree_node(right, out);
+            let left_idx = flatten_reg_tree(left, out);
+            let right_idx = flatten_reg_tree(right, out);
             out[idx].left = left_idx as u32;
             out[idx].right = right_idx as u32;
         }
@@ -67,30 +106,115 @@ fn flatten_tree_node(node: &TreeNode, out: &mut Vec<FlatTreeNode>) -> usize {
 }
 
 #[inline]
-fn predict_flat_tree(nodes: &[FlatTreeNode], row: &[f64]) -> f64 {
-    let mut idx = 0usize;
+fn traverse_flat_reg_from(nodes: &[FlatRegNode], mut idx: usize, row: &[f64]) -> f64 {
     loop {
         let node = nodes[idx];
         if node.right == u32::MAX {
             return node.value_or_threshold;
         }
-        if row[node.feature_index as usize] <= node.value_or_threshold {
-            idx = node.left as usize;
+        idx = if row[node.feature_index as usize] <= node.value_or_threshold {
+            node.left as usize
         } else {
-            idx = node.right as usize;
-        }
+            node.right as usize
+        };
     }
 }
 
-fn flatten_tree_proba(
+#[inline]
+fn predict_4rows(
+    nodes: &[FlatRegNode],
+    r0: &[f64],
+    r1: &[f64],
+    r2: &[f64],
+    r3: &[f64],
+) -> [f64; 4] {
+    let mut i0 = 0usize;
+    let mut i1 = 0usize;
+    let mut i2 = 0usize;
+    let mut i3 = 0usize;
+    loop {
+        let n0 = nodes[i0];
+        let n1 = nodes[i1];
+        let n2 = nodes[i2];
+        let n3 = nodes[i3];
+        if n0.right == u32::MAX
+            || n1.right == u32::MAX
+            || n2.right == u32::MAX
+            || n3.right == u32::MAX
+        {
+            break;
+        }
+        i0 = if r0[n0.feature_index as usize] <= n0.value_or_threshold {
+            n0.left as usize
+        } else {
+            n0.right as usize
+        };
+        i1 = if r1[n1.feature_index as usize] <= n1.value_or_threshold {
+            n1.left as usize
+        } else {
+            n1.right as usize
+        };
+        i2 = if r2[n2.feature_index as usize] <= n2.value_or_threshold {
+            n2.left as usize
+        } else {
+            n2.right as usize
+        };
+        i3 = if r3[n3.feature_index as usize] <= n3.value_or_threshold {
+            n3.left as usize
+        } else {
+            n3.right as usize
+        };
+    }
+    [
+        traverse_flat_reg_from(nodes, i0, r0),
+        traverse_flat_reg_from(nodes, i1, r1),
+        traverse_flat_reg_from(nodes, i2, r2),
+        traverse_flat_reg_from(nodes, i3, r3),
+    ]
+}
+
+fn predict_reg_chunk(
+    nodes: &[FlatRegNode],
+    x_chunk: &[f64],
+    cols: usize,
+    out: &mut [f64],
+) -> OchreResult<()> {
+    let n_rows = out.len();
+    let full_quads = n_rows / 4;
+    for q in 0..full_quads {
+        let base = q * 4 * cols;
+        let r0 = &x_chunk[base..base + cols];
+        let r1 = &x_chunk[base + cols..base + 2 * cols];
+        let r2 = &x_chunk[base + 2 * cols..base + 3 * cols];
+        let r3 = &x_chunk[base + 3 * cols..base + 4 * cols];
+        validate_4rows_finite(r0, r1, r2, r3)?;
+        let preds = predict_4rows(nodes, r0, r1, r2, r3);
+        let o = q * 4;
+        out[o] = preds[0];
+        out[o + 1] = preds[1];
+        out[o + 2] = preds[2];
+        out[o + 3] = preds[3];
+    }
+    for r in (full_quads * 4)..n_rows {
+        let row = &x_chunk[r * cols..(r + 1) * cols];
+        validate_row_finite(row)?;
+        out[r] = traverse_flat_reg_from(nodes, 0, row);
+    }
+    Ok(())
+}
+
+fn flatten_clf_tree(
     node: &TreeNode,
     classes: &[f64],
-    nodes: &mut Vec<FlatTreeNode>,
+    nodes: &mut Vec<FlatClfNode>,
     probs_out: &mut Vec<f64>,
 ) -> usize {
     let idx = nodes.len();
     match node {
-        TreeNode::Leaf { probabilities, .. } => {
+        TreeNode::Leaf {
+            value,
+            probabilities,
+        } => {
             let offset = probs_out.len() as u32;
             let start = probs_out.len();
             probs_out.resize(start + classes.len(), 0.0);
@@ -99,11 +223,11 @@ fn flatten_tree_proba(
                     probs_out[start + pos] = p;
                 }
             }
-            nodes.push(FlatTreeNode {
-                feature_index: offset,
+            nodes.push(FlatClfNode {
+                feature_or_offset: offset,
                 left: 0,
                 right: u32::MAX,
-                value_or_threshold: 0.0,
+                value_or_threshold: *value,
             });
         }
         TreeNode::Internal {
@@ -112,14 +236,14 @@ fn flatten_tree_proba(
             left,
             right,
         } => {
-            nodes.push(FlatTreeNode {
-                feature_index: *feature_index as u32,
+            nodes.push(FlatClfNode {
+                feature_or_offset: *feature_index as u32,
                 left: 0,
                 right: 0,
                 value_or_threshold: *threshold,
             });
-            let left_idx = flatten_tree_proba(left, classes, nodes, probs_out);
-            let right_idx = flatten_tree_proba(right, classes, nodes, probs_out);
+            let left_idx = flatten_clf_tree(left, classes, nodes, probs_out);
+            let right_idx = flatten_clf_tree(right, classes, nodes, probs_out);
             nodes[idx].left = left_idx as u32;
             nodes[idx].right = right_idx as u32;
         }
@@ -128,25 +252,135 @@ fn flatten_tree_proba(
 }
 
 #[inline]
-fn predict_flat_tree_proba<'a>(
-    nodes: &[FlatTreeNode],
-    probs: &'a [f64],
-    n_classes: usize,
-    row: &[f64],
-) -> &'a [f64] {
-    let mut idx = 0usize;
+fn traverse_flat_clf_from(nodes: &[FlatClfNode], mut idx: usize, row: &[f64]) -> FlatClfNode {
     loop {
         let node = nodes[idx];
         if node.right == u32::MAX {
-            let off = node.feature_index as usize;
-            return &probs[off..off + n_classes];
+            return node;
         }
-        if row[node.feature_index as usize] <= node.value_or_threshold {
-            idx = node.left as usize;
+        idx = if row[node.feature_or_offset as usize] <= node.value_or_threshold {
+            node.left as usize
         } else {
-            idx = node.right as usize;
+            node.right as usize
+        };
+    }
+}
+
+#[inline]
+fn predict_proba_4rows(
+    nodes: &[FlatClfNode],
+    r0: &[f64],
+    r1: &[f64],
+    r2: &[f64],
+    r3: &[f64],
+) -> [FlatClfNode; 4] {
+    let mut i0 = 0usize;
+    let mut i1 = 0usize;
+    let mut i2 = 0usize;
+    let mut i3 = 0usize;
+    loop {
+        let n0 = nodes[i0];
+        let n1 = nodes[i1];
+        let n2 = nodes[i2];
+        let n3 = nodes[i3];
+        if n0.right == u32::MAX
+            || n1.right == u32::MAX
+            || n2.right == u32::MAX
+            || n3.right == u32::MAX
+        {
+            break;
+        }
+        i0 = if r0[n0.feature_or_offset as usize] <= n0.value_or_threshold {
+            n0.left as usize
+        } else {
+            n0.right as usize
+        };
+        i1 = if r1[n1.feature_or_offset as usize] <= n1.value_or_threshold {
+            n1.left as usize
+        } else {
+            n1.right as usize
+        };
+        i2 = if r2[n2.feature_or_offset as usize] <= n2.value_or_threshold {
+            n2.left as usize
+        } else {
+            n2.right as usize
+        };
+        i3 = if r3[n3.feature_or_offset as usize] <= n3.value_or_threshold {
+            n3.left as usize
+        } else {
+            n3.right as usize
+        };
+    }
+    [
+        traverse_flat_clf_from(nodes, i0, r0),
+        traverse_flat_clf_from(nodes, i1, r1),
+        traverse_flat_clf_from(nodes, i2, r2),
+        traverse_flat_clf_from(nodes, i3, r3),
+    ]
+}
+
+fn predict_clf_chunk(
+    nodes: &[FlatClfNode],
+    x_chunk: &[f64],
+    cols: usize,
+    out: &mut [f64],
+) -> OchreResult<()> {
+    let n_rows = out.len();
+    let full_quads = n_rows / 4;
+    for q in 0..full_quads {
+        let base = q * 4 * cols;
+        let r0 = &x_chunk[base..base + cols];
+        let r1 = &x_chunk[base + cols..base + 2 * cols];
+        let r2 = &x_chunk[base + 2 * cols..base + 3 * cols];
+        let r3 = &x_chunk[base + 3 * cols..base + 4 * cols];
+        validate_4rows_finite(r0, r1, r2, r3)?;
+        let leaves = predict_proba_4rows(nodes, r0, r1, r2, r3);
+        let o = q * 4;
+        out[o] = leaves[0].value_or_threshold;
+        out[o + 1] = leaves[1].value_or_threshold;
+        out[o + 2] = leaves[2].value_or_threshold;
+        out[o + 3] = leaves[3].value_or_threshold;
+    }
+    for r in (full_quads * 4)..n_rows {
+        let row = &x_chunk[r * cols..(r + 1) * cols];
+        validate_row_finite(row)?;
+        out[r] = traverse_flat_clf_from(nodes, 0, row).value_or_threshold;
+    }
+    Ok(())
+}
+
+fn predict_clf_proba_chunk(
+    nodes: &[FlatClfNode],
+    probs: &[f64],
+    n_classes: usize,
+    x_chunk: &[f64],
+    cols: usize,
+    out: &mut [f64],
+) -> OchreResult<()> {
+    let n_rows = out.len() / n_classes;
+    let full_quads = n_rows / 4;
+    for q in 0..full_quads {
+        let base = q * 4 * cols;
+        let r0 = &x_chunk[base..base + cols];
+        let r1 = &x_chunk[base + cols..base + 2 * cols];
+        let r2 = &x_chunk[base + 2 * cols..base + 3 * cols];
+        let r3 = &x_chunk[base + 3 * cols..base + 4 * cols];
+        validate_4rows_finite(r0, r1, r2, r3)?;
+        let leaves = predict_proba_4rows(nodes, r0, r1, r2, r3);
+        let o = q * 4 * n_classes;
+        for (k, leaf) in leaves.iter().enumerate() {
+            let off = leaf.feature_or_offset as usize;
+            out[o + k * n_classes..o + (k + 1) * n_classes]
+                .copy_from_slice(&probs[off..off + n_classes]);
         }
     }
+    for r in (full_quads * 4)..n_rows {
+        let row = &x_chunk[r * cols..(r + 1) * cols];
+        validate_row_finite(row)?;
+        let off = traverse_flat_clf_from(nodes, 0, row).feature_or_offset as usize;
+        out[r * n_classes..(r + 1) * n_classes].copy_from_slice(&probs[off..off + n_classes]);
+    }
+    Ok(())
 }
 
 fn transpose_to_col_major(x: &Matrix) -> Vec<f64> {
@@ -263,6 +497,8 @@ pub struct DecisionTreeClassifier {
     pub root: Option<TreeNode>,
     pub classes_: Vec<f64>,
     pub n_features_in_: Option<usize>,
+    pub(crate) flat_nodes_: Vec<FlatClfNode>,
+    pub(crate) flat_probs_: Vec<f64>,
 }
 
 impl DecisionTreeClassifier {
@@ -290,7 +526,53 @@ impl DecisionTreeClassifier {
             root: None,
             classes_: Vec::new(),
             n_features_in_: None,
+            flat_nodes_: Vec::new(),
+            flat_probs_: Vec::new(),
         })
+    }
+
+    /// Construct a `DecisionTreeClassifier` from `.dit` deserialized fields and populate flat cache.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_loaded(
+        criterion: String,
+        max_depth: Option<usize>,
+        min_samples_split: usize,
+        min_samples_leaf: usize,
+        device: DeviceType,
+        device_: Option<String>,
+        root: Option<TreeNode>,
+        classes_: Vec<f64>,
+        n_features_in_: Option<usize>,
+    ) -> Self {
+        let mut clf = Self {
+            criterion,
+            max_depth,
+            min_samples_split,
+            min_samples_leaf,
+            device,
+            device_,
+            root,
+            classes_,
+            n_features_in_,
+            flat_nodes_: Vec::new(),
+            flat_probs_: Vec::new(),
+        };
+        clf.rebuild_flat_cache();
+        clf
+    }
+
+    /// Rebuild contiguous in-memory flat nodes and probability table from `self.root`.
+    pub(crate) fn rebuild_flat_cache(&mut self) {
+        self.flat_nodes_.clear();
+        self.flat_probs_.clear();
+        if let Some(ref root) = self.root {
+            flatten_clf_tree(
+                root,
+                &self.classes_,
+                &mut self.flat_nodes_,
+                &mut self.flat_probs_,
+            );
+        }
     }
 
     // Compute impurity (Gini or Entropy) from class frequency counts in O(C)
@@ -773,6 +1055,8 @@ impl DecisionTreeClassifier {
             self.root = Some(root);
         }
 
+        self.rebuild_flat_cache();
+
         Ok(())
     }
 
@@ -792,38 +1076,31 @@ impl DecisionTreeClassifier {
             });
         }
 
-        let cols = x.cols;
-        if x.rows < 64 {
-            let mut preds = Vec::with_capacity(x.rows);
-            for r in 0..x.rows {
-                let offset = r * cols;
-                let row_slice = &x.data[offset..offset + cols];
-                preds.push(root.predict_row(row_slice));
-            }
-            return Ok(preds);
+        if x.rows == 0 {
+            return Ok(Vec::new());
         }
 
-        let mut flat = Vec::with_capacity(64);
-        flatten_tree_node(root, &mut flat);
+        let nodes: Cow<'_, [FlatClfNode]> = if self.flat_nodes_.is_empty() {
+            let mut flat = Vec::with_capacity(64);
+            let mut probs = Vec::with_capacity(32 * self.classes_.len().max(1));
+            flatten_clf_tree(root, &self.classes_, &mut flat, &mut probs);
+            Cow::Owned(flat)
+        } else {
+            Cow::Borrowed(&self.flat_nodes_)
+        };
+
+        let cols = x.cols;
         let mut preds = vec![0.0; x.rows];
 
-        if x.rows >= 4096 {
+        if x.rows >= 2048 {
             preds
-                .par_chunks_mut(1024)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk)| {
-                    let base_r = chunk_idx * 1024;
-                    for (offset, dst) in chunk.iter_mut().enumerate() {
-                        let r = base_r + offset;
-                        let row_slice = &x.data[r * cols..(r + 1) * cols];
-                        *dst = predict_flat_tree(&flat, row_slice);
-                    }
-                });
+                .par_chunks_mut(2048)
+                .zip(x.data.par_chunks(2048 * cols))
+                .try_for_each(|(out_chunk, x_chunk)| {
+                    predict_clf_chunk(&nodes, x_chunk, cols, out_chunk)
+                })?;
         } else {
-            for (r, dst) in preds.iter_mut().enumerate() {
-                let row_slice = &x.data[r * cols..(r + 1) * cols];
-                *dst = predict_flat_tree(&flat, row_slice);
-            }
+            predict_clf_chunk(&nodes, &x.data, cols, &mut preds)?;
         }
         Ok(preds)
     }
@@ -845,40 +1122,36 @@ impl DecisionTreeClassifier {
         }
 
         let n_classes = self.classes_.len();
-        let cols = x.cols;
-        if x.rows < 64 {
-            let mut data = Vec::with_capacity(x.rows * n_classes);
-            for r in 0..x.rows {
-                let offset = r * cols;
-                let row_slice = &x.data[offset..offset + cols];
-                data.extend(root.predict_proba_row(row_slice, &self.classes_));
-            }
-            return Matrix::from_vec(x.rows, n_classes, data);
+        if n_classes == 0 {
+            return Err(OchreError::NotFitted);
+        }
+        if x.rows == 0 {
+            return Matrix::from_vec(0, n_classes, Vec::new());
         }
 
-        let mut flat = Vec::with_capacity(64);
-        let mut probs = Vec::with_capacity(32 * n_classes.max(1));
-        flatten_tree_proba(root, &self.classes_, &mut flat, &mut probs);
+        let (nodes, probs): (Cow<'_, [FlatClfNode]>, Cow<'_, [f64]>) =
+            if self.flat_nodes_.is_empty() {
+                let mut flat = Vec::with_capacity(64);
+                let mut flat_probs = Vec::with_capacity(32 * n_classes);
+                flatten_clf_tree(root, &self.classes_, &mut flat, &mut flat_probs);
+                (Cow::Owned(flat), Cow::Owned(flat_probs))
+            } else {
+                (
+                    Cow::Borrowed(&self.flat_nodes_),
+                    Cow::Borrowed(&self.flat_probs_),
+                )
+            };
 
+        let cols = x.cols;
         let mut data = vec![0.0; x.rows * n_classes];
-        if x.rows >= 4096 {
-            data.par_chunks_mut(1024 * n_classes)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk)| {
-                    let base_r = chunk_idx * 1024;
-                    for (offset, dst) in chunk.chunks_exact_mut(n_classes).enumerate() {
-                        let r = base_r + offset;
-                        let row_slice = &x.data[r * cols..(r + 1) * cols];
-                        dst.copy_from_slice(predict_flat_tree_proba(
-                            &flat, &probs, n_classes, row_slice,
-                        ));
-                    }
-                });
+        if x.rows >= 2048 {
+            data.par_chunks_mut(2048 * n_classes)
+                .zip(x.data.par_chunks(2048 * cols))
+                .try_for_each(|(out_chunk, x_chunk)| {
+                    predict_clf_proba_chunk(&nodes, &probs, n_classes, x_chunk, cols, out_chunk)
+                })?;
         } else {
-            for (r, dst) in data.chunks_exact_mut(n_classes).enumerate() {
-                let row_slice = &x.data[r * cols..(r + 1) * cols];
-                dst.copy_from_slice(predict_flat_tree_proba(&flat, &probs, n_classes, row_slice));
-            }
+            predict_clf_proba_chunk(&nodes, &probs, n_classes, &x.data, cols, &mut data)?;
         }
         Matrix::from_vec(x.rows, n_classes, data)
     }
@@ -912,6 +1185,7 @@ pub struct DecisionTreeRegressor {
     pub device_: Option<String>,
     pub root: Option<TreeNode>,
     pub n_features_in_: Option<usize>,
+    pub(crate) flat_nodes_: Vec<FlatRegNode>,
 }
 
 impl DecisionTreeRegressor {
@@ -938,7 +1212,43 @@ impl DecisionTreeRegressor {
             device_: None,
             root: None,
             n_features_in_: None,
+            flat_nodes_: Vec::new(),
         })
+    }
+
+    /// Construct a `DecisionTreeRegressor` from `.dit` deserialized fields and populate flat cache.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_loaded(
+        criterion: String,
+        max_depth: Option<usize>,
+        min_samples_split: usize,
+        min_samples_leaf: usize,
+        device: DeviceType,
+        device_: Option<String>,
+        root: Option<TreeNode>,
+        n_features_in_: Option<usize>,
+    ) -> Self {
+        let mut reg = Self {
+            criterion,
+            max_depth,
+            min_samples_split,
+            min_samples_leaf,
+            device,
+            device_,
+            root,
+            n_features_in_,
+            flat_nodes_: Vec::new(),
+        };
+        reg.rebuild_flat_cache();
+        reg
+    }
+
+    /// Rebuild contiguous in-memory flat nodes from `self.root`.
+    pub(crate) fn rebuild_flat_cache(&mut self) {
+        self.flat_nodes_.clear();
+        if let Some(ref root) = self.root {
+            flatten_reg_tree(root, &mut self.flat_nodes_);
+        }
     }
 
     // Recursively build regression tree with O(D * N log N) sliding split search and O(1) MSE updates
@@ -1318,6 +1628,8 @@ impl DecisionTreeRegressor {
             self.root = Some(root);
         }
 
+        self.rebuild_flat_cache();
+
         Ok(())
     }
 
@@ -1337,38 +1649,30 @@ impl DecisionTreeRegressor {
             });
         }
 
-        let cols = x.cols;
-        if x.rows < 64 {
-            let mut preds = Vec::with_capacity(x.rows);
-            for r in 0..x.rows {
-                let offset = r * cols;
-                let row_slice = &x.data[offset..offset + cols];
-                preds.push(root.predict_row(row_slice));
-            }
-            return Ok(preds);
+        if x.rows == 0 {
+            return Ok(Vec::new());
         }
 
-        let mut flat = Vec::with_capacity(64);
-        flatten_tree_node(root, &mut flat);
+        let nodes: Cow<'_, [FlatRegNode]> = if self.flat_nodes_.is_empty() {
+            let mut flat = Vec::with_capacity(64);
+            flatten_reg_tree(root, &mut flat);
+            Cow::Owned(flat)
+        } else {
+            Cow::Borrowed(&self.flat_nodes_)
+        };
+
+        let cols = x.cols;
         let mut preds = vec![0.0; x.rows];
 
-        if x.rows >= 4096 {
+        if x.rows >= 2048 {
             preds
-                .par_chunks_mut(1024)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk)| {
-                    let base_r = chunk_idx * 1024;
-                    for (offset, dst) in chunk.iter_mut().enumerate() {
-                        let r = base_r + offset;
-                        let row_slice = &x.data[r * cols..(r + 1) * cols];
-                        *dst = predict_flat_tree(&flat, row_slice);
-                    }
-                });
+                .par_chunks_mut(2048)
+                .zip(x.data.par_chunks(2048 * cols))
+                .try_for_each(|(out_chunk, x_chunk)| {
+                    predict_reg_chunk(&nodes, x_chunk, cols, out_chunk)
+                })?;
         } else {
-            for (r, dst) in preds.iter_mut().enumerate() {
-                let row_slice = &x.data[r * cols..(r + 1) * cols];
-                *dst = predict_flat_tree(&flat, row_slice);
-            }
+            predict_reg_chunk(&nodes, &x.data, cols, &mut preds)?;
         }
         Ok(preds)
     }
@@ -1501,10 +1805,58 @@ mod tests {
 
         let mut reg = DecisionTreeRegressor::new(None, Some(4), None, None, None).unwrap();
         reg.fit(&x, &y_reg).unwrap();
+        assert!(!reg.flat_nodes_.is_empty());
         let rpreds = reg.predict(&x).unwrap();
         assert_eq!(rpreds.len(), n);
         for (p, &t) in rpreds.iter().zip(y_reg.iter()) {
             assert!((p - t).abs() < 1e-6);
         }
+
+        // Verify NaN/Inf fused validation in both parallel (>= 2048) and serial paths
+        let mut bad_x = x.clone();
+        bad_x.data[(n - 3) * 2 + 1] = f64::NAN;
+        assert!(clf.predict(&bad_x).is_err());
+        assert!(clf.predict_proba(&bad_x).is_err());
+        assert!(clf.score(&bad_x, &y_cls).is_err());
+        assert!(reg.predict(&bad_x).is_err());
+        assert!(reg.score(&bad_x, &y_reg).is_err());
+
+        let small_bad = Matrix::from_vec(
+            5,
+            2,
+            vec![0.1, 0.2, 0.3, f64::INFINITY, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+        )
+        .unwrap();
+        assert!(clf.predict(&small_bad).is_err());
+        assert!(clf.predict_proba(&small_bad).is_err());
+        assert!(reg.predict(&small_bad).is_err());
+
+        // Verify from_loaded populates flat cache without changing serialization
+        let clf_loaded = DecisionTreeClassifier::from_loaded(
+            clf.criterion.clone(),
+            clf.max_depth,
+            clf.min_samples_split,
+            clf.min_samples_leaf,
+            clf.device.clone(),
+            clf.device_.clone(),
+            clf.root.clone(),
+            clf.classes_.clone(),
+            clf.n_features_in_,
+        );
+        assert!(!clf_loaded.flat_nodes_.is_empty());
+        assert_eq!(clf_loaded.predict(&x).unwrap(), y_cls);
+
+        let reg_loaded = DecisionTreeRegressor::from_loaded(
+            reg.criterion.clone(),
+            reg.max_depth,
+            reg.min_samples_split,
+            reg.min_samples_leaf,
+            reg.device.clone(),
+            reg.device_.clone(),
+            reg.root.clone(),
+            reg.n_features_in_,
+        );
+        assert!(!reg_loaded.flat_nodes_.is_empty());
+        assert_eq!(reg_loaded.predict(&x).unwrap(), rpreds);
     }
 }

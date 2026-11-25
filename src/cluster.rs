@@ -19,14 +19,17 @@ use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const TAG_KMEANS: u8 = 47;
 pub const TAG_MINI_BATCH_KMEANS: u8 = 48;
 
 const MAX_DIST_ELEMENTS: usize = 4_000_000;
 const FUSED_CPU_OPS_THRESHOLD: usize = 8_000_000;
+const FUSED_CPU_DIST_THRESHOLD: usize = 8_000_000;
 const PAR_ROW_THRESHOLD: usize = 4_096;
 const ASSIGN_PAR_ROW_THRESHOLD: usize = 1_024;
+const PREDICT_CHUNK_ROWS: usize = 4_096;
 
 /// Deterministic SplitMix64 + Xorshift64 PRNG (zero external crate dependencies).
 struct DeterministicRng {
@@ -69,6 +72,23 @@ impl DeterministicRng {
     }
 }
 
+#[inline]
+fn slice_all_finite(data: &[f64]) -> bool {
+    let mut acc = [0.0f64; 4];
+    let (chunks, rem) = data.as_chunks::<4>();
+    for &c in chunks {
+        acc[0] += c[0] * 0.0;
+        acc[1] += c[1] * 0.0;
+        acc[2] += c[2] * 0.0;
+        acc[3] += c[3] * 0.0;
+    }
+    let mut s = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    for &v in rem {
+        s += v * 0.0;
+    }
+    s == 0.0
+}
+
 fn validate_x(x: &Matrix) -> OchreResult<()> {
     if x.rows == 0 || x.cols == 0 {
         return Err(OchreError::EmptyData);
@@ -76,9 +96,9 @@ fn validate_x(x: &Matrix) -> OchreResult<()> {
     let has_non_finite = if x.data.len() >= 65_536 {
         x.data
             .par_chunks(16_384)
-            .any(|chunk| chunk.iter().any(|v| !v.is_finite()))
+            .any(|chunk| !slice_all_finite(chunk))
     } else {
-        x.data.iter().any(|v| !v.is_finite())
+        !slice_all_finite(&x.data)
     };
     if has_non_finite {
         return Err(OchreError::InvalidParameter(
@@ -160,6 +180,131 @@ fn validate_common_params(
     Ok(())
 }
 
+struct VarAcc {
+    w_sum: f64,
+    mean: Vec<f64>,
+    m2: Vec<f64>,
+    tmp_mean: Vec<f64>,
+    tmp_m2: Vec<f64>,
+}
+
+impl VarAcc {
+    fn new(p: usize) -> Self {
+        Self {
+            w_sum: 0.0,
+            mean: vec![0.0f64; p],
+            m2: vec![0.0f64; p],
+            tmp_mean: vec![0.0f64; p],
+            tmp_m2: vec![0.0f64; p],
+        }
+    }
+
+    /// Accumulate an L2-resident chunk into `self` via single-DRAM-pass Chan variance merge.
+    fn add_chunk(&mut self, x_chunk: &[f64], w_chunk: Option<&[f64]>, p: usize) {
+        let rows = x_chunk.len() / p;
+        if rows == 0 {
+            return;
+        }
+        self.tmp_mean.fill(0.0);
+        self.tmp_m2.fill(0.0);
+
+        let wb = match w_chunk {
+            Some(wc) => {
+                let mut ws = 0.0;
+                for (i, &w) in wc.iter().enumerate().take(rows) {
+                    ws += w;
+                    let row = &x_chunk[i * p..(i + 1) * p];
+                    for (m, &xj) in self.tmp_mean.iter_mut().zip(row.iter()) {
+                        *m += w * xj;
+                    }
+                }
+                ws
+            }
+            None => {
+                for i in 0..rows {
+                    let row = &x_chunk[i * p..(i + 1) * p];
+                    for (m, &xj) in self.tmp_mean.iter_mut().zip(row.iter()) {
+                        *m += xj;
+                    }
+                }
+                rows as f64
+            }
+        };
+        if wb <= 0.0 {
+            return;
+        }
+        let inv_wb = 1.0 / wb;
+        for m in &mut self.tmp_mean {
+            *m *= inv_wb;
+        }
+        match w_chunk {
+            Some(wc) => {
+                for (i, &w) in wc.iter().enumerate().take(rows) {
+                    let row = &x_chunk[i * p..(i + 1) * p];
+                    for ((m2, &xj), &mj) in self
+                        .tmp_m2
+                        .iter_mut()
+                        .zip(row.iter())
+                        .zip(self.tmp_mean.iter())
+                    {
+                        let d = xj - mj;
+                        *m2 += w * d * d;
+                    }
+                }
+            }
+            None => {
+                for i in 0..rows {
+                    let row = &x_chunk[i * p..(i + 1) * p];
+                    for ((m2, &xj), &mj) in self
+                        .tmp_m2
+                        .iter_mut()
+                        .zip(row.iter())
+                        .zip(self.tmp_mean.iter())
+                    {
+                        let d = xj - mj;
+                        *m2 += d * d;
+                    }
+                }
+            }
+        }
+
+        if self.w_sum <= 0.0 {
+            self.w_sum = wb;
+            self.mean.copy_from_slice(&self.tmp_mean);
+            self.m2.copy_from_slice(&self.tmp_m2);
+            return;
+        }
+        let w_ab = self.w_sum + wb;
+        let w_ratio = wb / w_ab;
+        let w_prod = (self.w_sum * wb) / w_ab;
+        for j in 0..p {
+            let delta = self.tmp_mean[j] - self.mean[j];
+            self.mean[j] += delta * w_ratio;
+            self.m2[j] += self.tmp_m2[j] + delta * delta * w_prod;
+        }
+        self.w_sum = w_ab;
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        if other.w_sum <= 0.0 {
+            return self;
+        }
+        if self.w_sum <= 0.0 {
+            return other;
+        }
+        let w_ab = self.w_sum + other.w_sum;
+        let w_ratio = other.w_sum / w_ab;
+        let w_prod = (self.w_sum * other.w_sum) / w_ab;
+        for j in 0..self.mean.len() {
+            let delta = other.mean[j] - self.mean[j];
+            self.mean[j] += delta * w_ratio;
+            self.m2[j] += other.m2[j] + delta * delta * w_prod;
+        }
+        self.w_sum = w_ab;
+        self
+    }
+}
+
 fn compute_mean_variance(x: &Matrix, sample_weight: Option<&[f64]>) -> f64 {
     let n = x.rows;
     let p = x.cols;
@@ -167,7 +312,7 @@ fn compute_mean_variance(x: &Matrix, sample_weight: Option<&[f64]>) -> f64 {
         return 0.0;
     }
 
-    let (mut means, w_sum) = if n >= PAR_ROW_THRESHOLD {
+    let acc = if n >= PAR_ROW_THRESHOLD {
         const CHUNK_ROWS: usize = 2048;
         match sample_weight {
             Some(sw) => x
@@ -175,156 +320,36 @@ fn compute_mean_variance(x: &Matrix, sample_weight: Option<&[f64]>) -> f64 {
                 .par_chunks(CHUNK_ROWS * p)
                 .zip(sw.par_chunks(CHUNK_ROWS))
                 .fold(
-                    || (vec![0.0f64; p], 0.0f64),
-                    |(mut acc_m, mut acc_w), (x_chunk, w_chunk)| {
-                        for (i, &w) in w_chunk.iter().enumerate() {
-                            acc_w += w;
-                            let row = &x_chunk[i * p..(i + 1) * p];
-                            for j in 0..p {
-                                acc_m[j] += w * row[j];
-                            }
-                        }
-                        (acc_m, acc_w)
+                    || VarAcc::new(p),
+                    |mut acc, (x_chunk, w_chunk)| {
+                        acc.add_chunk(x_chunk, Some(w_chunk), p);
+                        acc
                     },
                 )
-                .reduce(
-                    || (vec![0.0f64; p], 0.0f64),
-                    |(mut a_m, a_w), (b_m, b_w)| {
-                        for j in 0..p {
-                            a_m[j] += b_m[j];
-                        }
-                        (a_m, a_w + b_w)
-                    },
-                ),
-            None => {
-                let sum_vec = x
-                    .data
-                    .par_chunks(CHUNK_ROWS * p)
-                    .fold(
-                        || vec![0.0f64; p],
-                        |mut acc_m, x_chunk| {
-                            let rows = x_chunk.len() / p;
-                            for i in 0..rows {
-                                let row = &x_chunk[i * p..(i + 1) * p];
-                                for j in 0..p {
-                                    acc_m[j] += row[j];
-                                }
-                            }
-                            acc_m
-                        },
-                    )
-                    .reduce(
-                        || vec![0.0f64; p],
-                        |mut a_m, b_m| {
-                            for j in 0..p {
-                                a_m[j] += b_m[j];
-                            }
-                            a_m
-                        },
-                    );
-                (sum_vec, n as f64)
-            }
-        }
-    } else {
-        let mut means = vec![0.0; p];
-        let mut w_sum = 0.0;
-        match sample_weight {
-            Some(sw) => {
-                for (i, &w) in sw.iter().enumerate().take(n) {
-                    w_sum += w;
-                    let row = &x.data[i * p..(i + 1) * p];
-                    for j in 0..p {
-                        means[j] += w * row[j];
-                    }
-                }
-            }
-            None => {
-                w_sum = n as f64;
-                for i in 0..n {
-                    let row = &x.data[i * p..(i + 1) * p];
-                    for j in 0..p {
-                        means[j] += row[j];
-                    }
-                }
-            }
-        }
-        (means, w_sum)
-    };
-
-    if w_sum <= 0.0 {
-        return 0.0;
-    }
-    let inv_w = 1.0 / w_sum;
-    for m in &mut means {
-        *m *= inv_w;
-    }
-
-    let var_sum: f64 = if n >= PAR_ROW_THRESHOLD {
-        const CHUNK_ROWS: usize = 2048;
-        match sample_weight {
-            Some(sw) => x
-                .data
-                .par_chunks(CHUNK_ROWS * p)
-                .zip(sw.par_chunks(CHUNK_ROWS))
-                .map(|(x_chunk, w_chunk)| {
-                    let mut local = 0.0;
-                    for (i, &w) in w_chunk.iter().enumerate() {
-                        let row = &x_chunk[i * p..(i + 1) * p];
-                        let mut s = 0.0;
-                        for j in 0..p {
-                            let d = row[j] - means[j];
-                            s += d * d;
-                        }
-                        local += w * s;
-                    }
-                    local
-                })
-                .sum(),
+                .reduce(|| VarAcc::new(p), VarAcc::merge),
             None => x
                 .data
                 .par_chunks(CHUNK_ROWS * p)
-                .map(|x_chunk| {
-                    let rows = x_chunk.len() / p;
-                    let mut local = 0.0;
-                    for i in 0..rows {
-                        let row = &x_chunk[i * p..(i + 1) * p];
-                        for j in 0..p {
-                            let d = row[j] - means[j];
-                            local += d * d;
-                        }
-                    }
-                    local
-                })
-                .sum(),
+                .fold(
+                    || VarAcc::new(p),
+                    |mut acc, x_chunk| {
+                        acc.add_chunk(x_chunk, None, p);
+                        acc
+                    },
+                )
+                .reduce(|| VarAcc::new(p), VarAcc::merge),
         }
     } else {
-        let mut var_sum = 0.0;
-        match sample_weight {
-            Some(sw) => {
-                for (i, &w) in sw.iter().enumerate().take(n) {
-                    let row = &x.data[i * p..(i + 1) * p];
-                    let mut s = 0.0;
-                    for j in 0..p {
-                        let d = row[j] - means[j];
-                        s += d * d;
-                    }
-                    var_sum += w * s;
-                }
-            }
-            None => {
-                for i in 0..n {
-                    let row = &x.data[i * p..(i + 1) * p];
-                    for j in 0..p {
-                        let d = row[j] - means[j];
-                        var_sum += d * d;
-                    }
-                }
-            }
-        }
-        var_sum
+        let mut acc = VarAcc::new(p);
+        acc.add_chunk(&x.data, sample_weight, p);
+        acc
     };
 
-    var_sum / (w_sum * p as f64)
+    if acc.w_sum <= 0.0 {
+        return 0.0;
+    }
+    let var_sum: f64 = acc.m2.iter().sum();
+    var_sum / (acc.w_sum * p as f64)
 }
 
 #[inline(always)]
@@ -420,6 +445,13 @@ fn should_use_fused_cpu(backend: &Backend<'_>, n: usize, k: usize, p: usize) -> 
         || n.saturating_mul(k) < MAX_DIST_ELEMENTS
 }
 
+#[inline(always)]
+fn should_use_cpu_predict(backend: &Backend<'_>, n: usize, k: usize, p: usize) -> bool {
+    matches!(backend, Backend::Cpu)
+        || n.saturating_mul(k) < FUSED_CPU_DIST_THRESHOLD
+        || should_use_fused_cpu(backend, n, k, p)
+}
+
 /// Zero-allocation fused nearest-center kernel filling pre-allocated label and squared-distance buffers.
 fn cpu_assign_labels_fused_into(
     x: &Matrix,
@@ -465,11 +497,316 @@ fn cpu_assign_labels_fused(x: &Matrix, centers: &Matrix) -> (Vec<usize>, Vec<f64
     (labels, sq_dists)
 }
 
-/// 4-row-unrolled Euclidean argmin kernel minimizing `0.5 * ||c_j||^2 - dot(x_i, c_j)`.
-/// Processes 4 sample rows against 2 centers at a time so center vectors stay in registers/L1.
+/// Pre-packed centers for register-friendly SIMD distance-score evaluation (`0.5 * ||c||^2 - x.c`).
+enum PackedCenters {
+    K4 {
+        c_t: Vec<[f64; 4]>,
+        hn: [f64; 4],
+        k: usize,
+        p: usize,
+    },
+    K8 {
+        c_t: Vec<[f64; 8]>,
+        hn: [f64; 8],
+        k: usize,
+        p: usize,
+    },
+    General {
+        half_norms: Vec<f64>,
+        k: usize,
+        p: usize,
+    },
+}
+
+impl PackedCenters {
+    fn new(centers_data: &[f64], k: usize, p: usize) -> Self {
+        let mut half_norms = Vec::with_capacity(k);
+        for c in 0..k {
+            let cr = &centers_data[c * p..(c + 1) * p];
+            let mut norm_sq = 0.0;
+            for &v in cr {
+                norm_sq += v * v;
+            }
+            half_norms.push(0.5 * norm_sq);
+        }
+
+        if k <= 4 && p <= 512 {
+            let mut c_t = vec![[0.0f64; 4]; p];
+            let mut hn = [f64::INFINITY; 4];
+            for c in 0..k {
+                hn[c] = half_norms[c];
+                let cr = &centers_data[c * p..(c + 1) * p];
+                for j in 0..p {
+                    c_t[j][c] = cr[j];
+                }
+            }
+            Self::K4 { c_t, hn, k, p }
+        } else if k <= 8 && p <= 512 {
+            let mut c_t = vec![[0.0f64; 8]; p];
+            let mut hn = [f64::INFINITY; 8];
+            for c in 0..k {
+                hn[c] = half_norms[c];
+                let cr = &centers_data[c * p..(c + 1) * p];
+                for j in 0..p {
+                    c_t[j][c] = cr[j];
+                }
+            }
+            Self::K8 { c_t, hn, k, p }
+        } else {
+            Self::General { half_norms, k, p }
+        }
+    }
+}
+
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn assign_4rows(
+fn assign_4rows_k4<const COMPUTE_NORM: bool>(
+    r0: &[f64],
+    r1: &[f64],
+    r2: &[f64],
+    r3: &[f64],
+    c_t: &[[f64; 4]],
+    hn: &[f64; 4],
+    k: usize,
+    p: usize,
+) -> ([usize; 4], [f64; 4]) {
+    let r0 = &r0[..p];
+    let r1 = &r1[..p];
+    let r2 = &r2[..p];
+    let r3 = &r3[..p];
+    let c_t = &c_t[..p];
+
+    let mut d0 = [0.0f64; 4];
+    let mut d1 = [0.0f64; 4];
+    let mut d2 = [0.0f64; 4];
+    let mut d3 = [0.0f64; 4];
+    let mut nx = [0.0f64; 4];
+
+    for j in 0..p {
+        let ct = c_t[j];
+        let x0 = r0[j];
+        let x1 = r1[j];
+        let x2 = r2[j];
+        let x3 = r3[j];
+        if COMPUTE_NORM {
+            nx[0] += x0 * x0;
+            nx[1] += x1 * x1;
+            nx[2] += x2 * x2;
+            nx[3] += x3 * x3;
+        }
+        for c in 0..4 {
+            d0[c] += x0 * ct[c];
+            d1[c] += x1 * ct[c];
+            d2[c] += x2 * ct[c];
+            d3[c] += x3 * ct[c];
+        }
+    }
+
+    let mut best_k = [0usize; 4];
+    let mut best_s = [hn[0] - d0[0], hn[0] - d1[0], hn[0] - d2[0], hn[0] - d3[0]];
+    for c in 1..k {
+        let hnc = hn[c];
+        let s0 = hnc - d0[c];
+        let s1 = hnc - d1[c];
+        let s2 = hnc - d2[c];
+        let s3 = hnc - d3[c];
+        if s0 < best_s[0] {
+            best_s[0] = s0;
+            best_k[0] = c;
+        }
+        if s1 < best_s[1] {
+            best_s[1] = s1;
+            best_k[1] = c;
+        }
+        if s2 < best_s[2] {
+            best_s[2] = s2;
+            best_k[2] = c;
+        }
+        if s3 < best_s[3] {
+            best_s[3] = s3;
+            best_k[3] = c;
+        }
+    }
+
+    let sq = if COMPUTE_NORM {
+        [
+            (nx[0] + 2.0 * best_s[0]).max(0.0),
+            (nx[1] + 2.0 * best_s[1]).max(0.0),
+            (nx[2] + 2.0 * best_s[2]).max(0.0),
+            (nx[3] + 2.0 * best_s[3]).max(0.0),
+        ]
+    } else {
+        [0.0; 4]
+    };
+    (best_k, sq)
+}
+
+#[inline(always)]
+fn assign_1row_k4<const COMPUTE_NORM: bool>(
+    row: &[f64],
+    c_t: &[[f64; 4]],
+    hn: &[f64; 4],
+    k: usize,
+    p: usize,
+) -> (usize, f64) {
+    let row = &row[..p];
+    let c_t = &c_t[..p];
+    let mut d = [0.0f64; 4];
+    let mut nx = 0.0f64;
+    for j in 0..p {
+        let xj = row[j];
+        let ct = c_t[j];
+        if COMPUTE_NORM {
+            nx += xj * xj;
+        }
+        for c in 0..4 {
+            d[c] += xj * ct[c];
+        }
+    }
+    let mut best_k = 0usize;
+    let mut best_s = hn[0] - d[0];
+    for c in 1..k {
+        let s = hn[c] - d[c];
+        if s < best_s {
+            best_s = s;
+            best_k = c;
+        }
+    }
+    let sq = if COMPUTE_NORM {
+        (nx + 2.0 * best_s).max(0.0)
+    } else {
+        0.0
+    };
+    (best_k, sq)
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn assign_4rows_k8<const COMPUTE_NORM: bool>(
+    r0: &[f64],
+    r1: &[f64],
+    r2: &[f64],
+    r3: &[f64],
+    c_t: &[[f64; 8]],
+    hn: &[f64; 8],
+    k: usize,
+    p: usize,
+) -> ([usize; 4], [f64; 4]) {
+    let r0 = &r0[..p];
+    let r1 = &r1[..p];
+    let r2 = &r2[..p];
+    let r3 = &r3[..p];
+    let c_t = &c_t[..p];
+
+    let mut d0 = [0.0f64; 8];
+    let mut d1 = [0.0f64; 8];
+    let mut d2 = [0.0f64; 8];
+    let mut d3 = [0.0f64; 8];
+    let mut nx = [0.0f64; 4];
+
+    for j in 0..p {
+        let ct = &c_t[j];
+        let x0 = r0[j];
+        let x1 = r1[j];
+        let x2 = r2[j];
+        let x3 = r3[j];
+        if COMPUTE_NORM {
+            nx[0] += x0 * x0;
+            nx[1] += x1 * x1;
+            nx[2] += x2 * x2;
+            nx[3] += x3 * x3;
+        }
+        for c in 0..8 {
+            d0[c] += x0 * ct[c];
+            d1[c] += x1 * ct[c];
+            d2[c] += x2 * ct[c];
+            d3[c] += x3 * ct[c];
+        }
+    }
+
+    let mut best_k = [0usize; 4];
+    let mut best_s = [hn[0] - d0[0], hn[0] - d1[0], hn[0] - d2[0], hn[0] - d3[0]];
+    for c in 1..k {
+        let hnc = hn[c];
+        let s0 = hnc - d0[c];
+        let s1 = hnc - d1[c];
+        let s2 = hnc - d2[c];
+        let s3 = hnc - d3[c];
+        if s0 < best_s[0] {
+            best_s[0] = s0;
+            best_k[0] = c;
+        }
+        if s1 < best_s[1] {
+            best_s[1] = s1;
+            best_k[1] = c;
+        }
+        if s2 < best_s[2] {
+            best_s[2] = s2;
+            best_k[2] = c;
+        }
+        if s3 < best_s[3] {
+            best_s[3] = s3;
+            best_k[3] = c;
+        }
+    }
+
+    let sq = if COMPUTE_NORM {
+        [
+            (nx[0] + 2.0 * best_s[0]).max(0.0),
+            (nx[1] + 2.0 * best_s[1]).max(0.0),
+            (nx[2] + 2.0 * best_s[2]).max(0.0),
+            (nx[3] + 2.0 * best_s[3]).max(0.0),
+        ]
+    } else {
+        [0.0; 4]
+    };
+    (best_k, sq)
+}
+
+#[inline(always)]
+fn assign_1row_k8<const COMPUTE_NORM: bool>(
+    row: &[f64],
+    c_t: &[[f64; 8]],
+    hn: &[f64; 8],
+    k: usize,
+    p: usize,
+) -> (usize, f64) {
+    let row = &row[..p];
+    let c_t = &c_t[..p];
+    let mut d = [0.0f64; 8];
+    let mut nx = 0.0f64;
+    for j in 0..p {
+        let xj = row[j];
+        let ct = &c_t[j];
+        if COMPUTE_NORM {
+            nx += xj * xj;
+        }
+        for c in 0..8 {
+            d[c] += xj * ct[c];
+        }
+    }
+    let mut best_k = 0usize;
+    let mut best_s = hn[0] - d[0];
+    for c in 1..k {
+        let s = hn[c] - d[c];
+        if s < best_s {
+            best_s = s;
+            best_k = c;
+        }
+    }
+    let sq = if COMPUTE_NORM {
+        (nx + 2.0 * best_s).max(0.0)
+    } else {
+        0.0
+    };
+    (best_k, sq)
+}
+
+/// 4-row-unrolled Euclidean argmin kernel minimizing `0.5 * ||c_j||^2 - dot(x_i, c_j)`.
+/// Processes 4 sample rows against 2 centers at a time with 4-wide AVX2-friendly inner loops.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn assign_4rows_general<const COMPUTE_NORM: bool>(
     r0: &[f64],
     r1: &[f64],
     r2: &[f64],
@@ -478,7 +815,7 @@ fn assign_4rows(
     half_norms: &[f64],
     k: usize,
     p: usize,
-) -> [usize; 4] {
+) -> ([usize; 4], [f64; 4]) {
     let r0 = &r0[..p];
     let r1 = &r1[..p];
     let r2 = &r2[..p];
@@ -486,137 +823,143 @@ fn assign_4rows(
     let mut best_k = [0usize; 4];
     let mut best_score = [f64::INFINITY; 4];
 
+    let mut nx = [0.0f64; 4];
+    if COMPUTE_NORM {
+        let mut nx0 = [0.0f64; 4];
+        let mut nx1 = [0.0f64; 4];
+        let mut nx2 = [0.0f64; 4];
+        let mut nx3 = [0.0f64; 4];
+        let (r0c, r0r) = r0.as_chunks::<4>();
+        let (r1c, r1r) = r1.as_chunks::<4>();
+        let (r2c, r2r) = r2.as_chunks::<4>();
+        let (r3c, r3r) = r3.as_chunks::<4>();
+        for (((&v0, &v1), &v2), &v3) in r0c.iter().zip(r1c.iter()).zip(r2c.iter()).zip(r3c.iter()) {
+            for l in 0..4 {
+                nx0[l] += v0[l] * v0[l];
+                nx1[l] += v1[l] * v1[l];
+                nx2[l] += v2[l] * v2[l];
+                nx3[l] += v3[l] * v3[l];
+            }
+        }
+        nx[0] = (nx0[0] + nx0[1]) + (nx0[2] + nx0[3]);
+        nx[1] = (nx1[0] + nx1[1]) + (nx1[2] + nx1[3]);
+        nx[2] = (nx2[0] + nx2[1]) + (nx2[2] + nx2[3]);
+        nx[3] = (nx3[0] + nx3[1]) + (nx3[2] + nx3[3]);
+        for j in 0..r0r.len() {
+            nx[0] += r0r[j] * r0r[j];
+            nx[1] += r1r[j] * r1r[j];
+            nx[2] += r2r[j] * r2r[j];
+            nx[3] += r3r[j] * r3r[j];
+        }
+    }
+
     let mut c = 0usize;
     while c + 2 <= k {
         let c0 = &centers_data[c * p..(c + 1) * p];
         let c1 = &centers_data[(c + 1) * p..(c + 2) * p];
 
-        let mut d00_a = 0.0f64;
-        let mut d00_b = 0.0f64;
-        let mut d10_a = 0.0f64;
-        let mut d10_b = 0.0f64;
-        let mut d20_a = 0.0f64;
-        let mut d20_b = 0.0f64;
-        let mut d30_a = 0.0f64;
-        let mut d30_b = 0.0f64;
+        let mut d00 = [0.0f64; 4];
+        let mut d10 = [0.0f64; 4];
+        let mut d20 = [0.0f64; 4];
+        let mut d30 = [0.0f64; 4];
+        let mut d01 = [0.0f64; 4];
+        let mut d11 = [0.0f64; 4];
+        let mut d21 = [0.0f64; 4];
+        let mut d31 = [0.0f64; 4];
 
-        let mut d01_a = 0.0f64;
-        let mut d01_b = 0.0f64;
-        let mut d11_a = 0.0f64;
-        let mut d11_b = 0.0f64;
-        let mut d21_a = 0.0f64;
-        let mut d21_b = 0.0f64;
-        let mut d31_a = 0.0f64;
-        let mut d31_b = 0.0f64;
+        let (c0c, c0r) = c0.as_chunks::<4>();
+        let (c1c, c1r) = c1.as_chunks::<4>();
+        let (r0c, r0r) = r0.as_chunks::<4>();
+        let (r1c, r1r) = r1.as_chunks::<4>();
+        let (r2c, r2r) = r2.as_chunks::<4>();
+        let (r3c, r3r) = r3.as_chunks::<4>();
 
-        let mut j = 0usize;
-        while j + 2 <= p {
-            let c0_0 = c0[j];
-            let c0_1 = c0[j + 1];
-            let c1_0 = c1[j];
-            let c1_1 = c1[j + 1];
-
-            let x0_0 = r0[j];
-            let x0_1 = r0[j + 1];
-            d00_a += x0_0 * c0_0;
-            d00_b += x0_1 * c0_1;
-            d01_a += x0_0 * c1_0;
-            d01_b += x0_1 * c1_1;
-
-            let x1_0 = r1[j];
-            let x1_1 = r1[j + 1];
-            d10_a += x1_0 * c0_0;
-            d10_b += x1_1 * c0_1;
-            d11_a += x1_0 * c1_0;
-            d11_b += x1_1 * c1_1;
-
-            let x2_0 = r2[j];
-            let x2_1 = r2[j + 1];
-            d20_a += x2_0 * c0_0;
-            d20_b += x2_1 * c0_1;
-            d21_a += x2_0 * c1_0;
-            d21_b += x2_1 * c1_1;
-
-            let x3_0 = r3[j];
-            let x3_1 = r3[j + 1];
-            d30_a += x3_0 * c0_0;
-            d30_b += x3_1 * c0_1;
-            d31_a += x3_0 * c1_0;
-            d31_b += x3_1 * c1_1;
-
-            j += 2;
+        for (((((&vc0, &vc1), &vx0), &vx1), &vx2), &vx3) in c0c
+            .iter()
+            .zip(c1c.iter())
+            .zip(r0c.iter())
+            .zip(r1c.iter())
+            .zip(r2c.iter())
+            .zip(r3c.iter())
+        {
+            for l in 0..4 {
+                d00[l] += vx0[l] * vc0[l];
+                d01[l] += vx0[l] * vc1[l];
+                d10[l] += vx1[l] * vc0[l];
+                d11[l] += vx1[l] * vc1[l];
+                d20[l] += vx2[l] * vc0[l];
+                d21[l] += vx2[l] * vc1[l];
+                d30[l] += vx3[l] * vc0[l];
+                d31[l] += vx3[l] * vc1[l];
+            }
         }
 
-        let mut d00 = d00_a + d00_b;
-        let mut d10 = d10_a + d10_b;
-        let mut d20 = d20_a + d20_b;
-        let mut d30 = d30_a + d30_b;
-        let mut d01 = d01_a + d01_b;
-        let mut d11 = d11_a + d11_b;
-        let mut d21 = d21_a + d21_b;
-        let mut d31 = d31_a + d31_b;
+        let mut s00 = (d00[0] + d00[1]) + (d00[2] + d00[3]);
+        let mut s10 = (d10[0] + d10[1]) + (d10[2] + d10[3]);
+        let mut s20 = (d20[0] + d20[1]) + (d20[2] + d20[3]);
+        let mut s30 = (d30[0] + d30[1]) + (d30[2] + d30[3]);
+        let mut s01 = (d01[0] + d01[1]) + (d01[2] + d01[3]);
+        let mut s11 = (d11[0] + d11[1]) + (d11[2] + d11[3]);
+        let mut s21 = (d21[0] + d21[1]) + (d21[2] + d21[3]);
+        let mut s31 = (d31[0] + d31[1]) + (d31[2] + d31[3]);
 
-        if j < p {
-            let c0_j = c0[j];
-            let c1_j = c1[j];
-            let x0_j = r0[j];
-            let x1_j = r1[j];
-            let x2_j = r2[j];
-            let x3_j = r3[j];
-            d00 += x0_j * c0_j;
-            d10 += x1_j * c0_j;
-            d20 += x2_j * c0_j;
-            d30 += x3_j * c0_j;
-            d01 += x0_j * c1_j;
-            d11 += x1_j * c1_j;
-            d21 += x2_j * c1_j;
-            d31 += x3_j * c1_j;
+        for j in 0..c0r.len() {
+            let vc0 = c0r[j];
+            let vc1 = c1r[j];
+            s00 += r0r[j] * vc0;
+            s01 += r0r[j] * vc1;
+            s10 += r1r[j] * vc0;
+            s11 += r1r[j] * vc1;
+            s20 += r2r[j] * vc0;
+            s21 += r2r[j] * vc1;
+            s30 += r3r[j] * vc0;
+            s31 += r3r[j] * vc1;
         }
 
         let hn0 = half_norms[c];
         let hn1 = half_norms[c + 1];
 
-        let s00 = hn0 - d00;
-        let s01 = hn1 - d01;
-        if s00 < best_score[0] {
-            best_score[0] = s00;
+        let sc00 = hn0 - s00;
+        let sc01 = hn1 - s01;
+        if sc00 < best_score[0] {
+            best_score[0] = sc00;
             best_k[0] = c;
         }
-        if s01 < best_score[0] {
-            best_score[0] = s01;
+        if sc01 < best_score[0] {
+            best_score[0] = sc01;
             best_k[0] = c + 1;
         }
 
-        let s10 = hn0 - d10;
-        let s11 = hn1 - d11;
-        if s10 < best_score[1] {
-            best_score[1] = s10;
+        let sc10 = hn0 - s10;
+        let sc11 = hn1 - s11;
+        if sc10 < best_score[1] {
+            best_score[1] = sc10;
             best_k[1] = c;
         }
-        if s11 < best_score[1] {
-            best_score[1] = s11;
+        if sc11 < best_score[1] {
+            best_score[1] = sc11;
             best_k[1] = c + 1;
         }
 
-        let s20 = hn0 - d20;
-        let s21 = hn1 - d21;
-        if s20 < best_score[2] {
-            best_score[2] = s20;
+        let sc20 = hn0 - s20;
+        let sc21 = hn1 - s21;
+        if sc20 < best_score[2] {
+            best_score[2] = sc20;
             best_k[2] = c;
         }
-        if s21 < best_score[2] {
-            best_score[2] = s21;
+        if sc21 < best_score[2] {
+            best_score[2] = sc21;
             best_k[2] = c + 1;
         }
 
-        let s30 = hn0 - d30;
-        let s31 = hn1 - d31;
-        if s30 < best_score[3] {
-            best_score[3] = s30;
+        let sc30 = hn0 - s30;
+        let sc31 = hn1 - s31;
+        if sc30 < best_score[3] {
+            best_score[3] = sc30;
             best_k[3] = c;
         }
-        if s31 < best_score[3] {
-            best_score[3] = s31;
+        if sc31 < best_score[3] {
+            best_score[3] = sc31;
             best_k[3] = c + 1;
         }
 
@@ -629,63 +972,92 @@ fn assign_4rows(
         let mut d1 = [0.0f64; 4];
         let mut d2 = [0.0f64; 4];
         let mut d3 = [0.0f64; 4];
-        let mut j = 0usize;
-        while j + 4 <= p {
-            let cj0 = cr[j];
-            let cj1 = cr[j + 1];
-            let cj2 = cr[j + 2];
-            let cj3 = cr[j + 3];
-            d0[0] += r0[j] * cj0;
-            d0[1] += r0[j + 1] * cj1;
-            d0[2] += r0[j + 2] * cj2;
-            d0[3] += r0[j + 3] * cj3;
-            d1[0] += r1[j] * cj0;
-            d1[1] += r1[j + 1] * cj1;
-            d1[2] += r1[j + 2] * cj2;
-            d1[3] += r1[j + 3] * cj3;
-            d2[0] += r2[j] * cj0;
-            d2[1] += r2[j + 1] * cj1;
-            d2[2] += r2[j + 2] * cj2;
-            d2[3] += r2[j + 3] * cj3;
-            d3[0] += r3[j] * cj0;
-            d3[1] += r3[j + 1] * cj1;
-            d3[2] += r3[j + 2] * cj2;
-            d3[3] += r3[j + 3] * cj3;
-            j += 4;
+        let (crc, crr) = cr.as_chunks::<4>();
+        let (r0c, r0r) = r0.as_chunks::<4>();
+        let (r1c, r1r) = r1.as_chunks::<4>();
+        let (r2c, r2r) = r2.as_chunks::<4>();
+        let (r3c, r3r) = r3.as_chunks::<4>();
+        for ((((&vc, &vx0), &vx1), &vx2), &vx3) in crc
+            .iter()
+            .zip(r0c.iter())
+            .zip(r1c.iter())
+            .zip(r2c.iter())
+            .zip(r3c.iter())
+        {
+            for l in 0..4 {
+                d0[l] += vx0[l] * vc[l];
+                d1[l] += vx1[l] * vc[l];
+                d2[l] += vx2[l] * vc[l];
+                d3[l] += vx3[l] * vc[l];
+            }
         }
         let mut s0 = (d0[0] + d0[1]) + (d0[2] + d0[3]);
         let mut s1 = (d1[0] + d1[1]) + (d1[2] + d1[3]);
         let mut s2 = (d2[0] + d2[1]) + (d2[2] + d2[3]);
         let mut s3 = (d3[0] + d3[1]) + (d3[2] + d3[3]);
-        while j < p {
-            let cj = cr[j];
-            s0 += r0[j] * cj;
-            s1 += r1[j] * cj;
-            s2 += r2[j] * cj;
-            s3 += r3[j] * cj;
-            j += 1;
+        for j in 0..crr.len() {
+            let vc = crr[j];
+            s0 += r0r[j] * vc;
+            s1 += r1r[j] * vc;
+            s2 += r2r[j] * vc;
+            s3 += r3r[j] * vc;
         }
         let hn = half_norms[c];
         if hn - s0 < best_score[0] {
+            best_score[0] = hn - s0;
             best_k[0] = c;
         }
         if hn - s1 < best_score[1] {
+            best_score[1] = hn - s1;
             best_k[1] = c;
         }
         if hn - s2 < best_score[2] {
+            best_score[2] = hn - s2;
             best_k[2] = c;
         }
         if hn - s3 < best_score[3] {
+            best_score[3] = hn - s3;
             best_k[3] = c;
         }
     }
 
-    best_k
+    let sq = if COMPUTE_NORM {
+        [
+            (nx[0] + 2.0 * best_score[0]).max(0.0),
+            (nx[1] + 2.0 * best_score[1]).max(0.0),
+            (nx[2] + 2.0 * best_score[2]).max(0.0),
+            (nx[3] + 2.0 * best_score[3]).max(0.0),
+        ]
+    } else {
+        [0.0; 4]
+    };
+    (best_k, sq)
 }
 
 #[inline(always)]
-fn assign_1row(row: &[f64], centers_data: &[f64], half_norms: &[f64], k: usize, p: usize) -> usize {
+fn assign_1row_general<const COMPUTE_NORM: bool>(
+    row: &[f64],
+    centers_data: &[f64],
+    half_norms: &[f64],
+    k: usize,
+    p: usize,
+) -> (usize, f64) {
     let row = &row[..p];
+    let mut nx = 0.0f64;
+    if COMPUTE_NORM {
+        let mut nxa = [0.0f64; 4];
+        let (rc, rr) = row.as_chunks::<4>();
+        for &v in rc {
+            for l in 0..4 {
+                nxa[l] += v[l] * v[l];
+            }
+        }
+        nx = (nxa[0] + nxa[1]) + (nxa[2] + nxa[3]);
+        for &v in rr {
+            nx += v * v;
+        }
+    }
+
     let mut best_k = 0usize;
     let mut best_score = f64::INFINITY;
     let mut c = 0usize;
@@ -700,45 +1072,36 @@ fn assign_1row(row: &[f64], centers_data: &[f64], half_norms: &[f64], k: usize, 
         let mut acc2 = [0.0f64; 4];
         let mut acc3 = [0.0f64; 4];
 
-        let mut j = 0usize;
-        while j + 4 <= p {
-            let x0 = row[j];
-            let x1 = row[j + 1];
-            let x2 = row[j + 2];
-            let x3 = row[j + 3];
+        let (rc, rr) = row.as_chunks::<4>();
+        let (c0c, c0r) = c0.as_chunks::<4>();
+        let (c1c, c1r) = c1.as_chunks::<4>();
+        let (c2c, c2r) = c2.as_chunks::<4>();
+        let (c3c, c3r) = c3.as_chunks::<4>();
 
-            acc0[0] += x0 * c0[j];
-            acc0[1] += x1 * c0[j + 1];
-            acc0[2] += x2 * c0[j + 2];
-            acc0[3] += x3 * c0[j + 3];
-
-            acc1[0] += x0 * c1[j];
-            acc1[1] += x1 * c1[j + 1];
-            acc1[2] += x2 * c1[j + 2];
-            acc1[3] += x3 * c1[j + 3];
-
-            acc2[0] += x0 * c2[j];
-            acc2[1] += x1 * c2[j + 1];
-            acc2[2] += x2 * c2[j + 2];
-            acc2[3] += x3 * c2[j + 3];
-
-            acc3[0] += x0 * c3[j];
-            acc3[1] += x1 * c3[j + 1];
-            acc3[2] += x2 * c3[j + 2];
-            acc3[3] += x3 * c3[j + 3];
-            j += 4;
+        for ((((&vx, &vc0), &vc1), &vc2), &vc3) in rc
+            .iter()
+            .zip(c0c.iter())
+            .zip(c1c.iter())
+            .zip(c2c.iter())
+            .zip(c3c.iter())
+        {
+            for l in 0..4 {
+                acc0[l] += vx[l] * vc0[l];
+                acc1[l] += vx[l] * vc1[l];
+                acc2[l] += vx[l] * vc2[l];
+                acc3[l] += vx[l] * vc3[l];
+            }
         }
         let mut s0 = (acc0[0] + acc0[1]) + (acc0[2] + acc0[3]);
         let mut s1 = (acc1[0] + acc1[1]) + (acc1[2] + acc1[3]);
         let mut s2 = (acc2[0] + acc2[1]) + (acc2[2] + acc2[3]);
         let mut s3 = (acc3[0] + acc3[1]) + (acc3[2] + acc3[3]);
-        while j < p {
-            let xj = row[j];
-            s0 += xj * c0[j];
-            s1 += xj * c1[j];
-            s2 += xj * c2[j];
-            s3 += xj * c3[j];
-            j += 1;
+        for j in 0..rr.len() {
+            let xj = rr[j];
+            s0 += xj * c0r[j];
+            s1 += xj * c1r[j];
+            s2 += xj * c2r[j];
+            s3 += xj * c3r[j];
         }
         let v0 = half_norms[c] - s0;
         let v1 = half_norms[c + 1] - s1;
@@ -767,18 +1130,16 @@ fn assign_1row(row: &[f64], centers_data: &[f64], half_norms: &[f64], k: usize, 
     while c < k {
         let cr = &centers_data[c * p..(c + 1) * p];
         let mut acc = [0.0f64; 4];
-        let mut j = 0usize;
-        while j + 4 <= p {
-            acc[0] += row[j] * cr[j];
-            acc[1] += row[j + 1] * cr[j + 1];
-            acc[2] += row[j + 2] * cr[j + 2];
-            acc[3] += row[j + 3] * cr[j + 3];
-            j += 4;
+        let (rc, rr) = row.as_chunks::<4>();
+        let (crc, crr) = cr.as_chunks::<4>();
+        for (&vx, &vc) in rc.iter().zip(crc.iter()) {
+            for l in 0..4 {
+                acc[l] += vx[l] * vc[l];
+            }
         }
         let mut s = (acc[0] + acc[1]) + (acc[2] + acc[3]);
-        while j < p {
-            s += row[j] * cr[j];
-            j += 1;
+        for j in 0..rr.len() {
+            s += rr[j] * crr[j];
         }
         let v = half_norms[c] - s;
         if v < best_score {
@@ -788,73 +1149,442 @@ fn assign_1row(row: &[f64], centers_data: &[f64], half_norms: &[f64], k: usize, 
         c += 1;
     }
 
-    best_k
+    let sq = if COMPUTE_NORM {
+        (nx + 2.0 * best_score).max(0.0)
+    } else {
+        0.0
+    };
+    (best_k, sq)
 }
 
 #[inline]
-fn assign_labels_chunk(
-    x_chunk: &[f64],
-    lbl_chunk: &mut [usize],
+fn assign_subchunk_packed<const COMPUTE_NORM: bool, const WRITE_LABELS: bool>(
+    x_sub: &[f64],
+    mut lbl_sub: Option<&mut [usize]>,
+    w_sub: Option<&[f64]>,
+    packed: &PackedCenters,
     centers_data: &[f64],
-    half_norms: &[f64],
-    k: usize,
-    p: usize,
-) {
-    if p == 0 || k == 0 {
-        return;
-    }
-    let rows = lbl_chunk.len();
+    rows: usize,
+) -> f64 {
+    let mut inertia = 0.0f64;
     let mut i = 0usize;
-    while i + 4 <= rows {
-        let base = i * p;
-        let r0 = &x_chunk[base..base + p];
-        let r1 = &x_chunk[base + p..base + 2 * p];
-        let r2 = &x_chunk[base + 2 * p..base + 3 * p];
-        let r3 = &x_chunk[base + 3 * p..base + 4 * p];
-        let best = assign_4rows(r0, r1, r2, r3, centers_data, half_norms, k, p);
-        lbl_chunk[i] = best[0];
-        lbl_chunk[i + 1] = best[1];
-        lbl_chunk[i + 2] = best[2];
-        lbl_chunk[i + 3] = best[3];
-        i += 4;
+
+    match packed {
+        PackedCenters::K4 { c_t, hn, k, p } => {
+            let p = *p;
+            let k = *k;
+            if p == 0 || k == 0 {
+                return 0.0;
+            }
+            while i + 4 <= rows {
+                let base = i * p;
+                let (best, sq) = assign_4rows_k4::<COMPUTE_NORM>(
+                    &x_sub[base..base + p],
+                    &x_sub[base + p..base + 2 * p],
+                    &x_sub[base + 2 * p..base + 3 * p],
+                    &x_sub[base + 3 * p..base + 4 * p],
+                    c_t,
+                    hn,
+                    k,
+                    p,
+                );
+                if WRITE_LABELS && let Some(ref mut lbl) = lbl_sub {
+                    lbl[i] = best[0];
+                    lbl[i + 1] = best[1];
+                    lbl[i + 2] = best[2];
+                    lbl[i + 3] = best[3];
+                }
+                if COMPUTE_NORM {
+                    match w_sub {
+                        Some(w) => {
+                            inertia += w[i] * sq[0]
+                                + w[i + 1] * sq[1]
+                                + w[i + 2] * sq[2]
+                                + w[i + 3] * sq[3];
+                        }
+                        None => inertia += (sq[0] + sq[1]) + (sq[2] + sq[3]),
+                    }
+                }
+                i += 4;
+            }
+            while i < rows {
+                let row = &x_sub[i * p..(i + 1) * p];
+                let (best, sq) = assign_1row_k4::<COMPUTE_NORM>(row, c_t, hn, k, p);
+                if WRITE_LABELS && let Some(ref mut lbl) = lbl_sub {
+                    lbl[i] = best;
+                }
+                if COMPUTE_NORM {
+                    inertia += w_sub.map_or(sq, |w| w[i] * sq);
+                }
+                i += 1;
+            }
+        }
+        PackedCenters::K8 { c_t, hn, k, p } => {
+            let p = *p;
+            let k = *k;
+            if p == 0 || k == 0 {
+                return 0.0;
+            }
+            while i + 4 <= rows {
+                let base = i * p;
+                let (best, sq) = assign_4rows_k8::<COMPUTE_NORM>(
+                    &x_sub[base..base + p],
+                    &x_sub[base + p..base + 2 * p],
+                    &x_sub[base + 2 * p..base + 3 * p],
+                    &x_sub[base + 3 * p..base + 4 * p],
+                    c_t,
+                    hn,
+                    k,
+                    p,
+                );
+                if WRITE_LABELS && let Some(ref mut lbl) = lbl_sub {
+                    lbl[i] = best[0];
+                    lbl[i + 1] = best[1];
+                    lbl[i + 2] = best[2];
+                    lbl[i + 3] = best[3];
+                }
+                if COMPUTE_NORM {
+                    match w_sub {
+                        Some(w) => {
+                            inertia += w[i] * sq[0]
+                                + w[i + 1] * sq[1]
+                                + w[i + 2] * sq[2]
+                                + w[i + 3] * sq[3];
+                        }
+                        None => inertia += (sq[0] + sq[1]) + (sq[2] + sq[3]),
+                    }
+                }
+                i += 4;
+            }
+            while i < rows {
+                let row = &x_sub[i * p..(i + 1) * p];
+                let (best, sq) = assign_1row_k8::<COMPUTE_NORM>(row, c_t, hn, k, p);
+                if WRITE_LABELS && let Some(ref mut lbl) = lbl_sub {
+                    lbl[i] = best;
+                }
+                if COMPUTE_NORM {
+                    inertia += w_sub.map_or(sq, |w| w[i] * sq);
+                }
+                i += 1;
+            }
+        }
+        PackedCenters::General { half_norms, k, p } => {
+            let p = *p;
+            let k = *k;
+            if p == 0 || k == 0 {
+                return 0.0;
+            }
+            while i + 4 <= rows {
+                let base = i * p;
+                let (best, sq) = assign_4rows_general::<COMPUTE_NORM>(
+                    &x_sub[base..base + p],
+                    &x_sub[base + p..base + 2 * p],
+                    &x_sub[base + 2 * p..base + 3 * p],
+                    &x_sub[base + 3 * p..base + 4 * p],
+                    centers_data,
+                    half_norms,
+                    k,
+                    p,
+                );
+                if WRITE_LABELS && let Some(ref mut lbl) = lbl_sub {
+                    lbl[i] = best[0];
+                    lbl[i + 1] = best[1];
+                    lbl[i + 2] = best[2];
+                    lbl[i + 3] = best[3];
+                }
+                if COMPUTE_NORM {
+                    match w_sub {
+                        Some(w) => {
+                            inertia += w[i] * sq[0]
+                                + w[i + 1] * sq[1]
+                                + w[i + 2] * sq[2]
+                                + w[i + 3] * sq[3];
+                        }
+                        None => inertia += (sq[0] + sq[1]) + (sq[2] + sq[3]),
+                    }
+                }
+                i += 4;
+            }
+            while i < rows {
+                let row = &x_sub[i * p..(i + 1) * p];
+                let (best, sq) =
+                    assign_1row_general::<COMPUTE_NORM>(row, centers_data, half_norms, k, p);
+                if WRITE_LABELS && let Some(ref mut lbl) = lbl_sub {
+                    lbl[i] = best;
+                }
+                if COMPUTE_NORM {
+                    inertia += w_sub.map_or(sq, |w| w[i] * sq);
+                }
+                i += 1;
+            }
+        }
     }
-    while i < rows {
-        let row = &x_chunk[i * p..(i + 1) * p];
-        lbl_chunk[i] = assign_1row(row, centers_data, half_norms, k, p);
-        i += 1;
-    }
+    inertia
 }
 
-/// Zero-allocation fused nearest-center label-only kernel for `predict`.
-/// Minimizes `0.5 * ||c_j||^2 - dot(x_i, c_j)` with 4-row unrolling, parallelized over 1024-row chunks.
-fn cpu_assign_labels_only(x: &Matrix, centers: &Matrix) -> Vec<usize> {
+#[inline]
+fn assign_chunk_l1_checked<const COMPUTE_NORM: bool, const WRITE_LABELS: bool>(
+    x_chunk: &[f64],
+    mut lbl_chunk: Option<&mut [usize]>,
+    w_chunk: Option<&[f64]>,
+    packed: &PackedCenters,
+    centers_data: &[f64],
+    rows: usize,
+    has_non_finite: Option<&AtomicBool>,
+) -> f64 {
+    if let Some(flag) = has_non_finite
+        && flag.load(Ordering::Relaxed)
+    {
+        return 0.0;
+    }
+    let p = match packed {
+        PackedCenters::K4 { p, .. }
+        | PackedCenters::K8 { p, .. }
+        | PackedCenters::General { p, .. } => *p,
+    };
+    if rows == 0 || p == 0 {
+        return 0.0;
+    }
+    let sub_rows = ((2048 / p.max(1)).clamp(4, 64)) & !3;
+    let sub_rows = sub_rows.max(4);
+    let mut total_inertia = 0.0f64;
+    let mut start = 0usize;
+    while start < rows {
+        let end = (start + sub_rows).min(rows);
+        let x_sub = &x_chunk[start * p..end * p];
+        if let Some(flag) = has_non_finite
+            && !slice_all_finite(x_sub)
+        {
+            flag.store(true, Ordering::Relaxed);
+            return 0.0;
+        }
+        let lbl_sub = lbl_chunk.as_deref_mut().map(|l| &mut l[start..end]);
+        let w_sub = w_chunk.map(|w| &w[start..end]);
+        total_inertia += assign_subchunk_packed::<COMPUTE_NORM, WRITE_LABELS>(
+            x_sub,
+            lbl_sub,
+            w_sub,
+            packed,
+            centers_data,
+            end - start,
+        );
+        start = end;
+    }
+    total_inertia
+}
+
+fn cpu_assign_labels_impl(
+    x: &Matrix,
+    centers: &Matrix,
+    check_finite: bool,
+) -> OchreResult<Vec<usize>> {
     let n = x.rows;
     let p = x.cols;
     let k = centers.rows;
-    let centers_data = &centers.data;
-    let mut half_norms = Vec::with_capacity(k);
-    for c in 0..k {
-        let cr = &centers_data[c * p..(c + 1) * p];
-        let mut norm_sq = 0.0;
-        for &v in cr {
-            norm_sq += v * v;
-        }
-        half_norms.push(0.5 * norm_sq);
-    }
     let mut labels = vec![0usize; n];
+    if n == 0 || p == 0 || k == 0 {
+        return Ok(labels);
+    }
+    let packed = PackedCenters::new(&centers.data, k, p);
+    let flag = AtomicBool::new(false);
+    let flag_opt = if check_finite { Some(&flag) } else { None };
 
     if n < ASSIGN_PAR_ROW_THRESHOLD {
-        assign_labels_chunk(&x.data, &mut labels, centers_data, &half_norms, k, p);
+        assign_chunk_l1_checked::<false, true>(
+            &x.data,
+            Some(&mut labels),
+            None,
+            &packed,
+            &centers.data,
+            n,
+            flag_opt,
+        );
     } else {
-        const CHUNK_ROWS: usize = 1024;
+        let chunk_rows = if n >= 16_384 {
+            PREDICT_CHUNK_ROWS
+        } else {
+            1024
+        };
         labels
-            .par_chunks_mut(CHUNK_ROWS)
-            .zip(x.data.par_chunks(CHUNK_ROWS * p))
+            .par_chunks_mut(chunk_rows)
+            .zip(x.data.par_chunks(chunk_rows * p))
             .for_each(|(lbl_chunk, x_chunk)| {
-                assign_labels_chunk(x_chunk, lbl_chunk, centers_data, &half_norms, k, p);
+                let rows = lbl_chunk.len();
+                assign_chunk_l1_checked::<false, true>(
+                    x_chunk,
+                    Some(lbl_chunk),
+                    None,
+                    &packed,
+                    &centers.data,
+                    rows,
+                    flag_opt,
+                );
             });
     }
-    labels
+
+    if check_finite && flag.load(Ordering::Relaxed) {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN or infinite values ( >_< )".to_string(),
+        ));
+    }
+    Ok(labels)
+}
+
+/// Zero-allocation fused nearest-center label-only kernel for `predict`.
+/// Minimizes `0.5 * ||c_j||^2 - dot(x_i, c_j)` with register-friendly center packing.
+#[cfg_attr(not(test), allow(dead_code))]
+fn cpu_assign_labels_only(x: &Matrix, centers: &Matrix) -> Vec<usize> {
+    match cpu_assign_labels_impl(x, centers, false) {
+        Ok(labels) => labels,
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Zero-allocation fused nearest-center label-only kernel with fused finite check.
+fn cpu_assign_labels_checked(x: &Matrix, centers: &Matrix) -> OchreResult<Vec<usize>> {
+    cpu_assign_labels_impl(x, centers, true)
+}
+
+/// Zero-extra-alloc fused nearest-center label + inertia kernel computing
+/// `sum_i w_i * (||x_i||^2 + 2 * (0.5 * ||c_best||^2 - x_i . c_best))` inside Rayon chunks.
+fn cpu_assign_labels_and_inertia(
+    x: &Matrix,
+    centers: &Matrix,
+    sw: Option<&[f64]>,
+    labels: &mut [usize],
+) -> f64 {
+    let n = x.rows;
+    let p = x.cols;
+    let k = centers.rows;
+    if n == 0 || p == 0 || k == 0 {
+        return 0.0;
+    }
+    let packed = PackedCenters::new(&centers.data, k, p);
+
+    if n < ASSIGN_PAR_ROW_THRESHOLD {
+        return assign_chunk_l1_checked::<true, true>(
+            &x.data,
+            Some(labels),
+            sw,
+            &packed,
+            &centers.data,
+            n,
+            None,
+        );
+    }
+
+    let chunk_rows = if n >= 16_384 {
+        PREDICT_CHUNK_ROWS
+    } else {
+        1024
+    };
+    match sw {
+        Some(weights) => labels
+            .par_chunks_mut(chunk_rows)
+            .zip(x.data.par_chunks(chunk_rows * p))
+            .zip(weights.par_chunks(chunk_rows))
+            .map(|((lbl_chunk, x_chunk), w_chunk)| {
+                let rows = lbl_chunk.len();
+                assign_chunk_l1_checked::<true, true>(
+                    x_chunk,
+                    Some(lbl_chunk),
+                    Some(w_chunk),
+                    &packed,
+                    &centers.data,
+                    rows,
+                    None,
+                )
+            })
+            .sum(),
+        None => labels
+            .par_chunks_mut(chunk_rows)
+            .zip(x.data.par_chunks(chunk_rows * p))
+            .map(|(lbl_chunk, x_chunk)| {
+                let rows = lbl_chunk.len();
+                assign_chunk_l1_checked::<true, true>(
+                    x_chunk,
+                    Some(lbl_chunk),
+                    None,
+                    &packed,
+                    &centers.data,
+                    rows,
+                    None,
+                )
+            })
+            .sum(),
+    }
+}
+
+/// Zero-allocation fused inertia-only kernel with fused finite check for `score`.
+fn cpu_inertia_only_checked(x: &Matrix, centers: &Matrix, sw: Option<&[f64]>) -> OchreResult<f64> {
+    let n = x.rows;
+    let p = x.cols;
+    let k = centers.rows;
+    if n == 0 || p == 0 || k == 0 {
+        return Ok(0.0);
+    }
+    let packed = PackedCenters::new(&centers.data, k, p);
+    let flag = AtomicBool::new(false);
+
+    let inertia = if n < ASSIGN_PAR_ROW_THRESHOLD {
+        assign_chunk_l1_checked::<true, false>(
+            &x.data,
+            None,
+            sw,
+            &packed,
+            &centers.data,
+            n,
+            Some(&flag),
+        )
+    } else {
+        let chunk_rows = if n >= 16_384 {
+            PREDICT_CHUNK_ROWS
+        } else {
+            1024
+        };
+        match sw {
+            Some(weights) => x
+                .data
+                .par_chunks(chunk_rows * p)
+                .zip(weights.par_chunks(chunk_rows))
+                .map(|(x_chunk, w_chunk)| {
+                    let rows = w_chunk.len();
+                    assign_chunk_l1_checked::<true, false>(
+                        x_chunk,
+                        None,
+                        Some(w_chunk),
+                        &packed,
+                        &centers.data,
+                        rows,
+                        Some(&flag),
+                    )
+                })
+                .sum(),
+            None => x
+                .data
+                .par_chunks(chunk_rows * p)
+                .map(|x_chunk| {
+                    let rows = x_chunk.len() / p;
+                    assign_chunk_l1_checked::<true, false>(
+                        x_chunk,
+                        None,
+                        None,
+                        &packed,
+                        &centers.data,
+                        rows,
+                        Some(&flag),
+                    )
+                })
+                .sum(),
+        }
+    };
+
+    if flag.load(Ordering::Relaxed) {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN or infinite values ( >_< )".to_string(),
+        ));
+    }
+    Ok(inertia)
 }
 
 /// Fused Lloyd assignment + parallel centroid accumulation in a single memory pass over `X`.
@@ -1143,7 +1873,7 @@ fn assign_labels_and_sq_dists(
     Ok((all_labels, all_dists))
 }
 
-fn assign_labels_only(
+fn assign_labels_only_checked(
     backend: &Backend<'_>,
     x: &Matrix,
     centers: &Matrix,
@@ -1151,11 +1881,31 @@ fn assign_labels_only(
     let n = x.rows;
     let k = centers.rows;
     let p = x.cols;
-    if should_use_fused_cpu(backend, n, k, p) {
-        return Ok(cpu_assign_labels_only(x, centers));
+    if should_use_cpu_predict(backend, n, k, p) {
+        return cpu_assign_labels_checked(x, centers);
     }
+    validate_x(x)?;
     let (labels, _) = assign_labels_and_sq_dists(backend, x, centers)?;
     Ok(labels)
+}
+
+/// Assign nearest center labels and compute weighted inertia without allocating a `sq_dists` buffer on CPU.
+fn assign_labels_and_inertia_into(
+    backend: &Backend<'_>,
+    x: &Matrix,
+    centers: &Matrix,
+    sw: Option<&[f64]>,
+    labels: &mut [usize],
+) -> OchreResult<f64> {
+    let n = x.rows;
+    let k = centers.rows;
+    let p = x.cols;
+    if should_use_cpu_predict(backend, n, k, p) {
+        return Ok(cpu_assign_labels_and_inertia(x, centers, sw, labels));
+    }
+    let mut sq_dists = vec![0.0f64; n];
+    assign_labels_and_sq_dists_into(backend, x, centers, labels, &mut sq_dists)?;
+    Ok(compute_weighted_inertia(&sq_dists, sw))
 }
 
 /// Compute Euclidean distance matrix `sqrt(pairwise_l2_sq(X, centers))`, chunked for large inputs.
@@ -1664,14 +2414,16 @@ impl KMeans {
     }
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<usize>> {
-        validate_x(x)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         validate_fitted_cols(self.n_features_in_, x.cols)?;
         let centers = self
             .cluster_centers_
             .as_ref()
             .ok_or(OchreError::NotFitted)?;
         let backend = get_backend(&self.device_type);
-        assign_labels_only(&backend, x, centers)
+        assign_labels_only_checked(&backend, x, centers)
     }
 
     pub fn fit_predict(
@@ -1935,11 +2687,6 @@ impl MiniBatchKMeans {
         }
 
         let backend = get_backend(&self.device_type);
-        let tol_scaled = if self.tol > 0.0 {
-            self.tol * compute_mean_variance(x, sw)
-        } else {
-            0.0
-        };
         let mut rng = DeterministicRng::new(self.random_state);
 
         let n = x.rows;
@@ -1992,6 +2739,18 @@ impl MiniBatchKMeans {
             (None, None)
         };
 
+        // Estimate feature variance on `val_mat` (or full `x` only when `init_size >= n`)
+        // so large datasets are not scanned upfront before minibatching.
+        let precomputed_tol_scaled = if self.tol <= 0.0 {
+            Some(0.0)
+        } else if let Some(ref vm) = val_mat {
+            Some(self.tol * compute_mean_variance(vm, val_weights.as_deref()))
+        } else if init_size >= n {
+            Some(self.tol * compute_mean_variance(x, sw))
+        } else {
+            None
+        };
+
         let mut x_batch = Matrix::zeros(eff_batch, p);
         let mut batch_weights = vec![0.0f64; eff_batch];
         let mut batch_labels = vec![0usize; eff_batch];
@@ -2006,12 +2765,15 @@ impl MiniBatchKMeans {
         } else {
             Vec::new()
         };
-        let mut full_labels = vec![0usize; n];
-        let mut full_sq_dists = vec![0.0f64; n];
+        let mut cand_labels = if self.n_init > 1 && !use_val_subsample {
+            vec![0usize; n]
+        } else {
+            Vec::new()
+        };
 
         for _run in 0..self.n_init {
+            let mut sub_w_sum = 0.0;
             let mut centers = if let Some(ref mut sub_mat) = init_mat {
-                let mut sub_w_sum = 0.0;
                 for b in 0..init_size {
                     let idx = rng.gen_range(n);
                     sub_mat.data[b * p..(b + 1) * p]
@@ -2036,6 +2798,19 @@ impl MiniBatchKMeans {
                 }
             } else {
                 init_centers(&backend, x, sw, k, &self.init, &mut rng)?
+            };
+
+            let tol_scaled = match precomputed_tol_scaled {
+                Some(t) => t,
+                None => {
+                    if let Some(ref sub_mat) = init_mat
+                        && !(sw.is_some() && sub_w_sum <= 0.0)
+                    {
+                        self.tol * compute_mean_variance(sub_mat, init_weights.as_deref())
+                    } else {
+                        self.tol * compute_mean_variance(x, sw)
+                    }
+                }
             };
 
             let mut counts = vec![0.0; k];
@@ -2131,19 +2906,13 @@ impl MiniBatchKMeans {
                     best_n_steps = steps;
                 }
             } else {
-                assign_labels_and_sq_dists_into(
-                    &backend,
-                    x,
-                    &centers,
-                    &mut full_labels,
-                    &mut full_sq_dists,
-                )?;
-                let inertia = compute_weighted_inertia(&full_sq_dists, sw);
+                let inertia =
+                    assign_labels_and_inertia_into(&backend, x, &centers, sw, &mut cand_labels)?;
                 if inertia < best_inertia || best_centers.is_none() {
                     best_inertia = inertia;
                     best_centers = Some(centers);
                     best_counts = Some(counts);
-                    best_labels = Some(full_labels.clone());
+                    best_labels = Some(cand_labels.clone());
                     best_n_iter = steps.div_ceil((n.div_ceil(eff_batch)).max(1));
                     best_n_steps = steps;
                 }
@@ -2153,15 +2922,10 @@ impl MiniBatchKMeans {
         if best_labels.is_none()
             && let Some(ref centers) = best_centers
         {
-            assign_labels_and_sq_dists_into(
-                &backend,
-                x,
-                centers,
-                &mut full_labels,
-                &mut full_sq_dists,
-            )?;
-            best_inertia = compute_weighted_inertia(&full_sq_dists, sw);
-            best_labels = Some(full_labels);
+            let mut final_labels = vec![0usize; n];
+            best_inertia =
+                assign_labels_and_inertia_into(&backend, x, centers, sw, &mut final_labels)?;
+            best_labels = Some(final_labels);
         }
 
         self.cluster_centers_ = best_centers;
@@ -2220,9 +2984,14 @@ impl MiniBatchKMeans {
             &mut sq_dists,
         )?;
 
-        assign_labels_and_sq_dists_into(&backend, x, centers, &mut labels, &mut sq_dists)?;
+        self.inertia_ = Some(assign_labels_and_inertia_into(
+            &backend,
+            x,
+            centers,
+            sw,
+            &mut labels,
+        )?);
         self.labels_ = Some(labels);
-        self.inertia_ = Some(compute_weighted_inertia(&sq_dists, sw));
         self.n_steps_ += 1;
         self.n_iter_ += 1;
         self.device_ = Some(self.device_type.to_string());
@@ -2230,14 +2999,16 @@ impl MiniBatchKMeans {
     }
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<usize>> {
-        validate_x(x)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         validate_fitted_cols(self.n_features_in_, x.cols)?;
         let centers = self
             .cluster_centers_
             .as_ref()
             .ok_or(OchreError::NotFitted)?;
         let backend = get_backend(&self.device_type);
-        assign_labels_only(&backend, x, centers)
+        assign_labels_only_checked(&backend, x, centers)
     }
 
     pub fn fit_predict(
@@ -2270,7 +3041,9 @@ impl MiniBatchKMeans {
     }
 
     pub fn score(&self, x: &Matrix, sample_weight: Option<&[f64]>) -> OchreResult<f64> {
-        validate_x(x)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         validate_fitted_cols(self.n_features_in_, x.cols)?;
         let sw = validate_sample_weight(sample_weight, x.rows)?;
         let centers = self
@@ -2278,6 +3051,10 @@ impl MiniBatchKMeans {
             .as_ref()
             .ok_or(OchreError::NotFitted)?;
         let backend = get_backend(&self.device_type);
+        if should_use_cpu_predict(&backend, x.rows, centers.rows, x.cols) {
+            return Ok(-cpu_inertia_only_checked(x, centers, sw)?);
+        }
+        validate_x(x)?;
         let (_, sq_dists) = assign_labels_and_sq_dists(&backend, x, centers)?;
         Ok(-compute_weighted_inertia(&sq_dists, sw))
     }

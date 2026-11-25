@@ -924,6 +924,57 @@ pub struct SpectralClustering {
     device_type: DeviceType,
 }
 
+#[inline]
+fn l2_sq_row(a: &[f64], b: &[f64]) -> f64 {
+    let mut sum = 0.0;
+    for c in 0..a.len() {
+        let d = a[c] - b[c];
+        sum += d * d;
+    }
+    sum
+}
+
+/// Compute symmetric RBF affinity matrix `W[i, j] = exp(-gamma * ||x_i - x_j||^2)`
+/// on CPU by evaluating only the lower triangle (`j < i`) and mirroring to upper.
+fn cpu_symmetric_rbf_affinity(x: &Matrix, gamma: f64) -> Matrix {
+    let n = x.rows;
+    let cols = x.cols;
+    let mut w = Matrix::zeros(n, n);
+    let neg_gamma = -gamma;
+
+    let fill_chunk = |(chunk_idx, rows_slice): (usize, &mut [f64])| {
+        let row_start = chunk_idx * 16;
+        let n_rows = rows_slice.len() / n;
+        for local_r in 0..n_rows {
+            let i = row_start + local_r;
+            let xi = &x.data[i * cols..(i + 1) * cols];
+            let dst = &mut rows_slice[local_r * n..(local_r + 1) * n];
+            for (j, slot) in dst.iter_mut().enumerate().take(i) {
+                let xj = &x.data[j * cols..(j + 1) * cols];
+                *slot = (neg_gamma * l2_sq_row(xi, xj)).exp();
+            }
+            dst[i] = 1.0;
+        }
+    };
+
+    if n >= 128 {
+        w.data
+            .par_chunks_mut(16 * n)
+            .enumerate()
+            .for_each(fill_chunk);
+    } else {
+        w.data.chunks_mut(16 * n).enumerate().for_each(fill_chunk);
+    }
+
+    for i in 0..n {
+        let row_off = i * n;
+        for j in 0..i {
+            w.data[j * n + i] = w.data[row_off + j];
+        }
+    }
+    w
+}
+
 impl SpectralClustering {
     pub fn new(
         n_clusters: usize,
@@ -994,15 +1045,24 @@ impl SpectralClustering {
                 self.n_clusters, n
             )));
         }
-        let backend = get_backend(&self.device_type);
+        // Keep n <= 512 on CPU to avoid GPU launch / threadpool overhead on small affinity matrices.
+        let backend = if n <= 512 {
+            Backend::Cpu
+        } else {
+            get_backend(&self.device_type)
+        };
 
         // 1. Build symmetric affinity matrix W (n x n)
         let w = if self.affinity == "rbf" {
-            let mut dist_sq = backend.pairwise_l2_sq(x, x)?;
-            for v in dist_sq.data.iter_mut() {
-                *v = (-self.gamma * v.max(0.0)).exp();
+            if matches!(backend, Backend::Cpu) && n <= 2048 {
+                cpu_symmetric_rbf_affinity(x, self.gamma)
+            } else {
+                let mut dist_sq = backend.pairwise_l2_sq(x, x)?;
+                dist_sq.data.par_iter_mut().for_each(|v| {
+                    *v = (-self.gamma * v.max(0.0)).exp();
+                });
+                dist_sq
             }
-            dist_sq
         } else {
             let k = self.n_neighbors.min(n);
             let (nn_idx, _) = chunked_kneighbors(&backend, x, x, k, DistMetric::Euclidean, false)?;
@@ -1027,7 +1087,24 @@ impl SpectralClustering {
         // 2. Compute normalized affinity M = D^{-1/2} W D^{-1/2}
         let mut d_inv_sqrt = vec![0.0; n];
         for (i, slot) in d_inv_sqrt.iter_mut().enumerate() {
-            let row_sum: f64 = w.data[i * n..(i + 1) * n].iter().sum();
+            let row = &w.data[i * n..(i + 1) * n];
+            let mut s0 = 0.0;
+            let mut s1 = 0.0;
+            let mut s2 = 0.0;
+            let mut s3 = 0.0;
+            let mut j = 0;
+            while j + 4 <= n {
+                s0 += row[j];
+                s1 += row[j + 1];
+                s2 += row[j + 2];
+                s3 += row[j + 3];
+                j += 4;
+            }
+            let mut row_sum = (s0 + s1) + (s2 + s3);
+            while j < n {
+                row_sum += row[j];
+                j += 1;
+            }
             if row_sum > 0.0 {
                 *slot = 1.0 / row_sum.sqrt();
             }
@@ -1036,8 +1113,9 @@ impl SpectralClustering {
         let mut m_data = vec![0.0; n * n];
         for i in 0..n {
             let di = d_inv_sqrt[i];
+            let w_row = &w.data[i * n..i * n + n];
             for j in i..n {
-                let val = w.data[i * n + j] * di * d_inv_sqrt[j];
+                let val = w_row[j] * di * d_inv_sqrt[j];
                 m_data[i * n + j] = val;
                 m_data[j * n + i] = val;
             }
@@ -1070,8 +1148,8 @@ impl SpectralClustering {
         }
         let u_mat = Matrix::from_vec(n, k, u_data)?;
 
-        // 4. Cluster rows of U with KMeans (stay on CPU for small n * k to avoid GPU launch overhead)
-        let kmeans_device = if n.saturating_mul(k) < 131_072 {
+        // 4. Cluster rows of U with KMeans (stay on CPU for small n <= 512 or n * k < 131_072)
+        let kmeans_device = if n <= 512 || n.saturating_mul(k) < 131_072 {
             Some("cpu".to_string())
         } else {
             self.device_.clone()
@@ -2346,6 +2424,36 @@ mod tests {
         assert_ne!(labels[0], labels[1]);
         assert_ne!(labels[0], labels[2]);
         assert_ne!(labels[1], labels[2]);
+    }
+
+    #[test]
+    fn test_spectral_rbf_250_k2() {
+        let n = 250usize;
+        let mut data = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let c = i % 2;
+            let base = if c == 0 { -5.0 } else { 5.0 };
+            let jitter = ((i % 11) as f64 - 5.0) * 0.05;
+            data.push(base + jitter);
+            data.push(base - jitter);
+        }
+        let x = Matrix::from_vec(n, 2, data).expect("valid");
+        let mut sp = SpectralClustering::new(
+            2,
+            "rbf".to_string(),
+            1.0,
+            10,
+            10,
+            Some(42),
+            Some("auto".to_string()),
+        )
+        .expect("ok");
+        let labels = sp.fit_predict(&x).expect("fit_predict");
+        assert_eq!(labels.len(), n);
+        assert_ne!(labels[0], labels[1]);
+        for i in 0..n {
+            assert_eq!(labels[i], labels[i % 2]);
+        }
     }
 
     #[test]

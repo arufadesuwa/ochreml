@@ -1015,8 +1015,48 @@ fn build_clf_tree(
 }
 
 // =========================================================================
-// UNWEIGHTED U32 FAST-PATH: EXTRATREES CLASSIFIER
+// UNWEIGHTED U32/U64 FAST-PATH: EXTRATREES CLASSIFIER
 // =========================================================================
+
+trait EtClfSample: Copy + Default + Send + Sync {
+    fn pack(idx: usize, cls: u32) -> Self;
+    fn idx(self) -> usize;
+    fn cls(self) -> usize;
+}
+
+impl EtClfSample for u32 {
+    #[inline(always)]
+    fn pack(idx: usize, cls: u32) -> Self {
+        (idx as u32) | (cls << 24)
+    }
+
+    #[inline(always)]
+    fn idx(self) -> usize {
+        (self & 0x00FF_FFFF) as usize
+    }
+
+    #[inline(always)]
+    fn cls(self) -> usize {
+        (self >> 24) as usize
+    }
+}
+
+impl EtClfSample for u64 {
+    #[inline(always)]
+    fn pack(idx: usize, cls: u32) -> Self {
+        (idx as u64) | ((cls as u64) << 32)
+    }
+
+    #[inline(always)]
+    fn idx(self) -> usize {
+        (self as u32) as usize
+    }
+
+    #[inline(always)]
+    fn cls(self) -> usize {
+        (self >> 32) as usize
+    }
+}
 
 #[derive(Clone, Copy)]
 struct EtClfCfg<'a> {
@@ -1036,19 +1076,21 @@ struct EtClfCfg<'a> {
     root_counts: &'a [u32],
 }
 
-struct EtClfScratch {
+struct EtClfScratch<S: EtClfSample> {
     feat_pool: Vec<usize>,
     et_min: Vec<f64>,
     et_max: Vec<f64>,
     et_active_feats: Vec<usize>,
     et_active_thresh: Vec<f64>,
+    et_active_slots: Vec<usize>,
     et_thresh_by_feat: Vec<f64>,
     et_left_counts: Vec<u32>,
     counts_stack: Vec<u32>,
-    part_buf: Vec<u32>,
+    part_buf: Vec<S>,
+    cand_vals: Vec<f64>,
 }
 
-impl EtClfScratch {
+impl<S: EtClfSample> EtClfScratch<S> {
     fn new(n_features: usize, max_feat: usize, n_classes: usize) -> Self {
         let thresh_by_feat_cap = if max_feat == n_features {
             n_features
@@ -1061,12 +1103,231 @@ impl EtClfScratch {
             et_max: vec![0.0; max_feat],
             et_active_feats: Vec::with_capacity(max_feat),
             et_active_thresh: Vec::with_capacity(max_feat),
+            et_active_slots: Vec::with_capacity(max_feat),
             et_thresh_by_feat: vec![0.0; thresh_by_feat_cap],
             et_left_counts: vec![0; max_feat * n_classes],
             counts_stack: vec![0; 32 * 2 * n_classes],
             part_buf: Vec::new(),
+            cand_vals: Vec::new(),
         }
     }
+}
+
+#[inline]
+fn draw_et_thresholds_with_slots(
+    feat_pool: &[usize],
+    min_v: &[f64],
+    max_v: &[f64],
+    rng: &mut SplitMix64,
+    active_feats: &mut Vec<usize>,
+    active_thresh: &mut Vec<f64>,
+    active_slots: &mut Vec<usize>,
+) {
+    active_feats.clear();
+    active_thresh.clear();
+    active_slots.clear();
+    for (fi, &f) in feat_pool.iter().enumerate() {
+        let mn = min_v[fi];
+        let mx = max_v[fi];
+        if mx <= mn + 1e-12 {
+            continue;
+        }
+        let thresh = mn + rng.next_f64() * (mx - mn);
+        let thresh = if thresh >= mx {
+            0.5 * (mn + mx)
+        } else {
+            thresh
+        };
+        active_feats.push(f);
+        active_thresh.push(thresh);
+        active_slots.push(fi);
+    }
+}
+
+#[inline]
+fn gather_et_cand_minmax<S: EtClfSample>(
+    x_rows: &[f64],
+    p: usize,
+    samples: &[S],
+    feat_pool: &[usize],
+    min_v: &mut [f64],
+    max_v: &mut [f64],
+    cand: &mut [f64],
+) {
+    let n = samples.len();
+    let k = feat_pool.len();
+    if k == 4 {
+        let f0 = feat_pool[0];
+        let f1 = feat_pool[1];
+        let f2 = feat_pool[2];
+        let f3 = feat_pool[3];
+        let mut mn0 = f64::INFINITY;
+        let mut mx0 = f64::NEG_INFINITY;
+        let mut mn1 = f64::INFINITY;
+        let mut mx1 = f64::NEG_INFINITY;
+        let mut mn2 = f64::INFINITY;
+        let mut mx2 = f64::NEG_INFINITY;
+        let mut mn3 = f64::INFINITY;
+        let mut mx3 = f64::NEG_INFINITY;
+        let (c0, rest) = cand.split_at_mut(n);
+        let (c1, rest) = rest.split_at_mut(n);
+        let (c2, c3) = rest.split_at_mut(n);
+        for (i, &s) in samples.iter().enumerate() {
+            let base = s.idx() * p;
+            let row = &x_rows[base..base + p];
+            let v0 = row[f0];
+            let v1 = row[f1];
+            let v2 = row[f2];
+            let v3 = row[f3];
+            if v0 < mn0 {
+                mn0 = v0;
+            }
+            if v0 > mx0 {
+                mx0 = v0;
+            }
+            if v1 < mn1 {
+                mn1 = v1;
+            }
+            if v1 > mx1 {
+                mx1 = v1;
+            }
+            if v2 < mn2 {
+                mn2 = v2;
+            }
+            if v2 > mx2 {
+                mx2 = v2;
+            }
+            if v3 < mn3 {
+                mn3 = v3;
+            }
+            if v3 > mx3 {
+                mx3 = v3;
+            }
+            c0[i] = v0;
+            c1[i] = v1;
+            c2[i] = v2;
+            c3[i] = v3;
+        }
+        min_v[0] = mn0;
+        max_v[0] = mx0;
+        min_v[1] = mn1;
+        max_v[1] = mx1;
+        min_v[2] = mn2;
+        max_v[2] = mx2;
+        min_v[3] = mn3;
+        max_v[3] = mx3;
+    } else {
+        min_v[..k].fill(f64::INFINITY);
+        max_v[..k].fill(f64::NEG_INFINITY);
+        for (i, &s) in samples.iter().enumerate() {
+            let base = s.idx() * p;
+            let row = &x_rows[base..base + p];
+            for fi in 0..k {
+                let v = row[feat_pool[fi]];
+                if v < min_v[fi] {
+                    min_v[fi] = v;
+                }
+                if v > max_v[fi] {
+                    max_v[fi] = v;
+                }
+                cand[fi * n + i] = v;
+            }
+        }
+    }
+}
+
+#[inline]
+fn count_left_col_packed<S: EtClfSample>(
+    col: &[f64],
+    samples: &[S],
+    thresh: f64,
+    n_classes: usize,
+    lc: &mut [u32],
+) {
+    if n_classes == 2 {
+        let mut c0 = 0u32;
+        let mut c1 = 0u32;
+        for (&val, &s) in col.iter().zip(samples.iter()) {
+            let go_left = u32::from(val <= thresh);
+            let cls = s.cls() as u32;
+            c1 += go_left & cls;
+            c0 += go_left & (cls ^ 1);
+        }
+        lc[0] = c0;
+        lc[1] = c1;
+    } else {
+        let len = col.len();
+        let mut i = 0usize;
+        while i + 4 <= len {
+            let g0 = u32::from(col[i] <= thresh);
+            let g1 = u32::from(col[i + 1] <= thresh);
+            let g2 = u32::from(col[i + 2] <= thresh);
+            let g3 = u32::from(col[i + 3] <= thresh);
+            lc[samples[i].cls()] += g0;
+            lc[samples[i + 1].cls()] += g1;
+            lc[samples[i + 2].cls()] += g2;
+            lc[samples[i + 3].cls()] += g3;
+            i += 4;
+        }
+        while i < len {
+            lc[samples[i].cls()] += u32::from(col[i] <= thresh);
+            i += 1;
+        }
+    }
+}
+
+#[inline]
+fn partition_packed_with_vals<S: EtClfSample>(
+    col: &[f64],
+    best_thresh: f64,
+    left_len: usize,
+    samples: &mut [S],
+    part_buf: &mut Vec<S>,
+) {
+    let n = samples.len();
+    if part_buf.len() < n {
+        part_buf.resize(n, S::default());
+    }
+    let buf = &mut part_buf[..n];
+    let last = n.saturating_sub(1);
+    let mut l_pos = 0usize;
+    let mut r_pos = left_len;
+    for (&val, &s) in col.iter().zip(samples.iter()) {
+        let go_left = val <= best_thresh;
+        let dst = if go_left { l_pos } else { r_pos };
+        buf[dst.min(last)] = s;
+        l_pos += usize::from(go_left);
+        r_pos += usize::from(!go_left);
+    }
+    samples.copy_from_slice(buf);
+}
+
+#[inline]
+fn partition_packed_from_x<S: EtClfSample>(
+    x_rows: &[f64],
+    p: usize,
+    best_feat: usize,
+    best_thresh: f64,
+    left_len: usize,
+    samples: &mut [S],
+    part_buf: &mut Vec<S>,
+) {
+    let n = samples.len();
+    if part_buf.len() < n {
+        part_buf.resize(n, S::default());
+    }
+    let buf = &mut part_buf[..n];
+    let last = n.saturating_sub(1);
+    let mut l_pos = 0usize;
+    let mut r_pos = left_len;
+    for &s in samples.iter() {
+        let go_left = x_rows[s.idx() * p + best_feat] <= best_thresh;
+        let dst = if go_left { l_pos } else { r_pos };
+        buf[dst.min(last)] = s;
+        l_pos += usize::from(go_left);
+        r_pos += usize::from(!go_left);
+    }
+    samples.copy_from_slice(buf);
 }
 
 #[inline]
@@ -1099,7 +1360,8 @@ fn eval_et_clf_splits_u32(
     active_feats: &[usize],
     active_thresh: &[f64],
     left_counts: &[u32],
-    stride: usize,
+    col_stride: usize,
+    class_stride: usize,
     dense_by_feat: bool,
     counts: &[u32],
     n: usize,
@@ -1120,11 +1382,12 @@ fn eval_et_clf_splits_u32(
         let mut best_gain = 0.0;
         for (ai, (&feat, &thresh)) in active_feats.iter().zip(active_thresh.iter()).enumerate() {
             let col_idx = if dense_by_feat { feat } else { ai };
+            let col_base = col_idx * col_stride;
             let mut ln = 0u32;
             let mut l_ent_sum = 0.0;
             let mut r_ent_sum = 0.0;
             for c in 0..n_classes {
-                let lc = left_counts[c * stride + col_idx];
+                let lc = left_counts[col_base + c * class_stride];
                 let rc = counts[c] - lc;
                 ln += lc;
                 if lc > 0 {
@@ -1162,11 +1425,12 @@ fn eval_et_clf_splits_u32(
         let mut best_score = f64::NEG_INFINITY;
         for (ai, (&feat, &thresh)) in active_feats.iter().zip(active_thresh.iter()).enumerate() {
             let col_idx = if dense_by_feat { feat } else { ai };
+            let col_base = col_idx * col_stride;
             let mut ln = 0u64;
             let mut l_sum_sq = 0u64;
             let mut r_sum_sq = 0u64;
             for c in 0..n_classes {
-                let lc = left_counts[c * stride + col_idx] as u64;
+                let lc = left_counts[col_base + c * class_stride] as u64;
                 let rc = (counts[c] as u64) - lc;
                 ln += lc;
                 l_sum_sq += lc * lc;
@@ -1199,11 +1463,12 @@ fn eval_et_clf_splits_u32(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_clf_tree_root_et_u32(
+fn build_clf_tree_root_et_u32<S: EtClfSample>(
     cfg: &EtClfCfg<'_>,
+    samples: &mut [S],
     rng: &mut SplitMix64,
     importances: &mut [f64],
-    scratch: &mut EtClfScratch,
+    scratch: &mut EtClfScratch<S>,
     nodes: &mut Vec<FlatClfNode>,
     probs_out: &mut Vec<f64>,
 ) -> usize {
@@ -1238,12 +1503,70 @@ fn build_clf_tree_root_et_u32(
         return push_flat_clf_leaf_u32(cfg.root_counts, n, n_classes, nodes, probs_out);
     }
 
-    let dense_by_feat = m == p;
+    let use_cand = n >= 128 && m <= 8;
+    let dense_by_feat = m == p && !use_cand;
     let stride = if dense_by_feat { p } else { m };
     let left_counts = &mut scratch.et_left_counts[..n_classes * stride];
     left_counts.fill(0);
 
-    if dense_by_feat {
+    if use_cand {
+        let cand_len = m * n;
+        if scratch.cand_vals.len() < cand_len {
+            scratch.cand_vals.resize(cand_len, 0.0);
+        }
+        let cand = &mut scratch.cand_vals[..cand_len];
+        let active_feats = &scratch.et_active_feats[..m];
+        let active_thresh = &scratch.et_active_thresh[..m];
+        if m == 4 {
+            let f0 = active_feats[0];
+            let f1 = active_feats[1];
+            let f2 = active_feats[2];
+            let f3 = active_feats[3];
+            let t0 = active_thresh[0];
+            let t1 = active_thresh[1];
+            let t2 = active_thresh[2];
+            let t3 = active_thresh[3];
+            let (c0, rest) = cand.split_at_mut(n);
+            let (c1, rest) = rest.split_at_mut(n);
+            let (c2, c3) = rest.split_at_mut(n);
+            for (i, (row, &c)) in cfg
+                .x_rows
+                .chunks_exact(p)
+                .zip(cfg.class_idx.iter())
+                .enumerate()
+            {
+                let cu = c as usize;
+                let lc_c = &mut left_counts[cu * 4..cu * 4 + 4];
+                let v0 = row[f0];
+                let v1 = row[f1];
+                let v2 = row[f2];
+                let v3 = row[f3];
+                lc_c[0] += u32::from(v0 <= t0);
+                lc_c[1] += u32::from(v1 <= t1);
+                lc_c[2] += u32::from(v2 <= t2);
+                lc_c[3] += u32::from(v3 <= t3);
+                c0[i] = v0;
+                c1[i] = v1;
+                c2[i] = v2;
+                c3[i] = v3;
+            }
+        } else {
+            for (i, (row, &c)) in cfg
+                .x_rows
+                .chunks_exact(p)
+                .zip(cfg.class_idx.iter())
+                .enumerate()
+            {
+                let cu = c as usize;
+                let lc_c = &mut left_counts[cu * m..cu * m + m];
+                for ai in 0..m {
+                    let v = row[active_feats[ai]];
+                    lc_c[ai] += u32::from(v <= active_thresh[ai]);
+                    cand[ai * n + i] = v;
+                }
+            }
+        }
+    } else if dense_by_feat {
         let thresh_s = &mut scratch.et_thresh_by_feat[..p];
         for (&f, &t) in scratch
             .et_active_feats
@@ -1276,6 +1599,7 @@ fn build_clf_tree_root_et_u32(
             &scratch.et_active_feats[..m],
             &scratch.et_active_thresh[..m],
             left_counts,
+            1,
             stride,
             dense_by_feat,
             cfg.root_counts,
@@ -1305,16 +1629,31 @@ fn build_clf_tree_root_et_u32(
         scratch.counts_stack[r_off + c] = cfg.root_counts[c] - lc;
     }
 
-    let mut samples = vec![0u32; n];
     let last = n.saturating_sub(1);
     let mut l_pos = 0usize;
     let mut r_pos = best_left_n;
-    for (idx, row) in cfg.x_rows.chunks_exact(p).enumerate() {
-        let go_left = row[best_feat] <= best_thresh;
-        let dst = if go_left { l_pos } else { r_pos };
-        samples[dst.min(last)] = idx as u32;
-        l_pos += usize::from(go_left);
-        r_pos += usize::from(!go_left);
+    if use_cand {
+        let best_col = &scratch.cand_vals[best_col_idx * n..(best_col_idx + 1) * n];
+        for (idx, (&val, &c)) in best_col.iter().zip(cfg.class_idx.iter()).enumerate() {
+            let go_left = val <= best_thresh;
+            let dst = if go_left { l_pos } else { r_pos };
+            samples[dst.min(last)] = S::pack(idx, c);
+            l_pos += usize::from(go_left);
+            r_pos += usize::from(!go_left);
+        }
+    } else {
+        for (idx, (row, &c)) in cfg
+            .x_rows
+            .chunks_exact(p)
+            .zip(cfg.class_idx.iter())
+            .enumerate()
+        {
+            let go_left = row[best_feat] <= best_thresh;
+            let dst = if go_left { l_pos } else { r_pos };
+            samples[dst.min(last)] = S::pack(idx, c);
+            l_pos += usize::from(go_left);
+            r_pos += usize::from(!go_left);
+        }
     }
 
     let node_idx = nodes.len();
@@ -1354,13 +1693,13 @@ fn build_clf_tree_root_et_u32(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_clf_tree_et_u32(
+fn build_clf_tree_et_u32<S: EtClfSample>(
     cfg: &EtClfCfg<'_>,
-    samples: &mut [u32],
+    samples: &mut [S],
     depth: usize,
     rng: &mut SplitMix64,
     importances: &mut [f64],
-    scratch: &mut EtClfScratch,
+    scratch: &mut EtClfScratch<S>,
     nodes: &mut Vec<FlatClfNode>,
     probs_out: &mut Vec<f64>,
 ) -> usize {
@@ -1398,136 +1737,207 @@ fn build_clf_tree_et_u32(
     let p = cfg.n_features;
     sample_feature_subset(&mut scratch.feat_pool, p, cfg.max_features, rng);
     let k = scratch.feat_pool.len();
-    let all_feats = k == p;
+    let use_cand = n >= 128 && k <= 8;
 
-    if all_feats {
-        let min_v = &mut scratch.et_min[..p];
-        let max_v = &mut scratch.et_max[..p];
-        min_v.fill(f64::INFINITY);
-        max_v.fill(f64::NEG_INFINITY);
-        for &idx in samples.iter() {
-            let uidx = idx as usize;
-            let row = &cfg.x_rows[uidx * p..uidx * p + p];
-            for f in 0..p {
-                let v = row[f];
-                if v < min_v[f] {
-                    min_v[f] = v;
+    let (best_feat, best_thresh, best_gain, best_col_idx, best_left_n, col_stride, class_stride) =
+        if use_cand {
+            let cand_len = k * n;
+            if scratch.cand_vals.len() < cand_len {
+                scratch.cand_vals.resize(cand_len, 0.0);
+            }
+            gather_et_cand_minmax(
+                cfg.x_rows,
+                p,
+                samples,
+                &scratch.feat_pool[..k],
+                &mut scratch.et_min[..k],
+                &mut scratch.et_max[..k],
+                &mut scratch.cand_vals[..cand_len],
+            );
+            draw_et_thresholds_with_slots(
+                &scratch.feat_pool[..k],
+                &scratch.et_min[..k],
+                &scratch.et_max[..k],
+                rng,
+                &mut scratch.et_active_feats,
+                &mut scratch.et_active_thresh,
+                &mut scratch.et_active_slots,
+            );
+            let m = scratch.et_active_feats.len();
+            if m == 0 {
+                return push_flat_clf_leaf_u32(
+                    &scratch.counts_stack[cur_off..cur_off + n_classes],
+                    n,
+                    n_classes,
+                    nodes,
+                    probs_out,
+                );
+            }
+            let left_counts = &mut scratch.et_left_counts[..m * n_classes];
+            left_counts.fill(0);
+            for (ai, (&thresh, &slot)) in scratch.et_active_thresh[..m]
+                .iter()
+                .zip(scratch.et_active_slots[..m].iter())
+                .enumerate()
+            {
+                let col = &scratch.cand_vals[slot * n..(slot + 1) * n];
+                let lc = &mut left_counts[ai * n_classes..(ai + 1) * n_classes];
+                count_left_col_packed(col, samples, thresh, n_classes, lc);
+            }
+            let Some((bf, bt, bg, bci, bln)) = eval_et_clf_splits_u32(
+                &scratch.et_active_feats[..m],
+                &scratch.et_active_thresh[..m],
+                left_counts,
+                n_classes,
+                1,
+                false,
+                &scratch.counts_stack[cur_off..cur_off + n_classes],
+                n,
+                cfg.min_samples_leaf,
+                cfg.criterion_entropy,
+                parent_imp,
+                parent_sum_sq,
+            ) else {
+                return push_flat_clf_leaf_u32(
+                    &scratch.counts_stack[cur_off..cur_off + n_classes],
+                    n,
+                    n_classes,
+                    nodes,
+                    probs_out,
+                );
+            };
+            (bf, bt, bg, bci, bln, n_classes, 1)
+        } else {
+            let all_feats = k == p;
+            if all_feats {
+                let min_v = &mut scratch.et_min[..p];
+                let max_v = &mut scratch.et_max[..p];
+                min_v.fill(f64::INFINITY);
+                max_v.fill(f64::NEG_INFINITY);
+                for &s in samples.iter() {
+                    let uidx = s.idx();
+                    let row = &cfg.x_rows[uidx * p..uidx * p + p];
+                    for f in 0..p {
+                        let v = row[f];
+                        if v < min_v[f] {
+                            min_v[f] = v;
+                        }
+                        if v > max_v[f] {
+                            max_v[f] = v;
+                        }
+                    }
                 }
-                if v > max_v[f] {
-                    max_v[f] = v;
+                draw_et_thresholds(
+                    &scratch.feat_pool[..k],
+                    min_v,
+                    max_v,
+                    false,
+                    rng,
+                    &mut scratch.et_active_feats,
+                    &mut scratch.et_active_thresh,
+                );
+            } else {
+                let feat_pool = &scratch.feat_pool[..k];
+                let min_v = &mut scratch.et_min[..k];
+                let max_v = &mut scratch.et_max[..k];
+                min_v.fill(f64::INFINITY);
+                max_v.fill(f64::NEG_INFINITY);
+                for &s in samples.iter() {
+                    let uidx = s.idx();
+                    let row = &cfg.x_rows[uidx * p..uidx * p + p];
+                    for fi in 0..k {
+                        let v = row[feat_pool[fi]];
+                        if v < min_v[fi] {
+                            min_v[fi] = v;
+                        }
+                        if v > max_v[fi] {
+                            max_v[fi] = v;
+                        }
+                    }
+                }
+                draw_et_thresholds(
+                    feat_pool,
+                    min_v,
+                    max_v,
+                    true,
+                    rng,
+                    &mut scratch.et_active_feats,
+                    &mut scratch.et_active_thresh,
+                );
+            }
+
+            let m = scratch.et_active_feats.len();
+            if m == 0 {
+                return push_flat_clf_leaf_u32(
+                    &scratch.counts_stack[cur_off..cur_off + n_classes],
+                    n,
+                    n_classes,
+                    nodes,
+                    probs_out,
+                );
+            }
+
+            let dense_by_feat = m == p;
+            let stride = if dense_by_feat { p } else { m };
+            let left_counts = &mut scratch.et_left_counts[..n_classes * stride];
+            left_counts.fill(0);
+
+            if dense_by_feat {
+                let thresh_s = &mut scratch.et_thresh_by_feat[..p];
+                for (&f, &t) in scratch
+                    .et_active_feats
+                    .iter()
+                    .zip(scratch.et_active_thresh.iter())
+                {
+                    thresh_s[f] = t;
+                }
+                for &s in samples.iter() {
+                    let uidx = s.idx();
+                    let row = &cfg.x_rows[uidx * p..uidx * p + p];
+                    let cu = s.cls();
+                    let lc_c = &mut left_counts[cu * p..cu * p + p];
+                    for f in 0..p {
+                        lc_c[f] += u32::from(row[f] <= thresh_s[f]);
+                    }
+                }
+            } else {
+                let active_feats = &scratch.et_active_feats[..m];
+                let active_thresh = &scratch.et_active_thresh[..m];
+                for &s in samples.iter() {
+                    let uidx = s.idx();
+                    let row = &cfg.x_rows[uidx * p..uidx * p + p];
+                    let cu = s.cls();
+                    let lc_c = &mut left_counts[cu * m..cu * m + m];
+                    for ai in 0..m {
+                        lc_c[ai] += u32::from(row[active_feats[ai]] <= active_thresh[ai]);
+                    }
                 }
             }
-        }
-        draw_et_thresholds(
-            &scratch.feat_pool[..k],
-            min_v,
-            max_v,
-            false,
-            rng,
-            &mut scratch.et_active_feats,
-            &mut scratch.et_active_thresh,
-        );
-    } else {
-        let feat_pool = &scratch.feat_pool[..k];
-        let min_v = &mut scratch.et_min[..k];
-        let max_v = &mut scratch.et_max[..k];
-        min_v.fill(f64::INFINITY);
-        max_v.fill(f64::NEG_INFINITY);
-        for &idx in samples.iter() {
-            let uidx = idx as usize;
-            let row = &cfg.x_rows[uidx * p..uidx * p + p];
-            for fi in 0..k {
-                let v = row[feat_pool[fi]];
-                if v < min_v[fi] {
-                    min_v[fi] = v;
-                }
-                if v > max_v[fi] {
-                    max_v[fi] = v;
-                }
-            }
-        }
-        draw_et_thresholds(
-            feat_pool,
-            min_v,
-            max_v,
-            true,
-            rng,
-            &mut scratch.et_active_feats,
-            &mut scratch.et_active_thresh,
-        );
-    }
 
-    let m = scratch.et_active_feats.len();
-    if m == 0 {
-        return push_flat_clf_leaf_u32(
-            &scratch.counts_stack[cur_off..cur_off + n_classes],
-            n,
-            n_classes,
-            nodes,
-            probs_out,
-        );
-    }
-
-    let dense_by_feat = m == p;
-    let stride = if dense_by_feat { p } else { m };
-    let left_counts = &mut scratch.et_left_counts[..n_classes * stride];
-    left_counts.fill(0);
-
-    if dense_by_feat {
-        let thresh_s = &mut scratch.et_thresh_by_feat[..p];
-        for (&f, &t) in scratch
-            .et_active_feats
-            .iter()
-            .zip(scratch.et_active_thresh.iter())
-        {
-            thresh_s[f] = t;
-        }
-        for &idx in samples.iter() {
-            let uidx = idx as usize;
-            let row = &cfg.x_rows[uidx * p..uidx * p + p];
-            let cu = cfg.class_idx[uidx] as usize;
-            let lc_c = &mut left_counts[cu * p..cu * p + p];
-            for f in 0..p {
-                lc_c[f] += u32::from(row[f] <= thresh_s[f]);
-            }
-        }
-    } else {
-        let active_feats = &scratch.et_active_feats[..m];
-        let active_thresh = &scratch.et_active_thresh[..m];
-        for &idx in samples.iter() {
-            let uidx = idx as usize;
-            let row = &cfg.x_rows[uidx * p..uidx * p + p];
-            let cu = cfg.class_idx[uidx] as usize;
-            let lc_c = &mut left_counts[cu * m..cu * m + m];
-            for ai in 0..m {
-                lc_c[ai] += u32::from(row[active_feats[ai]] <= active_thresh[ai]);
-            }
-        }
-    }
-
-    let Some((best_feat, best_thresh, best_gain, best_col_idx, best_left_n)) =
-        eval_et_clf_splits_u32(
-            &scratch.et_active_feats[..m],
-            &scratch.et_active_thresh[..m],
-            left_counts,
-            stride,
-            dense_by_feat,
-            &scratch.counts_stack[cur_off..cur_off + n_classes],
-            n,
-            cfg.min_samples_leaf,
-            cfg.criterion_entropy,
-            parent_imp,
-            parent_sum_sq,
-        )
-    else {
-        return push_flat_clf_leaf_u32(
-            &scratch.counts_stack[cur_off..cur_off + n_classes],
-            n,
-            n_classes,
-            nodes,
-            probs_out,
-        );
-    };
+            let Some((bf, bt, bg, bci, bln)) = eval_et_clf_splits_u32(
+                &scratch.et_active_feats[..m],
+                &scratch.et_active_thresh[..m],
+                left_counts,
+                1,
+                stride,
+                dense_by_feat,
+                &scratch.counts_stack[cur_off..cur_off + n_classes],
+                n,
+                cfg.min_samples_leaf,
+                cfg.criterion_entropy,
+                parent_imp,
+                parent_sum_sq,
+            ) else {
+                return push_flat_clf_leaf_u32(
+                    &scratch.counts_stack[cur_off..cur_off + n_classes],
+                    n,
+                    n_classes,
+                    nodes,
+                    probs_out,
+                );
+            };
+            (bf, bt, bg, bci, bln, 1, stride)
+        };
 
     if cfg.total_tree_weight > 0.0 {
         importances[best_feat] += ((n as f64) / cfg.total_tree_weight) * best_gain;
@@ -1539,22 +1949,35 @@ fn build_clf_tree_et_u32(
     }
     let r_off = cur_off + n_classes;
     let l_off = (depth + 1) * 2 * n_classes;
+    let col_base = best_col_idx * col_stride;
     for c in 0..n_classes {
-        let lc = left_counts[c * stride + best_col_idx];
+        let lc = scratch.et_left_counts[col_base + c * class_stride];
         let tot = scratch.counts_stack[cur_off + c];
         scratch.counts_stack[l_off + c] = lc;
         scratch.counts_stack[r_off + c] = tot - lc;
     }
 
-    partition_u32_with_buf(
-        cfg.x_rows,
-        p,
-        best_feat,
-        best_thresh,
-        best_left_n,
-        samples,
-        &mut scratch.part_buf,
-    );
+    if use_cand {
+        let best_slot = scratch.et_active_slots[best_col_idx];
+        let best_col = &scratch.cand_vals[best_slot * n..(best_slot + 1) * n];
+        partition_packed_with_vals(
+            best_col,
+            best_thresh,
+            best_left_n,
+            samples,
+            &mut scratch.part_buf,
+        );
+    } else {
+        partition_packed_from_x(
+            cfg.x_rows,
+            p,
+            best_feat,
+            best_thresh,
+            best_left_n,
+            samples,
+            &mut scratch.part_buf,
+        );
+    }
 
     let node_idx = nodes.len();
     nodes.push(FlatClfNode {
@@ -1590,6 +2013,43 @@ fn build_clf_tree_et_u32(
     nodes[node_idx].left = left_idx as u32;
     nodes[node_idx].right = right_idx as u32;
     node_idx
+}
+
+fn run_et_clf_trees_packed<S: EtClfSample>(
+    cfg: &EtClfCfg<'_>,
+    n_estimators: usize,
+    base_seed: u64,
+) -> Vec<(Vec<FlatClfNode>, Vec<f64>, Vec<f64>)> {
+    (0..n_estimators)
+        .into_par_iter()
+        .map_init(
+            || {
+                (
+                    EtClfScratch::<S>::new(cfg.n_features, cfg.max_features, cfg.n_classes),
+                    vec![S::default(); cfg.n_samples],
+                )
+            },
+            |(scratch, root_samples), tree_idx| {
+                let seed = base_seed
+                    .wrapping_add((tree_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                    ^ 0xA5A5_5A5A_1234_5678;
+                let mut rng = SplitMix64::new(seed);
+                let mut imp = vec![0.0; cfg.n_features];
+                let mut t_nodes = Vec::with_capacity(256);
+                let mut t_probs = Vec::with_capacity(128 * cfg.n_classes);
+                build_clf_tree_root_et_u32(
+                    cfg,
+                    root_samples,
+                    &mut rng,
+                    &mut imp,
+                    scratch,
+                    &mut t_nodes,
+                    &mut t_probs,
+                );
+                (t_nodes, t_probs, imp)
+            },
+        )
+        .collect()
 }
 
 // =========================================================================
@@ -2705,28 +3165,11 @@ impl ForestClassifierCore {
                 root_counts: &root_counts,
             };
 
-            let results: Vec<(Vec<FlatClfNode>, Vec<f64>, Vec<f64>)> = (0..self.n_estimators)
-                .into_par_iter()
-                .map(|tree_idx| {
-                    let seed = base_seed
-                        .wrapping_add((tree_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-                        ^ 0xA5A5_5A5A_1234_5678;
-                    let mut rng = SplitMix64::new(seed);
-                    let mut imp = vec![0.0; n_features];
-                    let mut scratch = EtClfScratch::new(n_features, max_feat, n_classes);
-                    let mut t_nodes = Vec::with_capacity(256);
-                    let mut t_probs = Vec::with_capacity(128 * n_classes);
-                    build_clf_tree_root_et_u32(
-                        &cfg,
-                        &mut rng,
-                        &mut imp,
-                        &mut scratch,
-                        &mut t_nodes,
-                        &mut t_probs,
-                    );
-                    (t_nodes, t_probs, imp)
-                })
-                .collect();
+            let results = if n_samples < (1usize << 24) && n_classes <= 256 {
+                run_et_clf_trees_packed::<u32>(&cfg, self.n_estimators, base_seed)
+            } else {
+                run_et_clf_trees_packed::<u64>(&cfg, self.n_estimators, base_seed)
+            };
             merge_flat_clf_trees(results)
         } else {
             let sw = validate_sample_weight(sample_weight, x.rows)?;

@@ -715,17 +715,17 @@ impl DecisionTreeClassifier {
         } else {
             None
         };
-        Ok(Self {
+        Ok(Self::from_loaded(
             criterion,
             max_depth,
             min_samples_split,
             min_samples_leaf,
-            device: dev,
+            dev,
             device_,
             root,
             classes_,
             n_features_in_,
-        })
+        ))
     }
 
     pub fn set_device(&mut self, device: Option<&str>) -> OchreResult<()> {
@@ -769,16 +769,16 @@ impl DecisionTreeRegressor {
         } else {
             None
         };
-        Ok(Self {
+        Ok(Self::from_loaded(
             criterion,
             max_depth,
             min_samples_split,
             min_samples_leaf,
-            device: dev,
+            dev,
             device_,
             root,
             n_features_in_,
-        })
+        ))
     }
 
     pub fn set_device(&mut self, device: Option<&str>) -> OchreResult<()> {
@@ -801,21 +801,25 @@ pub fn get_device_info() -> HashMap<String, String> {
     device::get_device_info_map()
 }
 
+const MAX_POOLED_VEC_CAP: usize = 48 * 1024 * 1024;
+
 thread_local! {
     static MATRIX_BUF_POOL: std::cell::RefCell<Vec<Vec<f64>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn pop_pooled_vec(min_cap: usize) -> Vec<f64> {
-    MATRIX_BUF_POOL
-        .with(|pool| {
-            let mut slots = pool.borrow_mut();
-            if let Some(pos) = slots.iter().position(|v| v.capacity() >= min_cap) {
-                Some(slots.swap_remove(pos))
-            } else {
-                slots.pop()
-            }
-        })
-        .unwrap_or_default()
+fn pop_pooled_vec_for_copy(min_len: usize) -> Option<Vec<f64>> {
+    MATRIX_BUF_POOL.with(|pool| {
+        let mut slots = pool.borrow_mut();
+        let pos = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| {
+                v.len() >= min_len && (v.len() <= min_len.saturating_mul(2) || v.len() < 1_048_576)
+            })
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(idx, _)| idx);
+        pos.map(|idx| slots.swap_remove(idx))
+    })
 }
 
 struct PooledMatrix {
@@ -834,10 +838,10 @@ impl std::ops::Deref for PooledMatrix {
 impl Drop for PooledMatrix {
     fn drop(&mut self) {
         let buf = std::mem::take(&mut self.mat.data);
-        if buf.capacity() <= 16 * 1024 * 1024 {
+        if buf.capacity() <= MAX_POOLED_VEC_CAP {
             MATRIX_BUF_POOL.with(|pool| {
                 if let Ok(mut slots) = pool.try_borrow_mut() {
-                    if slots.len() < 2 {
+                    if slots.len() < 4 {
                         slots.push(buf);
                     } else if let Some(min_slot) = slots.iter_mut().min_by_key(|v| v.capacity())
                         && buf.capacity() > min_slot.capacity()
@@ -864,9 +868,10 @@ fn buffer_to_matrix(py: Python<'_>, x: &pyo3::buffer::PyBuffer<f64>) -> PyResult
         .checked_mul(cols)
         .ok_or_else(|| PyValueError::new_err("Matrix dimensions overflow ( >_< )"))?;
 
-    if x.is_c_contiguous() {
-        let mut data = pop_pooled_vec(len);
-        data.resize(len, 0.0);
+    if x.is_c_contiguous()
+        && let Some(mut data) = pop_pooled_vec_for_copy(len)
+    {
+        data.truncate(len);
         x.copy_to_slice(py, &mut data[..len]).map_err(|e| {
             PyValueError::new_err(format!("Failed to copy buffer data: {} (´；ω；`)", e))
         })?;
@@ -913,9 +918,10 @@ fn buffer_to_target_matrix(
     let len = rows
         .checked_mul(cols)
         .ok_or_else(|| PyValueError::new_err("Target dimensions overflow ( >_< )"))?;
-    if y.is_c_contiguous() {
-        let mut data = pop_pooled_vec(len);
-        data.resize(len, 0.0);
+    if y.is_c_contiguous()
+        && let Some(mut data) = pop_pooled_vec_for_copy(len)
+    {
+        data.truncate(len);
         y.copy_to_slice(py, &mut data[..len]).map_err(|e| {
             PyValueError::new_err(format!("Failed to copy target buffer: {} (´；ω；`)", e))
         })?;

@@ -24,6 +24,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use rayon::prelude::*;
+use std::borrow::Cow;
 
 pub const TAG_LINEAR_SVC: u8 = 54;
 pub const TAG_LINEAR_SVR: u8 = 55;
@@ -32,7 +33,31 @@ const LBFGS_HISTORY: usize = 10;
 const LARGE_MATRIX_THRESHOLD: usize = 262_144;
 const PREDICT_GPU_THRESHOLD: usize = 2_000_000;
 const PARALLEL_ROW_THRESHOLD: usize = 512;
-const PREDICT_CHUNK_ROWS: usize = 64;
+
+#[inline]
+fn compute_predict_chunk_rows(n: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    (n / (threads * 2)).clamp(256, 2048).next_multiple_of(4)
+}
+
+#[inline(always)]
+fn slice_is_finite(data: &[f64]) -> bool {
+    let (chunks, rem) = data.as_chunks::<8>();
+    for c in chunks {
+        let ok = c[0].is_finite()
+            & c[1].is_finite()
+            & c[2].is_finite()
+            & c[3].is_finite()
+            & c[4].is_finite()
+            & c[5].is_finite()
+            & c[6].is_finite()
+            & c[7].is_finite();
+        if !ok {
+            return false;
+        }
+    }
+    rem.iter().all(|v| v.is_finite())
+}
 
 #[inline(always)]
 fn dot4_4rows(a0: &[f64], a1: &[f64], a2: &[f64], a3: &[f64], b: &[f64]) -> (f64, f64, f64, f64) {
@@ -95,10 +120,19 @@ fn pack_coef_4(coef_data: &[f64], k: usize, p: usize) -> Vec<f64> {
     packed
 }
 
-fn cpu_linear_1d_chunk(x_chunk: &[f64], p: usize, w: &[f64], b: f64, out_chunk: &mut [f64]) {
+fn cpu_linear_1d_chunk(
+    x_chunk: &[f64],
+    p: usize,
+    w: &[f64],
+    b: f64,
+    out_chunk: &mut [f64],
+) -> bool {
     let n_rows = out_chunk.len();
     let mut r = 0usize;
     while r + 4 <= n_rows {
+        if !slice_is_finite(&x_chunk[r * p..(r + 4) * p]) {
+            return false;
+        }
         let (d0, d1, d2, d3) = dot4_4rows(
             &x_chunk[r * p..(r + 1) * p],
             &x_chunk[(r + 1) * p..(r + 2) * p],
@@ -113,25 +147,38 @@ fn cpu_linear_1d_chunk(x_chunk: &[f64], p: usize, w: &[f64], b: f64, out_chunk: 
         r += 4;
     }
     while r < n_rows {
-        out_chunk[r] = dot_unrolled(&x_chunk[r * p..(r + 1) * p], w) + b;
+        let x_row = &x_chunk[r * p..(r + 1) * p];
+        if !slice_is_finite(x_row) {
+            return false;
+        }
+        out_chunk[r] = dot_unrolled(x_row, w) + b;
         r += 1;
     }
+    true
 }
 
-fn cpu_linear_1d(x: &Matrix, w: &[f64], b: f64) -> Vec<f64> {
+fn cpu_linear_1d(x: &Matrix, w: &[f64], b: f64) -> OchreResult<Vec<f64>> {
     let n = x.rows;
     let p = x.cols;
     let mut out = vec![0.0; n];
     if n >= PARALLEL_ROW_THRESHOLD {
-        out.par_chunks_mut(PREDICT_CHUNK_ROWS)
-            .zip(x.data.par_chunks(PREDICT_CHUNK_ROWS * p))
-            .for_each(|(out_chunk, x_chunk)| {
-                cpu_linear_1d_chunk(x_chunk, p, w, b, out_chunk);
-            });
-    } else {
-        cpu_linear_1d_chunk(&x.data, p, w, b, &mut out);
+        let chunk_rows = compute_predict_chunk_rows(n);
+        out.par_chunks_mut(chunk_rows)
+            .zip(x.data.par_chunks(chunk_rows * p))
+            .try_for_each(|(out_chunk, x_chunk)| -> OchreResult<()> {
+                if !cpu_linear_1d_chunk(x_chunk, p, w, b, out_chunk) {
+                    return Err(OchreError::InvalidParameter(
+                        "Input X contains NaN or Inf values ( >_< )".to_string(),
+                    ));
+                }
+                Ok(())
+            })?;
+    } else if !cpu_linear_1d_chunk(&x.data, p, w, b, &mut out) {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN or Inf values ( >_< )".to_string(),
+        ));
     }
-    out
+    Ok(out)
 }
 
 fn cpu_svc_predict_binary_chunk(
@@ -142,10 +189,13 @@ fn cpu_svc_predict_binary_chunk(
     c0: f64,
     c1: f64,
     out_chunk: &mut [f64],
-) {
+) -> bool {
     let n_rows = out_chunk.len();
     let mut r = 0usize;
     while r + 4 <= n_rows {
+        if !slice_is_finite(&x_chunk[r * p..(r + 4) * p]) {
+            return false;
+        }
         let (d0, d1, d2, d3) = dot4_4rows(
             &x_chunk[r * p..(r + 1) * p],
             &x_chunk[(r + 1) * p..(r + 2) * p],
@@ -160,26 +210,45 @@ fn cpu_svc_predict_binary_chunk(
         r += 4;
     }
     while r < n_rows {
-        let s = dot_unrolled(&x_chunk[r * p..(r + 1) * p], w) + b;
+        let x_row = &x_chunk[r * p..(r + 1) * p];
+        if !slice_is_finite(x_row) {
+            return false;
+        }
+        let s = dot_unrolled(x_row, w) + b;
         out_chunk[r] = if s > 0.0 { c1 } else { c0 };
         r += 1;
     }
+    true
 }
 
-fn cpu_svc_predict_binary(x: &Matrix, w: &[f64], b: f64, c0: f64, c1: f64) -> Vec<f64> {
+fn cpu_svc_predict_binary(
+    x: &Matrix,
+    w: &[f64],
+    b: f64,
+    c0: f64,
+    c1: f64,
+) -> OchreResult<Vec<f64>> {
     let n = x.rows;
     let p = x.cols;
     let mut out = vec![0.0; n];
     if n >= PARALLEL_ROW_THRESHOLD {
-        out.par_chunks_mut(PREDICT_CHUNK_ROWS)
-            .zip(x.data.par_chunks(PREDICT_CHUNK_ROWS * p))
-            .for_each(|(out_chunk, x_chunk)| {
-                cpu_svc_predict_binary_chunk(x_chunk, p, w, b, c0, c1, out_chunk);
-            });
-    } else {
-        cpu_svc_predict_binary_chunk(&x.data, p, w, b, c0, c1, &mut out);
+        let chunk_rows = compute_predict_chunk_rows(n);
+        out.par_chunks_mut(chunk_rows)
+            .zip(x.data.par_chunks(chunk_rows * p))
+            .try_for_each(|(out_chunk, x_chunk)| -> OchreResult<()> {
+                if !cpu_svc_predict_binary_chunk(x_chunk, p, w, b, c0, c1, out_chunk) {
+                    return Err(OchreError::InvalidParameter(
+                        "Input X contains NaN or Inf values ( >_< )".to_string(),
+                    ));
+                }
+                Ok(())
+            })?;
+    } else if !cpu_svc_predict_binary_chunk(&x.data, p, w, b, c0, c1, &mut out) {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN or Inf values ( >_< )".to_string(),
+        ));
     }
-    out
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -192,12 +261,15 @@ fn cpu_linear_multi_chunk(
     intercept: &[f64],
     k: usize,
     out_chunk: &mut [f64],
-) {
+) -> bool {
     let n_blocks = k / 4;
     let k_rem_start = n_blocks * 4;
     let mut r = 0usize;
 
     while r + 4 <= n_rows {
+        if !slice_is_finite(&x_chunk[r * p..(r + 4) * p]) {
+            return false;
+        }
         let x0 = &x_chunk[r * p..(r + 1) * p];
         let x1 = &x_chunk[(r + 1) * p..(r + 2) * p];
         let x2 = &x_chunk[(r + 2) * p..(r + 3) * p];
@@ -253,48 +325,64 @@ fn cpu_linear_multi_chunk(
 
     while r < n_rows {
         let x_row = &x_chunk[r * p..(r + 1) * p];
+        if !slice_is_finite(x_row) {
+            return false;
+        }
         let dst = &mut out_chunk[r * k..(r + 1) * k];
         for c in 0..k {
             dst[c] = dot_unrolled(x_row, &coef_data[c * p..(c + 1) * p]) + intercept[c];
         }
         r += 1;
     }
+    true
 }
 
-fn cpu_linear_multi(x: &Matrix, coef: &Matrix, intercept: &[f64]) -> OchreResult<Matrix> {
+fn cpu_linear_multi(
+    x: &Matrix,
+    coef_packed: &[f64],
+    coef: &Matrix,
+    intercept: &[f64],
+) -> OchreResult<Matrix> {
     let n = x.rows;
     let p = x.cols;
     let k = coef.rows;
     let coef_data = &coef.data;
-    let coef_packed = pack_coef_4(coef_data, k, p);
     let mut out = vec![0.0; n * k];
     if n >= PARALLEL_ROW_THRESHOLD {
-        out.par_chunks_mut(PREDICT_CHUNK_ROWS * k)
-            .zip(x.data.par_chunks(PREDICT_CHUNK_ROWS * p))
-            .for_each(|(out_chunk, x_chunk)| {
+        let chunk_rows = compute_predict_chunk_rows(n);
+        out.par_chunks_mut(chunk_rows * k)
+            .zip(x.data.par_chunks(chunk_rows * p))
+            .try_for_each(|(out_chunk, x_chunk)| -> OchreResult<()> {
                 let n_rows = out_chunk.len() / k;
-                cpu_linear_multi_chunk(
+                if !cpu_linear_multi_chunk(
                     x_chunk,
                     n_rows,
                     p,
-                    &coef_packed,
+                    coef_packed,
                     coef_data,
                     intercept,
                     k,
                     out_chunk,
-                );
-            });
-    } else {
-        cpu_linear_multi_chunk(
-            &x.data,
-            n,
-            p,
-            &coef_packed,
-            coef_data,
-            intercept,
-            k,
-            &mut out,
-        );
+                ) {
+                    return Err(OchreError::InvalidParameter(
+                        "Input X contains NaN or Inf values ( >_< )".to_string(),
+                    ));
+                }
+                Ok(())
+            })?;
+    } else if !cpu_linear_multi_chunk(
+        &x.data,
+        n,
+        p,
+        coef_packed,
+        coef_data,
+        intercept,
+        k,
+        &mut out,
+    ) {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN or Inf values ( >_< )".to_string(),
+        ));
     }
     Matrix::from_vec(n, k, out)
 }
@@ -309,13 +397,17 @@ fn cpu_svc_predict_multi_chunk(
     classes: &[f64],
     k: usize,
     preds_chunk: &mut [f64],
-) {
+) -> bool {
     let n_rows = preds_chunk.len();
     let n_blocks = k / 4;
     let k_rem_start = n_blocks * 4;
+    let k_rem = k - k_rem_start;
     let mut r = 0usize;
 
     while r + 4 <= n_rows {
+        if !slice_is_finite(&x_chunk[r * p..(r + 4) * p]) {
+            return false;
+        }
         let x0 = &x_chunk[r * p..(r + 1) * p];
         let x1 = &x_chunk[(r + 1) * p..(r + 2) * p];
         let x2 = &x_chunk[(r + 2) * p..(r + 3) * p];
@@ -369,28 +461,118 @@ fn cpu_svc_predict_multi_chunk(
             }
         }
 
-        for c in k_rem_start..k {
+        if k_rem >= 2 {
+            // Compute remaining 2 or 3 classes in one pass over x0..x3
+            let c_a = k_rem_start;
+            let ca_row = &coef_data[c_a * p..(c_a + 1) * p];
+            let cb_row = &coef_data[(c_a + 1) * p..(c_a + 2) * p];
+            let mut a0 = 0.0;
+            let mut a1 = 0.0;
+            let mut a2 = 0.0;
+            let mut a3 = 0.0;
+            let mut b0 = 0.0;
+            let mut b1 = 0.0;
+            let mut b2 = 0.0;
+            let mut b3 = 0.0;
+            if k_rem == 3 {
+                let cc_row = &coef_data[(c_a + 2) * p..(c_a + 3) * p];
+                let mut c0 = 0.0;
+                let mut c1 = 0.0;
+                let mut c2 = 0.0;
+                let mut c3 = 0.0;
+                for f in 0..p {
+                    let xv0 = x0[f];
+                    let xv1 = x1[f];
+                    let xv2 = x2[f];
+                    let xv3 = x3[f];
+                    let wa = ca_row[f];
+                    let wb = cb_row[f];
+                    let wc = cc_row[f];
+                    a0 += xv0 * wa;
+                    a1 += xv1 * wa;
+                    a2 += xv2 * wa;
+                    a3 += xv3 * wa;
+                    b0 += xv0 * wb;
+                    b1 += xv1 * wb;
+                    b2 += xv2 * wb;
+                    b3 += xv3 * wb;
+                    c0 += xv0 * wc;
+                    c1 += xv1 * wc;
+                    c2 += xv2 * wc;
+                    c3 += xv3 * wc;
+                }
+                let vals = [
+                    [
+                        a0 + intercept[c_a],
+                        b0 + intercept[c_a + 1],
+                        c0 + intercept[c_a + 2],
+                    ],
+                    [
+                        a1 + intercept[c_a],
+                        b1 + intercept[c_a + 1],
+                        c1 + intercept[c_a + 2],
+                    ],
+                    [
+                        a2 + intercept[c_a],
+                        b2 + intercept[c_a + 1],
+                        c2 + intercept[c_a + 2],
+                    ],
+                    [
+                        a3 + intercept[c_a],
+                        b3 + intercept[c_a + 1],
+                        c3 + intercept[c_a + 2],
+                    ],
+                ];
+                for lane in 0..3 {
+                    for row in 0..4 {
+                        if vals[row][lane] > best_v[row] {
+                            best_v[row] = vals[row][lane];
+                            best_c[row] = c_a + lane;
+                        }
+                    }
+                }
+            } else {
+                for f in 0..p {
+                    let xv0 = x0[f];
+                    let xv1 = x1[f];
+                    let xv2 = x2[f];
+                    let xv3 = x3[f];
+                    let wa = ca_row[f];
+                    let wb = cb_row[f];
+                    a0 += xv0 * wa;
+                    a1 += xv1 * wa;
+                    a2 += xv2 * wa;
+                    a3 += xv3 * wa;
+                    b0 += xv0 * wb;
+                    b1 += xv1 * wb;
+                    b2 += xv2 * wb;
+                    b3 += xv3 * wb;
+                }
+                let vals = [
+                    [a0 + intercept[c_a], b0 + intercept[c_a + 1]],
+                    [a1 + intercept[c_a], b1 + intercept[c_a + 1]],
+                    [a2 + intercept[c_a], b2 + intercept[c_a + 1]],
+                    [a3 + intercept[c_a], b3 + intercept[c_a + 1]],
+                ];
+                for lane in 0..2 {
+                    for row in 0..4 {
+                        if vals[row][lane] > best_v[row] {
+                            best_v[row] = vals[row][lane];
+                            best_c[row] = c_a + lane;
+                        }
+                    }
+                }
+            }
+        } else if k_rem == 1 {
+            let c = k_rem_start;
             let (d0, d1, d2, d3) = dot4_4rows(x0, x1, x2, x3, &coef_data[c * p..(c + 1) * p]);
             let bc = intercept[c];
-            let v0 = d0 + bc;
-            if v0 > best_v[0] {
-                best_v[0] = v0;
-                best_c[0] = c;
-            }
-            let v1 = d1 + bc;
-            if v1 > best_v[1] {
-                best_v[1] = v1;
-                best_c[1] = c;
-            }
-            let v2 = d2 + bc;
-            if v2 > best_v[2] {
-                best_v[2] = v2;
-                best_c[2] = c;
-            }
-            let v3 = d3 + bc;
-            if v3 > best_v[3] {
-                best_v[3] = v3;
-                best_c[3] = c;
+            let vals = [d0 + bc, d1 + bc, d2 + bc, d3 + bc];
+            for row in 0..4 {
+                if vals[row] > best_v[row] {
+                    best_v[row] = vals[row];
+                    best_c[row] = c;
+                }
             }
         }
 
@@ -403,6 +585,9 @@ fn cpu_svc_predict_multi_chunk(
 
     while r < n_rows {
         let x_row = &x_chunk[r * p..(r + 1) * p];
+        if !slice_is_finite(x_row) {
+            return false;
+        }
         let mut best_c = 0usize;
         let mut best_v = dot_unrolled(x_row, &coef_data[..p]) + intercept[0];
         for c in 1..k {
@@ -415,49 +600,58 @@ fn cpu_svc_predict_multi_chunk(
         preds_chunk[r] = classes[best_c];
         r += 1;
     }
+    true
 }
 
 fn cpu_svc_predict_multi(
     x: &Matrix,
+    coef_packed: &[f64],
     coef: &Matrix,
     intercept: &[f64],
     classes: &[f64],
-) -> Vec<f64> {
+) -> OchreResult<Vec<f64>> {
     let n = x.rows;
     let p = x.cols;
     let k = classes.len();
     let coef_data = &coef.data;
-    let coef_packed = pack_coef_4(coef_data, k, p);
     let mut preds = vec![0.0; n];
     if n >= PARALLEL_ROW_THRESHOLD {
+        let chunk_rows = compute_predict_chunk_rows(n);
         preds
-            .par_chunks_mut(PREDICT_CHUNK_ROWS)
-            .zip(x.data.par_chunks(PREDICT_CHUNK_ROWS * p))
-            .for_each(|(preds_chunk, x_chunk)| {
-                cpu_svc_predict_multi_chunk(
+            .par_chunks_mut(chunk_rows)
+            .zip(x.data.par_chunks(chunk_rows * p))
+            .try_for_each(|(preds_chunk, x_chunk)| -> OchreResult<()> {
+                if !cpu_svc_predict_multi_chunk(
                     x_chunk,
                     p,
-                    &coef_packed,
+                    coef_packed,
                     coef_data,
                     intercept,
                     classes,
                     k,
                     preds_chunk,
-                );
-            });
-    } else {
-        cpu_svc_predict_multi_chunk(
-            &x.data,
-            p,
-            &coef_packed,
-            coef_data,
-            intercept,
-            classes,
-            k,
-            &mut preds,
-        );
+                ) {
+                    return Err(OchreError::InvalidParameter(
+                        "Input X contains NaN or Inf values ( >_< )".to_string(),
+                    ));
+                }
+                Ok(())
+            })?;
+    } else if !cpu_svc_predict_multi_chunk(
+        &x.data,
+        p,
+        coef_packed,
+        coef_data,
+        intercept,
+        classes,
+        k,
+        &mut preds,
+    ) {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN or Inf values ( >_< )".to_string(),
+        ));
     }
-    preds
+    Ok(preds)
 }
 
 #[inline(always)]
@@ -1353,6 +1547,7 @@ pub struct LinearSVC {
     pub classes_: Vec<f64>,
     pub n_features_in_: Option<usize>,
     pub n_iter_: usize,
+    coef_packed_: Option<Vec<f64>>,
 }
 
 impl LinearSVC {
@@ -1423,6 +1618,7 @@ impl LinearSVC {
             classes_: Vec::new(),
             n_features_in_: None,
             n_iter_: 0,
+            coef_packed_: None,
         })
     }
 
@@ -1474,6 +1670,7 @@ impl LinearSVC {
                 .collect();
             let (w, b, n_iter) = self.solve_binary(&backend, x, &y_pm1, &weights, cfg)?;
             self.coef_ = Some(Matrix::from_vec(1, p, w)?);
+            self.coef_packed_ = None;
             self.intercept_ = Some(vec![b]);
             self.n_iter_ = n_iter;
         } else {
@@ -1497,6 +1694,11 @@ impl LinearSVC {
                 intercepts.push(b);
                 max_n_iter = max_n_iter.max(ni);
             }
+            self.coef_packed_ = if n_classes >= 4 {
+                Some(pack_coef_4(&coef_data, n_classes, p))
+            } else {
+                None
+            };
             self.coef_ = Some(Matrix::from_vec(n_classes, p, coef_data)?);
             self.intercept_ = Some(intercepts);
             self.n_iter_ = max_n_iter;
@@ -1529,7 +1731,9 @@ impl LinearSVC {
         let coef = self.coef_.as_ref().ok_or(OchreError::NotFitted)?;
         let intercept = self.intercept_.as_ref().ok_or(OchreError::NotFitted)?;
         let n_features = self.n_features_in_.ok_or(OchreError::NotFitted)?;
-        validate_finite_matrix(x)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         if x.cols != n_features {
             return Err(OchreError::FeatureCountMismatch {
                 features: x.cols,
@@ -1544,31 +1748,38 @@ impl LinearSVC {
         };
         if matches!(backend, Backend::Cpu) {
             if coef.rows == 1 {
-                let scores = cpu_linear_1d(x, &coef.data, intercept[0]);
+                let scores = cpu_linear_1d(x, &coef.data, intercept[0])?;
                 Matrix::from_vec(x.rows, 1, scores)
             } else {
-                cpu_linear_multi(x, coef, intercept)
+                let coef_packed = match self.coef_packed_.as_deref() {
+                    Some(cp) => Cow::Borrowed(cp),
+                    None => Cow::Owned(pack_coef_4(&coef.data, coef.rows, n_features)),
+                };
+                cpu_linear_multi(x, &coef_packed, coef, intercept)
             }
-        } else if coef.rows == 1 {
-            let mut out = backend.matvec(x, &coef.data)?;
-            let b0 = intercept[0];
-            if b0 != 0.0 {
-                for v in &mut out {
-                    *v += b0;
-                }
-            }
-            Matrix::from_vec(x.rows, 1, out)
         } else {
-            let coef_t = coef.transpose();
-            let mut scores = backend.matmul(x, &coef_t)?;
-            let k = coef.rows;
-            for r in 0..scores.rows {
-                let row = &mut scores.data[r * k..(r + 1) * k];
-                for (dst, &b) in row.iter_mut().zip(intercept.iter()) {
-                    *dst += b;
+            validate_finite_matrix(x)?;
+            if coef.rows == 1 {
+                let mut out = backend.matvec(x, &coef.data)?;
+                let b0 = intercept[0];
+                if b0 != 0.0 {
+                    for v in &mut out {
+                        *v += b0;
+                    }
                 }
+                Matrix::from_vec(x.rows, 1, out)
+            } else {
+                let coef_t = coef.transpose();
+                let mut scores = backend.matmul(x, &coef_t)?;
+                let k = coef.rows;
+                for r in 0..scores.rows {
+                    let row = &mut scores.data[r * k..(r + 1) * k];
+                    for (dst, &b) in row.iter_mut().zip(intercept.iter()) {
+                        *dst += b;
+                    }
+                }
+                Ok(scores)
             }
-            Ok(scores)
         }
     }
 
@@ -1576,7 +1787,9 @@ impl LinearSVC {
         let coef = self.coef_.as_ref().ok_or(OchreError::NotFitted)?;
         let intercept = self.intercept_.as_ref().ok_or(OchreError::NotFitted)?;
         let n_features = self.n_features_in_.ok_or(OchreError::NotFitted)?;
-        validate_finite_matrix(x)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         if x.cols != n_features {
             return Err(OchreError::FeatureCountMismatch {
                 features: x.cols,
@@ -1591,15 +1804,19 @@ impl LinearSVC {
         };
         if matches!(backend, Backend::Cpu) {
             if self.classes_.len() == 2 {
-                return Ok(cpu_svc_predict_binary(
+                return cpu_svc_predict_binary(
                     x,
                     &coef.data,
                     intercept[0],
                     self.classes_[0],
                     self.classes_[1],
-                ));
+                );
             }
-            return Ok(cpu_svc_predict_multi(x, coef, intercept, &self.classes_));
+            let coef_packed = match self.coef_packed_.as_deref() {
+                Some(cp) => Cow::Borrowed(cp),
+                None => Cow::Owned(pack_coef_4(&coef.data, self.classes_.len(), n_features)),
+            };
+            return cpu_svc_predict_multi(x, &coef_packed, coef, intercept, &self.classes_);
         }
 
         let scores = self.decision_function(x)?;
@@ -1710,6 +1927,10 @@ impl LinearSVC {
         let n_iter_ = r.read_usize()?;
 
         let (dev, dev_str) = resolve_loaded_device(saved_device, coef_.is_some(), device)?;
+        let coef_packed_ = match (&coef_, n_features_in_) {
+            (Some(c), Some(p)) if c.rows >= 4 => Some(pack_coef_4(&c.data, c.rows, p)),
+            _ => None,
+        };
         Ok(Self {
             c,
             loss,
@@ -1729,6 +1950,7 @@ impl LinearSVC {
             classes_,
             n_features_in_,
             n_iter_,
+            coef_packed_,
         })
     }
 }
@@ -1850,7 +2072,9 @@ impl LinearSVR {
         let coef = self.coef_.as_ref().ok_or(OchreError::NotFitted)?;
         let intercept = self.intercept_.ok_or(OchreError::NotFitted)?;
         let n_features = self.n_features_in_.ok_or(OchreError::NotFitted)?;
-        validate_finite_matrix(x)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         if x.cols != n_features {
             return Err(OchreError::FeatureCountMismatch {
                 features: x.cols,
@@ -1864,8 +2088,9 @@ impl LinearSVR {
             get_backend(&self.device)
         };
         if matches!(backend, Backend::Cpu) {
-            Ok(cpu_linear_1d(x, coef, intercept))
+            cpu_linear_1d(x, coef, intercept)
         } else {
+            validate_finite_matrix(x)?;
             let mut out = backend.matvec(x, coef)?;
             if intercept != 0.0 {
                 for v in &mut out {
@@ -2487,5 +2712,49 @@ mod tests {
             assert!((svr_preds[r] - ref_v).abs() < 1e-10);
         }
         assert!(svr.score(&x, &y_reg).unwrap() > 0.99);
+
+        // Verify fused NaN/Inf detection on parallel predict & decision_function
+        let mut x_nan = x.clone();
+        x_nan[(515, 4)] = f64::NAN;
+        assert!(svc.predict(&x_nan).is_err());
+        assert!(svc.decision_function(&x_nan).is_err());
+        assert!(svr.predict(&x_nan).is_err());
+
+        let mut x_inf = x.clone();
+        x_inf[(650, p - 1)] = f64::NEG_INFINITY;
+        assert!(svc.predict(&x_inf).is_err());
+        assert!(svr.predict(&x_inf).is_err());
+
+        // Verify 3-class remainder path (k_rem == 3)
+        let y3: Vec<f64> = (0..n).map(|i| (i % 3) as f64).collect();
+        let mut svc3 = LinearSVC::new(
+            1.0,
+            "squared_hinge".to_string(),
+            "l2".to_string(),
+            true,
+            1e-4,
+            true,
+            1.0,
+            None,
+            None,
+            1000,
+            Some(42),
+            Some("cpu".to_string()),
+        )
+        .unwrap();
+        svc3.fit(&x, &y3).unwrap();
+        let df3 = svc3.decision_function(&x).unwrap();
+        let preds3 = svc3.predict(&x).unwrap();
+        for r in [0, 3, 4, 511, 512, 650] {
+            let mut best_c = 0;
+            let mut best_v = f64::NEG_INFINITY;
+            for c in 0..3 {
+                if df3[(r, c)] > best_v {
+                    best_v = df3[(r, c)];
+                    best_c = c;
+                }
+            }
+            assert_eq!(preds3[r], svc3.classes_[best_c]);
+        }
     }
 }

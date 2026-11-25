@@ -20,6 +20,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use rayon::prelude::*;
 use std::f64::consts::PI;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const TAG_GAUSSIAN_MIXTURE: u8 = 64;
 
@@ -28,6 +29,7 @@ const KMEANS_INIT_MAX_ITER: usize = 10;
 const GMM_GPU_THRESHOLD: usize = 2_000_000;
 const PARALLEL_ROW_THRESHOLD: usize = 512;
 const GMM_CHUNK_ROWS: usize = 64;
+const GMM_PREDICT_CHUNK_ROWS: usize = 256;
 
 #[inline]
 fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
@@ -38,44 +40,21 @@ fn effective_backend<'a>(dev: &'a DeviceType, elems: usize) -> Backend<'a> {
     }
 }
 
-#[inline(always)]
-fn dot4_4rows(a0: &[f64], a1: &[f64], a2: &[f64], a3: &[f64], b: &[f64]) -> (f64, f64, f64, f64) {
-    let mut s0 = [0.0f64; 4];
-    let mut s1 = [0.0f64; 4];
-    let mut s2 = [0.0f64; 4];
-    let mut s3 = [0.0f64; 4];
-    let (b_chunks, b_rem) = b.as_chunks::<4>();
-    let (a0_chunks, a0_rem) = a0.as_chunks::<4>();
-    let (a1_chunks, a1_rem) = a1.as_chunks::<4>();
-    let (a2_chunks, a2_rem) = a2.as_chunks::<4>();
-    let (a3_chunks, a3_rem) = a3.as_chunks::<4>();
-    for ((((&bc, &c0), &c1), &c2), &c3) in b_chunks
-        .iter()
-        .zip(a0_chunks.iter())
-        .zip(a1_chunks.iter())
-        .zip(a2_chunks.iter())
-        .zip(a3_chunks.iter())
-    {
-        for l in 0..4 {
-            let bv = bc[l];
-            s0[l] += c0[l] * bv;
-            s1[l] += c1[l] * bv;
-            s2[l] += c2[l] * bv;
-            s3[l] += c3[l] * bv;
-        }
+#[inline]
+fn slice_all_finite(data: &[f64]) -> bool {
+    let mut acc = [0.0f64; 4];
+    let (chunks, rem) = data.as_chunks::<4>();
+    for &c in chunks {
+        acc[0] += c[0] * 0.0;
+        acc[1] += c[1] * 0.0;
+        acc[2] += c[2] * 0.0;
+        acc[3] += c[3] * 0.0;
     }
-    let mut r0 = (s0[0] + s0[1]) + (s0[2] + s0[3]);
-    let mut r1 = (s1[0] + s1[1]) + (s1[2] + s1[3]);
-    let mut r2 = (s2[0] + s2[1]) + (s2[2] + s2[3]);
-    let mut r3 = (s3[0] + s3[1]) + (s3[2] + s3[3]);
-    for j in 0..b_rem.len() {
-        let bv = b_rem[j];
-        r0 += a0_rem[j] * bv;
-        r1 += a1_rem[j] * bv;
-        r2 += a2_rem[j] * bv;
-        r3 += a3_rem[j] * bv;
+    let mut s = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    for &v in rem {
+        s += v * 0.0;
     }
-    (r0, r1, r2, r3)
+    s == 0.0
 }
 
 #[inline(always)]
@@ -150,7 +129,14 @@ fn validate_x(x: &Matrix) -> OchreResult<()> {
     if x.rows == 0 || x.cols == 0 {
         return Err(OchreError::EmptyData);
     }
-    if x.data.iter().any(|v| !v.is_finite()) {
+    let has_non_finite = if x.data.len() >= 65_536 {
+        x.data
+            .par_chunks(16_384)
+            .any(|chunk| !slice_all_finite(chunk))
+    } else {
+        !slice_all_finite(&x.data)
+    };
+    if has_non_finite {
         return Err(OchreError::InvalidParameter(
             "Input X contains NaN or infinite values ( >_< )".to_string(),
         ));
@@ -581,13 +567,16 @@ fn estimate_gaussian_parameters_from_labels(
 
 enum GmmEvalData {
     Full {
-        u_t_all: Vec<f64>,
-        mu_u_all: Vec<f64>,
+        u_packed_all: Vec<[f64; 4]>,
+        u_comp_stride: usize,
+        mu_packed_all: Vec<[f64; 4]>,
+        nb: usize,
         offsets: Vec<f64>,
     },
     Tied {
-        u_t: Vec<f64>,
-        mu_u_all: Vec<f64>,
+        u_packed: Vec<[f64; 4]>,
+        mu_packed_all: Vec<[f64; 4]>,
+        nb: usize,
         offsets: Vec<f64>,
     },
     Diag {
@@ -598,6 +587,51 @@ enum GmmEvalData {
         prec_sq: Vec<f64>,
         offsets: Vec<f64>,
     },
+}
+
+/// Pack upper-triangular `prec_chol` (`p x p`) into zero-padded 4-column blocks `[f64; 4]`.
+/// Only rows `0..min((b+1)*4, p)` are stored per block `b`, keeping unused entries strictly `0.0`.
+fn pack_upper_chol_blocks(u_c: &[f64], p: usize, nb: usize, u_dst: &mut [[f64; 4]]) {
+    let mut ptr = 0usize;
+    for b in 0..nb {
+        let col_start = b * 4;
+        let r_end = (col_start + 4).min(p);
+        for r_idx in 0..r_end {
+            let mut blk = [0.0f64; 4];
+            for (l, slot) in blk.iter_mut().enumerate() {
+                let j = col_start + l;
+                if j < p && r_idx <= j {
+                    *slot = u_c[r_idx * p + j];
+                }
+            }
+            u_dst[ptr + r_idx] = blk;
+        }
+        ptr += r_end;
+    }
+}
+
+/// Project mean vector `mu_c` through packed upper-triangular blocks (`mu_c * U`).
+fn project_mean_packed(
+    mu_c: &[f64],
+    u_packed: &[[f64; 4]],
+    p: usize,
+    nb: usize,
+    mu_dst: &mut [[f64; 4]],
+) {
+    let mut ptr = 0usize;
+    for (b, mu_slot) in mu_dst.iter_mut().enumerate().take(nb) {
+        let r_end = ((b + 1) * 4).min(p);
+        let mut acc = [0.0f64; 4];
+        for r_idx in 0..r_end {
+            let mv = mu_c[r_idx];
+            let u4 = u_packed[ptr + r_idx];
+            for l in 0..4 {
+                acc[l] += mv * u4[l];
+            }
+        }
+        *mu_slot = acc;
+        ptr += r_end;
+    }
 }
 
 fn prepare_gmm_eval_data(
@@ -619,54 +653,53 @@ fn prepare_gmm_eval_data(
 
     match covariance_type {
         "full" => {
-            let mut u_t_all = vec![0.0; k * p * p];
-            let mut mu_u_all = vec![0.0; k * p];
+            let nb = p.div_ceil(4);
+            let u_comp_stride: usize = (0..nb).map(|b| ((b + 1) * 4).min(p)).sum();
+            let mut u_packed_all = vec![[0.0f64; 4]; k * u_comp_stride];
+            let mut mu_packed_all = vec![[0.0f64; 4]; k * nb];
             let mut offsets = vec![0.0; k];
             for c in 0..k {
                 let u_c = &precisions_cholesky[c * p * p..(c + 1) * p * p];
-                let u_t = &mut u_t_all[c * p * p..(c + 1) * p * p];
+                let u_dst = &mut u_packed_all[c * u_comp_stride..(c + 1) * u_comp_stride];
                 let mut log_det = 0.0;
                 for j in 0..p {
                     log_det += u_c[j * p + j].ln();
-                    for r in 0..=j {
-                        u_t[j * p + r] = u_c[r * p + j];
-                    }
                 }
+                pack_upper_chol_blocks(u_c, p, nb, u_dst);
                 let mu_c = &means.data[c * p..(c + 1) * p];
-                let mu_u = &mut mu_u_all[c * p..(c + 1) * p];
-                for j in 0..p {
-                    mu_u[j] = dot_slice(&mu_c[..=j], &u_t[j * p..j * p + j + 1]);
-                }
+                let mu_dst = &mut mu_packed_all[c * nb..(c + 1) * nb];
+                project_mean_packed(mu_c, u_dst, p, nb, mu_dst);
                 offsets[c] = -0.5 * const_term + log_det + log_w[c];
             }
             Ok(GmmEvalData::Full {
-                u_t_all,
-                mu_u_all,
+                u_packed_all,
+                u_comp_stride,
+                mu_packed_all,
+                nb,
                 offsets,
             })
         }
         "tied" => {
-            let mut u_t = vec![0.0; p * p];
+            let nb = p.div_ceil(4);
+            let u_stride: usize = (0..nb).map(|b| ((b + 1) * 4).min(p)).sum();
+            let mut u_packed = vec![[0.0f64; 4]; u_stride];
             let mut log_det = 0.0;
             for j in 0..p {
                 log_det += precisions_cholesky[j * p + j].ln();
-                for r in 0..=j {
-                    u_t[j * p + r] = precisions_cholesky[r * p + j];
-                }
             }
-            let mut mu_u_all = vec![0.0; k * p];
+            pack_upper_chol_blocks(precisions_cholesky, p, nb, &mut u_packed);
+            let mut mu_packed_all = vec![[0.0f64; 4]; k * nb];
             for c in 0..k {
                 let mu_c = &means.data[c * p..(c + 1) * p];
-                let mu_u = &mut mu_u_all[c * p..(c + 1) * p];
-                for j in 0..p {
-                    mu_u[j] = dot_slice(&mu_c[..=j], &u_t[j * p..j * p + j + 1]);
-                }
+                let mu_dst = &mut mu_packed_all[c * nb..(c + 1) * nb];
+                project_mean_packed(mu_c, &u_packed, p, nb, mu_dst);
             }
             let base = -0.5 * const_term + log_det;
             let offsets: Vec<f64> = log_w.iter().map(|&lw| base + lw).collect();
             Ok(GmmEvalData::Tied {
-                u_t,
-                mu_u_all,
+                u_packed,
+                mu_packed_all,
+                nb,
                 offsets,
             })
         }
@@ -717,10 +750,14 @@ fn eval_log_prob_chunk(
 ) {
     match eval {
         GmmEvalData::Full {
-            u_t_all,
-            mu_u_all,
+            u_packed_all,
+            u_comp_stride,
+            mu_packed_all,
+            nb,
             offsets,
         } => {
+            let nb = *nb;
+            let u_comp_stride = *u_comp_stride;
             let mut r = 0usize;
             while r + 4 <= m {
                 let x0 = &x_chunk[r * p..(r + 1) * p];
@@ -728,111 +765,189 @@ fn eval_log_prob_chunk(
                 let x2 = &x_chunk[(r + 2) * p..(r + 3) * p];
                 let x3 = &x_chunk[(r + 3) * p..(r + 4) * p];
                 for c in 0..k {
-                    let u_t = &u_t_all[c * p * p..(c + 1) * p * p];
-                    let mu_u = &mu_u_all[c * p..(c + 1) * p];
-                    let mut m0 = 0.0;
-                    let mut m1 = 0.0;
-                    let mut m2 = 0.0;
-                    let mut m3 = 0.0;
-                    for j in 0..p {
-                        let u_col = &u_t[j * p..j * p + j + 1];
-                        let (d0, d1, d2, d3) =
-                            dot4_4rows(&x0[..=j], &x1[..=j], &x2[..=j], &x3[..=j], u_col);
-                        let mj = mu_u[j];
-                        let e0 = d0 - mj;
-                        let e1 = d1 - mj;
-                        let e2 = d2 - mj;
-                        let e3 = d3 - mj;
-                        m0 += e0 * e0;
-                        m1 += e1 * e1;
-                        m2 += e2 * e2;
-                        m3 += e3 * e3;
+                    let u_packed = &u_packed_all[c * u_comp_stride..(c + 1) * u_comp_stride];
+                    let mu_packed = &mu_packed_all[c * nb..(c + 1) * nb];
+                    let mut m0 = [0.0f64; 4];
+                    let mut m1 = [0.0f64; 4];
+                    let mut m2 = [0.0f64; 4];
+                    let mut m3 = [0.0f64; 4];
+                    let mut ptr = 0usize;
+                    for (b, &mu4) in mu_packed.iter().enumerate().take(nb) {
+                        let r_end = ((b + 1) * 4).min(p);
+                        let u_blk = &u_packed[ptr..ptr + r_end];
+                        let mut y0 = [0.0f64; 4];
+                        let mut y1 = [0.0f64; 4];
+                        let mut y2 = [0.0f64; 4];
+                        let mut y3 = [0.0f64; 4];
+                        for r_idx in 0..r_end {
+                            let u4 = u_blk[r_idx];
+                            let v0 = x0[r_idx];
+                            let v1 = x1[r_idx];
+                            let v2 = x2[r_idx];
+                            let v3 = x3[r_idx];
+                            for l in 0..4 {
+                                y0[l] += v0 * u4[l];
+                                y1[l] += v1 * u4[l];
+                                y2[l] += v2 * u4[l];
+                                y3[l] += v3 * u4[l];
+                            }
+                        }
+                        ptr += r_end;
+                        for l in 0..4 {
+                            let e0 = y0[l] - mu4[l];
+                            let e1 = y1[l] - mu4[l];
+                            let e2 = y2[l] - mu4[l];
+                            let e3 = y3[l] - mu4[l];
+                            m0[l] += e0 * e0;
+                            m1[l] += e1 * e1;
+                            m2[l] += e2 * e2;
+                            m3[l] += e3 * e3;
+                        }
                     }
                     let off = offsets[c];
-                    out_lp[r * k + c] = off - 0.5 * m0;
-                    out_lp[(r + 1) * k + c] = off - 0.5 * m1;
-                    out_lp[(r + 2) * k + c] = off - 0.5 * m2;
-                    out_lp[(r + 3) * k + c] = off - 0.5 * m3;
+                    let ms0 = (m0[0] + m0[1]) + (m0[2] + m0[3]);
+                    let ms1 = (m1[0] + m1[1]) + (m1[2] + m1[3]);
+                    let ms2 = (m2[0] + m2[1]) + (m2[2] + m2[3]);
+                    let ms3 = (m3[0] + m3[1]) + (m3[2] + m3[3]);
+                    out_lp[r * k + c] = off - 0.5 * ms0;
+                    out_lp[(r + 1) * k + c] = off - 0.5 * ms1;
+                    out_lp[(r + 2) * k + c] = off - 0.5 * ms2;
+                    out_lp[(r + 3) * k + c] = off - 0.5 * ms3;
                 }
                 r += 4;
             }
             while r < m {
                 let x_row = &x_chunk[r * p..(r + 1) * p];
                 for c in 0..k {
-                    let u_t = &u_t_all[c * p * p..(c + 1) * p * p];
-                    let mu_u = &mu_u_all[c * p..(c + 1) * p];
-                    let mut maha_sq = 0.0;
-                    for j in 0..p {
-                        let d = dot_slice(&x_row[..=j], &u_t[j * p..j * p + j + 1]) - mu_u[j];
-                        maha_sq += d * d;
+                    let u_packed = &u_packed_all[c * u_comp_stride..(c + 1) * u_comp_stride];
+                    let mu_packed = &mu_packed_all[c * nb..(c + 1) * nb];
+                    let mut m0 = [0.0f64; 4];
+                    let mut ptr = 0usize;
+                    for (b, &mu4) in mu_packed.iter().enumerate().take(nb) {
+                        let r_end = ((b + 1) * 4).min(p);
+                        let u_blk = &u_packed[ptr..ptr + r_end];
+                        let mut y0 = [0.0f64; 4];
+                        for r_idx in 0..r_end {
+                            let u4 = u_blk[r_idx];
+                            let v0 = x_row[r_idx];
+                            for l in 0..4 {
+                                y0[l] += v0 * u4[l];
+                            }
+                        }
+                        ptr += r_end;
+                        for l in 0..4 {
+                            let e0 = y0[l] - mu4[l];
+                            m0[l] += e0 * e0;
+                        }
                     }
+                    let maha_sq = (m0[0] + m0[1]) + (m0[2] + m0[3]);
                     out_lp[r * k + c] = offsets[c] - 0.5 * maha_sq;
                 }
                 r += 1;
             }
         }
         GmmEvalData::Tied {
-            u_t,
-            mu_u_all,
+            u_packed,
+            mu_packed_all,
+            nb,
             offsets,
         } => {
-            xu_scratch.resize(4 * p, 0.0);
+            let nb = *nb;
+            let p_pad = nb * 4;
+            xu_scratch.resize(4 * p_pad, 0.0);
             let mut r = 0usize;
             while r + 4 <= m {
                 let x0 = &x_chunk[r * p..(r + 1) * p];
                 let x1 = &x_chunk[(r + 1) * p..(r + 2) * p];
                 let x2 = &x_chunk[(r + 2) * p..(r + 3) * p];
                 let x3 = &x_chunk[(r + 3) * p..(r + 4) * p];
-                let (xu01, xu23) = xu_scratch.split_at_mut(2 * p);
-                let (xu0, xu1) = xu01.split_at_mut(p);
-                let (xu2, xu3) = xu23.split_at_mut(p);
-                for j in 0..p {
-                    let u_col = &u_t[j * p..j * p + j + 1];
-                    let (d0, d1, d2, d3) =
-                        dot4_4rows(&x0[..=j], &x1[..=j], &x2[..=j], &x3[..=j], u_col);
-                    xu0[j] = d0;
-                    xu1[j] = d1;
-                    xu2[j] = d2;
-                    xu3[j] = d3;
+                let (xu01, xu23) = xu_scratch.split_at_mut(2 * p_pad);
+                let (xu0, xu1) = xu01.split_at_mut(p_pad);
+                let (xu2, xu3) = xu23.split_at_mut(p_pad);
+                let mut ptr = 0usize;
+                for b in 0..nb {
+                    let r_end = ((b + 1) * 4).min(p);
+                    let u_blk = &u_packed[ptr..ptr + r_end];
+                    let mut y0 = [0.0f64; 4];
+                    let mut y1 = [0.0f64; 4];
+                    let mut y2 = [0.0f64; 4];
+                    let mut y3 = [0.0f64; 4];
+                    for r_idx in 0..r_end {
+                        let u4 = u_blk[r_idx];
+                        let v0 = x0[r_idx];
+                        let v1 = x1[r_idx];
+                        let v2 = x2[r_idx];
+                        let v3 = x3[r_idx];
+                        for l in 0..4 {
+                            y0[l] += v0 * u4[l];
+                            y1[l] += v1 * u4[l];
+                            y2[l] += v2 * u4[l];
+                            y3[l] += v3 * u4[l];
+                        }
+                    }
+                    ptr += r_end;
+                    let off_b = b * 4;
+                    xu0[off_b..off_b + 4].copy_from_slice(&y0);
+                    xu1[off_b..off_b + 4].copy_from_slice(&y1);
+                    xu2[off_b..off_b + 4].copy_from_slice(&y2);
+                    xu3[off_b..off_b + 4].copy_from_slice(&y3);
                 }
                 for c in 0..k {
-                    let mu_u = &mu_u_all[c * p..(c + 1) * p];
-                    let mut m0 = 0.0;
-                    let mut m1 = 0.0;
-                    let mut m2 = 0.0;
-                    let mut m3 = 0.0;
-                    for j in 0..p {
-                        let mj = mu_u[j];
-                        let e0 = xu0[j] - mj;
-                        let e1 = xu1[j] - mj;
-                        let e2 = xu2[j] - mj;
-                        let e3 = xu3[j] - mj;
-                        m0 += e0 * e0;
-                        m1 += e1 * e1;
-                        m2 += e2 * e2;
-                        m3 += e3 * e3;
+                    let mu_packed = &mu_packed_all[c * nb..(c + 1) * nb];
+                    let mut m0 = [0.0f64; 4];
+                    let mut m1 = [0.0f64; 4];
+                    let mut m2 = [0.0f64; 4];
+                    let mut m3 = [0.0f64; 4];
+                    for (b, &mu4) in mu_packed.iter().enumerate().take(nb) {
+                        let off_b = b * 4;
+                        for l in 0..4 {
+                            let e0 = xu0[off_b + l] - mu4[l];
+                            let e1 = xu1[off_b + l] - mu4[l];
+                            let e2 = xu2[off_b + l] - mu4[l];
+                            let e3 = xu3[off_b + l] - mu4[l];
+                            m0[l] += e0 * e0;
+                            m1[l] += e1 * e1;
+                            m2[l] += e2 * e2;
+                            m3[l] += e3 * e3;
+                        }
                     }
                     let off = offsets[c];
-                    out_lp[r * k + c] = off - 0.5 * m0;
-                    out_lp[(r + 1) * k + c] = off - 0.5 * m1;
-                    out_lp[(r + 2) * k + c] = off - 0.5 * m2;
-                    out_lp[(r + 3) * k + c] = off - 0.5 * m3;
+                    out_lp[r * k + c] = off - 0.5 * ((m0[0] + m0[1]) + (m0[2] + m0[3]));
+                    out_lp[(r + 1) * k + c] = off - 0.5 * ((m1[0] + m1[1]) + (m1[2] + m1[3]));
+                    out_lp[(r + 2) * k + c] = off - 0.5 * ((m2[0] + m2[1]) + (m2[2] + m2[3]));
+                    out_lp[(r + 3) * k + c] = off - 0.5 * ((m3[0] + m3[1]) + (m3[2] + m3[3]));
                 }
                 r += 4;
             }
             while r < m {
                 let x_row = &x_chunk[r * p..(r + 1) * p];
-                let xu = &mut xu_scratch[..p];
-                for j in 0..p {
-                    xu[j] = dot_slice(&x_row[..=j], &u_t[j * p..j * p + j + 1]);
+                let xu = &mut xu_scratch[..p_pad];
+                let mut ptr = 0usize;
+                for b in 0..nb {
+                    let r_end = ((b + 1) * 4).min(p);
+                    let u_blk = &u_packed[ptr..ptr + r_end];
+                    let mut y0 = [0.0f64; 4];
+                    for r_idx in 0..r_end {
+                        let u4 = u_blk[r_idx];
+                        let v0 = x_row[r_idx];
+                        for l in 0..4 {
+                            y0[l] += v0 * u4[l];
+                        }
+                    }
+                    ptr += r_end;
+                    xu[b * 4..b * 4 + 4].copy_from_slice(&y0);
                 }
                 for c in 0..k {
-                    let mu_u = &mu_u_all[c * p..(c + 1) * p];
-                    let mut maha_sq = 0.0;
-                    for j in 0..p {
-                        let d = xu[j] - mu_u[j];
-                        maha_sq += d * d;
+                    let mu_packed = &mu_packed_all[c * nb..(c + 1) * nb];
+                    let mut m0 = [0.0f64; 4];
+                    for (b, &mu4) in mu_packed.iter().enumerate().take(nb) {
+                        let off_b = b * 4;
+                        for l in 0..4 {
+                            let e = xu[off_b + l] - mu4[l];
+                            m0[l] += e * e;
+                        }
                     }
+                    let maha_sq = (m0[0] + m0[1]) + (m0[2] + m0[3]);
                     out_lp[r * k + c] = offsets[c] - 0.5 * maha_sq;
                 }
                 r += 1;
@@ -1698,6 +1813,7 @@ fn estimate_weighted_log_prob(
     means: &Matrix,
     precisions_cholesky: &[f64],
     covariance_type: &str,
+    check_finite: bool,
 ) -> OchreResult<Matrix> {
     let n = x.rows;
     let p = x.cols;
@@ -1707,12 +1823,24 @@ fn estimate_weighted_log_prob(
             prepare_gmm_eval_data(Some(weights), means, precisions_cholesky, covariance_type)?;
         let mut wlp = vec![0.0; n * k];
         let means_data = &means.data;
+        let has_non_finite = AtomicBool::new(false);
+        let nb = p.div_ceil(4);
+        let scratch_cap = 4 * nb * 4;
         if n >= PARALLEL_ROW_THRESHOLD {
-            wlp.par_chunks_mut(GMM_CHUNK_ROWS * k)
-                .zip(x.data.par_chunks(GMM_CHUNK_ROWS * p))
+            wlp.par_chunks_mut(GMM_PREDICT_CHUNK_ROWS * k)
+                .zip(x.data.par_chunks(GMM_PREDICT_CHUNK_ROWS * p))
                 .for_each_init(
-                    || Vec::with_capacity(4 * p),
+                    || Vec::with_capacity(scratch_cap),
                     |xu_scratch, (out_chunk, x_chunk)| {
+                        if check_finite {
+                            if has_non_finite.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            if !slice_all_finite(x_chunk) {
+                                has_non_finite.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                        }
                         let m = out_chunk.len() / k;
                         eval_log_prob_chunk(
                             &eval,
@@ -1727,12 +1855,22 @@ fn estimate_weighted_log_prob(
                         );
                     },
                 );
+            if check_finite && has_non_finite.load(Ordering::Relaxed) {
+                return Err(OchreError::InvalidParameter(
+                    "Input X contains NaN or infinite values ( >_< )".to_string(),
+                ));
+            }
         } else {
-            let mut xu_scratch = Vec::with_capacity(4 * p);
+            let mut xu_scratch = Vec::with_capacity(scratch_cap);
             for (out_chunk, x_chunk) in wlp
-                .chunks_mut(GMM_CHUNK_ROWS * k)
-                .zip(x.data.chunks(GMM_CHUNK_ROWS * p))
+                .chunks_mut(GMM_PREDICT_CHUNK_ROWS * k)
+                .zip(x.data.chunks(GMM_PREDICT_CHUNK_ROWS * p))
             {
+                if check_finite && !slice_all_finite(x_chunk) {
+                    return Err(OchreError::InvalidParameter(
+                        "Input X contains NaN or infinite values ( >_< )".to_string(),
+                    ));
+                }
                 let m = out_chunk.len() / k;
                 eval_log_prob_chunk(
                     &eval,
@@ -1750,6 +1888,9 @@ fn estimate_weighted_log_prob(
         return Matrix::from_vec(n, k, wlp);
     }
 
+    if check_finite {
+        validate_x(x)?;
+    }
     let mut lp =
         estimate_log_gaussian_prob(backend, x, means, precisions_cholesky, covariance_type)?;
     let log_w: Vec<f64> = weights
@@ -1764,6 +1905,7 @@ fn estimate_weighted_log_prob(
     Ok(lp)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn e_step(
     backend: &Backend<'_>,
     x: &Matrix,
@@ -1771,6 +1913,8 @@ fn e_step(
     means: &Matrix,
     precisions_cholesky: &[f64],
     covariance_type: &str,
+    check_finite: bool,
+    normalize_to_probs: bool,
 ) -> OchreResult<(Vec<f64>, Matrix)> {
     let n = x.rows;
     let k = weights.len();
@@ -1781,7 +1925,39 @@ fn e_step(
         means,
         precisions_cholesky,
         covariance_type,
+        check_finite,
     )?;
+
+    if normalize_to_probs {
+        let normalize_row = |row: &mut [f64]| {
+            let mut max_v = f64::NEG_INFINITY;
+            for &v in row.iter() {
+                if v > max_v {
+                    max_v = v;
+                }
+            }
+            if max_v == f64::NEG_INFINITY {
+                row.fill(0.0);
+            } else {
+                let mut sum_exp = 0.0;
+                for v in row.iter_mut() {
+                    let e = (*v - max_v).exp();
+                    *v = e;
+                    sum_exp += e;
+                }
+                let inv_sum = 1.0 / sum_exp;
+                for v in row.iter_mut() {
+                    *v *= inv_sum;
+                }
+            }
+        };
+        if n >= PARALLEL_ROW_THRESHOLD {
+            wlp.data.par_chunks_exact_mut(k).for_each(normalize_row);
+        } else {
+            wlp.data.chunks_exact_mut(k).for_each(normalize_row);
+        }
+        return Ok((Vec::new(), wlp));
+    }
 
     let mut log_prob_norm = vec![0.0; n];
     let compute_lse = |(lpn, row): (&mut f64, &mut [f64])| {
@@ -1993,6 +2169,8 @@ impl GaussianMixture {
                             &means,
                             &prec_chols,
                             &self.covariance_type,
+                            false,
+                            false,
                         )?;
                         let lb = log_prob_norm.iter().sum::<f64>() / (n as f64);
                         let resp_data: Vec<f64> = log_resp.data.iter().map(|&v| v.exp()).collect();
@@ -2065,26 +2243,29 @@ impl GaussianMixture {
     }
 
     pub fn predict_proba(&self, x: &Matrix) -> OchreResult<Matrix> {
-        validate_x(x)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         validate_fitted_cols(self.n_features_in_, x.cols)?;
         let (weights, means, prec_chols) = self.get_fitted()?;
         let backend = effective_backend(&self.device_type, x.rows * x.cols);
-        let (_, mut log_resp) = e_step(
+        let (_, probs) = e_step(
             &backend,
             x,
             weights,
             means,
             prec_chols,
             &self.covariance_type,
+            true,
+            true,
         )?;
-        for v in &mut log_resp.data {
-            *v = v.exp();
-        }
-        Ok(log_resp)
+        Ok(probs)
     }
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<usize>> {
-        validate_x(x)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         validate_fitted_cols(self.n_features_in_, x.cols)?;
         let (weights, means, prec_chols) = self.get_fitted()?;
         let backend = effective_backend(&self.device_type, x.rows * x.cols);
@@ -2096,9 +2277,19 @@ impl GaussianMixture {
                 prepare_gmm_eval_data(Some(weights), means, prec_chols, &self.covariance_type)?;
             let means_data = &means.data;
             let mut labels = vec![0usize; n];
+            let has_non_finite = AtomicBool::new(false);
+            let nb = p.div_ceil(4);
+            let scratch_cap = 4 * nb * 4;
             let predict_chunk = |(wlp_buf, xu_scratch): &mut (Vec<f64>, Vec<f64>),
                                  lbl_chunk: &mut [usize],
                                  x_chunk: &[f64]| {
+                if has_non_finite.load(Ordering::Relaxed) {
+                    return;
+                }
+                if !slice_all_finite(x_chunk) {
+                    has_non_finite.store(true, Ordering::Relaxed);
+                    return;
+                }
                 let m = lbl_chunk.len();
                 wlp_buf.resize(m * k, 0.0);
                 eval_log_prob_chunk(
@@ -2119,13 +2310,13 @@ impl GaussianMixture {
             };
             if n >= PARALLEL_ROW_THRESHOLD {
                 labels
-                    .par_chunks_mut(GMM_CHUNK_ROWS)
-                    .zip(x.data.par_chunks(GMM_CHUNK_ROWS * p))
+                    .par_chunks_mut(GMM_PREDICT_CHUNK_ROWS)
+                    .zip(x.data.par_chunks(GMM_PREDICT_CHUNK_ROWS * p))
                     .for_each_init(
                         || {
                             (
-                                Vec::with_capacity(GMM_CHUNK_ROWS * k),
-                                Vec::with_capacity(4 * p),
+                                Vec::with_capacity(GMM_PREDICT_CHUNK_ROWS * k),
+                                Vec::with_capacity(scratch_cap),
                             )
                         },
                         |scratch, (lbl_chunk, x_chunk)| {
@@ -2134,15 +2325,23 @@ impl GaussianMixture {
                     );
             } else {
                 let mut scratch = (
-                    Vec::with_capacity(GMM_CHUNK_ROWS * k),
-                    Vec::with_capacity(4 * p),
+                    Vec::with_capacity(GMM_PREDICT_CHUNK_ROWS * k),
+                    Vec::with_capacity(scratch_cap),
                 );
                 for (lbl_chunk, x_chunk) in labels
-                    .chunks_mut(GMM_CHUNK_ROWS)
-                    .zip(x.data.chunks(GMM_CHUNK_ROWS * p))
+                    .chunks_mut(GMM_PREDICT_CHUNK_ROWS)
+                    .zip(x.data.chunks(GMM_PREDICT_CHUNK_ROWS * p))
                 {
                     predict_chunk(&mut scratch, lbl_chunk, x_chunk);
+                    if has_non_finite.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
+            }
+            if has_non_finite.load(Ordering::Relaxed) {
+                return Err(OchreError::InvalidParameter(
+                    "Input X contains NaN or infinite values ( >_< )".to_string(),
+                ));
             }
             return Ok(labels);
         }
@@ -2154,6 +2353,7 @@ impl GaussianMixture {
             means,
             prec_chols,
             &self.covariance_type,
+            true,
         )?;
         let mut labels = Vec::with_capacity(x.rows);
         for row in wlp.data.chunks(k) {
@@ -2171,7 +2371,9 @@ impl GaussianMixture {
     }
 
     pub fn score_samples(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
-        validate_x(x)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         validate_fitted_cols(self.n_features_in_, x.cols)?;
         let (weights, means, prec_chols) = self.get_fitted()?;
         let backend = effective_backend(&self.device_type, x.rows * x.cols);
@@ -2182,6 +2384,8 @@ impl GaussianMixture {
             means,
             prec_chols,
             &self.covariance_type,
+            true,
+            false,
         )?;
         Ok(log_prob_norm)
     }

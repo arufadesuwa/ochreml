@@ -404,43 +404,141 @@ pub fn cpu_small_sym_eig_svd(sym: &Matrix) -> OchreResult<SymEigResult> {
     }
 }
 
-/// Two-pass Modified Gram-Schmidt column orthonormalization on a `(rows x cols)` matrix.
-fn mgs_orthonormalize_2pass(mat: &mut Matrix) {
-    let rows = mat.rows;
-    let cols = mat.cols;
-    for j in 0..cols {
+#[inline(always)]
+fn dot_contig(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    let a = &a[..n];
+    let b = &b[..n];
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    let mut idx = 0;
+    while idx + 4 <= n {
+        s0 += a[idx] * b[idx];
+        s1 += a[idx + 1] * b[idx + 1];
+        s2 += a[idx + 2] * b[idx + 2];
+        s3 += a[idx + 3] * b[idx + 3];
+        idx += 4;
+    }
+    let mut sum = (s0 + s1) + (s2 + s3);
+    while idx < n {
+        sum += a[idx] * b[idx];
+        idx += 1;
+    }
+    sum
+}
+
+#[inline(always)]
+fn axpy_sub_contig(dst: &mut [f64], alpha: f64, src: &[f64]) {
+    let n = dst.len().min(src.len());
+    for i in 0..n {
+        dst[i] -= alpha * src[i];
+    }
+}
+
+#[inline]
+fn next_gaussian_pair(state: &mut u64) -> (f64, f64) {
+    let mut next_open01 = || -> f64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        let bits = (z ^ (z >> 31)) >> 11;
+        ((bits as f64) + 0.5) * (1.0 / ((1u64 << 53) as f64))
+    };
+    let u1 = next_open01().max(1e-15);
+    let u2 = next_open01();
+    let mag = (-2.0 * u1.ln()).sqrt();
+    let angle = 2.0 * std::f64::consts::PI * u2;
+    (mag * angle.cos(), mag * angle.sin())
+}
+
+fn fill_random_unit_ortho(
+    target: &mut [f64],
+    basis_a: &[f64],
+    n_a: usize,
+    basis_b: &[f64],
+    n_b: usize,
+    n: usize,
+    rng_state: &mut u64,
+) {
+    for _attempt in 0..4 {
+        let mut i = 0;
+        while i + 1 < n {
+            let (g0, g1) = next_gaussian_pair(rng_state);
+            target[i] = g0;
+            target[i + 1] = g1;
+            i += 2;
+        }
+        if i < n {
+            target[i] = next_gaussian_pair(rng_state).0;
+        }
         for _pass in 0..2 {
-            for prev in 0..j {
-                let mut dot = 0.0;
-                for r in 0..rows {
-                    dot += mat.data[r * cols + prev] * mat.data[r * cols + j];
-                }
-                for r in 0..rows {
-                    mat.data[r * cols + j] -= dot * mat.data[r * cols + prev];
-                }
+            for p in 0..n_a {
+                let qp = &basis_a[p * n..(p + 1) * n];
+                let h = dot_contig(qp, target);
+                axpy_sub_contig(target, h, qp);
+            }
+            for p in 0..n_b {
+                let qp = &basis_b[p * n..(p + 1) * n];
+                let h = dot_contig(qp, target);
+                axpy_sub_contig(target, h, qp);
             }
         }
-        let mut norm_sq = 0.0;
-        for r in 0..rows {
-            let v = mat.data[r * cols + j];
-            norm_sq += v * v;
-        }
-        let norm = norm_sq.sqrt();
-        if norm > 1e-13 {
+        let norm = dot_contig(target, target).sqrt();
+        if norm > 1e-12 {
             let inv = 1.0 / norm;
-            for r in 0..rows {
-                mat.data[r * cols + j] *= inv;
+            for v in target.iter_mut() {
+                *v *= inv;
             }
-        } else {
-            for r in 0..rows {
-                mat.data[r * cols + j] = 0.0;
+            return;
+        }
+    }
+    target.fill(0.0);
+}
+
+/// Compute `W = sym * Q_cur` where `Q_cur` has `b` contiguous vectors of length `n`.
+fn sym_block_matvec(sym: &Matrix, q_cur: &[f64], b: usize, w_out: &mut [f64]) {
+    let n = sym.rows;
+    if n < 512 {
+        for i in 0..n {
+            let row = &sym.data[i * n..(i + 1) * n];
+            for c in 0..b {
+                let qc = &q_cur[c * n..(c + 1) * n];
+                w_out[c * n + i] = dot_contig(row, qc);
             }
+        }
+        return;
+    }
+
+    // Parallelize row-wise for large n, writing contiguous row-major (n x b) then scattering to w_out.
+    let mut row_major = vec![0.0; n * b];
+    row_major
+        .par_chunks_mut(128 * b)
+        .enumerate()
+        .for_each(|(chunk_idx, out_chunk)| {
+            let r_start = chunk_idx * 128;
+            let r_count = out_chunk.len() / b;
+            for dr in 0..r_count {
+                let i = r_start + dr;
+                let row = &sym.data[i * n..(i + 1) * n];
+                let dst = &mut out_chunk[dr * b..(dr + 1) * b];
+                for c in 0..b {
+                    let qc = &q_cur[c * n..(c + 1) * n];
+                    dst[c] = dot_contig(row, qc);
+                }
+            }
+        });
+    for i in 0..n {
+        for c in 0..b {
+            w_out[c * n + i] = row_major[i * b + c];
         }
     }
 }
 
 /// Compute top `k` eigenvalues (descending) and eigenvectors `(p x k)` of symmetric matrix `sym`
-/// using Randomized Subspace Iteration with 2 power iterations (`O(p^2 * r)`).
+/// using Thick-Restart Block Symmetric Lanczos with full 2-pass MGS reorthogonalization.
 pub fn cpu_top_k_sym_eig(sym: &Matrix, k: usize) -> OchreResult<SymEigResult> {
     if sym.rows == 0 || sym.rows != sym.cols {
         return Err(OchreError::InvalidParameter(format!(
@@ -454,95 +552,230 @@ pub fn cpu_top_k_sym_eig(sym: &Matrix, k: usize) -> OchreResult<SymEigResult> {
         ));
     }
 
-    let p = sym.rows;
-    let k_eff = k.min(p);
-    let r = (k_eff + 12).min(p);
-    if r >= p || p < 32 {
+    let n = sym.rows;
+    let k_eff = k.min(n);
+    let b = if k_eff <= 6 { k_eff } else { 4 };
+    let m_target = (2 * k_eff + 20).clamp(16, 40).min(n);
+    let n_blocks = (m_target / b).max(6);
+    let m_cap = n_blocks * b;
+
+    if m_cap >= n || n < 32 {
         let full = cpu_small_sym_eig_svd(sym)?;
-        if k_eff == p {
+        if k_eff == n {
             return Ok(full);
         }
         let eigenvalues = full.eigenvalues[..k_eff].to_vec();
-        let mut vecs = vec![0.0; p * k_eff];
-        for row in 0..p {
-            let src = &full.eigenvectors.data[row * p..row * p + k_eff];
+        let mut vecs = vec![0.0; n * k_eff];
+        for row in 0..n {
+            let src = &full.eigenvectors.data[row * n..row * n + k_eff];
             vecs[row * k_eff..(row + 1) * k_eff].copy_from_slice(src);
         }
         return Ok(SymEigResult {
             eigenvalues,
-            eigenvectors: Matrix::from_vec(p, k_eff, vecs)?,
+            eigenvectors: Matrix::from_vec(n, k_eff, vecs)?,
         });
     }
 
-    // Deterministic SplitMix64 Box-Muller Gaussian probe Omega (p x r)
-    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut next_open01 = || -> f64 {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        let bits = (z ^ (z >> 31)) >> 11;
-        ((bits as f64) + 0.5) * (1.0 / ((1u64 << 53) as f64))
-    };
-    let mut omega_data = Vec::with_capacity(p * r);
-    for _ in 0..(p * r) {
-        let u1 = next_open01().max(1e-15);
-        let u2 = next_open01();
-        omega_data.push((-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos());
-    }
-    let omega = Matrix::from_vec(p, r, omega_data)?;
+    let mut q_vecs = vec![0.0; m_cap * n];
+    let mut w_vecs = vec![0.0; b * n];
+    let mut q_next = vec![0.0; b * n];
+    let mut t_data = vec![0.0; m_cap * m_cap];
+    let mut a_blk = vec![0.0; b * b];
+    let mut r_blk = vec![0.0; b * b];
+    let mut q_keep = Vec::new();
+    let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15;
 
-    // Initial range sample + 2 power iterations with orthonormalization
-    let mut q = sym.matmul(&omega)?;
-    mgs_orthonormalize_2pass(&mut q);
-    for _ in 0..2 {
-        q = sym.matmul(&q)?;
-        mgs_orthonormalize_2pass(&mut q);
+    // Seed initial orthonormal block Q_0 (b vectors of length n)
+    for c in 0..b {
+        let (prev_basis, tail) = q_vecs.split_at_mut(c * n);
+        let qc = &mut tail[..n];
+        fill_random_unit_ortho(qc, prev_basis, c, &[], 0, n, &mut rng_state);
     }
 
-    // Project B = Q^T * (M * Q) (r x r)
-    let mq = sym.matmul(&q)?;
-    let mut b_data = vec![0.0; r * r];
-    for row in 0..p {
-        let q_row = &q.data[row * r..(row + 1) * r];
-        let mq_row = &mq.data[row * r..(row + 1) * r];
-        for i in 0..r {
-            let qi = q_row[i];
-            let b_row = &mut b_data[i * r..(i + 1) * r];
-            for j in i..r {
-                b_row[j] += qi * mq_row[j];
+    let mut cur_start = 0usize;
+    let max_restarts = 2usize;
+
+    for restart in 0..=max_restarts {
+        let mut m_cur = cur_start;
+        while cur_start + b <= m_cap {
+            let cur_end = cur_start + b;
+            sym_block_matvec(sym, &q_vecs[cur_start * n..cur_end * n], b, &mut w_vecs);
+
+            // Compute diagonal block A = Q_cur^T * W and symmetrize into T
+            for r in 0..b {
+                let qr = &q_vecs[(cur_start + r) * n..(cur_start + r + 1) * n];
+                for c in 0..b {
+                    let wc = &w_vecs[c * n..(c + 1) * n];
+                    a_blk[r * b + c] = dot_contig(qr, wc);
+                }
+            }
+            for r in 0..b {
+                for c in r..b {
+                    let val = 0.5 * (a_blk[r * b + c] + a_blk[c * b + r]);
+                    t_data[(cur_start + r) * m_cap + (cur_start + c)] = val;
+                    t_data[(cur_start + c) * m_cap + (cur_start + r)] = val;
+                }
+            }
+
+            // Full 2-pass MGS reorthogonalization of W against all Q[0..cur_end]
+            for c in 0..b {
+                let wc = &mut w_vecs[c * n..(c + 1) * n];
+                for _pass in 0..2 {
+                    for p in 0..cur_end {
+                        let qp = &q_vecs[p * n..(p + 1) * n];
+                        let h = dot_contig(qp, wc);
+                        axpy_sub_contig(wc, h, qp);
+                    }
+                }
+            }
+
+            // Orthonormalize residual W -> Q_next * R (b x b upper triangular)
+            r_blk.fill(0.0);
+            let mut scale_w = 1.0f64;
+            for c in 0..b {
+                let wc = &w_vecs[c * n..(c + 1) * n];
+                scale_w = scale_w.max(dot_contig(wc, wc).sqrt());
+            }
+            for c in 0..b {
+                let (prev_next, tail_next) = q_next.split_at_mut(c * n);
+                let qn_c = &mut tail_next[..n];
+                qn_c.copy_from_slice(&w_vecs[c * n..(c + 1) * n]);
+                for _pass in 0..2 {
+                    for prev in 0..c {
+                        let qp = &prev_next[prev * n..(prev + 1) * n];
+                        let h = dot_contig(qp, qn_c);
+                        r_blk[prev * b + c] += h;
+                        axpy_sub_contig(qn_c, h, qp);
+                    }
+                }
+                let norm = dot_contig(qn_c, qn_c).sqrt();
+                if norm > 1e-12 * scale_w {
+                    r_blk[c * b + c] = norm;
+                    let inv = 1.0 / norm;
+                    for v in qn_c.iter_mut() {
+                        *v *= inv;
+                    }
+                } else {
+                    r_blk[c * b + c] = 0.0;
+                    fill_random_unit_ortho(
+                        qn_c,
+                        &q_vecs[..cur_end * n],
+                        cur_end,
+                        prev_next,
+                        c,
+                        n,
+                        &mut rng_state,
+                    );
+                }
+            }
+
+            m_cur = cur_end;
+            if cur_end + b <= m_cap {
+                q_vecs[cur_end * n..(cur_end + b) * n].copy_from_slice(&q_next);
+                for r in 0..b {
+                    for c in 0..b {
+                        let val = r_blk[r * b + c];
+                        t_data[(cur_end + r) * m_cap + (cur_start + c)] = val;
+                        t_data[(cur_start + c) * m_cap + (cur_end + r)] = val;
+                    }
+                }
+                cur_start = cur_end;
+            } else {
+                break;
             }
         }
-    }
-    for i in 0..r {
-        for j in (i + 1)..r {
-            let v = b_data[i * r + j];
-            b_data[j * r + i] = v;
-        }
-    }
-    let b_mat = Matrix::from_vec(r, r, b_data)?;
 
-    // Solve tiny (r x r) symmetric eigendecomposition and lift V = Q * U_k
-    let small_eig = cpu_small_sym_eig_svd(&b_mat)?;
-    let eigenvalues = small_eig.eigenvalues[..k_eff].to_vec();
-    let u_data = &small_eig.eigenvectors.data;
-    let mut v_data = vec![0.0; p * k_eff];
-    for row in 0..p {
-        let q_row = &q.data[row * r..(row + 1) * r];
-        let v_row = &mut v_data[row * k_eff..(row + 1) * k_eff];
-        for m in 0..r {
-            let q_rm = q_row[m];
-            let u_row = &u_data[m * r..m * r + k_eff];
-            for c in 0..k_eff {
-                v_row[c] += q_rm * u_row[c];
+        // Extract active (m_cur x m_cur) symmetric tridiagonal/arrow matrix and solve
+        let mut t_sub = vec![0.0; m_cur * m_cur];
+        for r in 0..m_cur {
+            t_sub[r * m_cur..(r + 1) * m_cur]
+                .copy_from_slice(&t_data[r * m_cap..r * m_cap + m_cur]);
+        }
+        let t_mat = Matrix::from_vec(m_cur, m_cur, t_sub)?;
+        let small_eig = cpu_small_sym_eig_svd(&t_mat)?;
+        let u_data = &small_eig.eigenvectors.data;
+
+        // Compute exact Lanczos residual norm ||M v_i - theta_i v_i||_2 = ||R * U[m_cur-b..m_cur, i]||_2
+        let tail_start = m_cur - b;
+        let mut max_res = 0.0f64;
+        for col in 0..k_eff {
+            let mut res_sq = 0.0f64;
+            for r in 0..b {
+                let mut acc = 0.0;
+                for c in 0..b {
+                    acc += r_blk[r * b + c] * u_data[(tail_start + c) * m_cur + col];
+                }
+                res_sq += acc * acc;
+            }
+            max_res = max_res.max(res_sq.sqrt());
+        }
+        let scale = small_eig.eigenvalues[0]
+            .abs()
+            .max(small_eig.eigenvalues[m_cur - 1].abs())
+            .max(1.0);
+
+        if max_res <= 1e-10 * scale || restart == max_restarts {
+            let eigenvalues = small_eig.eigenvalues[..k_eff].to_vec();
+            let mut v_data = vec![0.0; n * k_eff];
+            for col in 0..k_eff {
+                for j in 0..m_cur {
+                    let u_jc = u_data[j * m_cur + col];
+                    if u_jc == 0.0 {
+                        continue;
+                    }
+                    let qj = &q_vecs[j * n..(j + 1) * n];
+                    for row in 0..n {
+                        v_data[row * k_eff + col] += u_jc * qj[row];
+                    }
+                }
+            }
+            return Ok(SymEigResult {
+                eigenvalues,
+                eigenvectors: Matrix::from_vec(n, k_eff, v_data)?,
+            });
+        }
+
+        // Thick Restart: retain top k_keep Ritz vectors + Q_next residual block
+        let k_keep = (k_eff + 4)
+            .min(m_cur.saturating_sub(b))
+            .max(k_eff)
+            .min(m_cap - b);
+        q_keep.resize(k_keep * n, 0.0);
+        q_keep.fill(0.0);
+        for col in 0..k_keep {
+            let dst = &mut q_keep[col * n..(col + 1) * n];
+            for j in 0..m_cur {
+                let u_jc = u_data[j * m_cur + col];
+                if u_jc == 0.0 {
+                    continue;
+                }
+                let qj = &q_vecs[j * n..(j + 1) * n];
+                for row in 0..n {
+                    dst[row] += u_jc * qj[row];
+                }
             }
         }
+        q_vecs[..k_keep * n].copy_from_slice(&q_keep[..k_keep * n]);
+        q_vecs[k_keep * n..(k_keep + b) * n].copy_from_slice(&q_next);
+
+        t_data.fill(0.0);
+        for col in 0..k_keep {
+            t_data[col * m_cap + col] = small_eig.eigenvalues[col];
+            for r in 0..b {
+                let mut val = 0.0;
+                for c in 0..b {
+                    val += r_blk[r * b + c] * u_data[(tail_start + c) * m_cur + col];
+                }
+                t_data[(k_keep + r) * m_cap + col] = val;
+                t_data[col * m_cap + (k_keep + r)] = val;
+            }
+        }
+        cur_start = k_keep;
     }
 
-    Ok(SymEigResult {
-        eigenvalues,
-        eigenvectors: Matrix::from_vec(p, k_eff, v_data)?,
-    })
+    Err(OchreError::InvalidParameter(
+        "cpu_top_k_sym_eig failed to converge ( >_< )".to_string(),
+    ))
 }
 
 const GRAM_TILE: usize = 64;
@@ -1010,6 +1243,72 @@ mod tests {
             }
         }
         assert!(ortho_sq.sqrt() < 1e-10);
+    }
+
+    #[test]
+    fn test_top_k_sym_eig_near_degenerate_laplacian_250() {
+        // 250x250 normalized affinity matrix with two weakly-coupled clusters:
+        // top eigenvalues are ~1.0 and ~0.999 (near-degenerate).
+        let n = 250usize;
+        let half = n / 2;
+        let mut m = Matrix::zeros(n, n);
+        for i in 0..n {
+            let ci = if i < half { 0 } else { 1 };
+            for j in i..n {
+                let cj = if j < half { 0 } else { 1 };
+                let val = if ci == cj {
+                    let diff = ((i as f64) - (j as f64)) * 0.05;
+                    (-diff * diff).exp()
+                } else {
+                    1e-3 * (((i + j) % 5) as f64 + 1.0) / 5.0
+                };
+                m[(i, j)] = val;
+                m[(j, i)] = val;
+            }
+        }
+        let mut d_inv_sqrt = vec![0.0; n];
+        for i in 0..n {
+            let s: f64 = (0..n).map(|j| m[(i, j)]).sum();
+            d_inv_sqrt[i] = 1.0 / s.sqrt();
+        }
+        for i in 0..n {
+            for j in i..n {
+                let v = m[(i, j)] * d_inv_sqrt[i] * d_inv_sqrt[j];
+                m[(i, j)] = v;
+                m[(j, i)] = v;
+            }
+        }
+
+        let exact = cpu_small_sym_eig_svd(&m).unwrap();
+        let topk = cpu_top_k_sym_eig(&m, 2).unwrap();
+        assert_eq!(topk.eigenvalues.len(), 2);
+        for idx in 0..2 {
+            assert!(
+                (topk.eigenvalues[idx] - exact.eigenvalues[idx]).abs() < 1e-9,
+                "near-degenerate eig mismatch at {idx}: {} vs {}",
+                topk.eigenvalues[idx],
+                exact.eigenvalues[idx]
+            );
+        }
+
+        // Verify exact residual ||M * v_i - lam_i * v_i||_2 < 1e-8
+        for col in 0..2 {
+            let lam = topk.eigenvalues[col];
+            let mut res_sq = 0.0;
+            for r in 0..n {
+                let mut mv = 0.0;
+                for c in 0..n {
+                    mv += m[(r, c)] * topk.eigenvectors[(c, col)];
+                }
+                let diff = mv - lam * topk.eigenvectors[(r, col)];
+                res_sq += diff * diff;
+            }
+            assert!(
+                res_sq.sqrt() < 1e-8,
+                "Lanczos residual at col {col}: {}",
+                res_sq.sqrt()
+            );
+        }
     }
 
     #[test]
