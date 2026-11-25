@@ -273,8 +273,8 @@ fn regressor_loss_and_dloss_enum(loss: RegLoss, pred: f64, y: f64, epsilon: f64)
     }
 }
 
-const LARGE_N_BLOCK_SHUFFLE_THRESHOLD: usize = 100_000;
-const SHUFFLE_BLOCK_SIZE: usize = 512;
+const LARGE_N_BLOCK_SHUFFLE_THRESHOLD: usize = 32_768;
+const SHUFFLE_BLOCK_SIZE: usize = 256;
 
 enum EpochOrder {
     Rows(Vec<u32>),
@@ -647,33 +647,53 @@ impl SGDClassifier {
             self.n_iter_ = n_iter;
             self.t_ = t_total;
         } else {
+            use rayon::prelude::*;
+            let base_seed = self.random_state.unwrap_or(0x9E37_79B9_7F4A_7C15);
+            let loss_str = &self.loss;
+            let lr_str = &self.learning_rate;
+            let fit_intercept = self.fit_intercept;
+            let max_iter = self.max_iter;
+            let tol = self.tol;
+            let shuffle = self.shuffle;
+            let alpha = self.alpha;
+            let eta0 = self.eta0;
+            let power_t = self.power_t;
+
+            let results: Vec<(Vec<f64>, f64, usize, f64)> = (0..n_classes)
+                .into_par_iter()
+                .map(|c| {
+                    let y_pm1: Vec<f64> = y_idx
+                        .iter()
+                        .map(|&i| if i == c { 1.0 } else { -1.0 })
+                        .collect();
+                    let mut class_rng = SplitMix64::new(Some(
+                        base_seed.wrapping_add((c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                    ));
+                    fit_sgd_binary_classifier(
+                        x,
+                        &y_pm1,
+                        &weights,
+                        loss_str,
+                        l1_reg,
+                        l2_reg,
+                        alpha,
+                        fit_intercept,
+                        max_iter,
+                        tol,
+                        shuffle,
+                        lr_str,
+                        eta0,
+                        power_t,
+                        &mut class_rng,
+                    )
+                })
+                .collect();
+
             let mut coef_data = vec![0.0; n_classes * p];
             let mut intercepts = vec![0.0; n_classes];
             let mut max_n_iter = 0usize;
             let mut total_t = 0.0;
-
-            for c in 0..n_classes {
-                let y_pm1: Vec<f64> = y_idx
-                    .iter()
-                    .map(|&i| if i == c { 1.0 } else { -1.0 })
-                    .collect();
-                let (w, b, n_it, t_c) = fit_sgd_binary_classifier(
-                    x,
-                    &y_pm1,
-                    &weights,
-                    &self.loss,
-                    l1_reg,
-                    l2_reg,
-                    self.alpha,
-                    self.fit_intercept,
-                    self.max_iter,
-                    self.tol,
-                    self.shuffle,
-                    &self.learning_rate,
-                    self.eta0,
-                    self.power_t,
-                    &mut rng,
-                );
+            for (c, (w, b, n_it, t_c)) in results.into_iter().enumerate() {
                 coef_data[c * p..(c + 1) * p].copy_from_slice(&w);
                 intercepts[c] = b;
                 max_n_iter = max_n_iter.max(n_it);

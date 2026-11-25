@@ -3170,6 +3170,118 @@ impl MiniBatchKMeans {
 // PyO3 Bindings (*≧ω≦*)
 // ============================================================================
 
+/// Zero-copy CPU cluster prediction reading directly from a C-contiguous `PyBuffer<f64>`
+/// into `PyBytes` (`i64` LE), avoiding both the full `Matrix` copy and intermediate `Vec<usize>`.
+fn predict_buffer_zero_copy<'py>(
+    py: Python<'py>,
+    x: &PyBuffer<f64>,
+    centers: &Matrix,
+    n_features_in: Option<usize>,
+    device: &DeviceType,
+) -> PyResult<Option<Bound<'py, PyBytes>>> {
+    let shape = x.shape();
+    if shape.len() != 2 || !x.is_c_contiguous() {
+        return Ok(None);
+    }
+    let rows = shape[0];
+    let cols = shape[1];
+    if rows == 0 || cols == 0 {
+        return Err(OchreError::EmptyData.into());
+    }
+    validate_fitted_cols(n_features_in, cols)?;
+    let k = centers.rows;
+    let backend = get_backend(device);
+    if !should_use_cpu_predict(&backend, rows, k, cols) || cols > 256 {
+        return Ok(None);
+    }
+    let Some(cells) = x.as_slice(py) else {
+        return Ok(None);
+    };
+    if cells.len() != rows * cols {
+        return Ok(None);
+    }
+
+    let packed = PackedCenters::new(&centers.data, k, cols);
+    let centers_data = &centers.data;
+    let mut row_buf = vec![0.0f64; 4 * cols];
+    let mut non_finite = false;
+
+    let bytes = PyBytes::new_with(py, rows * 8, |out_bytes| {
+        let mut i = 0usize;
+        while i + 4 <= rows {
+            let base = i * cols;
+            let mut finite_ok = true;
+            for t in 0..(4 * cols) {
+                let v = cells[base + t].get();
+                finite_ok &= v.is_finite();
+                row_buf[t] = v;
+            }
+            if !finite_ok {
+                non_finite = true;
+                return Ok(());
+            }
+            let r0 = &row_buf[0..cols];
+            let r1 = &row_buf[cols..2 * cols];
+            let r2 = &row_buf[2 * cols..3 * cols];
+            let r3 = &row_buf[3 * cols..4 * cols];
+            let lbls: [usize; 4] = match &packed {
+                PackedCenters::K4 { c_t, hn, k, p } => {
+                    assign_4rows_k4::<false>(r0, r1, r2, r3, c_t, hn, *k, *p).0
+                }
+                PackedCenters::K8 { c_t, hn, k, p } => {
+                    assign_4rows_k8::<false>(r0, r1, r2, r3, c_t, hn, *k, *p).0
+                }
+                PackedCenters::General { half_norms, k, p } => {
+                    assign_4rows_general::<false>(r0, r1, r2, r3, centers_data, half_norms, *k, *p)
+                        .0
+                }
+            };
+            for m in 0..4 {
+                let off = (i + m) * 8;
+                out_bytes[off..off + 8].copy_from_slice(&(lbls[m] as i64).to_le_bytes());
+            }
+            i += 4;
+        }
+        while i < rows {
+            let base = i * cols;
+            let mut finite_ok = true;
+            for t in 0..cols {
+                let v = cells[base + t].get();
+                finite_ok &= v.is_finite();
+                row_buf[t] = v;
+            }
+            if !finite_ok {
+                non_finite = true;
+                return Ok(());
+            }
+            let r0 = &row_buf[0..cols];
+            let lbl = match &packed {
+                PackedCenters::K4 { c_t, hn, k, p } => {
+                    assign_1row_k4::<false>(r0, c_t, hn, *k, *p).0
+                }
+                PackedCenters::K8 { c_t, hn, k, p } => {
+                    assign_1row_k8::<false>(r0, c_t, hn, *k, *p).0
+                }
+                PackedCenters::General { half_norms, k, p } => {
+                    assign_1row_general::<false>(r0, centers_data, half_norms, *k, *p).0
+                }
+            };
+            let off = i * 8;
+            out_bytes[off..off + 8].copy_from_slice(&(lbl as i64).to_le_bytes());
+            i += 1;
+        }
+        Ok(())
+    })?;
+
+    if non_finite {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN or Inf values ( >_< )".to_string(),
+        )
+        .into());
+    }
+    Ok(Some(bytes))
+}
+
 #[pyclass(from_py_object, name = "KMeans")]
 #[derive(Clone)]
 pub struct PyKMeans {
@@ -3246,6 +3358,17 @@ crate::pymethods_with_dit!(PyKMeans, KMeans, {
         py: Python<'py>,
         x: PyBuffer<f64>,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        if let Some(centers) = self.inner.cluster_centers_.as_ref()
+            && let Some(bytes) = predict_buffer_zero_copy(
+                py,
+                &x,
+                centers,
+                self.inner.n_features_in_,
+                &self.inner.device_type,
+            )?
+        {
+            return Ok(bytes);
+        }
         let mat = buffer_to_pooled_matrix(py, &x)?;
         let labels = self.inner.predict(&mat)?;
         usize_slice_to_i64_pybytes(py, &labels)
@@ -3449,6 +3572,17 @@ crate::pymethods_with_dit!(PyMiniBatchKMeans, MiniBatchKMeans, {
         py: Python<'py>,
         x: PyBuffer<f64>,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        if let Some(centers) = self.inner.cluster_centers_.as_ref()
+            && let Some(bytes) = predict_buffer_zero_copy(
+                py,
+                &x,
+                centers,
+                self.inner.n_features_in_,
+                &self.inner.device_type,
+            )?
+        {
+            return Ok(bytes);
+        }
         let mat = buffer_to_pooled_matrix(py, &x)?;
         let labels = self.inner.predict(&mat)?;
         usize_slice_to_i64_pybytes(py, &labels)

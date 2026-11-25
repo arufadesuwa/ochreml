@@ -913,8 +913,8 @@ pub fn cuda_compute_normal_equation(
     y: &[f64],
     fit_intercept: bool,
 ) -> Option<OchreResult<(Matrix, Vec<f64>)>> {
-    if x.cols <= 48 && x.rows >= 250_000 {
-        // Tall-narrow matrices: PCIe host->device copy of X outweighs O(n p^2) CPU compute
+    if x.cols <= 48 {
+        // Narrow matrices: PCIe host->device copy + cuBLAS launch outweighs O(n p^2) CPU compute
         return Some(crate::backend::cpu_normal_equation_1d_slice(
             x,
             y,
@@ -1220,8 +1220,8 @@ pub fn cuda_compute_normal_equation_multi(
     sample_weight: Option<&[f64]>,
     fit_intercept: bool,
 ) -> Option<OchreResult<(Matrix, Matrix)>> {
-    if x.cols <= 48 && x.rows >= 250_000 && y.cols <= 16 {
-        // Tall-narrow matrices: PCIe host->device copy of X outweighs O(n p^2) CPU compute
+    if x.cols <= 48 && y.cols <= 16 {
+        // Narrow matrices: PCIe host->device copy + cuBLAS launch outweighs O(n p^2) CPU compute
         return Some(crate::backend::cpu_normal_equation_multi_slice(
             x,
             y,

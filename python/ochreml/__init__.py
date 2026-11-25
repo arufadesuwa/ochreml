@@ -106,7 +106,7 @@ from .linear_model import (
     SGDRegressor,
 )
 
-__version__ = "0.3.5b6"
+__version__ = "0.3.5b7"
 __all__ = [
     "LinearRegression",
     "Ridge",

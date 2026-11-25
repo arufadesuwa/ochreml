@@ -1760,8 +1760,15 @@ fn run_nipals(
     let mut p_vec = vec![0.0; p];
     let mut q_vec = vec![0.0; q];
 
+    let mut cross_cov = if !mode_b {
+        vec![0.0; p * q]
+    } else {
+        Vec::new()
+    };
+
     for k in 0..n_components {
         // Initialize u as first non-zero column of Yk
+        let mut init_col = None;
         u.fill(0.0);
         for col in 0..q {
             let mut col_sq = 0.0;
@@ -1770,6 +1777,7 @@ fn run_nipals(
                 col_sq += v * v;
             }
             if col_sq > 1e-24 {
+                init_col = Some(col);
                 for r in 0..n {
                     u[r] = yk[(r, col)];
                 }
@@ -1782,127 +1790,233 @@ fn run_nipals(
         t.fill(0.0);
         let mut iters_done = 0usize;
 
-        // Precompute Gram matrices if Mode B (CCA)
-        let xk_gram = if mode_b {
-            let mut g = backend.matmul_at_b(&xk, &xk)?;
-            g.add_ridge_diagonal(1e-12);
-            Some(g)
-        } else {
-            None
-        };
-        let yk_gram = if mode_b {
-            let mut g = backend.matmul_at_b(&yk, &yk)?;
-            g.add_ridge_diagonal(1e-12);
-            Some(g)
-        } else {
-            None
-        };
-
-        for it in 1..=max_iter {
-            iters_done = it;
-            w_old.copy_from_slice(&w);
-
-            if is_cpu && !mode_b {
-                cpu_mat_t_vec(&xk, &u, &mut w);
-                let u_norm_sq = dot4(&u, &u).max(1e-15);
-                let inv_u = 1.0 / u_norm_sq;
-                for val in &mut w {
-                    *val *= inv_u;
-                }
-            } else {
-                let u_mat = Matrix::from_vec(n, 1, u.clone())?;
-                let xk_t_u = backend.matmul_at_b(&xk, &u_mat)?;
-                if let Some(ref gram_x) = xk_gram {
-                    let sol = solve_cholesky_multi(gram_x, &xk_t_u)?;
-                    w.copy_from_slice(&sol.data);
-                } else {
-                    let u_norm_sq = dot_slice(&u, &u).max(1e-15);
-                    let inv_u = 1.0 / u_norm_sq;
-                    for (dst, &v) in w.iter_mut().zip(xk_t_u.data.iter()) {
-                        *dst = v * inv_u;
+        if !mode_b && is_cpu {
+            // Mode A (PLSRegression) NIPALS inner loop is mathematically equivalent to
+            // power iteration on the tiny (p x q) cross-covariance matrix C = X_k^T * Y_k:
+            //   c_step = C^T * w,  w_next = (C * c_step) / ||C * c_step||.
+            // Computing C once per component reduces O(iters * n * (p + q)) to
+            // O(n * p * q + iters * p * q) while matching NIPALS weights bit-for-bit.
+            cross_cov.fill(0.0);
+            for r in 0..n {
+                let x_row = &xk.data[r * p..(r + 1) * p];
+                let y_row = &yk.data[r * q..(r + 1) * q];
+                for i in 0..p {
+                    let xi = x_row[i];
+                    let dst = &mut cross_cov[i * q..(i + 1) * q];
+                    for j in 0..q {
+                        dst[j] += xi * y_row[j];
                     }
                 }
             }
-            let w_norm = vec_norm2(&w);
-            if w_norm > 1e-15 {
-                let inv = 1.0 / w_norm;
-                for val in &mut w {
-                    *val *= inv;
+
+            if let Some(col0) = init_col {
+                for i in 0..p {
+                    w[i] = cross_cov[i * q + col0];
+                }
+                let w_norm = vec_norm2(&w);
+                if w_norm > 1e-15 {
+                    let inv = 1.0 / w_norm;
+                    for val in &mut w {
+                        *val *= inv;
+                    }
+                } else {
+                    w[0] = 1.0;
+                }
+                iters_done = 1;
+
+                if q > 1 {
+                    for it in 2..=max_iter {
+                        w_old.copy_from_slice(&w);
+                        // c = C^T * w
+                        c.fill(0.0);
+                        for i in 0..p {
+                            let wi = w[i];
+                            let row_c = &cross_cov[i * q..(i + 1) * q];
+                            for j in 0..q {
+                                c[j] += wi * row_c[j];
+                            }
+                        }
+                        let c_norm_sq = dot4(&c, &c);
+                        if c_norm_sq > 1e-30 {
+                            // w = C * c
+                            for i in 0..p {
+                                let row_c = &cross_cov[i * q..(i + 1) * q];
+                                let mut s = 0.0;
+                                for j in 0..q {
+                                    s += row_c[j] * c[j];
+                                }
+                                w[i] = s;
+                            }
+                            let wn = vec_norm2(&w);
+                            if wn > 1e-15 {
+                                let inv = 1.0 / wn;
+                                for val in &mut w {
+                                    *val *= inv;
+                                }
+                            } else {
+                                w[0] = 1.0;
+                            }
+                        } else {
+                            w.fill(0.0);
+                            w[0] = 1.0;
+                        }
+                        iters_done = it;
+                        let mut diff_sq = 0.0;
+                        for (&wi, &wo) in w.iter().zip(w_old.iter()) {
+                            let d = wi - wo;
+                            diff_sq += d * d;
+                        }
+                        if diff_sq < tol {
+                            break;
+                        }
+                    }
                 }
             } else {
                 w[0] = 1.0;
-            }
-            if mode_b && dot_slice(&w, &w_old) < 0.0 {
-                for val in &mut w {
-                    *val = -*val;
-                }
+                iters_done = 1;
             }
 
-            if is_cpu {
-                cpu_mat_vec(&xk, &w, &mut t);
+            // Compute final scores t, y_weights c, and y_scores u once from converged w
+            cpu_mat_vec(&xk, &w, &mut t);
+            cpu_mat_t_vec(&yk, &t, &mut c);
+            let t_norm_sq = dot4(&t, &t).max(1e-15);
+            let inv_t = 1.0 / t_norm_sq;
+            for val in &mut c {
+                *val *= inv_t;
+            }
+            let c_norm_sq = dot4(&c, &c);
+            if c_norm_sq > 1e-15 {
+                cpu_mat_vec(&yk, &c, &mut u);
+                let inv_c = 1.0 / c_norm_sq;
+                for val in &mut u {
+                    *val *= inv_c;
+                }
             } else {
-                t = backend.matvec(&xk, &w)?;
+                u.fill(0.0);
             }
+        } else {
+            // Precompute Gram matrices if Mode B (CCA)
+            let xk_gram = if mode_b {
+                let mut g = backend.matmul_at_b(&xk, &xk)?;
+                g.add_ridge_diagonal(1e-12);
+                Some(g)
+            } else {
+                None
+            };
+            let yk_gram = if mode_b {
+                let mut g = backend.matmul_at_b(&yk, &yk)?;
+                g.add_ridge_diagonal(1e-12);
+                Some(g)
+            } else {
+                None
+            };
 
-            if is_cpu && !mode_b {
-                cpu_mat_t_vec(&yk, &t, &mut c);
-                let t_norm_sq = dot4(&t, &t).max(1e-15);
-                let inv_t = 1.0 / t_norm_sq;
-                for val in &mut c {
-                    *val *= inv_t;
-                }
-                let c_norm_sq = dot4(&c, &c);
-                if c_norm_sq > 1e-15 {
-                    cpu_mat_vec(&yk, &c, &mut u);
-                    let inv_c = 1.0 / c_norm_sq;
-                    for val in &mut u {
-                        *val *= inv_c;
+            for it in 1..=max_iter {
+                iters_done = it;
+                w_old.copy_from_slice(&w);
+
+                if is_cpu && !mode_b {
+                    cpu_mat_t_vec(&xk, &u, &mut w);
+                    let u_norm_sq = dot4(&u, &u).max(1e-15);
+                    let inv_u = 1.0 / u_norm_sq;
+                    for val in &mut w {
+                        *val *= inv_u;
                     }
                 } else {
-                    u.fill(0.0);
-                }
-            } else {
-                let t_mat = Matrix::from_vec(n, 1, t.clone())?;
-                let yk_t_t = backend.matmul_at_b(&yk, &t_mat)?;
-                if let Some(ref gram_y) = yk_gram {
-                    let sol = solve_cholesky_multi(gram_y, &yk_t_t)?;
-                    c.copy_from_slice(&sol.data);
-                    let c_norm = vec_norm2(&c);
-                    if c_norm > 1e-15 {
-                        let inv = 1.0 / c_norm;
-                        for val in &mut c {
-                            *val *= inv;
-                        }
+                    let u_mat = Matrix::from_vec(n, 1, u.clone())?;
+                    let xk_t_u = backend.matmul_at_b(&xk, &u_mat)?;
+                    if let Some(ref gram_x) = xk_gram {
+                        let sol = solve_cholesky_multi(gram_x, &xk_t_u)?;
+                        w.copy_from_slice(&sol.data);
                     } else {
-                        c[0] = 1.0;
+                        let u_norm_sq = dot_slice(&u, &u).max(1e-15);
+                        let inv_u = 1.0 / u_norm_sq;
+                        for (dst, &v) in w.iter_mut().zip(xk_t_u.data.iter()) {
+                            *dst = v * inv_u;
+                        }
                     }
-                    u = backend.matvec(&yk, &c)?;
+                }
+                let w_norm = vec_norm2(&w);
+                if w_norm > 1e-15 {
+                    let inv = 1.0 / w_norm;
+                    for val in &mut w {
+                        *val *= inv;
+                    }
                 } else {
-                    let t_norm_sq = dot_slice(&t, &t).max(1e-15);
-                    let inv_t = 1.0 / t_norm_sq;
-                    for (dst, &v) in c.iter_mut().zip(yk_t_t.data.iter()) {
-                        *dst = v * inv_t;
+                    w[0] = 1.0;
+                }
+                if mode_b && dot_slice(&w, &w_old) < 0.0 {
+                    for val in &mut w {
+                        *val = -*val;
                     }
-                    let c_norm_sq = dot_slice(&c, &c);
+                }
+
+                if is_cpu {
+                    cpu_mat_vec(&xk, &w, &mut t);
+                } else {
+                    t = backend.matvec(&xk, &w)?;
+                }
+
+                if is_cpu && !mode_b {
+                    cpu_mat_t_vec(&yk, &t, &mut c);
+                    let t_norm_sq = dot4(&t, &t).max(1e-15);
+                    let inv_t = 1.0 / t_norm_sq;
+                    for val in &mut c {
+                        *val *= inv_t;
+                    }
+                    let c_norm_sq = dot4(&c, &c);
                     if c_norm_sq > 1e-15 {
-                        let yk_c = backend.matvec(&yk, &c)?;
-                        let inv = 1.0 / c_norm_sq;
-                        for (dst, &v) in u.iter_mut().zip(yk_c.iter()) {
-                            *dst = v * inv;
+                        cpu_mat_vec(&yk, &c, &mut u);
+                        let inv_c = 1.0 / c_norm_sq;
+                        for val in &mut u {
+                            *val *= inv_c;
                         }
                     } else {
                         u.fill(0.0);
                     }
+                } else {
+                    let t_mat = Matrix::from_vec(n, 1, t.clone())?;
+                    let yk_t_t = backend.matmul_at_b(&yk, &t_mat)?;
+                    if let Some(ref gram_y) = yk_gram {
+                        let sol = solve_cholesky_multi(gram_y, &yk_t_t)?;
+                        c.copy_from_slice(&sol.data);
+                        let c_norm = vec_norm2(&c);
+                        if c_norm > 1e-15 {
+                            let inv = 1.0 / c_norm;
+                            for val in &mut c {
+                                *val *= inv;
+                            }
+                        } else {
+                            c[0] = 1.0;
+                        }
+                        u = backend.matvec(&yk, &c)?;
+                    } else {
+                        let t_norm_sq = dot_slice(&t, &t).max(1e-15);
+                        let inv_t = 1.0 / t_norm_sq;
+                        for (dst, &v) in c.iter_mut().zip(yk_t_t.data.iter()) {
+                            *dst = v * inv_t;
+                        }
+                        let c_norm_sq = dot_slice(&c, &c);
+                        if c_norm_sq > 1e-15 {
+                            let yk_c = backend.matvec(&yk, &c)?;
+                            let inv = 1.0 / c_norm_sq;
+                            for (dst, &v) in u.iter_mut().zip(yk_c.iter()) {
+                                *dst = v * inv;
+                            }
+                        } else {
+                            u.fill(0.0);
+                        }
+                    }
                 }
-            }
 
-            let mut diff_sq = 0.0;
-            for (&wi, &wo) in w.iter().zip(w_old.iter()) {
-                let d = wi - wo;
-                diff_sq += d * d;
-            }
-            if diff_sq < tol || (!mode_b && q == 1) {
-                break;
+                let mut diff_sq = 0.0;
+                for (&wi, &wo) in w.iter().zip(w_old.iter()) {
+                    let d = wi - wo;
+                    diff_sq += d * d;
+                }
+                if diff_sq < tol || (!mode_b && q == 1) {
+                    break;
+                }
             }
         }
         n_iter.push(iters_done);

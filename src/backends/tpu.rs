@@ -847,8 +847,8 @@ fn destroy_pjrt_buffer(api: &PjrtApiPrefix, buffer: *mut PjrtBuffer) {
     }
 }
 
-const MIN_TPU_DOT_OPS: usize = 8_000_000;
-const MIN_TPU_NE_COLS: usize = 16;
+const MIN_TPU_DOT_OPS: usize = 64_000_000;
+const MIN_TPU_NE_COLS: usize = 64;
 
 fn execute_tpu_dot(device_id: usize, op: TpuOpKind, a: &Matrix, b: &Matrix) -> Option<Matrix> {
     let (m, k, n) = match op {
@@ -856,7 +856,7 @@ fn execute_tpu_dot(device_id: usize, op: TpuOpKind, a: &Matrix, b: &Matrix) -> O
         TpuOpKind::MatMulAtB => (a.cols, a.rows, b.cols),
     };
     // Small or narrow matmuls are faster and full FP64 on CPU than padding to f32 over PJRT.
-    if m.saturating_mul(k).saturating_mul(n) < MIN_TPU_DOT_OPS {
+    if m.min(n) < 32 || m.saturating_mul(k).saturating_mul(n) < MIN_TPU_DOT_OPS {
         return None;
     }
 

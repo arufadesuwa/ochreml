@@ -12,6 +12,18 @@ use crate::matrix::{
     compute_normal_equation_multi_range, r2_score, r2_score_multi,
 };
 
+fn extract_unique_sorted_classes(y: &[f64]) -> Vec<f64> {
+    let mut classes: Vec<f64> = Vec::with_capacity(16);
+    for &v in y {
+        if !classes.iter().any(|&c| (c - v).abs() < 1e-9) {
+            classes.push(v);
+        }
+    }
+    classes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    classes.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    classes
+}
+
 fn validate_alpha(alpha: f64) -> OchreResult<()> {
     if alpha < 0.0 || !alpha.is_finite() {
         return Err(OchreError::InvalidAlpha(alpha));
@@ -281,9 +293,7 @@ impl RidgeClassifier {
             return Err(OchreError::EmptyData);
         }
 
-        let mut classes = y.to_vec();
-        classes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        classes.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        let classes = extract_unique_sorted_classes(y);
         self.classes_ = classes;
         self.n_features_in_ = Some(x.cols);
         self.device_ = Some(self.device.to_string());

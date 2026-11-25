@@ -1427,7 +1427,7 @@ pub fn cpu_batched_histogram_unit_f32_into(
         let use_par_features = (cols >= 4 && ((is_root && n_rows >= 2048) || n_samples >= 1024))
             || (cols < 4 && n_samples >= 16_384);
         let use_par_chunks =
-            (n_samples >= 32_768 && cols < 2 * n_threads) || (cols < 4 && n_samples >= 16_384);
+            (n_samples >= 65_536 && cols * 2 < n_threads) || (cols < 4 && n_samples >= 16_384);
 
         if use_par_features {
             out.sum_grad
@@ -1546,7 +1546,7 @@ pub fn cpu_batched_histogram_gh_f32_into(
         let use_par_features = (cols >= 4 && ((is_root && n_rows >= 2048) || n_samples >= 1024))
             || (cols < 4 && n_samples >= 16_384);
         let use_par_chunks =
-            (n_samples >= 32_768 && cols < 2 * n_threads) || (cols < 4 && n_samples >= 16_384);
+            (n_samples >= 65_536 && cols * 2 < n_threads) || (cols < 4 && n_samples >= 16_384);
 
         if use_par_features {
             out.sum_grad
