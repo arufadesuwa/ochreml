@@ -1445,6 +1445,84 @@ fn cpu_assign_labels_checked(x: &Matrix, centers: &Matrix) -> OchreResult<Vec<us
     cpu_assign_labels_impl(x, centers, true)
 }
 
+fn cpu_assign_labels_and_inertia_impl(
+    x: &Matrix,
+    centers: &Matrix,
+    sw: Option<&[f64]>,
+    labels: &mut [usize],
+    check_finite: bool,
+) -> OchreResult<f64> {
+    let n = x.rows;
+    let p = x.cols;
+    let k = centers.rows;
+    if n == 0 || p == 0 || k == 0 {
+        return Ok(0.0);
+    }
+    let packed = PackedCenters::new(&centers.data, k, p);
+    let flag = AtomicBool::new(false);
+    let flag_opt = if check_finite { Some(&flag) } else { None };
+
+    let inertia = if n < ASSIGN_PAR_ROW_THRESHOLD {
+        assign_chunk_l1_checked::<true, true>(
+            &x.data,
+            Some(labels),
+            sw,
+            &packed,
+            &centers.data,
+            n,
+            flag_opt,
+        )
+    } else {
+        let chunk_rows = if n >= 16_384 {
+            PREDICT_CHUNK_ROWS
+        } else {
+            1024
+        };
+        match sw {
+            Some(weights) => labels
+                .par_chunks_mut(chunk_rows)
+                .zip(x.data.par_chunks(chunk_rows * p))
+                .zip(weights.par_chunks(chunk_rows))
+                .map(|((lbl_chunk, x_chunk), w_chunk)| {
+                    let rows = lbl_chunk.len();
+                    assign_chunk_l1_checked::<true, true>(
+                        x_chunk,
+                        Some(lbl_chunk),
+                        Some(w_chunk),
+                        &packed,
+                        &centers.data,
+                        rows,
+                        flag_opt,
+                    )
+                })
+                .sum(),
+            None => labels
+                .par_chunks_mut(chunk_rows)
+                .zip(x.data.par_chunks(chunk_rows * p))
+                .map(|(lbl_chunk, x_chunk)| {
+                    let rows = lbl_chunk.len();
+                    assign_chunk_l1_checked::<true, true>(
+                        x_chunk,
+                        Some(lbl_chunk),
+                        None,
+                        &packed,
+                        &centers.data,
+                        rows,
+                        flag_opt,
+                    )
+                })
+                .sum(),
+        }
+    };
+
+    if check_finite && flag.load(Ordering::Relaxed) {
+        return Err(OchreError::InvalidParameter(
+            "Input X contains NaN or infinite values ( >_< )".to_string(),
+        ));
+    }
+    Ok(inertia)
+}
+
 /// Zero-extra-alloc fused nearest-center label + inertia kernel computing
 /// `sum_i w_i * (||x_i||^2 + 2 * (0.5 * ||c_best||^2 - x_i . c_best))` inside Rayon chunks.
 fn cpu_assign_labels_and_inertia(
@@ -1453,66 +1531,17 @@ fn cpu_assign_labels_and_inertia(
     sw: Option<&[f64]>,
     labels: &mut [usize],
 ) -> f64 {
-    let n = x.rows;
-    let p = x.cols;
-    let k = centers.rows;
-    if n == 0 || p == 0 || k == 0 {
-        return 0.0;
-    }
-    let packed = PackedCenters::new(&centers.data, k, p);
+    cpu_assign_labels_and_inertia_impl(x, centers, sw, labels, false).unwrap_or(0.0)
+}
 
-    if n < ASSIGN_PAR_ROW_THRESHOLD {
-        return assign_chunk_l1_checked::<true, true>(
-            &x.data,
-            Some(labels),
-            sw,
-            &packed,
-            &centers.data,
-            n,
-            None,
-        );
-    }
-
-    let chunk_rows = if n >= 16_384 {
-        PREDICT_CHUNK_ROWS
-    } else {
-        1024
-    };
-    match sw {
-        Some(weights) => labels
-            .par_chunks_mut(chunk_rows)
-            .zip(x.data.par_chunks(chunk_rows * p))
-            .zip(weights.par_chunks(chunk_rows))
-            .map(|((lbl_chunk, x_chunk), w_chunk)| {
-                let rows = lbl_chunk.len();
-                assign_chunk_l1_checked::<true, true>(
-                    x_chunk,
-                    Some(lbl_chunk),
-                    Some(w_chunk),
-                    &packed,
-                    &centers.data,
-                    rows,
-                    None,
-                )
-            })
-            .sum(),
-        None => labels
-            .par_chunks_mut(chunk_rows)
-            .zip(x.data.par_chunks(chunk_rows * p))
-            .map(|(lbl_chunk, x_chunk)| {
-                let rows = lbl_chunk.len();
-                assign_chunk_l1_checked::<true, true>(
-                    x_chunk,
-                    Some(lbl_chunk),
-                    None,
-                    &packed,
-                    &centers.data,
-                    rows,
-                    None,
-                )
-            })
-            .sum(),
-    }
+/// Zero-extra-alloc fused nearest-center label + inertia kernel with fused finite check.
+fn cpu_assign_labels_and_inertia_checked(
+    x: &Matrix,
+    centers: &Matrix,
+    sw: Option<&[f64]>,
+    labels: &mut [usize],
+) -> OchreResult<f64> {
+    cpu_assign_labels_and_inertia_impl(x, centers, sw, labels, true)
 }
 
 /// Zero-allocation fused inertia-only kernel with fused finite check for `score`.
@@ -2677,7 +2706,9 @@ impl MiniBatchKMeans {
     }
 
     pub fn fit(&mut self, x: &Matrix, sample_weight: Option<&[f64]>) -> OchreResult<()> {
-        validate_x(x)?;
+        if x.rows == 0 || x.cols == 0 {
+            return Err(OchreError::EmptyData);
+        }
         let sw = validate_sample_weight(sample_weight, x.rows)?;
         if self.n_clusters > x.rows {
             return Err(OchreError::InvalidParameter(format!(
@@ -2695,6 +2726,10 @@ impl MiniBatchKMeans {
         let eff_batch = self.batch_size.min(n).max(1);
         let ewma_alpha = ((2.0 * eff_batch as f64) / (n as f64 + 1.0)).clamp(0.01, 1.0);
         let init_size = (3 * eff_batch).max(3 * k).min(n);
+        let defer_full_validate = init_size < n && should_use_cpu_predict(&backend, n, k, p);
+        if !defer_full_validate {
+            validate_x(x)?;
+        }
 
         let mut best_centers: Option<Matrix> = None;
         let mut best_counts: Option<Vec<f64>> = None;
@@ -2923,8 +2958,11 @@ impl MiniBatchKMeans {
             && let Some(ref centers) = best_centers
         {
             let mut final_labels = vec![0usize; n];
-            best_inertia =
-                assign_labels_and_inertia_into(&backend, x, centers, sw, &mut final_labels)?;
+            best_inertia = if defer_full_validate {
+                cpu_assign_labels_and_inertia_checked(x, centers, sw, &mut final_labels)?
+            } else {
+                assign_labels_and_inertia_into(&backend, x, centers, sw, &mut final_labels)?
+            };
             best_labels = Some(final_labels);
         }
 

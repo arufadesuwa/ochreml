@@ -3610,6 +3610,42 @@ impl GaussianProcessClassifier {
 
     pub fn predict(&self, x: &Matrix) -> OchreResult<Vec<f64>> {
         let classes = self.classes_.as_ref().ok_or(OchreError::NotFitted)?;
+        if classes.len() == 2 {
+            // Fast binary path: since kappa = (1 + (pi/8) * var_f)^{-1/2} > 0 always,
+            // sigmoid(kappa * f_star) >= 0.5 iff f_star >= 0.0, so we avoid the L*V triangular solve.
+            let x_train = self.x_train_.as_ref().ok_or(OchreError::NotFitted)?;
+            let expected_cols = self.n_features_in_.ok_or(OchreError::NotFitted)?;
+            validate_matrix_finite(x, "Feature matrix X")?;
+            if x.cols != expected_cols {
+                return Err(OchreError::FeatureCountMismatch {
+                    features: x.cols,
+                    expected: expected_cols,
+                });
+            }
+            let n_test = x.rows;
+            let n_train = x_train.rows;
+            let elems = n_test.saturating_mul(n_train);
+            let backend = if elems < CPU_PAR_ELEMS {
+                Backend::Cpu
+            } else {
+                effective_backend(&self.parsed_device, elems)
+            };
+            let est = &self.estimators_[0];
+            let k_star = compute_kernel_matrix(&backend, x, x_train, &est.params, false)?;
+            let f_star = if matches!(backend, Backend::Cpu) && elems < CPU_PAR_ELEMS {
+                let mut out = vec![0.0; n_test];
+                matvec_into(&k_star, &est.y_train_minus_pi, &mut out);
+                out
+            } else {
+                backend.matvec(&k_star, &est.y_train_minus_pi)?
+            };
+            let c0 = classes[0];
+            let c1 = classes[1];
+            return Ok(f_star
+                .into_iter()
+                .map(|f| if f >= 0.0 { c1 } else { c0 })
+                .collect());
+        }
         let proba = self.predict_proba(x)?;
         let n_test = proba.rows;
         let n_classes = proba.cols;

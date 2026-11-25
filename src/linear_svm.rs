@@ -32,7 +32,7 @@ pub const TAG_LINEAR_SVR: u8 = 55;
 const LBFGS_HISTORY: usize = 10;
 const LARGE_MATRIX_THRESHOLD: usize = 262_144;
 const PREDICT_GPU_THRESHOLD: usize = 2_000_000;
-const PARALLEL_ROW_THRESHOLD: usize = 512;
+const PARALLEL_ROW_THRESHOLD: usize = 32_768;
 
 #[inline]
 fn compute_predict_chunk_rows(n: usize) -> usize {

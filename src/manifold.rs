@@ -373,7 +373,11 @@ impl TSNE {
             )));
         }
 
-        let backend = get_backend(&self.device);
+        let backend = if n <= 512 {
+            Backend::Cpu
+        } else {
+            get_backend(&self.device)
+        };
         let lr = self
             .learning_rate
             .unwrap_or_else(|| ((n as f64) / self.early_exaggeration / 4.0).max(50.0));
@@ -981,7 +985,11 @@ impl MDS {
     pub fn fit_transform(&mut self, x: &Matrix) -> OchreResult<Matrix> {
         validate_finite_matrix(x)?;
         let n = x.rows;
-        let backend = get_backend(&self.device);
+        let backend = if n <= 512 {
+            Backend::Cpu
+        } else {
+            get_backend(&self.device)
+        };
 
         let dissim = if self.dissimilarity == "precomputed" {
             if x.rows != x.cols {

@@ -263,7 +263,7 @@ fn project_cpu_matrix_cached(
     let p = x.cols;
     let mut out_data = vec![0.0; n * k];
 
-    if n >= PARALLEL_ROW_THRESHOLD {
+    if n >= PARALLEL_ROW_THRESHOLD && n.saturating_mul(p).saturating_mul(k) >= 2_000_000 {
         let chunk_rows = compute_project_chunk_rows(n);
         out_data
             .par_chunks_mut(chunk_rows * k)

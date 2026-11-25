@@ -50,7 +50,7 @@ fn axpy_add_unrolled(dst: &mut [f64], src: &[f64], scale: f64) {
 }
 
 const GLM_TILE_ROWS: usize = 64;
-const GLM_IRLS_CHUNK_ROWS: usize = 512;
+const GLM_IRLS_CHUNK_ROWS: usize = 4096;
 
 #[inline(always)]
 fn dot64(a: &[f64; GLM_TILE_ROWS], b: &[f64; GLM_TILE_ROWS]) -> f64 {
@@ -3037,6 +3037,103 @@ fn tweedie_irls_fused_cpu_pass(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn tweedie_gamma_log_grad_cpu_pass(
+    x: &Matrix,
+    y: &[f64],
+    sw_slice: Option<&[f64]>,
+    inv_n: f64,
+    theta: &[f64],
+    fit_intercept: bool,
+    grad: &mut [f64],
+) -> (f64, bool) {
+    let n = x.rows;
+    let p = x.cols;
+    let dim = p + usize::from(fit_intercept);
+    let w = &theta[..p];
+    let b_intercept = if fit_intercept { theta[p] } else { 0.0 };
+
+    if n >= 1024 && n * dim >= 16_384 {
+        let chunk_rows = GLM_IRLS_CHUNK_ROWS;
+        let (dl, g_par, invalid) = x
+            .data
+            .par_chunks(chunk_rows * p)
+            .zip(y.par_chunks(chunk_rows))
+            .enumerate()
+            .fold(
+                || (0.0_f64, vec![0.0; dim], false),
+                |(mut l_dl, mut l_g, mut l_inv), (c_idx, (xc, yc))| {
+                    if l_inv {
+                        return (l_dl, l_g, true);
+                    }
+                    let base = c_idx * chunk_rows;
+                    for (i, &yi) in yc.iter().enumerate() {
+                        let row = &xc[i * p..(i + 1) * p];
+                        let eta_c = (dot_unrolled(row, w) + b_intercept).clamp(-50.0, 50.0);
+                        if !eta_c.is_finite() {
+                            l_inv = true;
+                            break;
+                        }
+                        let wi = sw_slice.map_or(inv_n, |s| s[base + i]);
+                        let ratio = yi * (-eta_c).exp();
+                        let l_i = wi * (eta_c + ratio);
+                        let g_i = wi * (1.0 - ratio);
+                        if !l_i.is_finite() || !g_i.is_finite() {
+                            l_inv = true;
+                            break;
+                        }
+                        l_dl += l_i;
+                        axpy_add_unrolled(&mut l_g[..p], row, g_i);
+                        if fit_intercept {
+                            l_g[p] += g_i;
+                        }
+                    }
+                    (l_dl, l_g, l_inv)
+                },
+            )
+            .reduce(
+                || (0.0_f64, vec![0.0; dim], false),
+                |(dl1, mut g1, inv1), (dl2, g2, inv2)| {
+                    if inv1 || inv2 {
+                        return (0.0, g1, true);
+                    }
+                    for j in 0..dim {
+                        g1[j] += g2[j];
+                    }
+                    (dl1 + dl2, g1, false)
+                },
+            );
+        if invalid {
+            return (f64::INFINITY, true);
+        }
+        grad.copy_from_slice(&g_par);
+        (dl, false)
+    } else {
+        grad.fill(0.0);
+        let mut dl = 0.0_f64;
+        for (i, &yi) in y.iter().enumerate().take(n) {
+            let row = &x.data[i * p..(i + 1) * p];
+            let eta_c = (dot_unrolled(row, w) + b_intercept).clamp(-50.0, 50.0);
+            if !eta_c.is_finite() {
+                return (f64::INFINITY, true);
+            }
+            let wi = sw_slice.map_or(inv_n, |s| s[i]);
+            let ratio = yi * (-eta_c).exp();
+            let l_i = wi * (eta_c + ratio);
+            let g_i = wi * (1.0 - ratio);
+            if !l_i.is_finite() || !g_i.is_finite() {
+                return (f64::INFINITY, true);
+            }
+            dl += l_i;
+            axpy_add_unrolled(&mut grad[..p], row, g_i);
+            if fit_intercept {
+                grad[p] += g_i;
+            }
+        }
+        (dl, false)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn tweedie_loss_only_cpu(
     x: &Matrix,
     y: &[f64],
@@ -3245,6 +3342,18 @@ impl TweedieRegressor {
                     data_loss + loss_const + 0.5 * alpha * reg_loss
                 };
 
+            let const_hess =
+                matches!(power_kind, TweediePowerKind::Gamma) && eff_link == GlmLink::Log;
+            let add_reg_grad_only = |theta: &[f64], data_loss: f64, g: &mut [f64]| -> f64 {
+                let mut reg_loss = 0.0;
+                for j in 0..p {
+                    let wj = theta[j];
+                    reg_loss += wj * wj;
+                    g[j] += alpha * wj;
+                }
+                data_loss + loss_const + 0.5 * alpha * reg_loss
+            };
+
             let (init_data_loss, init_invalid) = tweedie_irls_fused_cpu_pass(
                 x,
                 y,
@@ -3289,39 +3398,58 @@ impl TweedieRegressor {
                         break;
                     }
 
-                    // Optimistic full Newton step (step = 1.0): compute loss, grad, and Hessian in one pass.
+                    // Optimistic full Newton step (step = 1.0): compute loss, grad, and (if non-constant) Hessian in one pass.
                     for d in 0..dim {
                         cand_theta[d] = init_theta[d] + delta[d];
                     }
-                    let (cand_data_loss, cand_invalid) = tweedie_irls_fused_cpu_pass(
-                        x,
-                        y,
-                        sw_slice,
-                        inv_n,
-                        &cand_theta,
-                        fit_intercept,
-                        eff_link,
-                        power_kind,
-                        check_pos_mu,
-                        &mut cand_grad,
-                        &mut cand_hess_data,
-                        &mut u_t,
-                    );
-                    let cand_loss = if !cand_invalid && cand_data_loss.is_finite() {
-                        add_reg_and_const(
+                    let cand_loss = if const_hess {
+                        let (cand_data_loss, cand_invalid) = tweedie_gamma_log_grad_cpu_pass(
+                            x,
+                            y,
+                            sw_slice,
+                            inv_n,
                             &cand_theta,
-                            cand_data_loss,
+                            fit_intercept,
+                            &mut cand_grad,
+                        );
+                        if !cand_invalid && cand_data_loss.is_finite() {
+                            add_reg_grad_only(&cand_theta, cand_data_loss, &mut cand_grad)
+                        } else {
+                            f64::INFINITY
+                        }
+                    } else {
+                        let (cand_data_loss, cand_invalid) = tweedie_irls_fused_cpu_pass(
+                            x,
+                            y,
+                            sw_slice,
+                            inv_n,
+                            &cand_theta,
+                            fit_intercept,
+                            eff_link,
+                            power_kind,
+                            check_pos_mu,
                             &mut cand_grad,
                             &mut cand_hess_data,
-                        )
-                    } else {
-                        f64::INFINITY
+                            &mut u_t,
+                        );
+                        if !cand_invalid && cand_data_loss.is_finite() {
+                            add_reg_and_const(
+                                &cand_theta,
+                                cand_data_loss,
+                                &mut cand_grad,
+                                &mut cand_hess_data,
+                            )
+                        } else {
+                            f64::INFINITY
+                        }
                     };
 
                     if cand_loss.is_finite() && cand_loss <= loss + c1 * dg {
                         init_theta.copy_from_slice(&cand_theta);
                         std::mem::swap(&mut grad, &mut cand_grad);
-                        std::mem::swap(&mut hess_data, &mut cand_hess_data);
+                        if !const_hess {
+                            std::mem::swap(&mut hess_data, &mut cand_hess_data);
+                        }
                         loss = cand_loss;
                         grad_valid = true;
                         irls_iters += 1;
