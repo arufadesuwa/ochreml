@@ -98,6 +98,7 @@ from ._ochreml import (
     get_device_info as _get_device_info,
 )
 from . import linear_model
+from . import nn
 from .linear_model import (
     ElasticNet,
     Lasso,
@@ -106,8 +107,9 @@ from .linear_model import (
     SGDRegressor,
 )
 
-__version__ = "0.3.5"
+__version__ = "0.3.6b1"
 __all__ = [
+    "nn",
     "LinearRegression",
     "Ridge",
     "RidgeClassifier",
@@ -474,6 +476,12 @@ def load(path: str, device: Optional[str] = None) -> Any:
             return SelectKBest._from_rust(_RustSelectKBest.from_bytes(data, target_dev), target_dev)
         if tag == 98:
             return SelectPercentile._from_rust(_RustSelectPercentile.from_bytes(data, target_dev), target_dev)
+        if tag == 100:
+            return nn.Sequential.from_dit_bytes(data, device=target_dev)
+        if tag == 101:
+            return nn.CausalLM.from_dit_bytes(data, device=target_dev)
+        if tag == 102:
+            return nn.LoRAAdapterState.from_dit_bytes(data, device=target_dev)
         raise ValueError(f"Unknown model tag ({tag}) in .dit file (・`ω´・)")
 
     # Fallback if the .dit file was written via joblib.dump or pickle.dump

@@ -17,6 +17,10 @@ pub fn write_u8(buf: &mut Vec<u8>, v: u8) {
     buf.push(v);
 }
 
+pub fn write_u16(buf: &mut Vec<u8>, v: u16) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
 pub fn write_bool(buf: &mut Vec<u8>, v: bool) {
     buf.push(u8::from(v));
 }
@@ -26,6 +30,10 @@ pub fn write_usize(buf: &mut Vec<u8>, v: usize) {
 }
 
 pub fn write_i64(buf: &mut Vec<u8>, v: i64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+pub fn write_f32(buf: &mut Vec<u8>, v: f32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
@@ -80,6 +88,20 @@ pub fn write_opt_f64(buf: &mut Vec<u8>, v: Option<f64>) {
             write_f64(buf, val);
         }
         None => write_u8(buf, 0),
+    }
+}
+
+pub fn write_f32_vec(buf: &mut Vec<u8>, v: &[f32]) {
+    write_usize(buf, v.len());
+    for &x in v {
+        write_f32(buf, x);
+    }
+}
+
+pub fn write_u16_vec(buf: &mut Vec<u8>, v: &[u16]) {
+    write_usize(buf, v.len());
+    for &x in v {
+        write_u16(buf, x);
     }
 }
 
@@ -174,6 +196,13 @@ impl<'a> ByteReader<'a> {
         Ok(self.read_exact(1)?[0])
     }
 
+    pub fn read_u16(&mut self) -> OchreResult<u16> {
+        let b = self.read_exact(2)?;
+        let mut arr = [0u8; 2];
+        arr.copy_from_slice(b);
+        Ok(u16::from_le_bytes(arr))
+    }
+
     pub fn read_bool(&mut self) -> OchreResult<bool> {
         Ok(self.read_u8()? != 0)
     }
@@ -190,6 +219,13 @@ impl<'a> ByteReader<'a> {
         let mut arr = [0u8; 8];
         arr.copy_from_slice(b);
         Ok(i64::from_le_bytes(arr))
+    }
+
+    pub fn read_f32(&mut self) -> OchreResult<f32> {
+        let b = self.read_exact(4)?;
+        let mut arr = [0u8; 4];
+        arr.copy_from_slice(b);
+        Ok(f32::from_le_bytes(arr))
     }
 
     pub fn read_f64(&mut self) -> OchreResult<f64> {
@@ -243,6 +279,30 @@ impl<'a> ByteReader<'a> {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn read_f32_vec(&mut self) -> OchreResult<Vec<f32>> {
+        let len = self.read_usize()?;
+        let byte_len = len.checked_mul(4).ok_or(OchreError::CorruptedDitFile)?;
+        let bytes = self.read_exact(byte_len)?;
+        let (chunks, _) = bytes.as_chunks::<4>();
+        let mut vec = Vec::with_capacity(len);
+        for &chunk in chunks {
+            vec.push(f32::from_le_bytes(chunk));
+        }
+        Ok(vec)
+    }
+
+    pub fn read_u16_vec(&mut self) -> OchreResult<Vec<u16>> {
+        let len = self.read_usize()?;
+        let byte_len = len.checked_mul(2).ok_or(OchreError::CorruptedDitFile)?;
+        let bytes = self.read_exact(byte_len)?;
+        let (chunks, _) = bytes.as_chunks::<2>();
+        let mut vec = Vec::with_capacity(len);
+        for &chunk in chunks {
+            vec.push(u16::from_le_bytes(chunk));
+        }
+        Ok(vec)
     }
 
     pub fn read_f64_vec(&mut self) -> OchreResult<Vec<f64>> {
@@ -317,4 +377,23 @@ pub fn check_magic_and_tag(reader: &mut ByteReader<'_>, expected_tag: u8) -> Och
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dit_io_f32_and_u16_roundtrip() {
+        let mut buf = write_header(100);
+        write_f32(&mut buf, -3.25);
+        write_f32_vec(&mut buf, &[0.0, 1.5, -2.75, 42.125]);
+        write_u16_vec(&mut buf, &[0x3c00, 0x3f80, 0xffff]);
+
+        let mut r = ByteReader::new(&buf);
+        check_magic_and_tag(&mut r, 100).unwrap();
+        assert!((r.read_f32().unwrap() + 3.25).abs() < 1e-6);
+        assert_eq!(r.read_f32_vec().unwrap(), vec![0.0, 1.5, -2.75, 42.125]);
+        assert_eq!(r.read_u16_vec().unwrap(), vec![0x3c00, 0x3f80, 0xffff]);
+    }
 }

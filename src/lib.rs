@@ -31,6 +31,7 @@ pub mod model_selection;
 pub mod naive_bayes;
 pub mod neighbors;
 pub mod neural_network;
+pub mod nn;
 pub mod preprocessing;
 pub mod primitives;
 pub mod ridge;
@@ -158,6 +159,9 @@ pub const TAG_RBF_SAMPLER: u8 = kernel_approx::TAG_RBF_SAMPLER;
 pub const TAG_VARIANCE_THRESHOLD: u8 = feature_selection::TAG_VARIANCE_THRESHOLD;
 pub const TAG_SELECT_K_BEST: u8 = feature_selection::TAG_SELECT_K_BEST;
 pub const TAG_SELECT_PERCENTILE: u8 = feature_selection::TAG_SELECT_PERCENTILE;
+pub const TAG_NN_SEQUENTIAL: u8 = nn::sequential::TAG_NN_SEQUENTIAL;
+pub const TAG_NN_TRANSFORMER_LM: u8 = nn::transformer::TAG_NN_TRANSFORMER_LM;
+pub const TAG_NN_STATE_DICT: u8 = nn::lora::TAG_NN_STATE_DICT;
 
 fn validate_dit_path(path: &str) -> OchreResult<()> {
     if !path.trim().to_lowercase().ends_with(".dit") {
@@ -3643,5 +3647,8 @@ fn _ochreml(m: &Bound<'_, PyModule>) -> PyResult<()> {
     kernel_approx::register_py_classes(m)?;
     feature_selection::register_py_classes(m)?;
     model_selection::register_py_classes(m)?;
+    let nn_mod = PyModule::new(m.py(), "nn")?;
+    nn::py_bindings::register_nn_submodule(&nn_mod)?;
+    m.add_submodule(&nn_mod)?;
     Ok(())
 }

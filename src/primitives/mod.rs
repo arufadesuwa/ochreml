@@ -6,6 +6,7 @@
 pub mod distance_topk;
 pub mod eig_svd;
 pub mod histogram;
+pub mod nn_ops;
 pub mod stats_ops;
 
 use crate::backend::Backend;
