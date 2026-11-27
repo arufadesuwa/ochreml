@@ -26,7 +26,7 @@ from ochreml import linear_model as ochre_lm
 
 
 def test_version_and_linear_model_exports():
-    assert ochreml.__version__ == "0.3.6b1"
+    assert ochreml.__version__ == "0.3.6b2"
     assert ochre_lm.LogisticRegression is LogisticRegression
     assert ochre_lm.Lasso is Lasso
     assert ochre_lm.ElasticNet is ElasticNet
