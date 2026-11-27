@@ -13,6 +13,63 @@ use crate::nn::dtype::DType;
 use crate::nn::layers::{Embedding, Linear};
 use crate::nn::norm::{LayerNorm, RMSNorm};
 use crate::nn::tensor::{FastRng, Tensor};
+use std::cell::RefCell;
+
+#[derive(Default)]
+struct SwiGluScratch {
+    gate: Vec<f32>,
+    up: Vec<f32>,
+}
+
+#[derive(Default)]
+struct FfnScratch {
+    hidden: Vec<f32>,
+}
+
+thread_local! {
+    static SWIGLU_SCRATCH: RefCell<SwiGluScratch> = RefCell::new(SwiGluScratch::default());
+    static FFN_SCRATCH: RefCell<FfnScratch> = RefCell::new(FfnScratch::default());
+}
+
+#[inline]
+fn ensure_len(buf: &mut Vec<f32>, len: usize) {
+    if buf.len() < len {
+        buf.resize(len, 0.0);
+    }
+}
+
+#[inline]
+fn rmsnorm_into_cpu(x: &[f32], gamma: &[f32], rows: usize, cols: usize, eps: f32, out: &mut [f32]) {
+    let inv_cols = 1.0f32 / (cols as f32);
+    for r in 0..rows {
+        let x_row = &x[r * cols..(r + 1) * cols];
+        let o_row = &mut out[r * cols..(r + 1) * cols];
+        let chunks = cols / 4;
+        let mut s0 = 0.0f32;
+        let mut s1 = 0.0f32;
+        let mut s2 = 0.0f32;
+        let mut s3 = 0.0f32;
+        for i in 0..chunks {
+            let off = i * 4;
+            let a = x_row[off];
+            let b = x_row[off + 1];
+            let c = x_row[off + 2];
+            let d = x_row[off + 3];
+            s0 += a * a;
+            s1 += b * b;
+            s2 += c * c;
+            s3 += d * d;
+        }
+        let mut sum_sq = (s0 + s1) + (s2 + s3);
+        for &v in &x_row[chunks * 4..] {
+            sum_sq += v * v;
+        }
+        let inv_rms = 1.0f32 / (sum_sq * inv_cols + eps).sqrt();
+        for ((dst, &xv), &gv) in o_row.iter_mut().zip(x_row.iter()).zip(gamma.iter()) {
+            *dst = xv * inv_rms * gv;
+        }
+    }
+}
 
 /// Binary serialization tag for `CausalLM` in `.dit` files.
 pub const TAG_NN_TRANSFORMER_LM: u8 = 101;
@@ -86,20 +143,34 @@ impl SwiGLU {
                 actual_cols: out.len(),
             });
         }
-        let mut gate_buf = vec![0.0f32; rows * self.hidden_dim];
-        let mut up_buf = vec![0.0f32; rows * self.hidden_dim];
-        self.w_gate.forward_raw(x, rows, &mut gate_buf)?;
-        self.w_up.forward_raw(x, rows, &mut up_buf)?;
-        let silu_gate = get_backend(&self.w_gate.device).silu_f32(&gate_buf);
-        for (dst, u) in gate_buf
-            .iter_mut()
-            .zip(silu_gate.iter())
-            .zip(up_buf.iter())
-            .map(|((d, s), u)| (d, s * *u))
-        {
-            *dst = u;
-        }
-        self.w_down.forward_raw(&gate_buf, rows, out)
+        let hidden_len = rows * self.hidden_dim;
+        SWIGLU_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            ensure_len(&mut scratch.gate, hidden_len);
+            ensure_len(&mut scratch.up, hidden_len);
+            let SwiGluScratch { gate, up } = &mut *scratch;
+            let gate_slice = &mut gate[..hidden_len];
+            let up_slice = &mut up[..hidden_len];
+
+            self.w_gate.forward_raw(x, rows, gate_slice)?;
+            self.w_up.forward_raw(x, rows, up_slice)?;
+            if self.w_gate.device == DeviceType::Cpu {
+                for (g, &u) in gate_slice.iter_mut().zip(up_slice.iter()) {
+                    let gv = *g;
+                    *g = (gv / (1.0 + (-gv).exp())) * u;
+                }
+            } else {
+                let silu_gate = get_backend(&self.w_gate.device).silu_f32(gate_slice);
+                for ((dst, &s), &u) in gate_slice
+                    .iter_mut()
+                    .zip(silu_gate.iter())
+                    .zip(up_slice.iter())
+                {
+                    *dst = s * u;
+                }
+            }
+            self.w_down.forward_raw(gate_slice, rows, out)
+        })
     }
 
     /// Returns references to all parameters in `w_gate`, `w_up`, `w_down`.
@@ -184,10 +255,15 @@ impl FeedForward {
                 actual_cols: out.len(),
             });
         }
-        let mut h = vec![0.0f32; rows * self.d_ff];
-        self.fc1.forward_raw(x, rows, &mut h)?;
-        let act = get_backend(&self.fc1.device).gelu_f32(&h);
-        self.fc2.forward_raw(&act, rows, out)
+        let hidden_len = rows * self.d_ff;
+        FFN_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            ensure_len(&mut scratch.hidden, hidden_len);
+            let h = &mut scratch.hidden[..hidden_len];
+            self.fc1.forward_raw(x, rows, h)?;
+            let act = get_backend(&self.fc1.device).gelu_f32(h);
+            self.fc2.forward_raw(&act, rows, out)
+        })
     }
 
     /// Returns references to all parameters in `fc1` and `fc2`.
@@ -356,8 +432,8 @@ impl TransformerEncoder {
 
     /// Autograd-tracked forward pass across all encoder layers.
     pub fn forward(&self, x: &Tensor) -> OchreResult<Tensor> {
-        let mut h = x.clone();
-        for layer in &self.layers {
+        let mut h = self.layers[0].forward(x)?;
+        for layer in &self.layers[1..] {
             h = layer.forward(&h)?;
         }
         if let Some(ref norm) = self.final_norm {
@@ -648,8 +724,9 @@ impl TransformerDecoder {
                 self.layers.len()
             )));
         }
-        let mut h = x.clone();
-        for (i, layer) in self.layers.iter().enumerate() {
+        let first_cache = kv_caches.as_deref_mut().map(|c| &mut c[0]);
+        let mut h = self.layers[0].forward(x, memory, first_cache)?;
+        for (i, layer) in self.layers.iter().enumerate().skip(1) {
             let cache_i = kv_caches.as_deref_mut().map(|c| &mut c[i]);
             h = layer.forward(&h, memory, cache_i)?;
         }
@@ -825,17 +902,42 @@ impl CausalLMBlock {
         kv_cache: Option<&mut KVCache>,
     ) -> OchreResult<()> {
         let rows = batch * seq_len;
-        let (norm1, _) = self.attn_norm.forward_raw(h, rows)?;
-        norm_buf.copy_from_slice(&norm1);
-        self.attn.forward_raw(
-            norm_buf, norm_buf, norm_buf, batch, seq_len, seq_len, kv_cache, sub_buf,
-        )?;
+        let d_model = self.attn.d_model;
+        if self.attn_norm.device == DeviceType::Cpu {
+            rmsnorm_into_cpu(
+                h,
+                &self.attn_norm.gamma.data,
+                rows,
+                d_model,
+                self.attn_norm.eps,
+                norm_buf,
+            );
+            self.attn.forward_raw(
+                norm_buf, norm_buf, norm_buf, batch, seq_len, seq_len, kv_cache, sub_buf,
+            )?;
+        } else {
+            let (norm1, _) = self.attn_norm.forward_raw(h, rows)?;
+            self.attn.forward_raw(
+                &norm1, &norm1, &norm1, batch, seq_len, seq_len, kv_cache, sub_buf,
+            )?;
+        }
         for (hv, &av) in h.iter_mut().zip(sub_buf.iter()) {
             *hv += av;
         }
-        let (norm2, _) = self.ffn_norm.forward_raw(h, rows)?;
-        norm_buf.copy_from_slice(&norm2);
-        self.ffn.forward_raw(norm_buf, rows, sub_buf)?;
+        if self.ffn_norm.device == DeviceType::Cpu {
+            rmsnorm_into_cpu(
+                h,
+                &self.ffn_norm.gamma.data,
+                rows,
+                d_model,
+                self.ffn_norm.eps,
+                norm_buf,
+            );
+            self.ffn.forward_raw(norm_buf, rows, sub_buf)?;
+        } else {
+            let (norm2, _) = self.ffn_norm.forward_raw(h, rows)?;
+            self.ffn.forward_raw(&norm2, rows, sub_buf)?;
+        }
         for (hv, &fv) in h.iter_mut().zip(sub_buf.iter()) {
             *hv += fv;
         }
@@ -1018,7 +1120,12 @@ impl CausalLM {
         let mut h = vec![0.0f32; max_buf * d_model];
         let mut norm_buf = vec![0.0f32; max_buf * d_model];
         let mut sub_buf = vec![0.0f32; max_buf * d_model];
-        let mut logits = vec![0.0f32; max_buf * vocab_size];
+        let mut logits = vec![0.0f32; vocab_size];
+        let mut sample_buf: Vec<(usize, f32)> = if temperature > 1e-6 {
+            Vec::with_capacity(vocab_size)
+        } else {
+            Vec::new()
+        };
 
         // Prefill prompt
         self.tok_embeddings
@@ -1033,13 +1140,33 @@ impl CausalLM {
                 Some(&mut caches[i]),
             )?;
         }
-        let (final_h, _) = self.final_norm.forward_raw(&h[..p_len * d_model], p_len)?;
-        self.lm_head
-            .forward_raw(&final_h, p_len, &mut logits[..p_len * vocab_size])?;
+        // Only normalize and project the last prompt token to logits.
+        let last_h = &h[(p_len - 1) * d_model..p_len * d_model];
+        if self.final_norm.device == DeviceType::Cpu {
+            rmsnorm_into_cpu(
+                last_h,
+                &self.final_norm.gamma.data,
+                1,
+                d_model,
+                self.final_norm.eps,
+                &mut norm_buf[..d_model],
+            );
+            self.lm_head
+                .forward_raw(&norm_buf[..d_model], 1, &mut logits)?;
+        } else {
+            let (final_h, _) = self.final_norm.forward_raw(last_h, 1)?;
+            self.lm_head.forward_raw(&final_h, 1, &mut logits)?;
+        }
 
         let mut rng = FastRng::new(seed);
-        let last_logits = &logits[(p_len - 1) * vocab_size..p_len * vocab_size];
-        let mut next_tok = sample_next_token(last_logits, temperature, top_k, top_p, &mut rng);
+        let mut next_tok = sample_next_token(
+            &logits,
+            temperature,
+            top_k,
+            top_p,
+            &mut rng,
+            &mut sample_buf,
+        );
         output.push(next_tok);
 
         // Single-token decode steps reusing pre-allocated buffers
@@ -1058,11 +1185,29 @@ impl CausalLM {
                     Some(&mut caches[i]),
                 )?;
             }
-            let (final_step, _) = self.final_norm.forward_raw(&h[..d_model], 1)?;
-            self.lm_head
-                .forward_raw(&final_step, 1, &mut logits[..vocab_size])?;
-            next_tok =
-                sample_next_token(&logits[..vocab_size], temperature, top_k, top_p, &mut rng);
+            if self.final_norm.device == DeviceType::Cpu {
+                rmsnorm_into_cpu(
+                    &h[..d_model],
+                    &self.final_norm.gamma.data,
+                    1,
+                    d_model,
+                    self.final_norm.eps,
+                    &mut norm_buf[..d_model],
+                );
+                self.lm_head
+                    .forward_raw(&norm_buf[..d_model], 1, &mut logits)?;
+            } else {
+                let (final_step, _) = self.final_norm.forward_raw(&h[..d_model], 1)?;
+                self.lm_head.forward_raw(&final_step, 1, &mut logits)?;
+            }
+            next_tok = sample_next_token(
+                &logits,
+                temperature,
+                top_k,
+                top_p,
+                &mut rng,
+                &mut sample_buf,
+            );
             output.push(next_tok);
         }
 
@@ -1238,6 +1383,7 @@ fn sample_next_token(
     top_k: usize,
     top_p: f32,
     rng: &mut FastRng,
+    candidates: &mut Vec<(usize, f32)>,
 ) -> usize {
     if temperature <= 1e-6 {
         let mut best_idx = 0usize;
@@ -1251,55 +1397,55 @@ fn sample_next_token(
         return best_idx;
     }
 
-    let inv_t = 1.0f64 / (temperature as f64);
-    let mut candidates: Vec<(usize, f64)> = logits
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| (i, (v as f64) * inv_t))
-        .collect();
-    candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+    let inv_t = 1.0f32 / temperature;
+    candidates.clear();
+    candidates.extend(logits.iter().enumerate().map(|(i, &v)| (i, v * inv_t)));
 
     if top_k > 0 && top_k < candidates.len() {
+        candidates.select_nth_unstable_by(top_k - 1, |a, b| b.1.total_cmp(&a.1));
         candidates.truncate(top_k);
     }
+    candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
     let max_l = candidates[0].1;
     let mut sum_exp = 0.0f64;
-    for (_, val) in &mut candidates {
-        let e = (*val - max_l).exp();
-        *val = e;
+    for (_, val) in candidates.iter_mut() {
+        let e = ((*val - max_l) as f64).exp();
+        *val = e as f32;
         sum_exp += e;
     }
     if sum_exp <= 0.0 || !sum_exp.is_finite() {
         return candidates[0].0;
     }
-    for (_, val) in &mut candidates {
-        *val /= sum_exp;
+    let inv_sum = 1.0f64 / sum_exp;
+    for (_, val) in candidates.iter_mut() {
+        *val = ((*val as f64) * inv_sum) as f32;
     }
 
     if top_p < 1.0 {
         let mut cum = 0.0f64;
         let mut keep = 0usize;
-        for (_, p) in &candidates {
-            cum += *p;
+        for (_, p) in candidates.iter() {
+            cum += *p as f64;
             keep += 1;
             if cum >= top_p as f64 {
                 break;
             }
         }
         candidates.truncate(keep.max(1));
-        let renorm: f64 = candidates.iter().map(|(_, p)| *p).sum();
+        let renorm: f64 = candidates.iter().map(|(_, p)| *p as f64).sum();
         if renorm > 0.0 {
-            for (_, p) in &mut candidates {
-                *p /= renorm;
+            let inv_renorm = 1.0f64 / renorm;
+            for (_, p) in candidates.iter_mut() {
+                *p = ((*p as f64) * inv_renorm) as f32;
             }
         }
     }
 
     let u = rng.next_f32() as f64;
     let mut acc = 0.0f64;
-    for &(idx, p) in &candidates {
-        acc += p;
+    for &(idx, p) in candidates.iter() {
+        acc += p as f64;
         if u <= acc {
             return idx;
         }

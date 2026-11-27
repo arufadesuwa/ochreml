@@ -6,13 +6,84 @@ use crate::device::DeviceType;
 use crate::error::{OchreError, OchreResult};
 use crate::nn::autograd::{AutogradTape, CustomBackward, Op};
 use crate::nn::dtype::{DType, TensorStorage};
+use crate::nn::gemm_f32::sgemm;
 use crate::nn::layers::Linear;
 use crate::nn::tensor::{Tensor, compute_strides};
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::sync::Arc;
 
-const FLASH_BR: usize = 32;
-const FLASH_BC: usize = 32;
+// 48 is an exact multiple of SGEMM MR=6 and NR=16, and < MC=64 so tile sgemm
+// never spawns nested Rayon tasks inside head-parallel FlashAttention loops.
+const FLASH_BR: usize = 48;
+const FLASH_BC: usize = 48;
+const DECODE_BC: usize = 64;
+
+#[derive(Default)]
+struct FlashScratch {
+    o_tile: Vec<f32>,
+    scores: Vec<f32>,
+    probs: Vec<f32>,
+    dp_tile: Vec<f32>,
+    ds_tile: Vec<f32>,
+    d_row: Vec<f32>,
+}
+
+#[derive(Default)]
+struct MhaRawScratch {
+    q_proj: Vec<f32>,
+    k_proj: Vec<f32>,
+    v_proj: Vec<f32>,
+    q_heads: Vec<f32>,
+    k_heads: Vec<f32>,
+    v_heads: Vec<f32>,
+    attn_out: Vec<f32>,
+    merged: Vec<f32>,
+}
+
+thread_local! {
+    static FLASH_SCRATCH: RefCell<FlashScratch> = RefCell::new(FlashScratch::default());
+    static MHA_RAW_SCRATCH: RefCell<MhaRawScratch> = RefCell::new(MhaRawScratch::default());
+}
+
+#[inline]
+fn ensure_len(buf: &mut Vec<f32>, len: usize) {
+    if buf.len() < len {
+        buf.resize(len, 0.0);
+    }
+}
+
+#[inline]
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let a = &a[..n];
+    let b = &b[..n];
+    let chunks = n / 4;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    for i in 0..chunks {
+        let off = i * 4;
+        s0 += a[off] * b[off];
+        s1 += a[off + 1] * b[off + 1];
+        s2 += a[off + 2] * b[off + 2];
+        s3 += a[off + 3] * b[off + 3];
+    }
+    let mut sum = (s0 + s1) + (s2 + s3);
+    for i in (chunks * 4)..n {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
+#[inline]
+fn axpy_f32(y: &mut [f32], x: &[f32], alpha: f32) {
+    let n = y.len().min(x.len());
+    for (yv, &xv) in y[..n].iter_mut().zip(x[..n].iter()) {
+        *yv += alpha * xv;
+    }
+}
 
 #[inline]
 fn maybe_quantize(data: Vec<f32>, dtype: DType) -> Vec<f32> {
@@ -342,29 +413,42 @@ fn apply_rope_slice(
     }
 
     let half = head_dim / 2;
-    let seq_stride = seq_len * head_dim;
+    let total_tokens = batch * num_heads * seq_len;
 
-    for bh in 0..(batch * num_heads) {
-        let head_slice = &mut data[bh * seq_stride..(bh + 1) * seq_stride];
-        for s in 0..seq_len {
-            let pos = offset + s;
-            let cos_row = &cos_table[pos * half..(pos + 1) * half];
-            let sin_row = &sin_table[pos * half..(pos + 1) * half];
-            let token_row = &mut head_slice[s * head_dim..(s + 1) * head_dim];
-            let (first_half, second_half) = token_row.split_at_mut(half);
+    let apply_token = |token_idx: usize, token_row: &mut [f32]| {
+        let s = token_idx % seq_len;
+        let pos = offset + s;
+        let cos_row = &cos_table[pos * half..(pos + 1) * half];
+        let sin_row = &sin_table[pos * half..(pos + 1) * half];
+        let (first_half, second_half) = token_row.split_at_mut(half);
+        if inverse {
             for d in 0..half {
                 let x0 = first_half[d];
                 let x1 = second_half[d];
                 let c = cos_row[d];
                 let sn = sin_row[d];
-                if inverse {
-                    first_half[d] = x0 * c + x1 * sn;
-                    second_half[d] = -x0 * sn + x1 * c;
-                } else {
-                    first_half[d] = x0 * c - x1 * sn;
-                    second_half[d] = x0 * sn + x1 * c;
-                }
+                first_half[d] = x0 * c + x1 * sn;
+                second_half[d] = -x0 * sn + x1 * c;
             }
+        } else {
+            for d in 0..half {
+                let x0 = first_half[d];
+                let x1 = second_half[d];
+                let c = cos_row[d];
+                let sn = sin_row[d];
+                first_half[d] = x0 * c - x1 * sn;
+                second_half[d] = x0 * sn + x1 * c;
+            }
+        }
+    };
+
+    if expected >= 8_192 && total_tokens >= 64 {
+        data.par_chunks_mut(head_dim)
+            .enumerate()
+            .for_each(|(token_idx, token_row)| apply_token(token_idx, token_row));
+    } else {
+        for (token_idx, token_row) in data.chunks_mut(head_dim).enumerate() {
+            apply_token(token_idx, token_row);
         }
     }
     Ok(())
@@ -472,165 +556,330 @@ fn flash_attention_forward_strided(
 ) -> OchreResult<(Vec<f32>, Vec<f32>)> {
     let total_heads = batch * num_heads;
     let q_head_stride = q_len * head_dim;
+    let mut out = vec![0.0f32; total_heads * q_head_stride];
+    let mut lse = vec![f32::NEG_INFINITY; total_heads * q_len];
+
+    flash_attention_forward_strided_into(
+        q,
+        k,
+        v,
+        batch,
+        num_heads,
+        num_kv_heads,
+        q_len,
+        kv_len,
+        kv_stride_seq,
+        head_dim,
+        causal,
+        kv_offset,
+        &mut out,
+        Some(&mut lse),
+    )?;
+
+    Ok((out, lse))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flash_attention_forward_strided_into(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    kv_stride_seq: usize,
+    head_dim: usize,
+    causal: bool,
+    kv_offset: usize,
+    out: &mut [f32],
+    mut lse: Option<&mut [f32]>,
+) -> OchreResult<()> {
+    let total_heads = batch * num_heads;
+    let q_head_stride = q_len * head_dim;
     let kv_head_stride = kv_stride_seq * head_dim;
     let group_size = num_heads / num_kv_heads;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    let mut out = vec![0.0f32; total_heads * q_head_stride];
-    let mut lse = vec![f32::NEG_INFINITY; total_heads * q_len];
-
-    if q_len == 0 {
-        return Ok((out, lse));
-    }
-    if kv_len == 0 {
-        return Ok((out, lse));
+    if q_len == 0 || kv_len == 0 {
+        out.fill(0.0);
+        if let Some(lse_buf) = lse.as_deref_mut() {
+            lse_buf.fill(f32::NEG_INFINITY);
+        }
+        return Ok(());
     }
 
-    let run_head = |bh: usize, out_head: &mut [f32], lse_head: &mut [f32]| {
-        let b = bh / num_heads;
-        let h = bh % num_heads;
-        let kv_h = h / group_size;
-        let q_head = &q[bh * q_head_stride..(bh + 1) * q_head_stride];
-        let kv_base = (b * num_kv_heads + kv_h) * kv_head_stride;
-        let k_head = &k[kv_base..kv_base + kv_len * head_dim];
-        let v_head = &v[kv_base..kv_base + kv_len * head_dim];
+    let run_head =
+        |bh: usize, out_head: &mut [f32], mut lse_head: Option<&mut [f32]>| -> OchreResult<()> {
+            let b = bh / num_heads;
+            let h = bh % num_heads;
+            let kv_h = h / group_size;
+            let q_head = &q[bh * q_head_stride..(bh + 1) * q_head_stride];
+            let kv_base = (b * num_kv_heads + kv_h) * kv_head_stride;
+            let k_head = &k[kv_base..kv_base + kv_len * head_dim];
+            let v_head = &v[kv_base..kv_base + kv_len * head_dim];
 
-        // Reusable tile scratch buffers (O(Br*Bc + Br*D) per head, zero O(S^2) matrix).
-        let mut m_i = [f32::NEG_INFINITY; FLASH_BR];
-        let mut l_i = [0.0f32; FLASH_BR];
-        let mut o_tile = vec![0.0f32; FLASH_BR * head_dim];
-        let mut scores = [0.0f32; FLASH_BR * FLASH_BC];
-        let mut probs = [0.0f32; FLASH_BR * FLASH_BC];
-
-        let mut i_start = 0usize;
-        while i_start < q_len {
-            let br = (q_len - i_start).min(FLASH_BR);
-            m_i[..br].fill(f32::NEG_INFINITY);
-            l_i[..br].fill(0.0);
-            o_tile[..br * head_dim].fill(0.0);
-
-            let max_allowed_k = if causal {
-                kv_offset + i_start + br - 1
-            } else {
-                usize::MAX
-            };
-
-            let mut j_start = 0usize;
-            while j_start < kv_len {
-                if causal && j_start > max_allowed_k {
-                    break;
-                }
-                let bc = (kv_len - j_start).min(FLASH_BC);
-
-                // Compute S_tile = scale * Q_tile @ K_tile^T
-                for r in 0..br {
-                    let qi = i_start + r;
-                    let q_row = &q_head[qi * head_dim..(qi + 1) * head_dim];
-                    let score_row = &mut scores[r * bc..(r + 1) * bc];
-                    for (c, score_slot) in score_row.iter_mut().enumerate() {
-                        let kj = j_start + c;
-                        if causal && kj > kv_offset + qi {
-                            *score_slot = f32::NEG_INFINITY;
-                        } else {
-                            let k_row = &k_head[kj * head_dim..(kj + 1) * head_dim];
-                            let mut dot = 0.0f32;
-                            for d in 0..head_dim {
-                                dot += q_row[d] * k_row[d];
-                            }
-                            *score_slot = dot * scale;
-                        }
+            // Fast path for single-token decode (q_len == 1): zero SGEMM packing overhead,
+            // 4-way unrolled dot/axpy with online softmax tiled over DECODE_BC keys.
+            if q_len == 1 {
+                let valid_kv = if causal {
+                    (kv_offset + 1).min(kv_len)
+                } else {
+                    kv_len
+                };
+                if valid_kv == 0 {
+                    out_head.fill(0.0);
+                    if let Some(lse_h) = lse_head {
+                        lse_h[0] = f32::NEG_INFINITY;
                     }
+                    return Ok(());
                 }
+                out_head.fill(0.0);
+                let mut m_i = f32::NEG_INFINITY;
+                let mut l_i = 0.0f32;
+                let mut scores = [0.0f32; DECODE_BC];
+                let mut probs = [0.0f32; DECODE_BC];
 
-                // Online softmax update per query row in tile
-                for r in 0..br {
-                    let score_row = &scores[r * bc..(r + 1) * bc];
+                let mut j_start = 0usize;
+                while j_start < valid_kv {
+                    let bc = (valid_kv - j_start).min(DECODE_BC);
                     let mut row_max = f32::NEG_INFINITY;
-                    for &s in score_row {
+                    for (c, score_slot) in scores[..bc].iter_mut().enumerate() {
+                        let kj = j_start + c;
+                        let k_row = &k_head[kj * head_dim..(kj + 1) * head_dim];
+                        let s = dot_f32(q_head, k_row) * scale;
+                        *score_slot = s;
                         if s > row_max {
                             row_max = s;
                         }
                     }
-                    if row_max == f32::NEG_INFINITY {
-                        continue;
-                    }
-
-                    let m_prev = m_i[r];
-                    let m_new = m_prev.max(row_max);
-                    let alpha = if m_prev.is_finite() {
-                        (m_prev - m_new).exp()
+                    let m_new = m_i.max(row_max);
+                    let alpha = if m_i.is_finite() {
+                        (m_i - m_new).exp()
                     } else {
                         0.0
                     };
-
-                    let prob_row = &mut probs[r * bc..(r + 1) * bc];
-                    let mut row_sum = 0.0f32;
-                    for c in 0..bc {
-                        let s = score_row[c];
-                        let p = if s == f32::NEG_INFINITY {
-                            0.0
-                        } else {
-                            (s - m_new).exp()
-                        };
-                        prob_row[c] = p;
-                        row_sum += p;
-                    }
-
-                    let o_row = &mut o_tile[r * head_dim..(r + 1) * head_dim];
-                    if alpha != 1.0 {
-                        for ov in o_row.iter_mut() {
+                    if alpha == 0.0 {
+                        out_head.fill(0.0);
+                    } else if alpha != 1.0 {
+                        for ov in out_head.iter_mut() {
                             *ov *= alpha;
                         }
                     }
-                    for (c, &p) in prob_row.iter().enumerate() {
+                    let mut row_sum = 0.0f32;
+                    for c in 0..bc {
+                        let p = (scores[c] - m_new).exp();
+                        probs[c] = p;
+                        row_sum += p;
+                    }
+                    for (c, &p) in probs[..bc].iter().enumerate() {
                         if p != 0.0 {
-                            let v_row =
-                                &v_head[(j_start + c) * head_dim..(j_start + c + 1) * head_dim];
-                            for d in 0..head_dim {
-                                o_row[d] += p * v_row[d];
+                            let kj = j_start + c;
+                            let v_row = &v_head[kj * head_dim..(kj + 1) * head_dim];
+                            axpy_f32(out_head, v_row, p);
+                        }
+                    }
+                    l_i = l_i * alpha + row_sum;
+                    m_i = m_new;
+                    j_start += DECODE_BC;
+                }
+
+                if l_i > 0.0 {
+                    let inv_l = 1.0f32 / l_i;
+                    for ov in out_head.iter_mut() {
+                        *ov *= inv_l;
+                    }
+                    if let Some(lse_h) = lse_head {
+                        lse_h[0] = m_i + l_i.ln();
+                    }
+                } else {
+                    out_head.fill(0.0);
+                    if let Some(lse_h) = lse_head {
+                        lse_h[0] = f32::NEG_INFINITY;
+                    }
+                }
+                return Ok(());
+            }
+
+            // GEMM-backed FlashAttention-2 tiled forward with thread-local scratchpad
+            // (zero heap allocations inside Rayon tasks, O(Br*Bc + Br*D) memory).
+            FLASH_SCRATCH.with(|cell| -> OchreResult<()> {
+                let mut scratch = cell.borrow_mut();
+                ensure_len(&mut scratch.o_tile, FLASH_BR * head_dim);
+                ensure_len(&mut scratch.scores, FLASH_BR * FLASH_BC);
+                ensure_len(&mut scratch.probs, FLASH_BR * FLASH_BC);
+
+                let FlashScratch {
+                    o_tile,
+                    scores,
+                    probs,
+                    ..
+                } = &mut *scratch;
+
+                let mut m_i = [f32::NEG_INFINITY; FLASH_BR];
+                let mut l_i = [0.0f32; FLASH_BR];
+
+                let mut i_start = 0usize;
+                while i_start < q_len {
+                    let br = (q_len - i_start).min(FLASH_BR);
+                    m_i[..br].fill(f32::NEG_INFINITY);
+                    l_i[..br].fill(0.0);
+                    o_tile[..br * head_dim].fill(0.0);
+
+                    let q_tile = &q_head[i_start * head_dim..(i_start + br) * head_dim];
+                    let max_allowed_k = if causal {
+                        kv_offset + i_start + br - 1
+                    } else {
+                        usize::MAX
+                    };
+
+                    let mut j_start = 0usize;
+                    while j_start < kv_len {
+                        if causal && j_start > max_allowed_k {
+                            break;
+                        }
+                        let bc = (kv_len - j_start).min(FLASH_BC);
+                        let k_tile = &k_head[j_start * head_dim..(j_start + bc) * head_dim];
+                        let v_tile = &v_head[j_start * head_dim..(j_start + bc) * head_dim];
+
+                        // S_tile[br x bc] = scale * Q_tile[br x D] @ K_tile[bc x D]^T
+                        sgemm(
+                            br,
+                            bc,
+                            head_dim,
+                            q_tile,
+                            k_tile,
+                            &mut scores[..br * bc],
+                            false,
+                            true,
+                            scale,
+                            0.0,
+                        )?;
+
+                        // Apply causal mask only on tiles that cross the diagonal.
+                        if causal && j_start + bc > kv_offset + i_start + 1 {
+                            for r in 0..br {
+                                let qi = i_start + r;
+                                let max_valid_c = (kv_offset + qi + 1).saturating_sub(j_start);
+                                if max_valid_c < bc {
+                                    scores[r * bc + max_valid_c..(r + 1) * bc]
+                                        .fill(f32::NEG_INFINITY);
+                                }
+                            }
+                        }
+
+                        // Online softmax update per query row in tile
+                        for r in 0..br {
+                            let score_row = &scores[r * bc..(r + 1) * bc];
+                            let mut row_max = f32::NEG_INFINITY;
+                            for &s in score_row {
+                                if s > row_max {
+                                    row_max = s;
+                                }
+                            }
+                            let prob_row = &mut probs[r * bc..(r + 1) * bc];
+                            if row_max == f32::NEG_INFINITY {
+                                prob_row.fill(0.0);
+                                continue;
+                            }
+
+                            let m_prev = m_i[r];
+                            let m_new = m_prev.max(row_max);
+                            let alpha = if m_prev.is_finite() {
+                                (m_prev - m_new).exp()
+                            } else {
+                                0.0
+                            };
+
+                            let mut row_sum = 0.0f32;
+                            for (p_slot, &s) in prob_row.iter_mut().zip(score_row.iter()) {
+                                let p = if s == f32::NEG_INFINITY {
+                                    0.0
+                                } else {
+                                    (s - m_new).exp()
+                                };
+                                *p_slot = p;
+                                row_sum += p;
+                            }
+
+                            let o_row = &mut o_tile[r * head_dim..(r + 1) * head_dim];
+                            if alpha == 0.0 {
+                                o_row.fill(0.0);
+                            } else if alpha != 1.0 {
+                                for ov in o_row.iter_mut() {
+                                    *ov *= alpha;
+                                }
+                            }
+
+                            l_i[r] = l_i[r] * alpha + row_sum;
+                            m_i[r] = m_new;
+                        }
+
+                        // O_tile[br x D] += P_tile[br x bc] @ V_tile[bc x D]
+                        sgemm(
+                            br,
+                            head_dim,
+                            bc,
+                            &probs[..br * bc],
+                            v_tile,
+                            &mut o_tile[..br * head_dim],
+                            false,
+                            false,
+                            1.0,
+                            1.0,
+                        )?;
+
+                        j_start += FLASH_BC;
+                    }
+
+                    // Normalize output tile and store logsumexp L_i
+                    for r in 0..br {
+                        let qi = i_start + r;
+                        let dst_row = &mut out_head[qi * head_dim..(qi + 1) * head_dim];
+                        let li = l_i[r];
+                        if li > 0.0 {
+                            let inv_l = 1.0f32 / li;
+                            let src_row = &o_tile[r * head_dim..(r + 1) * head_dim];
+                            for (dst, &src) in dst_row.iter_mut().zip(src_row.iter()) {
+                                *dst = src * inv_l;
+                            }
+                            if let Some(ref mut lse_h) = lse_head {
+                                lse_h[qi] = m_i[r] + li.ln();
+                            }
+                        } else {
+                            dst_row.fill(0.0);
+                            if let Some(ref mut lse_h) = lse_head {
+                                lse_h[qi] = f32::NEG_INFINITY;
                             }
                         }
                     }
 
-                    l_i[r] = l_i[r] * alpha + row_sum;
-                    m_i[r] = m_new;
+                    i_start += FLASH_BR;
                 }
-
-                j_start += FLASH_BC;
-            }
-
-            // Normalize output tile and store logsumexp L_i
-            for r in 0..br {
-                let qi = i_start + r;
-                let dst_row = &mut out_head[qi * head_dim..(qi + 1) * head_dim];
-                let li = l_i[r];
-                if li > 0.0 {
-                    let inv_l = 1.0f32 / li;
-                    let src_row = &o_tile[r * head_dim..(r + 1) * head_dim];
-                    for d in 0..head_dim {
-                        dst_row[d] = src_row[d] * inv_l;
-                    }
-                    lse_head[qi] = m_i[r] + li.ln();
-                } else {
-                    dst_row.fill(0.0);
-                    lse_head[qi] = f32::NEG_INFINITY;
-                }
-            }
-
-            i_start += FLASH_BR;
-        }
-    };
+                Ok(())
+            })
+        };
 
     if total_heads >= 2 {
-        out.par_chunks_mut(q_head_stride)
-            .zip(lse.par_chunks_mut(q_len))
-            .enumerate()
-            .for_each(|(bh, (out_head, lse_head))| run_head(bh, out_head, lse_head));
+        match lse {
+            Some(lse_buf) => out
+                .par_chunks_mut(q_head_stride)
+                .zip(lse_buf.par_chunks_mut(q_len))
+                .enumerate()
+                .try_for_each(|(bh, (out_head, lse_head))| {
+                    run_head(bh, out_head, Some(lse_head))
+                })?,
+            None => out
+                .par_chunks_mut(q_head_stride)
+                .enumerate()
+                .try_for_each(|(bh, out_head)| run_head(bh, out_head, None))?,
+        }
     } else {
-        run_head(0, &mut out, &mut lse);
+        run_head(0, out, lse)?;
     }
 
-    Ok((out, lse))
+    Ok(())
 }
 
 /// FlashAttention-2 style tiled backward pass recomputing attention weights from `lse` in O(S) memory.
@@ -691,146 +940,200 @@ pub fn flash_attention_backward(
     let kv_head_stride = kv_len * head_dim;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    let backward_one_head =
-        |bh: usize, dq_head: &mut [f32], dk_head: &mut [f32], dv_head: &mut [f32]| {
-            let b = bh / num_heads;
-            let h = bh % num_heads;
-            let kv_h = h / group_size;
+    let backward_one_head = |bh: usize,
+                             dq_head: &mut [f32],
+                             dk_head: &mut [f32],
+                             dv_head: &mut [f32]|
+     -> OchreResult<()> {
+        let b = bh / num_heads;
+        let h = bh % num_heads;
+        let kv_h = h / group_size;
 
-            let q_head = &q[bh * q_head_stride..(bh + 1) * q_head_stride];
-            let do_head = &d_out[bh * q_head_stride..(bh + 1) * q_head_stride];
-            let out_head = &out[bh * q_head_stride..(bh + 1) * q_head_stride];
-            let lse_head = &lse[bh * q_len..(bh + 1) * q_len];
+        let q_head = &q[bh * q_head_stride..(bh + 1) * q_head_stride];
+        let do_head = &d_out[bh * q_head_stride..(bh + 1) * q_head_stride];
+        let out_head = &out[bh * q_head_stride..(bh + 1) * q_head_stride];
+        let lse_head = &lse[bh * q_len..(bh + 1) * q_len];
 
-            let kv_off = (b * num_kv_heads + kv_h) * kv_head_stride;
-            let k_head = &k[kv_off..kv_off + kv_head_stride];
-            let v_head = &v[kv_off..kv_off + kv_head_stride];
+        let kv_off = (b * num_kv_heads + kv_h) * kv_head_stride;
+        let k_head = &k[kv_off..kv_off + kv_head_stride];
+        let v_head = &v[kv_off..kv_off + kv_head_stride];
+
+        FLASH_SCRATCH.with(|cell| -> OchreResult<()> {
+            let mut scratch = cell.borrow_mut();
+            ensure_len(&mut scratch.d_row, q_len);
+            ensure_len(&mut scratch.scores, FLASH_BR * FLASH_BC);
+            ensure_len(&mut scratch.dp_tile, FLASH_BR * FLASH_BC);
+            ensure_len(&mut scratch.probs, FLASH_BR * FLASH_BC);
+            ensure_len(&mut scratch.ds_tile, FLASH_BR * FLASH_BC);
+
+            let FlashScratch {
+                scores,
+                dp_tile,
+                probs,
+                ds_tile,
+                d_row,
+                ..
+            } = &mut *scratch;
 
             // D_i = sum_d dO[i, d] * O[i, d] (O(S) per head)
-            let mut d_row = vec![0.0f32; q_len];
-            for i in 0..q_len {
-                let mut dot = 0.0f32;
+            for (i, d_slot) in d_row[..q_len].iter_mut().enumerate() {
                 let o_r = &out_head[i * head_dim..(i + 1) * head_dim];
                 let do_r = &do_head[i * head_dim..(i + 1) * head_dim];
-                for d in 0..head_dim {
-                    dot += o_r[d] * do_r[d];
-                }
-                d_row[i] = dot;
+                *d_slot = dot_f32(o_r, do_r);
             }
-
-            let mut p_tile = [0.0f32; FLASH_BR * FLASH_BC];
-            let mut ds_tile = [0.0f32; FLASH_BR * FLASH_BC];
 
             let mut j_start = 0usize;
             while j_start < kv_len {
                 let bc = (kv_len - j_start).min(FLASH_BC);
-                let mut i_start = 0usize;
+                let k_tile = &k_head[j_start * head_dim..(j_start + bc) * head_dim];
+                let v_tile = &v_head[j_start * head_dim..(j_start + bc) * head_dim];
+                let dk_tile = &mut dk_head[j_start * head_dim..(j_start + bc) * head_dim];
+                let dv_tile = &mut dv_head[j_start * head_dim..(j_start + bc) * head_dim];
+
+                let mut i_start = if causal {
+                    j_start.saturating_sub(kv_offset)
+                } else {
+                    0
+                };
                 while i_start < q_len {
                     let br = (q_len - i_start).min(FLASH_BR);
-                    if causal && j_start > kv_offset + i_start + br - 1 {
-                        i_start += FLASH_BR;
-                        continue;
-                    }
+                    let q_tile = &q_head[i_start * head_dim..(i_start + br) * head_dim];
+                    let do_tile = &do_head[i_start * head_dim..(i_start + br) * head_dim];
+                    let dq_tile = &mut dq_head[i_start * head_dim..(i_start + br) * head_dim];
 
-                    // Recompute P_ij = exp(scale * Q_i @ K_j^T - lse_i) and dP_ij = dO_i @ V_j^T
+                    // S_tile[br x bc] = scale * Q_tile[br x D] @ K_tile[bc x D]^T
+                    sgemm(
+                        br,
+                        bc,
+                        head_dim,
+                        q_tile,
+                        k_tile,
+                        &mut scores[..br * bc],
+                        false,
+                        true,
+                        scale,
+                        0.0,
+                    )?;
+
+                    // dP_tile[br x bc] = dO_tile[br x D] @ V_tile[bc x D]^T
+                    sgemm(
+                        br,
+                        bc,
+                        head_dim,
+                        do_tile,
+                        v_tile,
+                        &mut dp_tile[..br * bc],
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                    )?;
+
+                    // Elementwise P = exp(S - lse) and dS_scaled = P * (dP - D) * scale
+                    let check_causal = causal && j_start + bc > kv_offset + i_start + 1;
                     for r in 0..br {
                         let qi = i_start + r;
                         let lse_i = lse_head[qi];
-                        let q_r = &q_head[qi * head_dim..(qi + 1) * head_dim];
-                        let do_r = &do_head[qi * head_dim..(qi + 1) * head_dim];
                         let di = d_row[qi];
-
-                        for c in 0..bc {
-                            let kj = j_start + c;
-                            if (causal && kj > kv_offset + qi) || !lse_i.is_finite() {
-                                p_tile[r * bc + c] = 0.0;
-                                ds_tile[r * bc + c] = 0.0;
-                            } else {
-                                let k_c = &k_head[kj * head_dim..(kj + 1) * head_dim];
-                                let v_c = &v_head[kj * head_dim..(kj + 1) * head_dim];
-                                let mut s = 0.0f32;
-                                let mut dp = 0.0f32;
-                                for d in 0..head_dim {
-                                    s += q_r[d] * k_c[d];
-                                    dp += do_r[d] * v_c[d];
-                                }
-                                let p = (s * scale - lse_i).exp();
-                                p_tile[r * bc + c] = p;
-                                ds_tile[r * bc + c] = p * (dp - di);
-                            }
+                        let row_off = r * bc;
+                        let p_row = &mut probs[row_off..row_off + bc];
+                        let ds_row = &mut ds_tile[row_off..row_off + bc];
+                        if !lse_i.is_finite() {
+                            p_row.fill(0.0);
+                            ds_row.fill(0.0);
+                            continue;
+                        }
+                        let valid_c = if check_causal {
+                            (kv_offset + qi + 1).saturating_sub(j_start).min(bc)
+                        } else {
+                            bc
+                        };
+                        let s_row = &scores[row_off..row_off + valid_c];
+                        let dp_row = &dp_tile[row_off..row_off + valid_c];
+                        for c in 0..valid_c {
+                            let p = (s_row[c] - lse_i).exp();
+                            p_row[c] = p;
+                            ds_row[c] = p * (dp_row[c] - di) * scale;
+                        }
+                        if valid_c < bc {
+                            p_row[valid_c..].fill(0.0);
+                            ds_row[valid_c..].fill(0.0);
                         }
                     }
 
-                    // Accumulate dV_j += P_ij^T @ dO_i and dK_j += scale * (dS_ij^T @ Q_i)
-                    for c in 0..bc {
-                        let kj = j_start + c;
-                        let dv_c = &mut dv_head[kj * head_dim..(kj + 1) * head_dim];
-                        let dk_c = &mut dk_head[kj * head_dim..(kj + 1) * head_dim];
-                        for r in 0..br {
-                            let qi = i_start + r;
-                            let p = p_tile[r * bc + c];
-                            let ds = ds_tile[r * bc + c] * scale;
-                            if p != 0.0 {
-                                let do_r = &do_head[qi * head_dim..(qi + 1) * head_dim];
-                                for d in 0..head_dim {
-                                    dv_c[d] += p * do_r[d];
-                                }
-                            }
-                            if ds != 0.0 {
-                                let q_r = &q_head[qi * head_dim..(qi + 1) * head_dim];
-                                for d in 0..head_dim {
-                                    dk_c[d] += ds * q_r[d];
-                                }
-                            }
-                        }
-                    }
+                    // dV_tile[bc x D] += P_tile[br x bc]^T @ dO_tile[br x D]
+                    sgemm(
+                        bc,
+                        head_dim,
+                        br,
+                        &probs[..br * bc],
+                        do_tile,
+                        dv_tile,
+                        true,
+                        false,
+                        1.0,
+                        1.0,
+                    )?;
 
-                    // Accumulate dQ_i += scale * (dS_ij @ K_j)
-                    for r in 0..br {
-                        let qi = i_start + r;
-                        let dq_r = &mut dq_head[qi * head_dim..(qi + 1) * head_dim];
-                        for c in 0..bc {
-                            let ds = ds_tile[r * bc + c] * scale;
-                            if ds != 0.0 {
-                                let kj = j_start + c;
-                                let k_c = &k_head[kj * head_dim..(kj + 1) * head_dim];
-                                for d in 0..head_dim {
-                                    dq_r[d] += ds * k_c[d];
-                                }
-                            }
-                        }
-                    }
+                    // dK_tile[bc x D] += dS_scaled[br x bc]^T @ Q_tile[br x D]
+                    sgemm(
+                        bc,
+                        head_dim,
+                        br,
+                        &ds_tile[..br * bc],
+                        q_tile,
+                        dk_tile,
+                        true,
+                        false,
+                        1.0,
+                        1.0,
+                    )?;
+
+                    // dQ_tile[br x D] += dS_scaled[br x bc] @ K_tile[bc x D]
+                    sgemm(
+                        br,
+                        head_dim,
+                        bc,
+                        &ds_tile[..br * bc],
+                        k_tile,
+                        dq_tile,
+                        false,
+                        false,
+                        1.0,
+                        1.0,
+                    )?;
 
                     i_start += FLASH_BR;
                 }
                 j_start += FLASH_BC;
             }
-        };
+            Ok(())
+        })
+    };
 
     if group_size == 1 && batch * num_heads >= 2 {
         dq.par_chunks_mut(q_head_stride)
             .zip(dk.par_chunks_mut(kv_head_stride))
             .zip(dv.par_chunks_mut(kv_head_stride))
             .enumerate()
-            .for_each(|(bh, ((dq_h, dk_h), dv_h))| {
-                backward_one_head(bh, dq_h, dk_h, dv_h);
-            });
+            .try_for_each(|(bh, ((dq_h, dk_h), dv_h))| backward_one_head(bh, dq_h, dk_h, dv_h))?;
     } else if batch * num_kv_heads >= 2 {
         let q_group_stride = group_size * q_head_stride;
         dq.par_chunks_mut(q_group_stride)
             .zip(dk.par_chunks_mut(kv_head_stride))
             .zip(dv.par_chunks_mut(kv_head_stride))
             .enumerate()
-            .for_each(|(b_kv, ((dq_grp, dk_h), dv_h))| {
+            .try_for_each(|(b_kv, ((dq_grp, dk_h), dv_h))| -> OchreResult<()> {
                 let b = b_kv / num_kv_heads;
                 let kv_h = b_kv % num_kv_heads;
                 for g in 0..group_size {
                     let h = kv_h * group_size + g;
                     let bh = b * num_heads + h;
                     let dq_h = &mut dq_grp[g * q_head_stride..(g + 1) * q_head_stride];
-                    backward_one_head(bh, dq_h, dk_h, dv_h);
+                    backward_one_head(bh, dq_h, dk_h, dv_h)?;
                 }
-            });
+                Ok(())
+            })?;
     } else {
         for b in 0..batch {
             for kv_h in 0..num_kv_heads {
@@ -841,7 +1144,7 @@ pub fn flash_attention_backward(
                     let h = kv_h * group_size + g;
                     let bh = b * num_heads + h;
                     let dq_h = &mut dq[bh * q_head_stride..(bh + 1) * q_head_stride];
-                    backward_one_head(bh, dq_h, dk_h, dv_h);
+                    backward_one_head(bh, dq_h, dk_h, dv_h)?;
                 }
             }
         }
@@ -898,7 +1201,6 @@ impl ScaledDotProductAttention {
             causal,
             kv_offset,
         )?;
-        let out_data = maybe_quantize(raw_out.clone(), q.dtype);
         let out_shape = vec![batch, num_heads, q_len, head_dim];
 
         let q_id = if q.requires_grad { q.node_id } else { None };
@@ -907,7 +1209,8 @@ impl ScaledDotProductAttention {
         let grad_active =
             AutogradTape::is_grad_enabled() && (q_id.is_some() || k_id.is_some() || v_id.is_some());
 
-        let node_id = if grad_active {
+        let (out_data, node_id) = if grad_active {
+            let out_data = maybe_quantize(raw_out.clone(), q.dtype);
             let q_saved = q.data.clone();
             let k_saved = k.data.clone();
             let v_saved = v.data.clone();
@@ -940,12 +1243,13 @@ impl ScaledDotProductAttention {
                 }
                 Ok(pairs)
             }));
-            Some(AutogradTape::record(Op::Custom {
+            let id = AutogradTape::record(Op::Custom {
                 inputs: vec![q_id, k_id, v_id],
                 backward: bwd,
-            }))
+            });
+            (out_data, Some(id))
         } else {
-            None
+            (maybe_quantize(raw_out, q.dtype), None)
         };
 
         Ok(Tensor {
@@ -1211,37 +1515,73 @@ impl MultiHeadAttention {
             k_heads = rope.forward(&k_heads, rope_offset)?;
         }
 
-        let (k_attn, v_attn, attn_kv_offset) = if let Some(cache) = kv_cache {
+        let attn = if let Some(cache) = kv_cache {
             cache.append(&k_heads.data, &v_heads.data, kv_len)?;
-            let (k_all, v_all) = cache.slice_kv();
             let total_kv_len = cache.cur_len;
-            let k_t = Tensor::new(
-                k_all,
-                vec![batch, self.num_kv_heads, total_kv_len, self.head_dim],
-                k_heads.dtype,
-                k_heads.device.clone(),
-                false,
-            )?;
-            let v_t = Tensor::new(
-                v_all,
-                vec![batch, self.num_kv_heads, total_kv_len, self.head_dim],
-                v_heads.dtype,
-                v_heads.device.clone(),
-                false,
-            )?;
-            let offset = total_kv_len.saturating_sub(q_len);
-            (k_t, v_t, offset)
+            let attn_kv_offset = total_kv_len.saturating_sub(q_len);
+            if !AutogradTape::is_grad_enabled() || !q_heads.requires_grad {
+                // Direct strided view over pre-allocated KVCache without copying K/V history.
+                let mut raw_out = vec![0.0f32; batch * self.num_heads * q_len * self.head_dim];
+                flash_attention_forward_strided_into(
+                    &q_heads.data,
+                    &cache.k,
+                    &cache.v,
+                    batch,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    q_len,
+                    total_kv_len,
+                    cache.max_seq_len,
+                    self.head_dim,
+                    self.causal,
+                    attn_kv_offset,
+                    &mut raw_out,
+                    None,
+                )?;
+                let out_data = maybe_quantize(raw_out, q_heads.dtype);
+                let out_shape = vec![batch, self.num_heads, q_len, self.head_dim];
+                Tensor {
+                    strides: compute_strides(&out_shape),
+                    shape: out_shape,
+                    data: out_data,
+                    dtype: q_heads.dtype,
+                    device: q_heads.device.clone(),
+                    requires_grad: false,
+                    node_id: None,
+                }
+            } else {
+                let (k_all, v_all) = cache.slice_kv();
+                let k_t = Tensor::new(
+                    k_all,
+                    vec![batch, self.num_kv_heads, total_kv_len, self.head_dim],
+                    k_heads.dtype,
+                    k_heads.device.clone(),
+                    false,
+                )?;
+                let v_t = Tensor::new(
+                    v_all,
+                    vec![batch, self.num_kv_heads, total_kv_len, self.head_dim],
+                    v_heads.dtype,
+                    v_heads.device.clone(),
+                    false,
+                )?;
+                ScaledDotProductAttention::new().forward(
+                    &q_heads,
+                    &k_t,
+                    &v_t,
+                    self.causal,
+                    attn_kv_offset,
+                )?
+            }
         } else {
-            (k_heads, v_heads, 0usize)
+            ScaledDotProductAttention::new().forward(
+                &q_heads,
+                &k_heads,
+                &v_heads,
+                self.causal,
+                0,
+            )?
         };
-
-        let attn = ScaledDotProductAttention::new().forward(
-            &q_heads,
-            &k_attn,
-            &v_attn,
-            self.causal,
-            attn_kv_offset,
-        )?;
 
         let merged = permute_bhsd_to_bshd(&attn, batch, self.num_heads, q_len, self.head_dim)?;
         let merged = if was_2d {
@@ -1284,75 +1624,140 @@ impl MultiHeadAttention {
             ));
         }
 
-        let mut q_proj_buf = vec![0.0f32; q_rows * self.d_model];
-        let mut k_proj_buf = vec![0.0f32; kv_rows * kv_dim];
-        let mut v_proj_buf = vec![0.0f32; kv_rows * kv_dim];
-        self.q_proj.forward_raw(q_in, q_rows, &mut q_proj_buf)?;
-        self.k_proj.forward_raw(k_in, kv_rows, &mut k_proj_buf)?;
-        self.v_proj.forward_raw(v_in, kv_rows, &mut v_proj_buf)?;
+        let q_len_elems = q_rows * self.d_model;
+        let kv_len_elems = kv_rows * kv_dim;
+        let q_no_transpose = q_len == 1 || self.num_heads == 1;
+        let kv_no_transpose = kv_len == 1 || self.num_kv_heads == 1;
 
-        let mut q_heads =
-            transpose_bshd_to_bhsd_raw(&q_proj_buf, batch, q_len, self.num_heads, self.head_dim);
-        let mut k_heads = transpose_bshd_to_bhsd_raw(
-            &k_proj_buf,
-            batch,
-            kv_len,
-            self.num_kv_heads,
-            self.head_dim,
-        );
-        let v_heads = transpose_bshd_to_bhsd_raw(
-            &v_proj_buf,
-            batch,
-            kv_len,
-            self.num_kv_heads,
-            self.head_dim,
-        );
+        MHA_RAW_SCRATCH.with(|cell| -> OchreResult<()> {
+            let mut scratch = cell.borrow_mut();
+            ensure_len(&mut scratch.q_proj, q_len_elems);
+            ensure_len(&mut scratch.k_proj, kv_len_elems);
+            ensure_len(&mut scratch.v_proj, kv_len_elems);
+            ensure_len(&mut scratch.attn_out, q_len_elems);
+            if !q_no_transpose {
+                ensure_len(&mut scratch.q_heads, q_len_elems);
+                ensure_len(&mut scratch.merged, q_len_elems);
+            }
+            if !kv_no_transpose {
+                ensure_len(&mut scratch.k_heads, kv_len_elems);
+                ensure_len(&mut scratch.v_heads, kv_len_elems);
+            }
 
-        let rope_offset = kv_cache.as_ref().map_or(0, |c| c.cur_len);
-        if let Some(ref rope) = self.rope {
-            rope.apply_inplace(&mut q_heads, batch, self.num_heads, q_len, rope_offset)?;
-            rope.apply_inplace(&mut k_heads, batch, self.num_kv_heads, kv_len, rope_offset)?;
-        }
+            let MhaRawScratch {
+                q_proj,
+                k_proj,
+                v_proj,
+                q_heads,
+                k_heads,
+                v_heads,
+                attn_out,
+                merged,
+            } = &mut *scratch;
 
-        let attn_out = if let Some(cache) = kv_cache {
-            cache.append(&k_heads, &v_heads, kv_len)?;
-            let total_kv = cache.cur_len;
-            let attn_offset = total_kv.saturating_sub(q_len);
-            let (out_heads, _) = flash_attention_forward_strided(
-                &q_heads,
-                &cache.k,
-                &cache.v,
-                batch,
-                self.num_heads,
-                self.num_kv_heads,
-                q_len,
-                total_kv,
-                cache.max_seq_len,
-                self.head_dim,
-                self.causal,
-                attn_offset,
-            )?;
-            out_heads
-        } else {
-            let (out_heads, _) = flash_attention_forward(
-                &q_heads,
-                &k_heads,
-                &v_heads,
-                batch,
-                self.num_heads,
-                self.num_kv_heads,
-                q_len,
-                kv_len,
-                self.head_dim,
-                self.causal,
-                0,
-            )?;
-            out_heads
-        };
+            self.q_proj
+                .forward_raw(q_in, q_rows, &mut q_proj[..q_len_elems])?;
+            self.k_proj
+                .forward_raw(k_in, kv_rows, &mut k_proj[..kv_len_elems])?;
+            self.v_proj
+                .forward_raw(v_in, kv_rows, &mut v_proj[..kv_len_elems])?;
 
-        let merged =
-            transpose_bhsd_to_bshd_raw(&attn_out, batch, self.num_heads, q_len, self.head_dim);
-        self.o_proj.forward_raw(&merged, q_rows, out)
+            let q_slice: &mut [f32] = if q_no_transpose {
+                &mut q_proj[..q_len_elems]
+            } else {
+                transpose_bshd_to_bhsd_into(
+                    &q_proj[..q_len_elems],
+                    &mut q_heads[..q_len_elems],
+                    batch,
+                    q_len,
+                    self.num_heads,
+                    self.head_dim,
+                );
+                &mut q_heads[..q_len_elems]
+            };
+
+            let (k_slice, v_slice): (&mut [f32], &[f32]) = if kv_no_transpose {
+                (&mut k_proj[..kv_len_elems], &v_proj[..kv_len_elems])
+            } else {
+                transpose_bshd_to_bhsd_into(
+                    &k_proj[..kv_len_elems],
+                    &mut k_heads[..kv_len_elems],
+                    batch,
+                    kv_len,
+                    self.num_kv_heads,
+                    self.head_dim,
+                );
+                transpose_bshd_to_bhsd_into(
+                    &v_proj[..kv_len_elems],
+                    &mut v_heads[..kv_len_elems],
+                    batch,
+                    kv_len,
+                    self.num_kv_heads,
+                    self.head_dim,
+                );
+                (&mut k_heads[..kv_len_elems], &v_heads[..kv_len_elems])
+            };
+
+            let rope_offset = kv_cache.as_ref().map_or(0, |c| c.cur_len);
+            if let Some(ref rope) = self.rope {
+                rope.apply_inplace(q_slice, batch, self.num_heads, q_len, rope_offset)?;
+                rope.apply_inplace(k_slice, batch, self.num_kv_heads, kv_len, rope_offset)?;
+            }
+
+            if let Some(cache) = kv_cache {
+                cache.append(k_slice, v_slice, kv_len)?;
+                let total_kv = cache.cur_len;
+                let attn_offset = total_kv.saturating_sub(q_len);
+                flash_attention_forward_strided_into(
+                    q_slice,
+                    &cache.k,
+                    &cache.v,
+                    batch,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    q_len,
+                    total_kv,
+                    cache.max_seq_len,
+                    self.head_dim,
+                    self.causal,
+                    attn_offset,
+                    &mut attn_out[..q_len_elems],
+                    None,
+                )?;
+            } else {
+                flash_attention_forward_strided_into(
+                    q_slice,
+                    k_slice,
+                    v_slice,
+                    batch,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    q_len,
+                    kv_len,
+                    kv_len,
+                    self.head_dim,
+                    self.causal,
+                    0,
+                    &mut attn_out[..q_len_elems],
+                    None,
+                )?;
+            }
+
+            let o_in: &[f32] = if q_no_transpose {
+                &attn_out[..q_len_elems]
+            } else {
+                transpose_bhsd_to_bshd_into(
+                    &attn_out[..q_len_elems],
+                    &mut merged[..q_len_elems],
+                    batch,
+                    self.num_heads,
+                    q_len,
+                    self.head_dim,
+                );
+                &merged[..q_len_elems]
+            };
+            self.o_proj.forward_raw(o_in, q_rows, out)
+        })
     }
 
     /// Returns references to all trainable parameters in `q, k, v, o` projections.
@@ -1396,6 +1801,85 @@ fn extract_bsd(t: &Tensor) -> OchreResult<(usize, usize, usize)> {
     }
 }
 
+fn transpose_bshd_to_bhsd_into(
+    src: &[f32],
+    dst: &mut [f32],
+    batch: usize,
+    seq_len: usize,
+    heads: usize,
+    head_dim: usize,
+) {
+    if seq_len <= 1 || heads <= 1 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let head_stride = seq_len * head_dim;
+    let total_heads = batch * heads;
+    if src.len() >= 16_384 && total_heads >= 2 {
+        dst.par_chunks_mut(head_stride)
+            .enumerate()
+            .for_each(|(bh, dst_head)| {
+                let b = bh / heads;
+                let h = bh % heads;
+                for s in 0..seq_len {
+                    let s_off = ((b * seq_len + s) * heads + h) * head_dim;
+                    let d_off = s * head_dim;
+                    dst_head[d_off..d_off + head_dim]
+                        .copy_from_slice(&src[s_off..s_off + head_dim]);
+                }
+            });
+    } else {
+        for b in 0..batch {
+            for s in 0..seq_len {
+                for h in 0..heads {
+                    let s_off = ((b * seq_len + s) * heads + h) * head_dim;
+                    let d_off = ((b * heads + h) * seq_len + s) * head_dim;
+                    dst[d_off..d_off + head_dim].copy_from_slice(&src[s_off..s_off + head_dim]);
+                }
+            }
+        }
+    }
+}
+
+fn transpose_bhsd_to_bshd_into(
+    src: &[f32],
+    dst: &mut [f32],
+    batch: usize,
+    heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+) {
+    if seq_len <= 1 || heads <= 1 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let token_stride = heads * head_dim;
+    let total_tokens = batch * seq_len;
+    if src.len() >= 16_384 && total_tokens >= 2 {
+        dst.par_chunks_mut(token_stride)
+            .enumerate()
+            .for_each(|(bs, dst_tok)| {
+                let b = bs / seq_len;
+                let s = bs % seq_len;
+                for h in 0..heads {
+                    let s_off = ((b * heads + h) * seq_len + s) * head_dim;
+                    let d_off = h * head_dim;
+                    dst_tok[d_off..d_off + head_dim].copy_from_slice(&src[s_off..s_off + head_dim]);
+                }
+            });
+    } else {
+        for b in 0..batch {
+            for h in 0..heads {
+                for s in 0..seq_len {
+                    let s_off = ((b * heads + h) * seq_len + s) * head_dim;
+                    let d_off = ((b * seq_len + s) * heads + h) * head_dim;
+                    dst[d_off..d_off + head_dim].copy_from_slice(&src[s_off..s_off + head_dim]);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn transpose_bshd_to_bhsd_raw(
     src: &[f32],
     batch: usize,
@@ -1403,16 +1887,11 @@ pub(crate) fn transpose_bshd_to_bhsd_raw(
     heads: usize,
     head_dim: usize,
 ) -> Vec<f32> {
-    let mut dst = vec![0.0f32; src.len()];
-    for b in 0..batch {
-        for s in 0..seq_len {
-            for h in 0..heads {
-                let s_off = ((b * seq_len + s) * heads + h) * head_dim;
-                let d_off = ((b * heads + h) * seq_len + s) * head_dim;
-                dst[d_off..d_off + head_dim].copy_from_slice(&src[s_off..s_off + head_dim]);
-            }
-        }
+    if seq_len <= 1 || heads <= 1 {
+        return src.to_vec();
     }
+    let mut dst = vec![0.0f32; src.len()];
+    transpose_bshd_to_bhsd_into(src, &mut dst, batch, seq_len, heads, head_dim);
     dst
 }
 
@@ -1423,16 +1902,11 @@ pub(crate) fn transpose_bhsd_to_bshd_raw(
     seq_len: usize,
     head_dim: usize,
 ) -> Vec<f32> {
-    let mut dst = vec![0.0f32; src.len()];
-    for b in 0..batch {
-        for h in 0..heads {
-            for s in 0..seq_len {
-                let s_off = ((b * heads + h) * seq_len + s) * head_dim;
-                let d_off = ((b * seq_len + s) * heads + h) * head_dim;
-                dst[d_off..d_off + head_dim].copy_from_slice(&src[s_off..s_off + head_dim]);
-            }
-        }
+    if seq_len <= 1 || heads <= 1 {
+        return src.to_vec();
     }
+    let mut dst = vec![0.0f32; src.len()];
+    transpose_bhsd_to_bshd_into(src, &mut dst, batch, heads, seq_len, head_dim);
     dst
 }
 
@@ -1620,11 +2094,13 @@ mod tests {
     #[test]
     fn test_flash_attention_parity_gqa_and_causal_fwd_bwd() {
         let mut rng = FastRng::new(1337);
-        // Test sizes > BR/BC=32 (e.g. q_len=40, kv_len=45) to exercise multi-tile online softmax!
+        // Test sizes > BR/BC=48 (e.g. q_len=100, kv_len=105) plus q_len=1 decode path!
         for &(batch, num_heads, num_kv_heads, q_len, kv_len, head_dim, causal, kv_offset) in &[
             (2, 4, 2, 40, 40, 16, true, 0),
             (1, 6, 2, 35, 42, 12, true, 7),
             (2, 4, 4, 33, 37, 8, false, 0),
+            (1, 4, 2, 100, 105, 64, true, 5),
+            (1, 4, 2, 1, 75, 32, true, 74),
         ] {
             let q: Vec<f32> = (0..batch * num_heads * q_len * head_dim)
                 .map(|_| rng.uniform_f32(-0.8, 0.8))
