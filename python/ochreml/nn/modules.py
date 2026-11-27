@@ -1436,7 +1436,7 @@ class Sequential(Module):
             )
         )
 
-    def predict(self, X: Any, batch_size: int = 64) -> Any:
+    def predict(self, X: Any, batch_size: int = 8192) -> Any:
         """Run batched inference in eval mode and return a NumPy float32 array (*≧ω≦*)."""
         if self._rust_seq is None:
             with no_grad():
@@ -1447,7 +1447,7 @@ class Sequential(Module):
             return raw
         return np.frombuffer(raw, dtype=np.float32).reshape(tuple(shape)).copy()
 
-    def predict_proba(self, X: Any, batch_size: int = 64) -> Any:
+    def predict_proba(self, X: Any, batch_size: int = 8192) -> Any:
         """Return softmax class probabilities as a NumPy float32 array (o´∀｀o)."""
         if self._rust_seq is None:
             raise ValueError(
@@ -1457,6 +1457,18 @@ class Sequential(Module):
         if np is None:
             return raw
         return np.frombuffer(raw, dtype=np.float32).reshape(tuple(shape)).copy()
+
+    def predict_classes(self, X: Any, batch_size: int = 8192) -> Any:
+        """Run batched inference in eval mode and return 1D int64 class indices (*≧ω≦*)."""
+        if self._rust_seq is None:
+            logits = self.predict(X, batch_size=batch_size)
+            if np is None:
+                return [int(max(range(len(row)), key=lambda idx: row[idx])) for row in logits]
+            return np.argmax(logits, axis=-1).astype(np.int64)
+        classes = self._rust_seq.predict_classes(X, batch_size=int(batch_size))
+        if np is None:
+            return list(classes)
+        return np.asarray(classes, dtype=np.int64)
 
     def num_parameters(self) -> int:
         if self._rust_seq is not None:

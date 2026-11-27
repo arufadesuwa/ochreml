@@ -522,6 +522,33 @@ class CausalLM(Module):
             )
         )
 
+    def train_steps(
+        self,
+        input_ids: Any,
+        targets: Any,
+        batch: Optional[int] = None,
+        seq_len: Optional[int] = None,
+        steps: int = 1,
+        lr: float = 1e-3,
+        weight_decay: float = 0.0,
+        grad_clip: Optional[float] = None,
+    ) -> List[float]:
+        """Run zero-GIL multi-step AdamW + CrossEntropy training in Rust and return per-step losses (＾▽＾)."""
+        losses = list(
+            self._rust.train_steps(
+                input_ids,
+                targets,
+                batch=int(batch) if batch is not None else None,
+                seq_len=int(seq_len) if seq_len is not None else None,
+                steps=int(steps),
+                lr=float(lr),
+                weight_decay=float(weight_decay),
+                grad_clip=float(grad_clip) if grad_clip is not None else None,
+            )
+        )
+        self._cached_params = [Parameter._from_rust(p) for p in self._rust.parameters()]
+        return losses
+
     def num_parameters(self) -> int:
         return int(self._rust.num_parameters())
 

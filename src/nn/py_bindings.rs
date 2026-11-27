@@ -267,6 +267,76 @@ fn ingest_usize_vec(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<usiz
     ))
 }
 
+fn buffer_shape_2d_or_1d<T: pyo3::buffer::Element>(buf: &PyBuffer<T>) -> PyResult<(usize, usize)> {
+    let shape = buf.shape();
+    match shape.len() {
+        2 => Ok((shape[0], shape[1])),
+        1 => Ok((1, shape[0])),
+        _ => Err(PyValueError::new_err(format!(
+            "Expected 1D or 2D token IDs, got shape {:?} ( >_< )",
+            shape
+        ))),
+    }
+}
+
+fn ingest_token_ids_with_shape(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    batch: Option<usize>,
+    seq_len: Option<usize>,
+) -> PyResult<(Vec<usize>, usize, usize)> {
+    if let (Some(b), Some(s)) = (batch, seq_len) {
+        return Ok((ingest_usize_vec(py, obj)?, b, s));
+    }
+    if batch.is_some() || seq_len.is_some() {
+        return Err(PyValueError::new_err(
+            "Specify both batch and seq_len, or neither ( >_< )",
+        ));
+    }
+    if let Ok(buf) = PyBuffer::<i64>::get(obj) {
+        let (b, s) = buffer_shape_2d_or_1d(&buf)?;
+        let ids = buf
+            .to_vec(py)?
+            .into_iter()
+            .map(|v| {
+                usize::try_from(v)
+                    .map_err(|_| PyValueError::new_err("Token ID cannot be negative ( >_< )"))
+            })
+            .collect::<PyResult<Vec<usize>>>()?;
+        return Ok((ids, b, s));
+    }
+    if let Ok(buf) = PyBuffer::<i32>::get(obj) {
+        let (b, s) = buffer_shape_2d_or_1d(&buf)?;
+        let ids = buf
+            .to_vec(py)?
+            .into_iter()
+            .map(|v| {
+                usize::try_from(v)
+                    .map_err(|_| PyValueError::new_err("Token ID cannot be negative ( >_< )"))
+            })
+            .collect::<PyResult<Vec<usize>>>()?;
+        return Ok((ids, b, s));
+    }
+    if let Ok(buf) = PyBuffer::<u64>::get(obj) {
+        let (b, s) = buffer_shape_2d_or_1d(&buf)?;
+        let ids = buf.to_vec(py)?.into_iter().map(|v| v as usize).collect();
+        return Ok((ids, b, s));
+    }
+    if let Ok(rows) = obj.extract::<Vec<Vec<usize>>>() {
+        let b = rows.len();
+        let s = rows.first().map_or(0, Vec::len);
+        if rows.iter().any(|r| r.len() != s) {
+            return Err(PyValueError::new_err(
+                "Ragged token ID rows are not supported ( >_< )",
+            ));
+        }
+        return Ok((rows.into_iter().flatten().collect(), b, s));
+    }
+    let flat = ingest_usize_vec(py, obj)?;
+    let s = flat.len();
+    Ok((flat, 1, s))
+}
+
 /// Trait enabling in-place optimizer steps on `PyTensor` views backed by stateful Rust layers.
 pub trait ParamOwner: Send + Sync {
     fn update_param(&self, idx: usize, data: &[f32]) -> OchreResult<()>;
@@ -390,6 +460,73 @@ impl PyTensor {
     fn tensor(&self) -> PyResult<Tensor> {
         read_tensor(&self.inner)
     }
+
+    fn read_guard(&self) -> PyResult<std::sync::RwLockReadGuard<'_, Tensor>> {
+        self.inner
+            .read()
+            .map_err(|_| PyValueError::new_err("Tensor lock poisoned ( >_< )"))
+    }
+
+    fn write_guard(&self) -> PyResult<std::sync::RwLockWriteGuard<'_, Tensor>> {
+        self.inner
+            .write()
+            .map_err(|_| PyValueError::new_err("Tensor lock poisoned ( >_< )"))
+    }
+}
+
+fn with_two_tensors<R>(
+    a: &PyTensor,
+    b: &PyTensor,
+    f: impl FnOnce(&Tensor, &Tensor) -> PyResult<R>,
+) -> PyResult<R> {
+    let ga = a.read_guard()?;
+    if Arc::ptr_eq(&a.inner, &b.inner) {
+        f(&ga, &ga)
+    } else {
+        let gb = b.read_guard()?;
+        f(&ga, &gb)
+    }
+}
+
+fn with_three_tensors<R>(
+    a: &PyTensor,
+    b: &PyTensor,
+    c: &PyTensor,
+    f: impl FnOnce(&Tensor, &Tensor, &Tensor) -> PyResult<R>,
+) -> PyResult<R> {
+    let ga = a.read_guard()?;
+    if Arc::ptr_eq(&a.inner, &b.inner) {
+        if Arc::ptr_eq(&a.inner, &c.inner) {
+            return f(&ga, &ga, &ga);
+        }
+        let gc = c.read_guard()?;
+        return f(&ga, &ga, &gc);
+    }
+    let gb = b.read_guard()?;
+    if Arc::ptr_eq(&a.inner, &c.inner) {
+        return f(&ga, &gb, &ga);
+    }
+    if Arc::ptr_eq(&b.inner, &c.inner) {
+        return f(&ga, &gb, &gb);
+    }
+    let gc = c.read_guard()?;
+    f(&ga, &gb, &gc)
+}
+
+fn with_tensor_and_opt<R>(
+    a: &PyTensor,
+    opt_b: Option<&PyTensor>,
+    f: impl FnOnce(&Tensor, Option<&Tensor>) -> PyResult<R>,
+) -> PyResult<R> {
+    let ga = a.read_guard()?;
+    match opt_b {
+        Some(b) if Arc::ptr_eq(&a.inner, &b.inner) => f(&ga, Some(&ga)),
+        Some(b) => {
+            let gb = b.read_guard()?;
+            f(&ga, Some(&gb))
+        }
+        None => f(&ga, None),
+    }
 }
 
 #[pymethods]
@@ -481,53 +618,54 @@ impl PyTensor {
 
     #[getter]
     pub fn shape(&self) -> PyResult<Vec<usize>> {
-        Ok(self.tensor()?.shape)
+        Ok(self.read_guard()?.shape.clone())
     }
 
     #[getter]
     pub fn ndim(&self) -> PyResult<usize> {
-        Ok(self.tensor()?.ndim())
+        Ok(self.read_guard()?.ndim())
     }
 
     #[getter]
     pub fn numel(&self) -> PyResult<usize> {
-        Ok(self.tensor()?.numel())
+        Ok(self.read_guard()?.numel())
     }
 
     #[getter]
     pub fn dtype(&self) -> PyResult<String> {
-        Ok(dtype_str(self.tensor()?.dtype).to_string())
+        Ok(dtype_str(self.read_guard()?.dtype).to_string())
     }
 
     #[getter]
     pub fn device(&self) -> PyResult<String> {
-        Ok(self.tensor()?.device.to_string())
+        Ok(self.read_guard()?.device.to_string())
     }
 
     #[getter]
     pub fn requires_grad(&self) -> PyResult<bool> {
-        Ok(self.tensor()?.requires_grad)
+        Ok(self.read_guard()?.requires_grad)
     }
 
     #[setter]
     pub fn set_requires_grad(&mut self, val: bool) -> PyResult<()> {
-        let mut guard = self
-            .inner
-            .write()
-            .map_err(|_| PyValueError::new_err("Tensor lock poisoned ( >_< )"))?;
-        let updated = guard.clone().with_requires_grad(val);
-        *guard = updated;
+        let mut guard = self.write_guard()?;
+        guard.requires_grad = val;
+        if val && guard.node_id.is_none() {
+            guard.node_id = Some(AutogradTape::alloc_leaf());
+        } else if !val {
+            guard.node_id = None;
+        }
         Ok(())
     }
 
     #[getter]
     pub fn node_id(&self) -> PyResult<Option<usize>> {
-        Ok(self.tensor()?.node_id)
+        Ok(self.read_guard()?.node_id)
     }
 
     #[getter]
     pub fn grad(&self) -> PyResult<Option<PyTensor>> {
-        let t = self.tensor()?;
+        let t = self.read_guard()?;
         let Some(nid) = t.node_id else {
             return Ok(None);
         };
@@ -542,7 +680,7 @@ impl PyTensor {
     }
 
     pub fn zero_grad(&self) -> PyResult<()> {
-        let t = self.tensor()?;
+        let t = self.read_guard()?;
         if let Some(nid) = t.node_id {
             THREAD_GRADS.with(|cell| {
                 cell.borrow_mut().remove(nid);
@@ -552,48 +690,48 @@ impl PyTensor {
     }
 
     pub fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<(Vec<usize>, Bound<'py, PyBytes>)> {
-        let t = self.tensor()?;
+        let t = self.read_guard()?;
         let bytes = f32_slice_to_pybytes(py, &t.data)?;
-        Ok((t.shape, bytes))
+        Ok((t.shape.clone(), bytes))
     }
 
     pub fn numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let t = self.tensor()?;
+        let t = self.read_guard()?;
         let bytes = f32_slice_to_pybytes(py, &t.data)?;
         let np = py.import("numpy")?;
         let arr = np
             .getattr("frombuffer")?
             .call1((bytes, "float32"))?
-            .call_method1("reshape", (t.shape,))?
+            .call_method1("reshape", (t.shape.clone(),))?
             .call_method0("copy")?;
         Ok(arr)
     }
 
     pub fn tolist(&self) -> PyResult<Vec<f32>> {
-        Ok(self.tensor()?.data)
+        Ok(self.read_guard()?.data.clone())
     }
 
     pub fn to_dtype(&self, dtype: String) -> PyResult<Self> {
         let dt = parse_dtype(&dtype)?;
-        Ok(Self::from_tensor(self.tensor()?.to_dtype(dt)))
+        Ok(Self::from_tensor(self.read_guard()?.to_dtype(dt)))
     }
 
     pub fn to_device(&self, device: String) -> PyResult<Self> {
         let dev = parse_device(Some(&device))?;
-        Ok(Self::from_tensor(self.tensor()?.to_device(dev)))
+        Ok(Self::from_tensor(self.read_guard()?.to_device(dev)))
     }
 
     pub fn detach(&self) -> PyResult<Self> {
-        Ok(Self::from_tensor(self.tensor()?.detach()))
+        Ok(Self::from_tensor(self.read_guard()?.detach()))
     }
 
     pub fn copy_from_(&self, other: &PyTensor) -> PyResult<()> {
-        let src = other.tensor()?;
+        if Arc::ptr_eq(&self.inner, &other.inner) {
+            return Ok(());
+        }
+        let src = other.read_guard()?;
         {
-            let mut dst = self
-                .inner
-                .write()
-                .map_err(|_| PyValueError::new_err("Tensor lock poisoned ( >_< )"))?;
+            let mut dst = self.write_guard()?;
             if dst.shape != src.shape {
                 return Err(PyValueError::new_err(format!(
                     "Shape mismatch in copy_from_: {:?} vs {:?} ( >_< )",
@@ -609,57 +747,55 @@ impl PyTensor {
     }
 
     pub fn reshape(&self, shape: Vec<usize>) -> PyResult<Self> {
-        Ok(Self::from_tensor(self.tensor()?.reshape(shape)?))
+        Ok(Self::from_tensor(self.read_guard()?.reshape(shape)?))
     }
 
     pub fn transpose_last2(&self) -> PyResult<Self> {
-        Ok(Self::from_tensor(self.tensor()?.transpose_last2()?))
+        Ok(Self::from_tensor(self.read_guard()?.transpose_last2()?))
     }
 
     pub fn matmul(&self, other: &PyTensor) -> PyResult<Self> {
-        let a = self.tensor()?;
-        let b = other.tensor()?;
-        Ok(Self::from_tensor(a.matmul(&b)?))
+        with_two_tensors(self, other, |a, b| Ok(Self::from_tensor(a.matmul(b)?)))
     }
 
     pub fn relu(&self) -> PyResult<Self> {
-        Ok(Self::from_tensor(self.tensor()?.relu()?))
+        Ok(Self::from_tensor(self.read_guard()?.relu()?))
     }
 
     pub fn sigmoid(&self) -> PyResult<Self> {
-        Ok(Self::from_tensor(self.tensor()?.sigmoid()?))
+        Ok(Self::from_tensor(self.read_guard()?.sigmoid()?))
     }
 
     pub fn tanh(&self) -> PyResult<Self> {
-        Ok(Self::from_tensor(self.tensor()?.tanh()?))
+        Ok(Self::from_tensor(self.read_guard()?.tanh()?))
     }
 
     pub fn gelu(&self) -> PyResult<Self> {
-        Ok(Self::from_tensor(self.tensor()?.gelu()?))
+        Ok(Self::from_tensor(self.read_guard()?.gelu()?))
     }
 
     pub fn silu(&self) -> PyResult<Self> {
-        Ok(Self::from_tensor(self.tensor()?.silu()?))
+        Ok(Self::from_tensor(self.read_guard()?.silu()?))
     }
 
     #[pyo3(signature = (axis = None))]
     pub fn sum(&self, axis: Option<usize>) -> PyResult<Self> {
-        Ok(Self::from_tensor(self.tensor()?.sum(axis)?))
+        Ok(Self::from_tensor(self.read_guard()?.sum(axis)?))
     }
 
     #[pyo3(signature = (axis = None))]
     pub fn mean(&self, axis: Option<usize>) -> PyResult<Self> {
-        Ok(Self::from_tensor(self.tensor()?.mean(axis)?))
+        Ok(Self::from_tensor(self.read_guard()?.mean(axis)?))
     }
 
     pub fn backward(&self) -> PyResult<PyGradStore> {
-        let gs = self.tensor()?.backward()?;
+        let gs = self.read_guard()?.backward()?;
         accumulate_thread_grads(&gs)?;
         Ok(PyGradStore { inner: gs })
     }
 
     pub fn item(&self) -> PyResult<f32> {
-        let t = self.tensor()?;
+        let t = self.read_guard()?;
         if t.data.len() != 1 {
             return Err(PyValueError::new_err(format!(
                 "item() only works on 1-element tensors, got {} elements ( >_< )",
@@ -670,12 +806,11 @@ impl PyTensor {
     }
 
     pub fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let a = self.tensor()?;
         if let Ok(b_py) = other.extract::<PyRef<'_, PyTensor>>() {
-            let b = b_py.tensor()?;
-            return Ok(Self::from_tensor(a.add(&b)?));
+            return with_two_tensors(self, &b_py, |a, b| Ok(Self::from_tensor(a.add(b)?)));
         }
         if let Ok(scalar) = other.extract::<f32>() {
+            let a = self.read_guard()?;
             let b = Tensor::new(vec![scalar], vec![1], a.dtype, a.device.clone(), false)?;
             return Ok(Self::from_tensor(a.add(&b)?));
         }
@@ -685,18 +820,17 @@ impl PyTensor {
     }
 
     pub fn __radd__(&self, other: f32) -> PyResult<Self> {
-        let a = self.tensor()?;
+        let a = self.read_guard()?;
         let b = Tensor::new(vec![other], vec![1], a.dtype, a.device.clone(), false)?;
         Ok(Self::from_tensor(b.add(&a)?))
     }
 
     pub fn __sub__(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let a = self.tensor()?;
         if let Ok(b_py) = other.extract::<PyRef<'_, PyTensor>>() {
-            let b = b_py.tensor()?;
-            return Ok(Self::from_tensor(a.sub(&b)?));
+            return with_two_tensors(self, &b_py, |a, b| Ok(Self::from_tensor(a.sub(b)?)));
         }
         if let Ok(scalar) = other.extract::<f32>() {
+            let a = self.read_guard()?;
             let b = Tensor::new(vec![scalar], vec![1], a.dtype, a.device.clone(), false)?;
             return Ok(Self::from_tensor(a.sub(&b)?));
         }
@@ -706,23 +840,21 @@ impl PyTensor {
     }
 
     pub fn __rsub__(&self, other: f32) -> PyResult<Self> {
-        let a = self.tensor()?;
+        let a = self.read_guard()?;
         let b = Tensor::new(vec![other], vec![1], a.dtype, a.device.clone(), false)?;
         Ok(Self::from_tensor(b.sub(&a)?))
     }
 
     pub fn __neg__(&self) -> PyResult<Self> {
-        Ok(Self::from_tensor(self.tensor()?.scale(-1.0)?))
+        Ok(Self::from_tensor(self.read_guard()?.scale(-1.0)?))
     }
 
     pub fn __mul__(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let a = self.tensor()?;
         if let Ok(b_py) = other.extract::<PyRef<'_, PyTensor>>() {
-            let b = b_py.tensor()?;
-            return Ok(Self::from_tensor(a.mul(&b)?));
+            return with_two_tensors(self, &b_py, |a, b| Ok(Self::from_tensor(a.mul(b)?)));
         }
         if let Ok(scalar) = other.extract::<f32>() {
-            return Ok(Self::from_tensor(a.scale(scalar)?));
+            return Ok(Self::from_tensor(self.read_guard()?.scale(scalar)?));
         }
         Err(PyValueError::new_err(
             "Tensor multiplication requires a Tensor or float scalar ( >_< )",
@@ -730,7 +862,7 @@ impl PyTensor {
     }
 
     pub fn __rmul__(&self, other: f32) -> PyResult<Self> {
-        Ok(Self::from_tensor(self.tensor()?.scale(other)?))
+        Ok(Self::from_tensor(self.read_guard()?.scale(other)?))
     }
 
     pub fn __matmul__(&self, other: &PyTensor) -> PyResult<Self> {
@@ -738,7 +870,7 @@ impl PyTensor {
     }
 
     pub fn __repr__(&self) -> PyResult<String> {
-        let t = self.tensor()?;
+        let t = self.read_guard()?;
         Ok(format!(
             "Tensor(shape={:?}, dtype='{}', device='{}', requires_grad={})",
             t.shape,
@@ -809,6 +941,36 @@ pub fn init_linear_params(
     ))
 }
 
+fn linear_forward_borrowed(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+) -> PyResult<PyTensor> {
+    if weight.shape.len() != 2 {
+        return Err(OchreError::InvalidParameter(format!(
+            "Linear weight must be 2D [out_features, in_features], got {:?} ( >_< )",
+            weight.shape
+        ))
+        .into());
+    }
+    let out_features = weight.shape[0];
+    if let Some(b) = bias
+        && b.shape != [out_features]
+    {
+        return Err(OchreError::InvalidParameter(format!(
+            "Linear bias must have shape [{out_features}], got {:?} ( >_< )",
+            b.shape
+        ))
+        .into());
+    }
+    let out = x.matmul_trans(weight, false, true)?;
+    let out = match bias {
+        Some(b) => out.add(b)?,
+        None => out,
+    };
+    Ok(PyTensor::from_tensor(out))
+}
+
 #[pyfunction]
 #[pyo3(signature = (x, weight, bias = None))]
 pub fn linear_forward(
@@ -816,10 +978,12 @@ pub fn linear_forward(
     weight: &PyTensor,
     bias: Option<&PyTensor>,
 ) -> PyResult<PyTensor> {
-    let w = weight.tensor()?;
-    let b = bias.map(PyTensor::tensor).transpose()?;
-    let lin = Linear::from_weights(w, b)?;
-    Ok(PyTensor::from_tensor(lin.forward(&x.tensor()?)?))
+    match bias {
+        Some(b) => with_three_tensors(x, weight, b, |xt, wt, bt| {
+            linear_forward_borrowed(xt, wt, Some(bt))
+        }),
+        None => with_two_tensors(x, weight, |xt, wt| linear_forward_borrowed(xt, wt, None)),
+    }
 }
 
 #[pyfunction]
@@ -872,7 +1036,8 @@ pub fn conv2d_forward(
     let w = weight.tensor()?;
     let b = bias.map(PyTensor::tensor).transpose()?;
     let conv = Conv2d::from_weights(w, b, stride, padding, dilation, groups)?;
-    Ok(PyTensor::from_tensor(conv.forward(&x.tensor()?)?))
+    let xt = x.read_guard()?;
+    Ok(PyTensor::from_tensor(conv.forward(&xt)?))
 }
 
 #[pyfunction]
@@ -946,7 +1111,8 @@ pub fn depthwise_conv2d_forward(
         padding,
         dilation,
     };
-    Ok(PyTensor::from_tensor(dw.forward(&x.tensor()?)?))
+    let xt = x.read_guard()?;
+    Ok(PyTensor::from_tensor(dw.forward(&xt)?))
 }
 
 #[pyfunction]
@@ -959,7 +1125,8 @@ pub fn max_pool2d_forward(
 ) -> PyResult<PyTensor> {
     let st = stride.unwrap_or(kernel_size);
     let pool = MaxPool2d::new(kernel_size, st, padding)?;
-    Ok(PyTensor::from_tensor(pool.forward(&x.tensor()?)?))
+    let xt = x.read_guard()?;
+    Ok(PyTensor::from_tensor(pool.forward(&xt)?))
 }
 
 #[pyfunction]
@@ -972,14 +1139,16 @@ pub fn avg_pool2d_forward(
 ) -> PyResult<PyTensor> {
     let st = stride.unwrap_or(kernel_size);
     let pool = AvgPool2d::new(kernel_size, st, padding)?;
-    Ok(PyTensor::from_tensor(pool.forward(&x.tensor()?)?))
+    let xt = x.read_guard()?;
+    Ok(PyTensor::from_tensor(pool.forward(&xt)?))
 }
 
 #[pyfunction]
 #[pyo3(signature = (x, keep_dims = true))]
 pub fn global_avg_pool2d_forward(x: &PyTensor, keep_dims: bool) -> PyResult<PyTensor> {
     let gap = GlobalAvgPool2d::with_keep_dims(keep_dims);
-    Ok(PyTensor::from_tensor(gap.forward(&x.tensor()?)?))
+    let xt = x.read_guard()?;
+    Ok(PyTensor::from_tensor(gap.forward(&xt)?))
 }
 
 #[pyfunction]
@@ -996,9 +1165,9 @@ pub fn batch_norm2d_forward(
     eps: f32,
     momentum: f32,
 ) -> PyResult<(PyTensor, Vec<f32>, Vec<f32>)> {
-    let xt = x.tensor()?;
     let w = weight.map(PyTensor::tensor).transpose()?;
     let b = bias.map(PyTensor::tensor).transpose()?;
+    let xt = x.read_guard()?;
     let mut bn = BatchNorm2d::new(
         num_features,
         eps,
@@ -1022,7 +1191,8 @@ pub fn batch_norm2d_forward(
 #[pyo3(signature = (x, start_dim = 1))]
 pub fn flatten_forward(x: &PyTensor, start_dim: usize) -> PyResult<PyTensor> {
     let fl = Flatten::with_start_dim(start_dim);
-    Ok(PyTensor::from_tensor(fl.forward(&x.tensor()?)?))
+    let xt = x.read_guard()?;
+    Ok(PyTensor::from_tensor(fl.forward(&xt)?))
 }
 
 #[pyfunction]
@@ -1034,9 +1204,9 @@ pub fn layer_norm_forward(
     gamma: Option<&PyTensor>,
     beta: Option<&PyTensor>,
 ) -> PyResult<PyTensor> {
-    let xt = x.tensor()?;
     let g = gamma.map(PyTensor::tensor).transpose()?;
     let b = beta.map(PyTensor::tensor).transpose()?;
+    let xt = x.read_guard()?;
     let ln = LayerNorm::from_weights(normalized_shape, eps, g, b, xt.dtype, xt.device.clone())?;
     Ok(PyTensor::from_tensor(ln.forward(&xt)?))
 }
@@ -1050,7 +1220,8 @@ pub fn rms_norm_forward(
     gamma: &PyTensor,
 ) -> PyResult<PyTensor> {
     let rn = RMSNorm::from_weight(normalized_shape, eps, gamma.tensor()?)?;
-    Ok(PyTensor::from_tensor(rn.forward(&x.tensor()?)?))
+    let xt = x.read_guard()?;
+    Ok(PyTensor::from_tensor(rn.forward(&xt)?))
 }
 
 #[pyfunction]
@@ -1100,7 +1271,8 @@ pub fn dropout_forward(
 ) -> PyResult<(PyTensor, u64)> {
     let mut drop = Dropout::new(p, seed)?;
     drop.training = training;
-    let out = drop.forward(&x.tensor()?)?;
+    let xt = x.read_guard()?;
+    let out = drop.forward(&xt)?;
     Ok((PyTensor::from_tensor(out), drop.seed))
 }
 
@@ -1113,7 +1285,8 @@ pub fn positional_encoding_forward(
     offset: usize,
 ) -> PyResult<PyTensor> {
     let pe = PositionalEncoding::new(max_len, d_model)?;
-    Ok(PyTensor::from_tensor(pe.forward(&x.tensor()?, offset)?))
+    let xt = x.read_guard()?;
+    Ok(PyTensor::from_tensor(pe.forward(&xt, offset)?))
 }
 
 #[pyfunction]
@@ -1126,7 +1299,8 @@ pub fn rope_forward(
     offset: usize,
 ) -> PyResult<PyTensor> {
     let rope = RoPE::new(head_dim, max_seq_len, theta)?;
-    Ok(PyTensor::from_tensor(rope.forward(&x.tensor()?, offset)?))
+    let xt = x.read_guard()?;
+    Ok(PyTensor::from_tensor(rope.forward(&xt, offset)?))
 }
 
 #[pyfunction]
@@ -1139,22 +1313,20 @@ pub fn sdpa_forward(
     kv_offset: usize,
 ) -> PyResult<PyTensor> {
     let sdpa = ScaledDotProductAttention::new();
-    Ok(PyTensor::from_tensor(sdpa.forward(
-        &q.tensor()?,
-        &k.tensor()?,
-        &v.tensor()?,
-        causal,
-        kv_offset,
-    )?))
+    with_three_tensors(q, k, v, |qt, kt, vt| {
+        Ok(PyTensor::from_tensor(
+            sdpa.forward(qt, kt, vt, causal, kv_offset)?,
+        ))
+    })
 }
 
 #[pyfunction]
 #[pyo3(signature = (pred, target, reduction = "mean".to_string()))]
 pub fn mse_loss(pred: &PyTensor, target: &PyTensor, reduction: String) -> PyResult<PyTensor> {
     let loss_fn = MSELoss::new(parse_reduction(&reduction)?);
-    Ok(PyTensor::from_tensor(
-        loss_fn.forward_tensor(&pred.tensor()?, &target.tensor()?)?,
-    ))
+    with_two_tensors(pred, target, |pt, tt| {
+        Ok(PyTensor::from_tensor(loss_fn.forward_tensor(pt, tt)?))
+    })
 }
 
 #[pyfunction]
@@ -1168,9 +1340,8 @@ pub fn cross_entropy_loss(
 ) -> PyResult<PyTensor> {
     let tgt = ingest_usize_vec(py, targets)?;
     let loss_fn = CrossEntropyLoss::new(label_smoothing, ignore_index)?;
-    Ok(PyTensor::from_tensor(
-        loss_fn.forward_tensor(&logits.tensor()?, &tgt)?,
-    ))
+    let lt = logits.read_guard()?;
+    Ok(PyTensor::from_tensor(loss_fn.forward_tensor(&lt, &tgt)?))
 }
 
 // =========================================================================
@@ -1217,7 +1388,8 @@ impl PyResidualBlock {
             .inner
             .write()
             .map_err(|_| PyValueError::new_err("ResidualBlock lock poisoned ( >_< )"))?;
-        Ok(PyTensor::from_tensor(guard.forward(&x.tensor()?)?))
+        let xt = x.read_guard()?;
+        Ok(PyTensor::from_tensor(guard.forward(&xt)?))
     }
 
     pub fn train(&self) -> PyResult<()> {
@@ -1294,9 +1466,10 @@ impl PyRNN {
             .inner
             .read()
             .map_err(|_| PyValueError::new_err("RNN lock poisoned ( >_< )"))?;
-        let h0_t = h0.map(PyTensor::tensor).transpose()?;
-        let (out, hn) = guard.forward(&input.tensor()?, h0_t.as_ref())?;
-        Ok((PyTensor::from_tensor(out), PyTensor::from_tensor(hn)))
+        with_tensor_and_opt(input, h0, |inp, h0_ref| {
+            let (out, hn) = guard.forward(inp, h0_ref)?;
+            Ok((PyTensor::from_tensor(out), PyTensor::from_tensor(hn)))
+        })
     }
 
     pub fn parameters(&self) -> PyResult<Vec<PyTensor>> {
@@ -1355,9 +1528,10 @@ impl PyGRU {
             .inner
             .read()
             .map_err(|_| PyValueError::new_err("GRU lock poisoned ( >_< )"))?;
-        let h0_t = h0.map(PyTensor::tensor).transpose()?;
-        let (out, hn) = guard.forward(&input.tensor()?, h0_t.as_ref())?;
-        Ok((PyTensor::from_tensor(out), PyTensor::from_tensor(hn)))
+        with_tensor_and_opt(input, h0, |inp, h0_ref| {
+            let (out, hn) = guard.forward(inp, h0_ref)?;
+            Ok((PyTensor::from_tensor(out), PyTensor::from_tensor(hn)))
+        })
     }
 
     pub fn parameters(&self) -> PyResult<Vec<PyTensor>> {
@@ -1417,21 +1591,26 @@ impl PyLSTM {
             .inner
             .read()
             .map_err(|_| PyValueError::new_err("LSTM lock poisoned ( >_< )"))?;
-        let hx_owned = match (h0, c0) {
-            (Some(h), Some(c)) => Some((h.tensor()?, c.tensor()?)),
-            (None, None) => None,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "LSTM forward requires both h0 and c0 when state is provided ( >_< )",
-                ));
+        match (h0, c0) {
+            (Some(h), Some(c)) => with_three_tensors(input, h, c, |inp, ht, ct| {
+                let (out, (hn, cn)) = guard.forward(inp, Some((ht, ct)))?;
+                Ok((
+                    PyTensor::from_tensor(out),
+                    (PyTensor::from_tensor(hn), PyTensor::from_tensor(cn)),
+                ))
+            }),
+            (None, None) => {
+                let inp = input.read_guard()?;
+                let (out, (hn, cn)) = guard.forward(&inp, None)?;
+                Ok((
+                    PyTensor::from_tensor(out),
+                    (PyTensor::from_tensor(hn), PyTensor::from_tensor(cn)),
+                ))
             }
-        };
-        let hx_ref = hx_owned.as_ref().map(|(h, c)| (h, c));
-        let (out, (hn, cn)) = guard.forward(&input.tensor()?, hx_ref)?;
-        Ok((
-            PyTensor::from_tensor(out),
-            (PyTensor::from_tensor(hn), PyTensor::from_tensor(cn)),
-        ))
+            _ => Err(PyValueError::new_err(
+                "LSTM forward requires both h0 and c0 when state is provided ( >_< )",
+            )),
+        }
     }
 
     pub fn parameters(&self) -> PyResult<Vec<PyTensor>> {
@@ -1560,8 +1739,9 @@ impl PyMultiHeadAttention {
             .read()
             .map_err(|_| PyValueError::new_err("MultiHeadAttention lock poisoned ( >_< )"))?;
         let cache_ref = kv_cache.as_deref_mut().map(|c| &mut c.inner);
-        let out = guard.forward(&q.tensor()?, &k.tensor()?, &v.tensor()?, cache_ref)?;
-        Ok(PyTensor::from_tensor(out))
+        with_three_tensors(q, k, v, |qt, kt, vt| {
+            Ok(PyTensor::from_tensor(guard.forward(qt, kt, vt, cache_ref)?))
+        })
     }
 
     pub fn parameters(&self) -> PyResult<Vec<PyTensor>> {
@@ -1610,7 +1790,8 @@ impl PySwiGLU {
             .inner
             .read()
             .map_err(|_| PyValueError::new_err("SwiGLU lock poisoned ( >_< )"))?;
-        Ok(PyTensor::from_tensor(guard.forward(&x.tensor()?)?))
+        let xt = x.read_guard()?;
+        Ok(PyTensor::from_tensor(guard.forward(&xt)?))
     }
 
     pub fn parameters(&self) -> PyResult<Vec<PyTensor>> {
@@ -1663,7 +1844,8 @@ impl PyFeedForward {
             .inner
             .read()
             .map_err(|_| PyValueError::new_err("FeedForward lock poisoned ( >_< )"))?;
-        Ok(PyTensor::from_tensor(guard.forward(&x.tensor()?)?))
+        let xt = x.read_guard()?;
+        Ok(PyTensor::from_tensor(guard.forward(&xt)?))
     }
 
     pub fn parameters(&self) -> PyResult<Vec<PyTensor>> {
@@ -1723,7 +1905,8 @@ impl PyTransformerEncoderLayer {
             .inner
             .read()
             .map_err(|_| PyValueError::new_err("TransformerEncoderLayer lock poisoned ( >_< )"))?;
-        Ok(PyTensor::from_tensor(guard.forward(&x.tensor()?)?))
+        let xt = x.read_guard()?;
+        Ok(PyTensor::from_tensor(guard.forward(&xt)?))
     }
 
     pub fn parameters(&self) -> PyResult<Vec<PyTensor>> {
@@ -1785,7 +1968,8 @@ impl PyTransformerEncoder {
             .inner
             .read()
             .map_err(|_| PyValueError::new_err("TransformerEncoder lock poisoned ( >_< )"))?;
-        Ok(PyTensor::from_tensor(guard.forward(&x.tensor()?)?))
+        let xt = x.read_guard()?;
+        Ok(PyTensor::from_tensor(guard.forward(&xt)?))
     }
 
     pub fn parameters(&self) -> PyResult<Vec<PyTensor>> {
@@ -1855,13 +2039,12 @@ impl PyTransformerDecoderLayer {
             .inner
             .read()
             .map_err(|_| PyValueError::new_err("TransformerDecoderLayer lock poisoned ( >_< )"))?;
-        let mem_t = memory.map(PyTensor::tensor).transpose()?;
         let cache_ref = kv_cache.as_deref_mut().map(|c| &mut c.inner);
-        Ok(PyTensor::from_tensor(guard.forward(
-            &x.tensor()?,
-            mem_t.as_ref(),
-            cache_ref,
-        )?))
+        with_tensor_and_opt(x, memory, |xt, mem_ref| {
+            Ok(PyTensor::from_tensor(
+                guard.forward(xt, mem_ref, cache_ref)?,
+            ))
+        })
     }
 
     pub fn parameters(&self) -> PyResult<Vec<PyTensor>> {
@@ -1933,19 +2116,21 @@ impl PyTransformerDecoder {
             .inner
             .read()
             .map_err(|_| PyValueError::new_err("TransformerDecoder lock poisoned ( >_< )"))?;
-        let mem_t = memory.map(PyTensor::tensor).transpose()?;
-        let out = match kv_caches {
-            Some(mut caches) => {
-                let mut raw_caches: Vec<KVCache> = caches.iter().map(|c| c.inner.clone()).collect();
-                let res = guard.forward(&x.tensor()?, mem_t.as_ref(), Some(&mut raw_caches))?;
-                for (py_c, updated) in caches.iter_mut().zip(raw_caches) {
-                    py_c.inner = updated;
+        with_tensor_and_opt(x, memory, |xt, mem_ref| {
+            let out = match kv_caches {
+                Some(mut caches) => {
+                    let mut raw_caches: Vec<KVCache> =
+                        caches.iter().map(|c| c.inner.clone()).collect();
+                    let res = guard.forward(xt, mem_ref, Some(&mut raw_caches))?;
+                    for (py_c, updated) in caches.iter_mut().zip(raw_caches) {
+                        py_c.inner = updated;
+                    }
+                    res
                 }
-                res
-            }
-            None => guard.forward(&x.tensor()?, mem_t.as_ref(), None)?,
-        };
-        Ok(PyTensor::from_tensor(out))
+                None => guard.forward(xt, mem_ref, None)?,
+            };
+            Ok(PyTensor::from_tensor(out))
+        })
     }
 
     pub fn parameters(&self) -> PyResult<Vec<PyTensor>> {
@@ -2232,7 +2417,8 @@ impl PySequential {
     }
 
     pub fn forward(&mut self, x: &PyTensor) -> PyResult<PyTensor> {
-        Ok(PyTensor::from_tensor(self.inner.forward(&x.tensor()?)?))
+        let xt = x.read_guard()?;
+        Ok(PyTensor::from_tensor(self.inner.forward(&xt)?))
     }
 
     #[pyo3(signature = (x, y, out_dim = None, epochs = 10, batch_size = 32, lr = 1e-3, optimizer = "adamw".to_string(), loss = "cross_entropy".to_string(), weight_decay = 0.0, grad_clip = None, shuffle = true, seed = 42))]
@@ -2309,22 +2495,15 @@ impl PySequential {
         Ok(history)
     }
 
-    #[pyo3(signature = (x, batch_size = 64))]
+    #[pyo3(signature = (x, batch_size = 8192))]
     pub fn predict<'py>(
         &self,
         py: Python<'py>,
         x: &Bound<'_, PyAny>,
         batch_size: usize,
     ) -> PyResult<(Vec<usize>, Bound<'py, PyBytes>)> {
-        let (x_data, x_shape) = ingest_f32_data(py, x, None)?;
-        if x_shape.len() < 2 {
-            return Err(PyValueError::new_err(format!(
-                "Sequential.predict expects at least 2D input [N, ...], got shape {:?} ( >_< )",
-                x_shape
-            )));
-        }
-        let n_samples = x_shape[0];
-        let sample_shape = x_shape[1..].to_vec();
+        let (x_data, n_samples, sample_shape) =
+            ingest_sequential_inputs(py, x, "Sequential.predict")?;
         let (preds, out_dim) = py.detach(|| {
             self.inner
                 .predict_nd(&x_data, n_samples, &sample_shape, batch_size)
@@ -2333,45 +2512,40 @@ impl PySequential {
         Ok((vec![n_samples, out_dim], bytes))
     }
 
-    #[pyo3(signature = (x, batch_size = 64))]
+    #[pyo3(signature = (x, batch_size = 8192))]
     pub fn predict_proba<'py>(
         &self,
         py: Python<'py>,
         x: &Bound<'_, PyAny>,
         batch_size: usize,
     ) -> PyResult<(Vec<usize>, Bound<'py, PyBytes>)> {
-        let (x_data, x_shape) = ingest_f32_data(py, x, None)?;
-        if x_shape.len() < 2 {
-            return Err(PyValueError::new_err(format!(
-                "Sequential.predict_proba expects at least 2D input [N, ...], got shape {:?} ( >_< )",
-                x_shape
-            )));
-        }
-        let n_samples = x_shape[0];
-        let sample_shape = x_shape[1..].to_vec();
-        let (mut logits, out_dim) = py.detach(|| {
-            let (mut out, od) =
+        let (x_data, n_samples, sample_shape) =
+            ingest_sequential_inputs(py, x, "Sequential.predict_proba")?;
+        let (logits, out_dim) = py.detach(|| {
+            let (mut out, out_dim) =
                 self.inner
                     .predict_nd(&x_data, n_samples, &sample_shape, batch_size)?;
-            for row in out.chunks_exact_mut(od) {
-                let max_v = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for v in row.iter_mut() {
-                    *v = (*v - max_v).exp();
-                    sum += *v;
-                }
-                if sum > 0.0 {
-                    let inv = 1.0 / sum;
-                    for v in row.iter_mut() {
-                        *v *= inv;
-                    }
-                }
-            }
-            OchreResult::Ok((out, od))
+            crate::nn::simd_math::simd_softmax_rows_inplace(&mut out, n_samples, out_dim);
+            OchreResult::Ok((out, out_dim))
         })?;
-        let _ = &mut logits;
         let bytes = f32_slice_to_pybytes(py, &logits)?;
         Ok((vec![n_samples, out_dim], bytes))
+    }
+
+    #[pyo3(signature = (x, batch_size = 8192))]
+    pub fn predict_classes(
+        &self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        batch_size: usize,
+    ) -> PyResult<Vec<usize>> {
+        let (x_data, n_samples, sample_shape) =
+            ingest_sequential_inputs(py, x, "Sequential.predict_classes")?;
+        let classes = py.detach(|| {
+            self.inner
+                .predict_classes(&x_data, n_samples, &sample_shape, batch_size)
+        })?;
+        Ok(classes)
     }
 
     pub fn train(&mut self) {
@@ -2433,6 +2607,23 @@ impl PySequential {
     pub fn __len__(&self) -> usize {
         self.inner.layers.len()
     }
+}
+
+fn ingest_sequential_inputs(
+    py: Python<'_>,
+    x: &Bound<'_, PyAny>,
+    method_name: &str,
+) -> PyResult<(Vec<f32>, usize, Vec<usize>)> {
+    let (x_data, x_shape) = ingest_f32_data(py, x, None)?;
+    if x_shape.len() < 2 {
+        return Err(PyValueError::new_err(format!(
+            "{method_name} expects at least 2D input [N, ...], got shape {:?} ( >_< )",
+            x_shape
+        )));
+    }
+    let n_samples = x_shape[0];
+    let sample_shape = x_shape[1..].to_vec();
+    Ok((x_data, n_samples, sample_shape))
 }
 
 fn infer_last_linear_out(seq: &Sequential) -> Option<usize> {
@@ -2509,17 +2700,7 @@ impl PyCausalLM {
         seq_len: Option<usize>,
         kv_caches: Option<Vec<PyRefMut<'_, PyKVCache>>>,
     ) -> PyResult<PyTensor> {
-        let (ids, b, s) = if let (Some(b), Some(s)) = (batch, seq_len) {
-            (ingest_usize_vec(py, input_ids)?, b, s)
-        } else if let Ok(rows) = input_ids.extract::<Vec<Vec<usize>>>() {
-            let b = rows.len();
-            let s = rows.first().map_or(0, Vec::len);
-            (rows.into_iter().flatten().collect(), b, s)
-        } else {
-            let flat = ingest_usize_vec(py, input_ids)?;
-            let s = flat.len();
-            (flat, 1, s)
-        };
+        let (ids, b, s) = ingest_token_ids_with_shape(py, input_ids, batch, seq_len)?;
 
         let guard = self
             .inner
@@ -2537,6 +2718,32 @@ impl PyCausalLM {
             None => guard.forward_ids(&ids, b, s, None)?,
         };
         Ok(PyTensor::from_tensor(out))
+    }
+
+    #[pyo3(signature = (input_ids, targets, batch = None, seq_len = None, steps = 1, lr = 1e-3, weight_decay = 0.0, grad_clip = None))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_steps(
+        &self,
+        py: Python<'_>,
+        input_ids: &Bound<'_, PyAny>,
+        targets: &Bound<'_, PyAny>,
+        batch: Option<usize>,
+        seq_len: Option<usize>,
+        steps: usize,
+        lr: f32,
+        weight_decay: f32,
+        grad_clip: Option<f32>,
+    ) -> PyResult<Vec<f32>> {
+        let (ids, b, s) = ingest_token_ids_with_shape(py, input_ids, batch, seq_len)?;
+        let tgt = ingest_usize_vec(py, targets)?;
+        let inner = &self.inner;
+        let losses = py.detach(|| -> OchreResult<Vec<f32>> {
+            let mut guard = inner
+                .write()
+                .map_err(|_| OchreError::General("CausalLM lock poisoned ( >_< )".into()))?;
+            guard.train_steps(&ids, &tgt, b, s, steps, lr, weight_decay, grad_clip)
+        })?;
+        Ok(losses)
     }
 
     #[pyo3(signature = (prompt_ids, max_new_tokens = 32, temperature = 1.0, top_k = 0, top_p = 1.0, seed = 42))]
@@ -2789,7 +2996,8 @@ impl PyLoRALinear {
             .inner
             .read()
             .map_err(|_| PyValueError::new_err("LoRALinear lock poisoned ( >_< )"))?;
-        Ok(PyTensor::from_tensor(guard.forward(&x.tensor()?)?))
+        let xt = x.read_guard()?;
+        Ok(PyTensor::from_tensor(guard.forward(&xt)?))
     }
 
     pub fn merge_weights(&self) -> PyResult<()> {
@@ -3001,11 +3209,11 @@ fn optimizer_step_params(
         })?,
     }
     for (p, updated) in params.iter().zip(owned) {
-        if let Ok(mut guard) = p.inner.write() {
-            *guard = updated.clone();
-        }
         if let Some(ref link) = p.link {
             link.owner.update_param(link.index, &updated.data)?;
+        }
+        if let Ok(mut guard) = p.inner.write() {
+            *guard = updated;
         }
     }
     Ok(())
@@ -3155,7 +3363,7 @@ pub fn clip_grad_norm_(
 ) -> PyResult<f32> {
     let mut ids = Vec::with_capacity(params.len());
     for p in &params {
-        if let Some(nid) = p.tensor()?.node_id {
+        if let Some(nid) = p.read_guard()?.node_id {
             ids.push(nid);
         }
     }
