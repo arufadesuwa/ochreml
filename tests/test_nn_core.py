@@ -359,10 +359,14 @@ def test_sequential_fit_classification_and_regression_and_dit(tmp_path):
 
     probs = clf.predict_proba(X_cls)
     preds_logits = clf.predict(X_cls)
+    pred_classes = clf.predict_classes(X_cls)
     assert probs.shape == (120, 3)
     assert preds_logits.shape == (120, 3)
+    assert pred_classes.shape == (120,)
+    assert pred_classes.dtype == np.int64
+    assert np.array_equal(pred_classes, np.argmax(probs, axis=1))
     assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-4)
-    acc = float(np.mean(np.argmax(probs, axis=1) == y_cls))
+    acc = float(np.mean(pred_classes == y_cls))
     assert acc >= 0.95
 
     # .dit round-trip via ochreml.save / ochreml.load

@@ -274,6 +274,34 @@ def test_causal_lm_forward_train_generate_kv_cache_and_dit(tmp_path):
     assert loaded.generate([1, 2, 3], max_new_tokens=6, temperature=0.0, seed=11) == g_greedy_1
 
 
+def test_causal_lm_train_steps():
+    lm = nn.CausalLM(
+        vocab_size=24,
+        d_model=16,
+        num_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        ffn_hidden_dim=32,
+        max_seq_len=32,
+        device="cpu",
+        seed=42,
+    )
+    params_before = [p.numpy().copy() for p in lm.parameters()]
+    inputs = [[1, 2, 3, 4], [5, 6, 7, 8]]
+    targets = [2, 3, 4, 5, 6, 7, 8, 9]
+
+    losses = lm.train_steps(inputs, targets, steps=5, lr=0.02)
+    assert len(losses) == 5
+    assert all(math.isfinite(val) for val in losses)
+    assert losses[-1] < losses[0]
+
+    params_after = [p.numpy() for p in lm.parameters()]
+    assert len(params_after) == len(params_before)
+    assert any(
+        not np.allclose(b, a, atol=1e-7) for b, a in zip(params_before, params_after)
+    )
+
+
 def test_lora_linear_training_merge_unmerge_and_adapter_dit(tmp_path):
     rng = np.random.default_rng(13)
     base_lin = nn.Linear(8, 6, bias=True, device="cpu", seed=5)
