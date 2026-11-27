@@ -14,5 +14,6 @@ pub mod optim;
 pub mod py_bindings;
 pub mod rnn;
 pub mod sequential;
+pub mod simd_math;
 pub mod tensor;
 pub mod transformer;

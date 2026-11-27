@@ -7,57 +7,14 @@
 use crate::backend::Backend;
 use crate::error::{OchreError, OchreResult};
 use crate::nn::gemm_f32::batched_sgemm;
+use crate::nn::simd_math::{
+    simd_adamw_step_f32, simd_exp_sub_max_sum, simd_gelu_bwd_into, simd_gelu_fwd_into,
+    simd_silu_bwd_into, simd_silu_fwd_into,
+};
 use rayon::prelude::*;
 
 const PAR_ELEMS_THRESHOLD: usize = 16_384;
 const PAR_ROWS_THRESHOLD: usize = 64;
-
-#[inline]
-fn gelu_scalar_fwd(x: f32) -> f32 {
-    let xd = x as f64;
-    let c = 0.797_884_560_802_865_4_f64;
-    let k = 0.044_715_f64;
-    let u = c * (xd + k * xd * xd * xd);
-    (0.5 * xd * (1.0 + u.tanh())) as f32
-}
-
-#[inline]
-fn gelu_scalar_bwd(dy: f32, x: f32) -> f32 {
-    let xd = x as f64;
-    let c = 0.797_884_560_802_865_4_f64;
-    let k = 0.044_715_f64;
-    let x2 = xd * xd;
-    let u = c * (xd + k * x2 * xd);
-    let t = u.tanh();
-    let sech2 = 1.0 - t * t;
-    let du = c * (1.0 + 3.0 * k * x2);
-    let deriv = 0.5 * (1.0 + t) + 0.5 * xd * sech2 * du;
-    ((dy as f64) * deriv) as f32
-}
-
-#[inline]
-fn sigmoid_f64(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
-}
-
-#[inline]
-fn silu_scalar_fwd(x: f32) -> f32 {
-    let xd = x as f64;
-    (xd * sigmoid_f64(xd)) as f32
-}
-
-#[inline]
-fn silu_scalar_bwd(dy: f32, x: f32) -> f32 {
-    let xd = x as f64;
-    let sig = sigmoid_f64(xd);
-    let deriv = sig * (1.0 + xd * (1.0 - sig));
-    ((dy as f64) * deriv) as f32
-}
 
 #[allow(clippy::too_many_arguments)]
 fn validate_conv_out_dims(
@@ -557,56 +514,32 @@ pub fn cpu_row_rmsnorm_bwd_f32(
 
 /// N8: CPU GELU forward (`0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`).
 pub fn cpu_gelu_f32(x: &[f32]) -> Vec<f32> {
-    if x.len() >= PAR_ELEMS_THRESHOLD {
-        x.par_iter().map(|&v| gelu_scalar_fwd(v)).collect()
-    } else {
-        x.iter().map(|&v| gelu_scalar_fwd(v)).collect()
-    }
+    let mut out = vec![0.0f32; x.len()];
+    simd_gelu_fwd_into(x, &mut out);
+    out
 }
 
 /// N8: CPU GELU backward.
 pub fn cpu_gelu_bwd_f32(dy: &[f32], x: &[f32]) -> Vec<f32> {
     let n = dy.len().min(x.len());
-    if n >= PAR_ELEMS_THRESHOLD {
-        dy[..n]
-            .par_iter()
-            .zip(x[..n].par_iter())
-            .map(|(&g, &xv)| gelu_scalar_bwd(g, xv))
-            .collect()
-    } else {
-        dy[..n]
-            .iter()
-            .zip(x[..n].iter())
-            .map(|(&g, &xv)| gelu_scalar_bwd(g, xv))
-            .collect()
-    }
+    let mut dx = vec![0.0f32; n];
+    simd_gelu_bwd_into(&dy[..n], &x[..n], &mut dx);
+    dx
 }
 
 /// N8: CPU SiLU / Swish forward (`x * sigmoid(x)`).
 pub fn cpu_silu_f32(x: &[f32]) -> Vec<f32> {
-    if x.len() >= PAR_ELEMS_THRESHOLD {
-        x.par_iter().map(|&v| silu_scalar_fwd(v)).collect()
-    } else {
-        x.iter().map(|&v| silu_scalar_fwd(v)).collect()
-    }
+    let mut out = vec![0.0f32; x.len()];
+    simd_silu_fwd_into(x, &mut out);
+    out
 }
 
 /// N8: CPU SiLU backward.
 pub fn cpu_silu_bwd_f32(dy: &[f32], x: &[f32]) -> Vec<f32> {
     let n = dy.len().min(x.len());
-    if n >= PAR_ELEMS_THRESHOLD {
-        dy[..n]
-            .par_iter()
-            .zip(x[..n].par_iter())
-            .map(|(&g, &xv)| silu_scalar_bwd(g, xv))
-            .collect()
-    } else {
-        dy[..n]
-            .iter()
-            .zip(x[..n].iter())
-            .map(|(&g, &xv)| silu_scalar_bwd(g, xv))
-            .collect()
-    }
+    let mut dx = vec![0.0f32; n];
+    simd_silu_bwd_into(&dy[..n], &x[..n], &mut dx);
+    dx
 }
 
 /// N8: CPU causal attention mask in-place (`kj > offset + qi` set to `-inf`).
@@ -706,33 +639,31 @@ pub fn cpu_cross_entropy_grad_f32(
             return 0.0;
         }
         let row = &logits[r * cols..(r + 1) * cols];
-        let mut max_v = f64::NEG_INFINITY;
-        for &v in row {
-            let vd = v as f64;
-            if vd > max_v {
-                max_v = vd;
+        let (max_v, sum_exp) = simd_exp_sub_max_sum(row, grad_row);
+        let sum_exp_d = sum_exp as f64;
+        let log_z = (max_v as f64) + sum_exp_d.ln();
+        let inv_sum_exp = 1.0 / sum_exp_d;
+        if label_smoothing == 0.0 {
+            let scale = (inv_sum_exp * inv_valid) as f32;
+            for g in grad_row.iter_mut() {
+                *g *= scale;
             }
+            grad_row[tgt] -= inv_valid as f32;
+            log_z - (row[tgt] as f64)
+        } else {
+            let mut row_loss = 0.0f64;
+            for (j, &v) in row.iter().enumerate() {
+                let prob = (grad_row[j] as f64) * inv_sum_exp;
+                let q = if j == tgt {
+                    smooth_base + one_minus_ls
+                } else {
+                    smooth_base
+                };
+                row_loss -= q * ((v as f64) - log_z);
+                grad_row[j] = ((prob - q) * inv_valid) as f32;
+            }
+            row_loss
         }
-        let mut sum_exp = 0.0f64;
-        for (j, &v) in row.iter().enumerate() {
-            let e = ((v as f64) - max_v).exp();
-            grad_row[j] = e as f32;
-            sum_exp += e;
-        }
-        let log_z = max_v + sum_exp.ln();
-        let inv_sum_exp = 1.0 / sum_exp;
-        let mut row_loss = 0.0f64;
-        for (j, &v) in row.iter().enumerate() {
-            let prob = ((v as f64) - max_v).exp() * inv_sum_exp;
-            let q = if j == tgt {
-                smooth_base + one_minus_ls
-            } else {
-                smooth_base
-            };
-            row_loss -= q * ((v as f64) - log_z);
-            grad_row[j] = ((prob - q) * inv_valid) as f32;
-        }
-        row_loss
     };
 
     let total_loss: f64 = if rows >= PAR_ROWS_THRESHOLD && total >= PAR_ELEMS_THRESHOLD {
@@ -796,39 +727,7 @@ pub fn cpu_adamw_step_f32(
         return Ok(());
     }
 
-    let b1 = beta1 as f64;
-    let b2 = beta2 as f64;
-    let omb1 = 1.0 - b1;
-    let omb2 = 1.0 - b2;
-    let lr_d = lr as f64;
-    let eps_d = eps as f64;
-    let decay = 1.0 - lr_d * (weight_decay as f64);
-    let inv_bc1 = 1.0 / (1.0 - b1.powi(step as i32));
-    let inv_bc2 = 1.0 / (1.0 - b2.powi(step as i32));
-
-    let update_one = |p: &mut f32, g: &f32, mv: &mut f32, vv: &mut f32| {
-        let gd = *g as f64;
-        let m_new = b1 * (*mv as f64) + omb1 * gd;
-        let v_new = b2 * (*vv as f64) + omb2 * gd * gd;
-        *mv = m_new as f32;
-        *vv = v_new as f32;
-        let m_hat = m_new * inv_bc1;
-        let v_hat = v_new * inv_bc2;
-        *p = ((*p as f64) * decay - lr_d * m_hat / (v_hat.sqrt() + eps_d)) as f32;
-    };
-
-    if n >= PAR_ELEMS_THRESHOLD {
-        param
-            .par_iter_mut()
-            .zip(grad.par_iter())
-            .zip(m.par_iter_mut())
-            .zip(v.par_iter_mut())
-            .for_each(|(((p, g), mv), vv)| update_one(p, g, mv, vv));
-    } else {
-        for i in 0..n {
-            update_one(&mut param[i], &grad[i], &mut m[i], &mut v[i]);
-        }
-    }
+    simd_adamw_step_f32(param, grad, m, v, lr, beta1, beta2, eps, weight_decay, step);
     Ok(())
 }
 
