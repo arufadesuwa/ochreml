@@ -721,7 +721,19 @@ fn rnn_forward_core(
 
             let b_ih = snap.bias_ih[u].as_deref();
             let b_hh = snap.bias_hh[u].as_deref();
+            let mut b_total = vec![0.0f32; h];
+            if let Some(v) = b_ih {
+                for (d, &s) in b_total.iter_mut().zip(v.iter()) {
+                    *d += s;
+                }
+            }
+            if let Some(v) = b_hh {
+                for (d, &s) in b_total.iter_mut().zip(v.iter()) {
+                    *d += s;
+                }
+            }
 
+            let mut h_cur = vec![0.0f32; bh];
             for step in 0..seq_len {
                 let t = if dir == 0 { step } else { seq_len - 1 - step };
                 if save_cache {
@@ -741,18 +753,21 @@ fn rnn_forward_core(
                     &cfg.device,
                 )?;
 
-                let mut h_cur = vec![0.0f32; bh];
                 for b in 0..batch {
-                    let xp_off = (b * seq_len + t) * h;
-                    let hp_off = b * h;
-                    for j in 0..h {
-                        let b1 = b_ih.map_or(0.0f32, |v| v[j]);
-                        let b2 = b_hh.map_or(0.0f32, |v| v[j]);
-                        let pre = x_proj[xp_off + j] + h_proj[hp_off + j] + b1 + b2;
-                        h_cur[hp_off + j] = match nonlin {
-                            RnnNonlinearity::Tanh => pre.tanh(),
-                            RnnNonlinearity::Relu => pre.max(0.0),
-                        };
+                    let xp_row = &x_proj[(b * seq_len + t) * h..(b * seq_len + t + 1) * h];
+                    let hp_row = &h_proj[b * h..(b + 1) * h];
+                    let hc_row = &mut h_cur[b * h..(b + 1) * h];
+                    match nonlin {
+                        RnnNonlinearity::Tanh => {
+                            for j in 0..h {
+                                hc_row[j] = (xp_row[j] + hp_row[j] + b_total[j]).tanh();
+                            }
+                        }
+                        RnnNonlinearity::Relu => {
+                            for j in 0..h {
+                                hc_row[j] = (xp_row[j] + hp_row[j] + b_total[j]).max(0.0);
+                            }
+                        }
                     }
                 }
 
@@ -769,7 +784,7 @@ fn rnn_forward_core(
                 if save_cache {
                     all_states[step * bh..(step + 1) * bh].copy_from_slice(&h_cur);
                 }
-                h_prev = h_cur;
+                std::mem::swap(&mut h_prev, &mut h_cur);
             }
 
             hn[u * bh..(u + 1) * bh].copy_from_slice(&h_prev);
@@ -843,69 +858,48 @@ fn rnn_backward_core(
             let u = layer * dirs + dir;
             let mut dh_next = d_hn[u * bh..(u + 1) * bh].to_vec();
             let mut da_all = vec![0.0f32; batch * seq_len * h];
-            let mut da = vec![0.0f32; bh];
+            let mut da_steps = vec![0.0f32; seq_len * bh];
 
             for step in (0..seq_len).rev() {
                 let t = if dir == 0 { step } else { seq_len - 1 - step };
                 let h_cur = &cache.unit_h_states[u][step * bh..(step + 1) * bh];
-                let h_prev = &cache.unit_h_prev[u][step * bh..(step + 1) * bh];
+                let da_step = &mut da_steps[step * bh..(step + 1) * bh];
 
                 for b in 0..batch {
                     let out_off = (b * seq_len + t) * out_dim + dir * h;
                     let hp_off = b * h;
-                    for j in 0..h {
-                        let dh = d_cur_out[out_off + j] + dh_next[hp_off + j];
-                        let y = h_cur[hp_off + j];
-                        let deriv = match nonlin {
-                            RnnNonlinearity::Tanh => 1.0 - y * y,
-                            RnnNonlinearity::Relu => {
-                                if y > 0.0 {
-                                    1.0
-                                } else {
-                                    0.0
-                                }
+                    let da_all_row = &mut da_all[(b * seq_len + t) * h..(b * seq_len + t + 1) * h];
+                    let da_step_row = &mut da_step[hp_off..hp_off + h];
+                    let h_cur_row = &h_cur[hp_off..hp_off + h];
+                    let dh_next_row = &dh_next[hp_off..hp_off + h];
+                    let d_out_row = &d_cur_out[out_off..out_off + h];
+
+                    match nonlin {
+                        RnnNonlinearity::Tanh => {
+                            for j in 0..h {
+                                let dh = d_out_row[j] + dh_next_row[j];
+                                let y = h_cur_row[j];
+                                let g = dh * (1.0 - y * y);
+                                da_step_row[j] = g;
+                                da_all_row[j] = g;
                             }
-                        };
-                        let g = dh * deriv;
-                        da[hp_off + j] = g;
-                        da_all[(b * seq_len + t) * h + j] = g;
-                    }
-                }
-
-                if let Some(ref mut db) = d_bias_ih[u] {
-                    for b in 0..batch {
-                        let off = b * h;
-                        for j in 0..h {
-                            db[j] += da[off + j];
                         }
-                    }
-                }
-                if let Some(ref mut db) = d_bias_hh[u] {
-                    for b in 0..batch {
-                        let off = b * h;
-                        for j in 0..h {
-                            db[j] += da[off + j];
+                        RnnNonlinearity::Relu => {
+                            for j in 0..h {
+                                let dh = d_out_row[j] + dh_next_row[j];
+                                let g = if h_cur_row[j] > 0.0 { dh } else { 0.0 };
+                                da_step_row[j] = g;
+                                da_all_row[j] = g;
+                            }
                         }
                     }
                 }
 
                 gemm_dispatch(
-                    h,
-                    h,
-                    batch,
-                    &da,
-                    h_prev,
-                    &mut d_weight_hh[u],
-                    true,
-                    false,
-                    1.0,
-                    &cfg.device,
-                )?;
-                gemm_dispatch(
                     batch,
                     h,
                     h,
-                    &da,
+                    da_step,
                     &snap.weight_hh[u],
                     &mut dh_next,
                     false,
@@ -917,6 +911,37 @@ fn rnn_backward_core(
 
             d_h0[u * bh..(u + 1) * bh].copy_from_slice(&dh_next);
 
+            if d_bias_ih[u].is_some() || d_bias_hh[u].is_some() {
+                let mut db_acc = vec![0.0f32; h];
+                for row in da_steps.chunks_exact(h) {
+                    for (d, &v) in db_acc.iter_mut().zip(row.iter()) {
+                        *d += v;
+                    }
+                }
+                if let Some(ref mut db) = d_bias_ih[u] {
+                    for (d, &v) in db.iter_mut().zip(db_acc.iter()) {
+                        *d += v;
+                    }
+                }
+                if let Some(ref mut db) = d_bias_hh[u] {
+                    for (d, &v) in db.iter_mut().zip(db_acc.iter()) {
+                        *d += v;
+                    }
+                }
+            }
+
+            gemm_dispatch(
+                h,
+                h,
+                seq_len * batch,
+                &da_steps,
+                &cache.unit_h_prev[u],
+                &mut d_weight_hh[u],
+                true,
+                false,
+                1.0,
+                &cfg.device,
+            )?;
             gemm_dispatch(
                 h,
                 in_dim,
@@ -1283,7 +1308,26 @@ fn gru_forward_core(
 
             let b_ih = snap.bias_ih[u].as_deref();
             let b_hh = snap.bias_hh[u].as_deref();
+            let mut br_sum = vec![0.0f32; h];
+            let mut bz_sum = vec![0.0f32; h];
+            let mut bi_n = vec![0.0f32; h];
+            let mut bh_n = vec![0.0f32; h];
+            if let Some(v) = b_ih {
+                for j in 0..h {
+                    br_sum[j] += v[j];
+                    bz_sum[j] += v[h + j];
+                    bi_n[j] = v[2 * h + j];
+                }
+            }
+            if let Some(v) = b_hh {
+                for j in 0..h {
+                    br_sum[j] += v[j];
+                    bz_sum[j] += v[h + j];
+                    bh_n[j] = v[2 * h + j];
+                }
+            }
 
+            let mut h_cur = vec![0.0f32; bh];
             for step in 0..seq_len {
                 let t = if dir == 0 { step } else { seq_len - 1 - step };
                 if save_cache {
@@ -1303,33 +1347,36 @@ fn gru_forward_core(
                     &cfg.device,
                 )?;
 
-                let mut h_cur = vec![0.0f32; bh];
                 for b in 0..batch {
                     let gi_row = &gi_all[(b * seq_len + t) * h3..(b * seq_len + t + 1) * h3];
                     let gh_row = &gh[b * h3..(b + 1) * h3];
                     let hp_row = &h_prev[b * h..(b + 1) * h];
                     let hc_row = &mut h_cur[b * h..(b + 1) * h];
 
-                    for j in 0..h {
-                        let bi_r = b_ih.map_or(0.0f32, |v| v[j]);
-                        let bh_r = b_hh.map_or(0.0f32, |v| v[j]);
-                        let bi_z = b_ih.map_or(0.0f32, |v| v[h + j]);
-                        let bh_z = b_hh.map_or(0.0f32, |v| v[h + j]);
-                        let bi_n = b_ih.map_or(0.0f32, |v| v[2 * h + j]);
-                        let bh_n = b_hh.map_or(0.0f32, |v| v[2 * h + j]);
-
-                        let r = sigmoid_f32((gi_row[j] + bi_r) + (gh_row[j] + bh_r));
-                        let z = sigmoid_f32((gi_row[h + j] + bi_z) + (gh_row[h + j] + bh_z));
-                        let gh_n_val = gh_row[2 * h + j] + bh_n;
-                        let n = ((gi_row[2 * h + j] + bi_n) + r * gh_n_val).tanh();
-                        hc_row[j] = (1.0 - z) * n + z * hp_row[j];
-
-                        if save_cache {
-                            let idx = step * bh + b * h + j;
-                            all_r[idx] = r;
-                            all_z[idx] = z;
-                            all_n[idx] = n;
-                            all_gh_n[idx] = gh_n_val;
+                    if save_cache {
+                        let base = step * bh + b * h;
+                        let r_dst = &mut all_r[base..base + h];
+                        let z_dst = &mut all_z[base..base + h];
+                        let n_dst = &mut all_n[base..base + h];
+                        let ghn_dst = &mut all_gh_n[base..base + h];
+                        for j in 0..h {
+                            let r = sigmoid_f32(gi_row[j] + gh_row[j] + br_sum[j]);
+                            let z = sigmoid_f32(gi_row[h + j] + gh_row[h + j] + bz_sum[j]);
+                            let gh_n_val = gh_row[2 * h + j] + bh_n[j];
+                            let n = (gi_row[2 * h + j] + bi_n[j] + r * gh_n_val).tanh();
+                            hc_row[j] = (1.0 - z) * n + z * hp_row[j];
+                            r_dst[j] = r;
+                            z_dst[j] = z;
+                            n_dst[j] = n;
+                            ghn_dst[j] = gh_n_val;
+                        }
+                    } else {
+                        for j in 0..h {
+                            let r = sigmoid_f32(gi_row[j] + gh_row[j] + br_sum[j]);
+                            let z = sigmoid_f32(gi_row[h + j] + gh_row[h + j] + bz_sum[j]);
+                            let gh_n_val = gh_row[2 * h + j] + bh_n[j];
+                            let n = (gi_row[2 * h + j] + bi_n[j] + r * gh_n_val).tanh();
+                            hc_row[j] = (1.0 - z) * n + z * hp_row[j];
                         }
                     }
                 }
@@ -1344,7 +1391,7 @@ fn gru_forward_core(
                     t,
                     &mut layer_out,
                 );
-                h_prev = h_cur;
+                std::mem::swap(&mut h_prev, &mut h_cur);
             }
 
             hn[u * bh..(u + 1) * bh].copy_from_slice(&h_prev);
@@ -1425,7 +1472,7 @@ fn gru_backward_core(
             let u = layer * dirs + dir;
             let mut dh_next = d_hn[u * bh..(u + 1) * bh].to_vec();
             let mut dgi_all = vec![0.0f32; batch * seq_len * h3];
-            let mut dgh = vec![0.0f32; bh3];
+            let mut dgh_steps = vec![0.0f32; seq_len * bh3];
             let mut dh_from_gh = vec![0.0f32; bh];
 
             for step in (0..seq_len).rev() {
@@ -1436,12 +1483,14 @@ fn gru_backward_core(
                 let z_s = &cache.unit_z[u][off..off + bh];
                 let n_s = &cache.unit_n[u][off..off + bh];
                 let ghn_s = &cache.unit_gh_n[u][off..off + bh];
+                let dgh = &mut dgh_steps[step * bh3..(step + 1) * bh3];
 
                 for b in 0..batch {
                     let out_off = (b * seq_len + t) * out_dim + dir * h;
                     let hp_off = b * h;
                     let g_off = b * h3;
                     let dgi_row = &mut dgi_all[(b * seq_len + t) * h3..(b * seq_len + t + 1) * h3];
+                    let dgh_row = &mut dgh[g_off..g_off + h3];
 
                     for j in 0..h {
                         let dh = d_cur_out[out_off + j] + dh_next[hp_off + j];
@@ -1462,48 +1511,19 @@ fn gru_backward_core(
                         dgi_row[h + j] = da_z;
                         dgi_row[2 * h + j] = da_n;
 
-                        dgh[g_off + j] = da_r;
-                        dgh[g_off + h + j] = da_z;
-                        dgh[g_off + 2 * h + j] = da_n * r;
+                        dgh_row[j] = da_r;
+                        dgh_row[h + j] = da_z;
+                        dgh_row[2 * h + j] = da_n * r;
 
                         dh_next[hp_off + j] = dh * z;
                     }
                 }
 
-                if let Some(ref mut db) = d_bias_ih[u] {
-                    for b in 0..batch {
-                        let row = &dgi_all[(b * seq_len + t) * h3..(b * seq_len + t + 1) * h3];
-                        for k in 0..h3 {
-                            db[k] += row[k];
-                        }
-                    }
-                }
-                if let Some(ref mut db) = d_bias_hh[u] {
-                    for b in 0..batch {
-                        let row = &dgh[b * h3..(b + 1) * h3];
-                        for k in 0..h3 {
-                            db[k] += row[k];
-                        }
-                    }
-                }
-
-                gemm_dispatch(
-                    h3,
-                    h,
-                    batch,
-                    &dgh,
-                    h_prev,
-                    &mut d_weight_hh[u],
-                    true,
-                    false,
-                    1.0,
-                    &cfg.device,
-                )?;
                 gemm_dispatch(
                     batch,
                     h,
                     h3,
-                    &dgh,
+                    dgh,
                     &snap.weight_hh[u],
                     &mut dh_from_gh,
                     false,
@@ -1511,13 +1531,40 @@ fn gru_backward_core(
                     0.0,
                     &cfg.device,
                 )?;
-                for idx in 0..bh {
-                    dh_next[idx] += dh_from_gh[idx];
+                for (d, &s) in dh_next.iter_mut().zip(dh_from_gh.iter()) {
+                    *d += s;
                 }
             }
 
             d_h0[u * bh..(u + 1) * bh].copy_from_slice(&dh_next);
 
+            if let Some(ref mut db) = d_bias_ih[u] {
+                for row in dgi_all.chunks_exact(h3) {
+                    for (d, &v) in db.iter_mut().zip(row.iter()) {
+                        *d += v;
+                    }
+                }
+            }
+            if let Some(ref mut db) = d_bias_hh[u] {
+                for row in dgh_steps.chunks_exact(h3) {
+                    for (d, &v) in db.iter_mut().zip(row.iter()) {
+                        *d += v;
+                    }
+                }
+            }
+
+            gemm_dispatch(
+                h3,
+                h,
+                seq_len * batch,
+                &dgh_steps,
+                &cache.unit_h_prev[u],
+                &mut d_weight_hh[u],
+                true,
+                false,
+                1.0,
+                &cfg.device,
+            )?;
             gemm_dispatch(
                 h3,
                 in_dim,
@@ -1944,7 +1991,20 @@ fn lstm_forward_core(
 
             let b_ih = snap.bias_ih[u].as_deref();
             let b_hh = snap.bias_hh[u].as_deref();
+            let mut b_total = vec![0.0f32; h4];
+            if let Some(v) = b_ih {
+                for (d, &s) in b_total.iter_mut().zip(v.iter()) {
+                    *d += s;
+                }
+            }
+            if let Some(v) = b_hh {
+                for (d, &s) in b_total.iter_mut().zip(v.iter()) {
+                    *d += s;
+                }
+            }
 
+            let mut h_cur = vec![0.0f32; bh];
+            let mut c_cur = vec![0.0f32; bh];
             for step in 0..seq_len {
                 let t = if dir == 0 { step } else { seq_len - 1 - step };
                 if save_cache {
@@ -1965,8 +2025,6 @@ fn lstm_forward_core(
                     &cfg.device,
                 )?;
 
-                let mut h_cur = vec![0.0f32; bh];
-                let mut c_cur = vec![0.0f32; bh];
                 for b in 0..batch {
                     let gi_row = &gi_all[(b * seq_len + t) * h4..(b * seq_len + t + 1) * h4];
                     let gh_row = &gh[b * h4..(b + 1) * h4];
@@ -1974,33 +2032,47 @@ fn lstm_forward_core(
                     let hc_row = &mut h_cur[b * h..(b + 1) * h];
                     let cc_row = &mut c_cur[b * h..(b + 1) * h];
 
-                    for j in 0..h {
-                        let bi_i = b_ih.map_or(0.0f32, |v| v[j]);
-                        let bh_i = b_hh.map_or(0.0f32, |v| v[j]);
-                        let bi_f = b_ih.map_or(0.0f32, |v| v[h + j]);
-                        let bh_f = b_hh.map_or(0.0f32, |v| v[h + j]);
-                        let bi_g = b_ih.map_or(0.0f32, |v| v[2 * h + j]);
-                        let bh_g = b_hh.map_or(0.0f32, |v| v[2 * h + j]);
-                        let bi_o = b_ih.map_or(0.0f32, |v| v[3 * h + j]);
-                        let bh_o = b_hh.map_or(0.0f32, |v| v[3 * h + j]);
+                    if save_cache {
+                        let base = step * bh + b * h;
+                        let i_dst = &mut all_i[base..base + h];
+                        let f_dst = &mut all_f[base..base + h];
+                        let g_dst = &mut all_g[base..base + h];
+                        let o_dst = &mut all_o[base..base + h];
+                        let tc_dst = &mut all_tc[base..base + h];
+                        for j in 0..h {
+                            let iv = sigmoid_f32(gi_row[j] + gh_row[j] + b_total[j]);
+                            let fv = sigmoid_f32(gi_row[h + j] + gh_row[h + j] + b_total[h + j]);
+                            let gv =
+                                (gi_row[2 * h + j] + gh_row[2 * h + j] + b_total[2 * h + j]).tanh();
+                            let ov = sigmoid_f32(
+                                gi_row[3 * h + j] + gh_row[3 * h + j] + b_total[3 * h + j],
+                            );
 
-                        let iv = sigmoid_f32(gi_row[j] + gh_row[j] + bi_i + bh_i);
-                        let fv = sigmoid_f32(gi_row[h + j] + gh_row[h + j] + bi_f + bh_f);
-                        let gv = (gi_row[2 * h + j] + gh_row[2 * h + j] + bi_g + bh_g).tanh();
-                        let ov = sigmoid_f32(gi_row[3 * h + j] + gh_row[3 * h + j] + bi_o + bh_o);
+                            let c_new = fv * cp_row[j] + iv * gv;
+                            let tc = c_new.tanh();
+                            cc_row[j] = c_new;
+                            hc_row[j] = ov * tc;
 
-                        let c_new = fv * cp_row[j] + iv * gv;
-                        let tc = c_new.tanh();
-                        cc_row[j] = c_new;
-                        hc_row[j] = ov * tc;
+                            i_dst[j] = iv;
+                            f_dst[j] = fv;
+                            g_dst[j] = gv;
+                            o_dst[j] = ov;
+                            tc_dst[j] = tc;
+                        }
+                    } else {
+                        for j in 0..h {
+                            let iv = sigmoid_f32(gi_row[j] + gh_row[j] + b_total[j]);
+                            let fv = sigmoid_f32(gi_row[h + j] + gh_row[h + j] + b_total[h + j]);
+                            let gv =
+                                (gi_row[2 * h + j] + gh_row[2 * h + j] + b_total[2 * h + j]).tanh();
+                            let ov = sigmoid_f32(
+                                gi_row[3 * h + j] + gh_row[3 * h + j] + b_total[3 * h + j],
+                            );
 
-                        if save_cache {
-                            let idx = step * bh + b * h + j;
-                            all_i[idx] = iv;
-                            all_f[idx] = fv;
-                            all_g[idx] = gv;
-                            all_o[idx] = ov;
-                            all_tc[idx] = tc;
+                            let c_new = fv * cp_row[j] + iv * gv;
+                            let tc = c_new.tanh();
+                            cc_row[j] = c_new;
+                            hc_row[j] = ov * tc;
                         }
                     }
                 }
@@ -2015,8 +2087,8 @@ fn lstm_forward_core(
                     t,
                     &mut layer_out,
                 );
-                h_prev = h_cur;
-                c_prev = c_cur;
+                std::mem::swap(&mut h_prev, &mut h_cur);
+                std::mem::swap(&mut c_prev, &mut c_cur);
             }
 
             hn[u * bh..(u + 1) * bh].copy_from_slice(&h_prev);
@@ -2106,18 +2178,18 @@ fn lstm_backward_core(
             let mut dh_next = d_hn[u * bh..(u + 1) * bh].to_vec();
             let mut dc_next = d_cn[u * bh..(u + 1) * bh].to_vec();
             let mut dgates_all = vec![0.0f32; batch * seq_len * h4];
-            let mut dgates_step = vec![0.0f32; bh4];
+            let mut dgates_steps = vec![0.0f32; seq_len * bh4];
 
             for step in (0..seq_len).rev() {
                 let t = if dir == 0 { step } else { seq_len - 1 - step };
                 let off = step * bh;
-                let h_prev = &cache.unit_h_prev[u][off..off + bh];
                 let c_prev = &cache.unit_c_prev[u][off..off + bh];
                 let i_s = &cache.unit_i[u][off..off + bh];
                 let f_s = &cache.unit_f[u][off..off + bh];
                 let g_s = &cache.unit_g[u][off..off + bh];
                 let o_s = &cache.unit_o[u][off..off + bh];
                 let tc_s = &cache.unit_tc[u][off..off + bh];
+                let dgates_step = &mut dgates_steps[step * bh4..(step + 1) * bh4];
 
                 for b in 0..batch {
                     let out_off = (b * seq_len + t) * out_dim + dir * h;
@@ -2125,6 +2197,7 @@ fn lstm_backward_core(
                     let g_off = b * h4;
                     let dg_row =
                         &mut dgates_all[(b * seq_len + t) * h4..(b * seq_len + t + 1) * h4];
+                    let dg_step_row = &mut dgates_step[g_off..g_off + h4];
 
                     for j in 0..h {
                         let dh = d_cur_out[out_off + j] + dh_next[hp_off + j];
@@ -2148,49 +2221,20 @@ fn lstm_backward_core(
                         dg_row[2 * h + j] = da_g;
                         dg_row[3 * h + j] = da_o;
 
-                        dgates_step[g_off + j] = da_i;
-                        dgates_step[g_off + h + j] = da_f;
-                        dgates_step[g_off + 2 * h + j] = da_g;
-                        dgates_step[g_off + 3 * h + j] = da_o;
+                        dg_step_row[j] = da_i;
+                        dg_step_row[h + j] = da_f;
+                        dg_step_row[2 * h + j] = da_g;
+                        dg_step_row[3 * h + j] = da_o;
 
                         dc_next[hp_off + j] = dc * fv;
                     }
                 }
 
-                if let Some(ref mut db) = d_bias_ih[u] {
-                    for b in 0..batch {
-                        let row = &dgates_step[b * h4..(b + 1) * h4];
-                        for k in 0..h4 {
-                            db[k] += row[k];
-                        }
-                    }
-                }
-                if let Some(ref mut db) = d_bias_hh[u] {
-                    for b in 0..batch {
-                        let row = &dgates_step[b * h4..(b + 1) * h4];
-                        for k in 0..h4 {
-                            db[k] += row[k];
-                        }
-                    }
-                }
-
-                gemm_dispatch(
-                    h4,
-                    h,
-                    batch,
-                    &dgates_step,
-                    h_prev,
-                    &mut d_weight_hh[u],
-                    true,
-                    false,
-                    1.0,
-                    &cfg.device,
-                )?;
                 gemm_dispatch(
                     batch,
                     h,
                     h4,
-                    &dgates_step,
+                    dgates_step,
                     &snap.weight_hh[u],
                     &mut dh_next,
                     false,
@@ -2203,6 +2247,37 @@ fn lstm_backward_core(
             d_h0[u * bh..(u + 1) * bh].copy_from_slice(&dh_next);
             d_c0[u * bh..(u + 1) * bh].copy_from_slice(&dc_next);
 
+            if d_bias_ih[u].is_some() || d_bias_hh[u].is_some() {
+                let mut db_acc = vec![0.0f32; h4];
+                for row in dgates_steps.chunks_exact(h4) {
+                    for (d, &v) in db_acc.iter_mut().zip(row.iter()) {
+                        *d += v;
+                    }
+                }
+                if let Some(ref mut db) = d_bias_ih[u] {
+                    for (d, &v) in db.iter_mut().zip(db_acc.iter()) {
+                        *d += v;
+                    }
+                }
+                if let Some(ref mut db) = d_bias_hh[u] {
+                    for (d, &v) in db.iter_mut().zip(db_acc.iter()) {
+                        *d += v;
+                    }
+                }
+            }
+
+            gemm_dispatch(
+                h4,
+                h,
+                seq_len * batch,
+                &dgates_steps,
+                &cache.unit_h_prev[u],
+                &mut d_weight_hh[u],
+                true,
+                false,
+                1.0,
+                &cfg.device,
+            )?;
             gemm_dispatch(
                 h4,
                 in_dim,
