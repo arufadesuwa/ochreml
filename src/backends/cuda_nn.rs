@@ -231,6 +231,22 @@ struct NnPtxFuncs {
     row_rmsnorm_bwd_dx_f32: CuFunction,
     row_rmsnorm_bwd_dg_f32: CuFunction,
     dropout_fwd_f32: CuFunction,
+    // Wave 1: RNN/GRU/LSTM fused step kernels & Transformer VRAM kernels
+    rnn_step_fwd_f32: CuFunction,
+    rnn_step_bwd_f32: CuFunction,
+    gru_step_fwd_f32: CuFunction,
+    gru_step_bwd_f32: CuFunction,
+    lstm_step_fwd_f32: CuFunction,
+    lstm_step_bwd_f32: CuFunction,
+    rope_fwd_bwd_f32: CuFunction,
+    swiglu_fwd_f32: CuFunction,
+    swiglu_bwd_f32: CuFunction,
+    flash_sdpa_fwd_f32: CuFunction,
+    flash_sdpa_bwd_dq_f32: CuFunction,
+    flash_sdpa_bwd_dkv_f32: CuFunction,
+    embedding_scatter_add_f32: CuFunction,
+    bshd_to_bhsd_f32: CuFunction,
+    bhsd_to_bshd_f32: CuFunction,
 }
 
 struct CudaNnCtxState {
@@ -3423,6 +3439,1967 @@ RNBG_DONE:
 DO_DONE:
     ret;
 }
+
+.visible .entry ochre_rnn_step_fwd_f32(
+    .param .u64 p_x_proj,
+    .param .u64 p_h_proj,
+    .param .u64 p_bias,
+    .param .u64 p_h_cur,
+    .param .u64 p_layer_out,
+    .param .u64 p_batch,
+    .param .u64 p_seq_len,
+    .param .u64 p_h,
+    .param .u64 p_out_dim,
+    .param .u64 p_t,
+    .param .u64 p_dir_off,
+    .param .u32 p_nonlin,
+    .param .u32 p_has_bias
+)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<12>;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
+    cvt.u64.u32 %rd1, %r1;         // idx = b * h + j
+    ld.param.u64 %rd2, [p_batch];
+    ld.param.u64 %rd3, [p_h];
+    mul.lo.u64 %rd4, %rd2, %rd3;   // bh
+    setp.ge.u64 %p1, %rd1, %rd4;
+    @%p1 bra RSF_DONE;
+
+    div.u64 %rd5, %rd1, %rd3;      // b
+    rem.u64 %rd6, %rd1, %rd3;      // j
+    ld.param.u64 %rd7, [p_seq_len];
+    ld.param.u64 %rd8, [p_t];
+    mul.lo.u64 %rd9, %rd5, %rd7;
+    add.u64 %rd9, %rd9, %rd8;      // b * seq_len + t
+
+    // x_proj[(b * seq_len + t) * h + j]
+    mul.lo.u64 %rd10, %rd9, %rd3;
+    add.u64 %rd10, %rd10, %rd6;
+    shl.b64 %rd10, %rd10, 2;
+    ld.param.u64 %rd11, [p_x_proj];
+    add.u64 %rd11, %rd11, %rd10;
+    ld.global.f32 %f1, [%rd11];
+
+    // h_proj[idx]
+    shl.b64 %rd12, %rd1, 2;
+    ld.param.u64 %rd11, [p_h_proj];
+    add.u64 %rd11, %rd11, %rd12;
+    ld.global.f32 %f2, [%rd11];
+    add.f32 %f1, %f1, %f2;
+
+    ld.param.u32 %r4, [p_has_bias];
+    setp.eq.u32 %p2, %r4, 0;
+    @%p2 bra RSF_ACT;
+    ld.param.u64 %rd11, [p_bias];
+    shl.b64 %rd13, %rd6, 2;
+    add.u64 %rd11, %rd11, %rd13;
+    ld.global.f32 %f3, [%rd11];
+    add.f32 %f1, %f1, %f3;
+
+RSF_ACT:
+    ld.param.u32 %r5, [p_nonlin];
+    setp.ne.u32 %p3, %r5, 0;
+    @%p3 bra RSF_RELU;
+
+    // Tanh via clamped ex2(2u * log2(e))
+    add.f32 %f4, %f1, %f1;
+    mov.f32 %f5, 0fC2200000;       // -40.0
+    mov.f32 %f6, 0f42200000;       // +40.0
+    max.f32 %f4, %f4, %f5;
+    min.f32 %f4, %f4, %f6;
+    mov.f32 %f7, 0f3FB8AA3B;       // log2(e)
+    mul.f32 %f4, %f4, %f7;
+    ex2.approx.f32 %f8, %f4;
+    mov.f32 %f9, 0f3F800000;       // 1.0
+    sub.f32 %f10, %f8, %f9;
+    add.f32 %f11, %f8, %f9;
+    div.rn.f32 %f1, %f10, %f11;
+    bra RSF_STORE;
+
+RSF_RELU:
+    mov.f32 %f4, 0f00000000;
+    max.f32 %f1, %f1, %f4;
+
+RSF_STORE:
+    ld.param.u64 %rd11, [p_h_cur];
+    add.u64 %rd11, %rd11, %rd12;
+    st.global.f32 [%rd11], %f1;
+
+    ld.param.u64 %rd14, [p_out_dim];
+    ld.param.u64 %rd15, [p_dir_off];
+    mul.lo.u64 %rd10, %rd9, %rd14;
+    add.u64 %rd10, %rd10, %rd15;
+    add.u64 %rd10, %rd10, %rd6;
+    shl.b64 %rd10, %rd10, 2;
+    ld.param.u64 %rd11, [p_layer_out];
+    add.u64 %rd11, %rd11, %rd10;
+    st.global.f32 [%rd11], %f1;
+RSF_DONE:
+    ret;
+}
+
+.visible .entry ochre_rnn_step_bwd_f32(
+    .param .u64 p_d_out,
+    .param .u64 p_dh_next,
+    .param .u64 p_h_cur,
+    .param .u64 p_da_step,
+    .param .u64 p_da_all,
+    .param .u64 p_batch,
+    .param .u64 p_seq_len,
+    .param .u64 p_h,
+    .param .u64 p_out_dim,
+    .param .u64 p_t,
+    .param .u64 p_dir_off,
+    .param .u32 p_nonlin
+)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<7>;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
+    cvt.u64.u32 %rd1, %r1;
+    ld.param.u64 %rd2, [p_batch];
+    ld.param.u64 %rd3, [p_h];
+    mul.lo.u64 %rd4, %rd2, %rd3;
+    setp.ge.u64 %p1, %rd1, %rd4;
+    @%p1 bra RSB_DONE;
+
+    div.u64 %rd5, %rd1, %rd3;      // b
+    rem.u64 %rd6, %rd1, %rd3;      // j
+    ld.param.u64 %rd7, [p_seq_len];
+    ld.param.u64 %rd8, [p_t];
+    mul.lo.u64 %rd9, %rd5, %rd7;
+    add.u64 %rd9, %rd9, %rd8;      // b * seq_len + t
+
+    ld.param.u64 %rd10, [p_out_dim];
+    ld.param.u64 %rd11, [p_dir_off];
+    mul.lo.u64 %rd12, %rd9, %rd10;
+    add.u64 %rd12, %rd12, %rd11;
+    add.u64 %rd12, %rd12, %rd6;
+    shl.b64 %rd12, %rd12, 2;
+    ld.param.u64 %rd13, [p_d_out];
+    add.u64 %rd13, %rd13, %rd12;
+    ld.global.f32 %f1, [%rd13];    // d_out
+
+    shl.b64 %rd14, %rd1, 2;
+    ld.param.u64 %rd13, [p_dh_next];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f2, [%rd13];    // dh_next
+    add.f32 %f1, %f1, %f2;         // dh
+
+    ld.param.u64 %rd13, [p_h_cur];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f3, [%rd13];    // y = h_cur
+
+    ld.param.u32 %r4, [p_nonlin];
+    setp.ne.u32 %p2, %r4, 0;
+    @%p2 bra RSB_RELU;
+
+    // Tanh derivative: dh * (1 - y*y)
+    mov.f32 %f4, 0f3F800000;
+    mul.f32 %f5, %f3, %f3;
+    sub.f32 %f5, %f4, %f5;
+    mul.f32 %f6, %f1, %f5;
+    bra RSB_STORE;
+
+RSB_RELU:
+    mov.f32 %f4, 0f00000000;
+    setp.gt.f32 %p3, %f3, %f4;
+    selp.f32 %f6, %f1, %f4, %p3;
+
+RSB_STORE:
+    ld.param.u64 %rd13, [p_da_step];
+    add.u64 %rd13, %rd13, %rd14;
+    st.global.f32 [%rd13], %f6;
+
+    mul.lo.u64 %rd15, %rd9, %rd3;
+    add.u64 %rd15, %rd15, %rd6;
+    shl.b64 %rd15, %rd15, 2;
+    ld.param.u64 %rd13, [p_da_all];
+    add.u64 %rd13, %rd13, %rd15;
+    st.global.f32 [%rd13], %f6;
+RSB_DONE:
+    ret;
+}
+
+.visible .entry ochre_gru_step_fwd_f32(
+    .param .u64 p_gi_all,
+    .param .u64 p_gh,
+    .param .u64 p_biases,
+    .param .u64 p_h_prev,
+    .param .u64 p_h_cur,
+    .param .u64 p_layer_out,
+    .param .u64 p_r_out,
+    .param .u64 p_z_out,
+    .param .u64 p_n_out,
+    .param .u64 p_ghn_out,
+    .param .u64 p_batch,
+    .param .u64 p_seq_len,
+    .param .u64 p_h,
+    .param .u64 p_out_dim,
+    .param .u64 p_t,
+    .param .u64 p_dir_off,
+    .param .u32 p_save_cache
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<18>;
+    .reg .f32 %f<24>;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
+    cvt.u64.u32 %rd1, %r1;         // idx = b * h + j
+    ld.param.u64 %rd2, [p_batch];
+    ld.param.u64 %rd3, [p_h];
+    mul.lo.u64 %rd4, %rd2, %rd3;
+    setp.ge.u64 %p1, %rd1, %rd4;
+    @%p1 bra GSF_DONE;
+
+    div.u64 %rd5, %rd1, %rd3;      // b
+    rem.u64 %rd6, %rd1, %rd3;      // j
+    ld.param.u64 %rd7, [p_seq_len];
+    ld.param.u64 %rd8, [p_t];
+    mul.lo.u64 %rd9, %rd5, %rd7;
+    add.u64 %rd9, %rd9, %rd8;      // bt = b * seq_len + t
+
+    mul.lo.u64 %rd10, %rd3, 3;     // h3 = 3 * h
+    mul.lo.u64 %rd11, %rd9, %rd10;
+    add.u64 %rd11, %rd11, %rd6;
+    shl.b64 %rd11, %rd11, 2;       // gi byte offset for gate 0
+    mul.lo.u64 %rd12, %rd5, %rd10;
+    add.u64 %rd12, %rd12, %rd6;
+    shl.b64 %rd12, %rd12, 2;       // gh byte offset for gate 0
+    shl.b64 %rd13, %rd3, 2;        // h_bytes = h * 4
+
+    ld.param.u64 %rd14, [p_gi_all];
+    add.u64 %rd14, %rd14, %rd11;
+    ld.param.u64 %rd15, [p_gh];
+    add.u64 %rd15, %rd15, %rd12;
+    ld.param.u64 %rd16, [p_biases];
+    shl.b64 %rd17, %rd6, 2;
+    add.u64 %rd16, %rd16, %rd17;   // &biases[j]
+
+    // Constants
+    mov.f32 %f16, 0fC2A00000;      // -80.0
+    mov.f32 %f17, 0f42A00000;      // +80.0
+    mov.f32 %f18, 0f3FB8AA3B;      // log2(e)
+    mov.f32 %f19, 0f3F800000;      // 1.0
+
+    // Gate r = sigmoid(gi[0] + gh[0] + br_sum[j])
+    ld.global.f32 %f1, [%rd14];
+    ld.global.f32 %f2, [%rd15];
+    ld.global.f32 %f3, [%rd16];
+    add.f32 %f1, %f1, %f2;
+    add.f32 %f1, %f1, %f3;
+    neg.f32 %f4, %f1;
+    max.f32 %f4, %f4, %f16;
+    min.f32 %f4, %f4, %f17;
+    mul.f32 %f4, %f4, %f18;
+    ex2.approx.f32 %f4, %f4;
+    add.f32 %f4, %f19, %f4;
+    div.rn.f32 %f20, %f19, %f4;    // r
+
+    // Gate z = sigmoid(gi[h] + gh[h] + bz_sum[j])
+    add.u64 %rd14, %rd14, %rd13;
+    add.u64 %rd15, %rd15, %rd13;
+    add.u64 %rd16, %rd16, %rd13;
+    ld.global.f32 %f1, [%rd14];
+    ld.global.f32 %f2, [%rd15];
+    ld.global.f32 %f3, [%rd16];
+    add.f32 %f1, %f1, %f2;
+    add.f32 %f1, %f1, %f3;
+    neg.f32 %f4, %f1;
+    max.f32 %f4, %f4, %f16;
+    min.f32 %f4, %f4, %f17;
+    mul.f32 %f4, %f4, %f18;
+    ex2.approx.f32 %f4, %f4;
+    add.f32 %f4, %f19, %f4;
+    div.rn.f32 %f21, %f19, %f4;    // z
+
+    // Gate n: ghn = gh[2h] + bh_n[j], n = tanh(gi[2h] + bi_n[j] + r * ghn)
+    add.u64 %rd14, %rd14, %rd13;
+    add.u64 %rd15, %rd15, %rd13;
+    add.u64 %rd16, %rd16, %rd13;   // bi_n[j]
+    ld.global.f32 %f1, [%rd14];    // gi[2h]
+    ld.global.f32 %f2, [%rd15];    // gh[2h]
+    ld.global.f32 %f3, [%rd16];    // bi_n
+    add.u64 %rd16, %rd16, %rd13;   // bh_n[j]
+    ld.global.f32 %f5, [%rd16];    // bh_n
+    add.f32 %f22, %f2, %f5;        // ghn
+    add.f32 %f1, %f1, %f3;
+    fma.rn.f32 %f1, %f20, %f22, %f1; // pre_n
+    add.f32 %f6, %f1, %f1;
+    mov.f32 %f7, 0fC2200000;       // -40.0
+    mov.f32 %f8, 0f42200000;       // +40.0
+    max.f32 %f6, %f6, %f7;
+    min.f32 %f6, %f6, %f8;
+    mul.f32 %f6, %f6, %f18;
+    ex2.approx.f32 %f6, %f6;
+    sub.f32 %f9, %f6, %f19;
+    add.f32 %f10, %f6, %f19;
+    div.rn.f32 %f23, %f9, %f10;    // n
+
+    // h_cur = (1 - z) * n + z * h_prev
+    shl.b64 %rd17, %rd1, 2;
+    ld.param.u64 %rd14, [p_h_prev];
+    add.u64 %rd14, %rd14, %rd17;
+    ld.global.f32 %f11, [%rd14];   // h_prev
+    sub.f32 %f12, %f19, %f21;      // 1 - z
+    mul.f32 %f13, %f12, %f23;
+    fma.rn.f32 %f13, %f21, %f11, %f13; // h_cur
+
+    ld.param.u64 %rd14, [p_h_cur];
+    add.u64 %rd14, %rd14, %rd17;
+    st.global.f32 [%rd14], %f13;
+
+    ld.param.u64 %rd14, [p_out_dim];
+    ld.param.u64 %rd15, [p_dir_off];
+    mul.lo.u64 %rd11, %rd9, %rd14;
+    add.u64 %rd11, %rd11, %rd15;
+    add.u64 %rd11, %rd11, %rd6;
+    shl.b64 %rd11, %rd11, 2;
+    ld.param.u64 %rd16, [p_layer_out];
+    add.u64 %rd16, %rd16, %rd11;
+    st.global.f32 [%rd16], %f13;
+
+    ld.param.u32 %r4, [p_save_cache];
+    setp.eq.u32 %p2, %r4, 0;
+    @%p2 bra GSF_DONE;
+
+    ld.param.u64 %rd14, [p_r_out];
+    add.u64 %rd14, %rd14, %rd17;
+    st.global.f32 [%rd14], %f20;
+    ld.param.u64 %rd14, [p_z_out];
+    add.u64 %rd14, %rd14, %rd17;
+    st.global.f32 [%rd14], %f21;
+    ld.param.u64 %rd14, [p_n_out];
+    add.u64 %rd14, %rd14, %rd17;
+    st.global.f32 [%rd14], %f23;
+    ld.param.u64 %rd14, [p_ghn_out];
+    add.u64 %rd14, %rd14, %rd17;
+    st.global.f32 [%rd14], %f22;
+GSF_DONE:
+    ret;
+}
+
+.visible .entry ochre_gru_step_bwd_f32(
+    .param .u64 p_d_out,
+    .param .u64 p_dh_next,
+    .param .u64 p_h_prev,
+    .param .u64 p_r,
+    .param .u64 p_z,
+    .param .u64 p_n,
+    .param .u64 p_ghn,
+    .param .u64 p_dgi_all,
+    .param .u64 p_dgh_step,
+    .param .u64 p_batch,
+    .param .u64 p_seq_len,
+    .param .u64 p_h,
+    .param .u64 p_out_dim,
+    .param .u64 p_t,
+    .param .u64 p_dir_off
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<18>;
+    .reg .f32 %f<19>;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
+    cvt.u64.u32 %rd1, %r1;
+    ld.param.u64 %rd2, [p_batch];
+    ld.param.u64 %rd3, [p_h];
+    mul.lo.u64 %rd4, %rd2, %rd3;
+    setp.ge.u64 %p1, %rd1, %rd4;
+    @%p1 bra GSB_DONE;
+
+    div.u64 %rd5, %rd1, %rd3;      // b
+    rem.u64 %rd6, %rd1, %rd3;      // j
+    ld.param.u64 %rd7, [p_seq_len];
+    ld.param.u64 %rd8, [p_t];
+    mul.lo.u64 %rd9, %rd5, %rd7;
+    add.u64 %rd9, %rd9, %rd8;      // bt
+
+    ld.param.u64 %rd10, [p_out_dim];
+    ld.param.u64 %rd11, [p_dir_off];
+    mul.lo.u64 %rd12, %rd9, %rd10;
+    add.u64 %rd12, %rd12, %rd11;
+    add.u64 %rd12, %rd12, %rd6;
+    shl.b64 %rd12, %rd12, 2;
+    ld.param.u64 %rd13, [p_d_out];
+    add.u64 %rd13, %rd13, %rd12;
+    ld.global.f32 %f1, [%rd13];    // d_out
+
+    shl.b64 %rd14, %rd1, 2;
+    ld.param.u64 %rd15, [p_dh_next];
+    add.u64 %rd15, %rd15, %rd14;
+    ld.global.f32 %f2, [%rd15];    // dh_next
+    add.f32 %f1, %f1, %f2;         // dh
+
+    ld.param.u64 %rd13, [p_h_prev];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f3, [%rd13];    // hp
+    ld.param.u64 %rd13, [p_r];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f4, [%rd13];    // r
+    ld.param.u64 %rd13, [p_z];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f5, [%rd13];    // z
+    ld.param.u64 %rd13, [p_n];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f6, [%rd13];    // n
+    ld.param.u64 %rd13, [p_ghn];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f7, [%rd13];    // ghn
+
+    mov.f32 %f8, 0f3F800000;       // 1.0
+    sub.f32 %f9, %f8, %f5;         // 1 - z
+    mul.f32 %f10, %f1, %f9;        // dn = dh * (1 - z)
+    sub.f32 %f11, %f3, %f6;        // hp - n
+    mul.f32 %f11, %f1, %f11;       // dz = dh * (hp - n)
+    mul.f32 %f12, %f6, %f6;
+    sub.f32 %f12, %f8, %f12;
+    mul.f32 %f13, %f10, %f12;      // da_n = dn * (1 - n^2)
+    mul.f32 %f14, %f13, %f7;       // dr = da_n * ghn
+    mul.f32 %f15, %f11, %f5;
+    mul.f32 %f15, %f15, %f9;       // da_z = dz * z * (1 - z)
+    sub.f32 %f16, %f8, %f4;        // 1 - r
+    mul.f32 %f16, %f4, %f16;
+    mul.f32 %f16, %f14, %f16;      // da_r = dr * r * (1 - r)
+    mul.f32 %f17, %f13, %f4;       // da_n * r
+    mul.f32 %f18, %f1, %f5;        // dh * z
+
+    // Update dh_next in-place with dh * z
+    st.global.f32 [%rd15], %f18;
+
+    // Store dgi_all[(bt)*3h + (0,h,2h) + j] and dgh_step[b*3h + (0,h,2h) + j]
+    mul.lo.u64 %rd10, %rd3, 3;     // 3h
+    shl.b64 %rd11, %rd3, 2;        // h * 4
+
+    mul.lo.u64 %rd12, %rd9, %rd10;
+    add.u64 %rd12, %rd12, %rd6;
+    shl.b64 %rd12, %rd12, 2;
+    ld.param.u64 %rd16, [p_dgi_all];
+    add.u64 %rd16, %rd16, %rd12;
+    st.global.f32 [%rd16], %f16;
+    add.u64 %rd16, %rd16, %rd11;
+    st.global.f32 [%rd16], %f15;
+    add.u64 %rd16, %rd16, %rd11;
+    st.global.f32 [%rd16], %f13;
+
+    mul.lo.u64 %rd12, %rd5, %rd10;
+    add.u64 %rd12, %rd12, %rd6;
+    shl.b64 %rd12, %rd12, 2;
+    ld.param.u64 %rd17, [p_dgh_step];
+    add.u64 %rd17, %rd17, %rd12;
+    st.global.f32 [%rd17], %f16;
+    add.u64 %rd17, %rd17, %rd11;
+    st.global.f32 [%rd17], %f15;
+    add.u64 %rd17, %rd17, %rd11;
+    st.global.f32 [%rd17], %f17;
+GSB_DONE:
+    ret;
+}
+
+.visible .entry ochre_lstm_step_fwd_f32(
+    .param .u64 p_gi_all,
+    .param .u64 p_gh,
+    .param .u64 p_b_total,
+    .param .u64 p_c_prev,
+    .param .u64 p_h_cur,
+    .param .u64 p_c_cur,
+    .param .u64 p_layer_out,
+    .param .u64 p_i_out,
+    .param .u64 p_f_out,
+    .param .u64 p_g_out,
+    .param .u64 p_o_out,
+    .param .u64 p_tc_out,
+    .param .u64 p_batch,
+    .param .u64 p_seq_len,
+    .param .u64 p_h,
+    .param .u64 p_out_dim,
+    .param .u64 p_t,
+    .param .u64 p_dir_off,
+    .param .u32 p_save_cache
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<18>;
+    .reg .f32 %f<26>;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
+    cvt.u64.u32 %rd1, %r1;
+    ld.param.u64 %rd2, [p_batch];
+    ld.param.u64 %rd3, [p_h];
+    mul.lo.u64 %rd4, %rd2, %rd3;
+    setp.ge.u64 %p1, %rd1, %rd4;
+    @%p1 bra LSF_DONE;
+
+    div.u64 %rd5, %rd1, %rd3;      // b
+    rem.u64 %rd6, %rd1, %rd3;      // j
+    ld.param.u64 %rd7, [p_seq_len];
+    ld.param.u64 %rd8, [p_t];
+    mul.lo.u64 %rd9, %rd5, %rd7;
+    add.u64 %rd9, %rd9, %rd8;      // bt
+
+    shl.b64 %rd10, %rd3, 2;        // h4 = 4 * h (elements)
+    mul.lo.u64 %rd11, %rd9, %rd10;
+    add.u64 %rd11, %rd11, %rd6;
+    shl.b64 %rd11, %rd11, 2;
+    mul.lo.u64 %rd12, %rd5, %rd10;
+    add.u64 %rd12, %rd12, %rd6;
+    shl.b64 %rd12, %rd12, 2;
+    shl.b64 %rd13, %rd3, 2;        // h_bytes = h * 4
+
+    ld.param.u64 %rd14, [p_gi_all];
+    add.u64 %rd14, %rd14, %rd11;
+    ld.param.u64 %rd15, [p_gh];
+    add.u64 %rd15, %rd15, %rd12;
+    ld.param.u64 %rd16, [p_b_total];
+    shl.b64 %rd17, %rd6, 2;
+    add.u64 %rd16, %rd16, %rd17;
+
+    mov.f32 %f14, 0fC2A00000;      // -80.0
+    mov.f32 %f15, 0f42A00000;      // +80.0
+    mov.f32 %f16, 0fC2200000;      // -40.0
+    mov.f32 %f17, 0f42200000;      // +40.0
+    mov.f32 %f18, 0f3FB8AA3B;      // log2(e)
+    mov.f32 %f19, 0f3F800000;      // 1.0
+
+    // i = sigmoid(gi[0] + gh[0] + b[0])
+    ld.global.f32 %f1, [%rd14];
+    ld.global.f32 %f2, [%rd15];
+    ld.global.f32 %f3, [%rd16];
+    add.f32 %f1, %f1, %f2;
+    add.f32 %f1, %f1, %f3;
+    neg.f32 %f4, %f1;
+    max.f32 %f4, %f4, %f14;
+    min.f32 %f4, %f4, %f15;
+    mul.f32 %f4, %f4, %f18;
+    ex2.approx.f32 %f4, %f4;
+    add.f32 %f4, %f19, %f4;
+    div.rn.f32 %f20, %f19, %f4;    // iv
+
+    // f = sigmoid(gi[h] + gh[h] + b[h])
+    add.u64 %rd14, %rd14, %rd13;
+    add.u64 %rd15, %rd15, %rd13;
+    add.u64 %rd16, %rd16, %rd13;
+    ld.global.f32 %f1, [%rd14];
+    ld.global.f32 %f2, [%rd15];
+    ld.global.f32 %f3, [%rd16];
+    add.f32 %f1, %f1, %f2;
+    add.f32 %f1, %f1, %f3;
+    neg.f32 %f4, %f1;
+    max.f32 %f4, %f4, %f14;
+    min.f32 %f4, %f4, %f15;
+    mul.f32 %f4, %f4, %f18;
+    ex2.approx.f32 %f4, %f4;
+    add.f32 %f4, %f19, %f4;
+    div.rn.f32 %f21, %f19, %f4;    // fv
+
+    // g = tanh(gi[2h] + gh[2h] + b[2h])
+    add.u64 %rd14, %rd14, %rd13;
+    add.u64 %rd15, %rd15, %rd13;
+    add.u64 %rd16, %rd16, %rd13;
+    ld.global.f32 %f1, [%rd14];
+    ld.global.f32 %f2, [%rd15];
+    ld.global.f32 %f3, [%rd16];
+    add.f32 %f1, %f1, %f2;
+    add.f32 %f1, %f1, %f3;
+    add.f32 %f4, %f1, %f1;
+    max.f32 %f4, %f4, %f16;
+    min.f32 %f4, %f4, %f17;
+    mul.f32 %f4, %f4, %f18;
+    ex2.approx.f32 %f4, %f4;
+    sub.f32 %f5, %f4, %f19;
+    add.f32 %f6, %f4, %f19;
+    div.rn.f32 %f22, %f5, %f6;     // gv
+
+    // o = sigmoid(gi[3h] + gh[3h] + b[3h])
+    add.u64 %rd14, %rd14, %rd13;
+    add.u64 %rd15, %rd15, %rd13;
+    add.u64 %rd16, %rd16, %rd13;
+    ld.global.f32 %f1, [%rd14];
+    ld.global.f32 %f2, [%rd15];
+    ld.global.f32 %f3, [%rd16];
+    add.f32 %f1, %f1, %f2;
+    add.f32 %f1, %f1, %f3;
+    neg.f32 %f4, %f1;
+    max.f32 %f4, %f4, %f14;
+    min.f32 %f4, %f4, %f15;
+    mul.f32 %f4, %f4, %f18;
+    ex2.approx.f32 %f4, %f4;
+    add.f32 %f4, %f19, %f4;
+    div.rn.f32 %f23, %f19, %f4;    // ov
+
+    // c_new = fv * c_prev + iv * gv, tc = tanh(c_new), h_new = ov * tc
+    shl.b64 %rd17, %rd1, 2;
+    ld.param.u64 %rd14, [p_c_prev];
+    add.u64 %rd14, %rd14, %rd17;
+    ld.global.f32 %f7, [%rd14];    // c_prev
+    mul.f32 %f8, %f21, %f7;
+    fma.rn.f32 %f8, %f20, %f22, %f8; // c_new
+
+    add.f32 %f4, %f8, %f8;
+    max.f32 %f4, %f4, %f16;
+    min.f32 %f4, %f4, %f17;
+    mul.f32 %f4, %f4, %f18;
+    ex2.approx.f32 %f4, %f4;
+    sub.f32 %f5, %f4, %f19;
+    add.f32 %f6, %f4, %f19;
+    div.rn.f32 %f24, %f5, %f6;     // tc = tanh(c_new)
+    mul.f32 %f25, %f23, %f24;      // h_new = ov * tc
+
+    ld.param.u64 %rd14, [p_c_cur];
+    add.u64 %rd14, %rd14, %rd17;
+    st.global.f32 [%rd14], %f8;
+
+    ld.param.u64 %rd14, [p_h_cur];
+    add.u64 %rd14, %rd14, %rd17;
+    st.global.f32 [%rd14], %f25;
+
+    ld.param.u64 %rd14, [p_out_dim];
+    ld.param.u64 %rd15, [p_dir_off];
+    mul.lo.u64 %rd11, %rd9, %rd14;
+    add.u64 %rd11, %rd11, %rd15;
+    add.u64 %rd11, %rd11, %rd6;
+    shl.b64 %rd11, %rd11, 2;
+    ld.param.u64 %rd16, [p_layer_out];
+    add.u64 %rd16, %rd16, %rd11;
+    st.global.f32 [%rd16], %f25;
+
+    ld.param.u32 %r4, [p_save_cache];
+    setp.eq.u32 %p2, %r4, 0;
+    @%p2 bra LSF_DONE;
+
+    ld.param.u64 %rd14, [p_i_out];
+    add.u64 %rd14, %rd14, %rd17;
+    st.global.f32 [%rd14], %f20;
+    ld.param.u64 %rd14, [p_f_out];
+    add.u64 %rd14, %rd14, %rd17;
+    st.global.f32 [%rd14], %f21;
+    ld.param.u64 %rd14, [p_g_out];
+    add.u64 %rd14, %rd14, %rd17;
+    st.global.f32 [%rd14], %f22;
+    ld.param.u64 %rd14, [p_o_out];
+    add.u64 %rd14, %rd14, %rd17;
+    st.global.f32 [%rd14], %f23;
+    ld.param.u64 %rd14, [p_tc_out];
+    add.u64 %rd14, %rd14, %rd17;
+    st.global.f32 [%rd14], %f24;
+LSF_DONE:
+    ret;
+}
+
+.visible .entry ochre_lstm_step_bwd_f32(
+    .param .u64 p_d_out,
+    .param .u64 p_dh_next,
+    .param .u64 p_dc_next,
+    .param .u64 p_c_prev,
+    .param .u64 p_i,
+    .param .u64 p_f,
+    .param .u64 p_g,
+    .param .u64 p_o,
+    .param .u64 p_tc,
+    .param .u64 p_dg_all,
+    .param .u64 p_dg_step,
+    .param .u64 p_batch,
+    .param .u64 p_seq_len,
+    .param .u64 p_h,
+    .param .u64 p_out_dim,
+    .param .u64 p_t,
+    .param .u64 p_dir_off
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<18>;
+    .reg .f32 %f<20>;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
+    cvt.u64.u32 %rd1, %r1;
+    ld.param.u64 %rd2, [p_batch];
+    ld.param.u64 %rd3, [p_h];
+    mul.lo.u64 %rd4, %rd2, %rd3;
+    setp.ge.u64 %p1, %rd1, %rd4;
+    @%p1 bra LSB_DONE;
+
+    div.u64 %rd5, %rd1, %rd3;      // b
+    rem.u64 %rd6, %rd1, %rd3;      // j
+    ld.param.u64 %rd7, [p_seq_len];
+    ld.param.u64 %rd8, [p_t];
+    mul.lo.u64 %rd9, %rd5, %rd7;
+    add.u64 %rd9, %rd9, %rd8;      // bt
+
+    ld.param.u64 %rd10, [p_out_dim];
+    ld.param.u64 %rd11, [p_dir_off];
+    mul.lo.u64 %rd12, %rd9, %rd10;
+    add.u64 %rd12, %rd12, %rd11;
+    add.u64 %rd12, %rd12, %rd6;
+    shl.b64 %rd12, %rd12, 2;
+    ld.param.u64 %rd13, [p_d_out];
+    add.u64 %rd13, %rd13, %rd12;
+    ld.global.f32 %f1, [%rd13];    // d_out
+
+    shl.b64 %rd14, %rd1, 2;
+    ld.param.u64 %rd13, [p_dh_next];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f2, [%rd13];    // dh_next
+    add.f32 %f1, %f1, %f2;         // dh
+
+    ld.param.u64 %rd15, [p_dc_next];
+    add.u64 %rd15, %rd15, %rd14;
+    ld.global.f32 %f3, [%rd15];    // dc_next
+
+    ld.param.u64 %rd13, [p_c_prev];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f4, [%rd13];    // cp
+    ld.param.u64 %rd13, [p_i];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f5, [%rd13];    // iv
+    ld.param.u64 %rd13, [p_f];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f6, [%rd13];    // fv
+    ld.param.u64 %rd13, [p_g];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f7, [%rd13];    // gv
+    ld.param.u64 %rd13, [p_o];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f8, [%rd13];    // ov
+    ld.param.u64 %rd13, [p_tc];
+    add.u64 %rd13, %rd13, %rd14;
+    ld.global.f32 %f9, [%rd13];    // tc
+
+    mov.f32 %f10, 0f3F800000;      // 1.0
+    mul.f32 %f11, %f1, %f9;        // do_v = dh * tc
+    mul.f32 %f12, %f9, %f9;
+    sub.f32 %f12, %f10, %f12;      // 1 - tc^2
+    mul.f32 %f12, %f8, %f12;       // ov * (1 - tc^2)
+    fma.rn.f32 %f13, %f1, %f12, %f3; // dc = dh * ov * (1 - tc^2) + dc_next
+
+    // da_i = dc * gv * iv * (1 - iv)
+    sub.f32 %f14, %f10, %f5;
+    mul.f32 %f14, %f5, %f14;
+    mul.f32 %f14, %f7, %f14;
+    mul.f32 %f14, %f13, %f14;
+
+    // da_f = dc * cp * fv * (1 - fv)
+    sub.f32 %f15, %f10, %f6;
+    mul.f32 %f15, %f6, %f15;
+    mul.f32 %f15, %f4, %f15;
+    mul.f32 %f15, %f13, %f15;
+
+    // da_g = dc * iv * (1 - gv^2)
+    mul.f32 %f16, %f7, %f7;
+    sub.f32 %f16, %f10, %f16;
+    mul.f32 %f16, %f5, %f16;
+    mul.f32 %f16, %f13, %f16;
+
+    // da_o = do_v * ov * (1 - ov)
+    sub.f32 %f17, %f10, %f8;
+    mul.f32 %f17, %f8, %f17;
+    mul.f32 %f17, %f11, %f17;
+
+    // dc_next = dc * fv
+    mul.f32 %f18, %f13, %f6;
+    st.global.f32 [%rd15], %f18;
+
+    shl.b64 %rd10, %rd3, 2;        // 4h elements
+    shl.b64 %rd11, %rd3, 2;        // h * 4 bytes
+
+    mul.lo.u64 %rd12, %rd9, %rd10;
+    add.u64 %rd12, %rd12, %rd6;
+    shl.b64 %rd12, %rd12, 2;
+    ld.param.u64 %rd16, [p_dg_all];
+    add.u64 %rd16, %rd16, %rd12;
+    st.global.f32 [%rd16], %f14;
+    add.u64 %rd16, %rd16, %rd11;
+    st.global.f32 [%rd16], %f15;
+    add.u64 %rd16, %rd16, %rd11;
+    st.global.f32 [%rd16], %f16;
+    add.u64 %rd16, %rd16, %rd11;
+    st.global.f32 [%rd16], %f17;
+
+    mul.lo.u64 %rd12, %rd5, %rd10;
+    add.u64 %rd12, %rd12, %rd6;
+    shl.b64 %rd12, %rd12, 2;
+    ld.param.u64 %rd17, [p_dg_step];
+    add.u64 %rd17, %rd17, %rd12;
+    st.global.f32 [%rd17], %f14;
+    add.u64 %rd17, %rd17, %rd11;
+    st.global.f32 [%rd17], %f15;
+    add.u64 %rd17, %rd17, %rd11;
+    st.global.f32 [%rd17], %f16;
+    add.u64 %rd17, %rd17, %rd11;
+    st.global.f32 [%rd17], %f17;
+LSB_DONE:
+    ret;
+}
+
+.visible .entry ochre_rope_fwd_bwd_f32(
+    .param .u64 p_data,
+    .param .u64 p_cos,
+    .param .u64 p_sin,
+    .param .u64 p_total_pairs,
+    .param .u64 p_seq_len,
+    .param .u64 p_half_dim,
+    .param .u64 p_offset,
+    .param .u32 p_inverse
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<15>;
+    .reg .f32 %f<8>;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
+    cvt.u64.u32 %rd1, %r1;         // pair idx
+    ld.param.u64 %rd2, [p_total_pairs];
+    setp.ge.u64 %p1, %rd1, %rd2;
+    @%p1 bra ROPE_DONE;
+
+    ld.param.u64 %rd3, [p_half_dim];
+    ld.param.u64 %rd4, [p_seq_len];
+    ld.param.u64 %rd5, [p_offset];
+
+    rem.u64 %rd6, %rd1, %rd3;      // d in 0..half
+    div.u64 %rd7, %rd1, %rd3;      // token_idx
+    rem.u64 %rd8, %rd7, %rd4;      // s in 0..seq_len
+    add.u64 %rd8, %rd8, %rd5;      // pos = offset + s
+
+    // cos/sin offset: (pos * half + d) * 4
+    mul.lo.u64 %rd9, %rd8, %rd3;
+    add.u64 %rd9, %rd9, %rd6;
+    shl.b64 %rd9, %rd9, 2;
+    ld.param.u64 %rd10, [p_cos];
+    add.u64 %rd10, %rd10, %rd9;
+    ld.global.f32 %f3, [%rd10];    // c
+    ld.param.u64 %rd10, [p_sin];
+    add.u64 %rd10, %rd10, %rd9;
+    ld.global.f32 %f4, [%rd10];    // sn
+
+    // data offsets: base0 = (token_idx * 2 * half + d) * 4, base1 = base0 + half * 4
+    shl.b64 %rd11, %rd3, 1;        // head_dim = 2 * half
+    mul.lo.u64 %rd12, %rd7, %rd11;
+    add.u64 %rd12, %rd12, %rd6;
+    shl.b64 %rd12, %rd12, 2;
+    ld.param.u64 %rd13, [p_data];
+    add.u64 %rd13, %rd13, %rd12;   // &data[base + d]
+    shl.b64 %rd14, %rd3, 2;        // half * 4
+    add.u64 %rd14, %rd13, %rd14;   // &data[base + half + d]
+
+    ld.global.f32 %f1, [%rd13];    // x0
+    ld.global.f32 %f2, [%rd14];    // x1
+
+    ld.param.u32 %r4, [p_inverse];
+    setp.ne.u32 %p2, %r4, 0;
+    @%p2 bra ROPE_INV;
+
+    // Forward: y0 = x0*c - x1*sn, y1 = x0*sn + x1*c
+    mul.f32 %f5, %f1, %f3;
+    mul.f32 %f6, %f2, %f4;
+    sub.f32 %f5, %f5, %f6;
+    mul.f32 %f7, %f1, %f4;
+    fma.rn.f32 %f7, %f2, %f3, %f7;
+    bra ROPE_STORE;
+
+ROPE_INV:
+    // Inverse: y0 = x0*c + x1*sn, y1 = -x0*sn + x1*c
+    mul.f32 %f5, %f1, %f3;
+    fma.rn.f32 %f5, %f2, %f4, %f5;
+    mul.f32 %f6, %f2, %f3;
+    mul.f32 %f7, %f1, %f4;
+    sub.f32 %f7, %f6, %f7;
+
+ROPE_STORE:
+    st.global.f32 [%rd13], %f5;
+    st.global.f32 [%rd14], %f7;
+ROPE_DONE:
+    ret;
+}
+
+.visible .entry ochre_swiglu_fwd_f32(
+    .param .u64 p_gate,
+    .param .u64 p_up,
+    .param .u64 p_out,
+    .param .u64 p_n
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<7>;
+    .reg .f32 %f<11>;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
+    cvt.u64.u32 %rd1, %r1;
+    ld.param.u64 %rd2, [p_n];
+    setp.ge.u64 %p1, %rd1, %rd2;
+    @%p1 bra SWF_DONE;
+
+    shl.b64 %rd3, %rd1, 2;
+    ld.param.u64 %rd4, [p_gate];
+    ld.param.u64 %rd5, [p_up];
+    ld.param.u64 %rd6, [p_out];
+    add.u64 %rd4, %rd4, %rd3;
+    add.u64 %rd5, %rd5, %rd3;
+    add.u64 %rd6, %rd6, %rd3;
+    ld.global.f32 %f1, [%rd4];     // g
+    ld.global.f32 %f2, [%rd5];     // u
+
+    neg.f32 %f3, %f1;
+    mov.f32 %f4, 0fC2A00000;       // -80.0
+    mov.f32 %f5, 0f42A00000;       // +80.0
+    max.f32 %f3, %f3, %f4;
+    min.f32 %f3, %f3, %f5;
+    mov.f32 %f6, 0f3FB8AA3B;       // log2(e)
+    mul.f32 %f3, %f3, %f6;
+    ex2.approx.f32 %f7, %f3;
+    mov.f32 %f8, 0f3F800000;
+    add.f32 %f9, %f8, %f7;
+    div.rn.f32 %f10, %f1, %f9;     // silu(g)
+    mul.f32 %f10, %f10, %f2;       // silu(g) * u
+    st.global.f32 [%rd6], %f10;
+SWF_DONE:
+    ret;
+}
+
+.visible .entry ochre_swiglu_bwd_f32(
+    .param .u64 p_dy,
+    .param .u64 p_gate,
+    .param .u64 p_up,
+    .param .u64 p_dgate,
+    .param .u64 p_dup,
+    .param .u64 p_n
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<9>;
+    .reg .f32 %f<16>;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
+    cvt.u64.u32 %rd1, %r1;
+    ld.param.u64 %rd2, [p_n];
+    setp.ge.u64 %p1, %rd1, %rd2;
+    @%p1 bra SWB_DONE;
+
+    shl.b64 %rd3, %rd1, 2;
+    ld.param.u64 %rd4, [p_dy];
+    ld.param.u64 %rd5, [p_gate];
+    ld.param.u64 %rd6, [p_up];
+    ld.param.u64 %rd7, [p_dgate];
+    ld.param.u64 %rd8, [p_dup];
+    add.u64 %rd4, %rd4, %rd3;
+    add.u64 %rd5, %rd5, %rd3;
+    add.u64 %rd6, %rd6, %rd3;
+    add.u64 %rd7, %rd7, %rd3;
+    add.u64 %rd8, %rd8, %rd3;
+
+    ld.global.f32 %f1, [%rd4];     // dy
+    ld.global.f32 %f2, [%rd5];     // g
+    ld.global.f32 %f3, [%rd6];     // u
+
+    neg.f32 %f4, %f2;
+    mov.f32 %f5, 0fC2A00000;
+    mov.f32 %f6, 0f42A00000;
+    max.f32 %f4, %f4, %f5;
+    min.f32 %f4, %f4, %f6;
+    mov.f32 %f7, 0f3FB8AA3B;
+    mul.f32 %f4, %f4, %f7;
+    ex2.approx.f32 %f8, %f4;
+    mov.f32 %f9, 0f3F800000;       // 1.0
+    add.f32 %f10, %f9, %f8;
+    div.rn.f32 %f11, %f9, %f10;    // sig
+
+    // dup = dy * g * sig
+    mul.f32 %f12, %f2, %f11;       // silu(g)
+    mul.f32 %f13, %f1, %f12;       // dup
+    st.global.f32 [%rd8], %f13;
+
+    // dgate = dy * u * sig * (1 + g * (1 - sig))
+    sub.f32 %f14, %f9, %f11;       // 1 - sig
+    fma.rn.f32 %f14, %f2, %f14, %f9; // 1 + g * (1 - sig)
+    mul.f32 %f15, %f11, %f14;      // dsilu
+    mul.f32 %f15, %f15, %f3;
+    mul.f32 %f15, %f15, %f1;
+    st.global.f32 [%rd7], %f15;
+SWB_DONE:
+    ret;
+}
+
+.visible .entry ochre_flash_sdpa_fwd_f32(
+    .param .u64 p_q,
+    .param .u64 p_k,
+    .param .u64 p_v,
+    .param .u64 p_out,
+    .param .u64 p_lse,
+    .param .u64 p_total_q_rows,
+    .param .u64 p_num_heads,
+    .param .u64 p_num_kv_heads,
+    .param .u64 p_q_len,
+    .param .u64 p_kv_len,
+    .param .u64 p_head_dim,
+    .param .u32 p_causal,
+    .param .u64 p_kv_offset,
+    .param .f32 p_scale
+)
+{
+    .shared .f32 smem_fsf_s[64];
+    .shared .f32 smem_fsf_p[64];
+    .shared .f32 smem_fsf_r[64];
+    .reg .pred %p<6>;
+    .reg .b32 %r<7>;
+    .reg .b64 %rd<26>;
+    .reg .f32 %f<18>;
+
+    mov.u32 %r4, %ctaid.x;         // row_idx = bh * q_len + qi
+    mov.u32 %r1, %tid.x;           // tid in 0..63
+    cvt.u64.u32 %rd1, %r4;
+    ld.param.u64 %rd2, [p_total_q_rows];
+    setp.ge.u64 %p1, %rd1, %rd2;
+    @%p1 bra FSF_DONE;
+
+    ld.param.u64 %rd3, [p_q_len];
+    ld.param.u64 %rd4, [p_kv_len];
+    ld.param.u64 %rd5, [p_head_dim];
+    ld.param.u64 %rd6, [p_num_heads];
+    ld.param.u64 %rd7, [p_num_kv_heads];
+
+    div.u64 %rd8, %rd1, %rd3;      // bh
+    rem.u64 %rd9, %rd1, %rd3;      // qi
+    div.u64 %rd10, %rd8, %rd6;     // b
+    rem.u64 %rd11, %rd8, %rd6;     // h
+    div.u64 %rd12, %rd6, %rd7;     // group_size
+    div.u64 %rd11, %rd11, %rd12;   // kv_h
+    mul.lo.u64 %rd10, %rd10, %rd7;
+    add.u64 %rd10, %rd10, %rd11;   // kv_bh = b * num_kv_heads + kv_h
+
+    // valid_kv = causal ? min(kv_offset + qi + 1, kv_len) : kv_len
+    mov.u64 %rd12, %rd4;
+    ld.param.u32 %r5, [p_causal];
+    setp.eq.u32 %p2, %r5, 0;
+    @%p2 bra FSF_VKV_OK;
+    ld.param.u64 %rd13, [p_kv_offset];
+    add.u64 %rd13, %rd13, %rd9;
+    add.u64 %rd13, %rd13, 1;
+    min.u64 %rd12, %rd12, %rd13;
+FSF_VKV_OK:
+
+    // Base pointers: q_row, out_row, k_head, v_head
+    mul.lo.u64 %rd14, %rd1, %rd5;
+    shl.b64 %rd14, %rd14, 2;
+    ld.param.u64 %rd15, [p_q];
+    add.u64 %rd15, %rd15, %rd14;   // q_row
+    ld.param.u64 %rd16, [p_out];
+    add.u64 %rd16, %rd16, %rd14;   // out_row
+
+    mul.lo.u64 %rd14, %rd10, %rd4;
+    mul.lo.u64 %rd14, %rd14, %rd5;
+    shl.b64 %rd14, %rd14, 2;
+    ld.param.u64 %rd17, [p_k];
+    add.u64 %rd17, %rd17, %rd14;   // k_head
+    ld.param.u64 %rd18, [p_v];
+    add.u64 %rd18, %rd18, %rd14;   // v_head
+
+    // Handle valid_kv == 0 uniformly
+    setp.ne.u64 %p2, %rd12, 0;
+    @%p2 bra FSF_INIT;
+    mov.f32 %f1, 0f00000000;
+    cvt.u64.u32 %rd19, %r1;
+FSF_ZERO:
+    setp.ge.u64 %p3, %rd19, %rd5;
+    @%p3 bra FSF_ZERO_LSE;
+    shl.b64 %rd20, %rd19, 2;
+    add.u64 %rd21, %rd16, %rd20;
+    st.global.f32 [%rd21], %f1;
+    add.u64 %rd19, %rd19, 64;
+    bra FSF_ZERO;
+FSF_ZERO_LSE:
+    setp.ne.u32 %p3, %r1, 0;
+    @%p3 bra FSF_DONE;
+    ld.param.u64 %rd20, [p_lse];
+    shl.b64 %rd21, %rd1, 2;
+    add.u64 %rd20, %rd20, %rd21;
+    mov.f32 %f2, 0fFF800000;       // -inf
+    st.global.f32 [%rd20], %f2;
+    bra FSF_DONE;
+
+FSF_INIT:
+    mov.f32 %f1, 0fFF800000;       // m_i = -inf
+    mov.f32 %f2, 0f00000000;       // l_i = 0.0
+    ld.param.f32 %f3, [p_scale];
+    mov.u64 %rd19, 0;              // j_start = 0
+    cvt.u64.u32 %rd24, %r1;        // tid u64
+    shl.b64 %rd25, %rd24, 2;       // tid * 4
+
+FSF_TILE:
+    setp.ge.u64 %p2, %rd19, %rd12;
+    @%p2 bra FSF_FINAL;
+
+    sub.u64 %rd20, %rd12, %rd19;
+    mov.u64 %rd21, 64;
+    min.u64 %rd20, %rd20, %rd21;   // bc = min(64, valid_kv - j_start)
+
+    // Each thread tid < bc computes score s_j = dot(q_row, k_head[j_start + tid]) * scale
+    mov.f32 %f4, 0fFF800000;       // s_j = -inf
+    setp.ge.u64 %p3, %rd24, %rd20;
+    @%p3 bra FSF_STORE_S;
+    add.u64 %rd21, %rd19, %rd24;   // kj = j_start + tid
+    mul.lo.u64 %rd21, %rd21, %rd5;
+    shl.b64 %rd21, %rd21, 2;
+    add.u64 %rd21, %rd17, %rd21;   // &k_head[kj * D]
+    mov.f32 %f4, 0f00000000;
+    mov.u64 %rd22, 0;
+FSF_DOT:
+    setp.ge.u64 %p4, %rd22, %rd5;
+    @%p4 bra FSF_DOT_END;
+    shl.b64 %rd23, %rd22, 2;
+    add.u64 %rd14, %rd15, %rd23;
+    ld.global.f32 %f5, [%rd14];
+    add.u64 %rd14, %rd21, %rd23;
+    ld.global.f32 %f6, [%rd14];
+    fma.rn.f32 %f4, %f5, %f6, %f4;
+    add.u64 %rd22, %rd22, 1;
+    bra FSF_DOT;
+FSF_DOT_END:
+    mul.f32 %f4, %f4, %f3;         // s_j = dot * scale
+
+FSF_STORE_S:
+    mov.u64 %rd21, smem_fsf_s;
+    add.u64 %rd21, %rd21, %rd25;
+    st.shared.f32 [%rd21], %f4;
+    mov.u64 %rd22, smem_fsf_r;
+    add.u64 %rd22, %rd22, %rd25;
+    st.shared.f32 [%rd22], %f4;
+    bar.sync 0;
+
+    // Tree max reduction over 64 threads
+    mov.u32 %r2, 32;
+FSF_MAX_TREE:
+    setp.eq.u32 %p4, %r2, 0;
+    @%p4 bra FSF_MAX_DONE;
+    setp.ge.u32 %p3, %r1, %r2;
+    @%p3 bra FSF_MAX_SYNC;
+    add.u32 %r3, %r1, %r2;
+    cvt.u64.u32 %rd23, %r3;
+    shl.b64 %rd23, %rd23, 2;
+    mov.u64 %rd14, smem_fsf_r;
+    add.u64 %rd14, %rd14, %rd23;
+    ld.shared.f32 %f5, [%rd14];
+    ld.shared.f32 %f6, [%rd22];
+    max.f32 %f6, %f6, %f5;
+    st.shared.f32 [%rd22], %f6;
+FSF_MAX_SYNC:
+    bar.sync 0;
+    shr.u32 %r2, %r2, 1;
+    bra FSF_MAX_TREE;
+
+FSF_MAX_DONE:
+    mov.u64 %rd14, smem_fsf_r;
+    ld.shared.f32 %f7, [%rd14];    // tile_max
+    max.f32 %f8, %f1, %f7;         // m_new = max(m_i, tile_max)
+
+    // alpha = (j_start == 0) ? 0.0 : exp(clamp(m_i - m_new, -80, 0))
+    mov.f32 %f9, 0f00000000;
+    setp.eq.u64 %p4, %rd19, 0;
+    @%p4 bra FSF_ALPHA_OK;
+    sub.f32 %f10, %f1, %f8;
+    mov.f32 %f11, 0fC2A00000;      // -80.0
+    max.f32 %f10, %f10, %f11;
+    mov.f32 %f12, 0f3FB8AA3B;      // log2(e)
+    mul.f32 %f10, %f10, %f12;
+    ex2.approx.f32 %f9, %f10;      // alpha
+FSF_ALPHA_OK:
+    bar.sync 0;
+
+    // Each thread computes p_j = (tid < bc) ? exp(clamp(s_j - m_new, -80, 0)) : 0.0
+    mov.f32 %f13, 0f00000000;
+    setp.ge.u64 %p3, %rd24, %rd20;
+    @%p3 bra FSF_STORE_P;
+    ld.shared.f32 %f4, [%rd21];    // s_j
+    sub.f32 %f10, %f4, %f8;
+    mov.f32 %f11, 0fC2A00000;
+    max.f32 %f10, %f10, %f11;
+    mov.f32 %f12, 0f3FB8AA3B;
+    mul.f32 %f10, %f10, %f12;
+    ex2.approx.f32 %f13, %f10;     // p_j
+FSF_STORE_P:
+    mov.u64 %rd21, smem_fsf_p;
+    add.u64 %rd21, %rd21, %rd25;
+    st.shared.f32 [%rd21], %f13;
+    st.shared.f32 [%rd22], %f13;
+    bar.sync 0;
+
+    // Tree sum reduction over 64 threads
+    mov.u32 %r2, 32;
+FSF_SUM_TREE:
+    setp.eq.u32 %p4, %r2, 0;
+    @%p4 bra FSF_SUM_DONE;
+    setp.ge.u32 %p3, %r1, %r2;
+    @%p3 bra FSF_SUM_SYNC;
+    add.u32 %r3, %r1, %r2;
+    cvt.u64.u32 %rd23, %r3;
+    shl.b64 %rd23, %rd23, 2;
+    mov.u64 %rd14, smem_fsf_r;
+    add.u64 %rd14, %rd14, %rd23;
+    ld.shared.f32 %f5, [%rd14];
+    ld.shared.f32 %f6, [%rd22];
+    add.f32 %f6, %f6, %f5;
+    st.shared.f32 [%rd22], %f6;
+FSF_SUM_SYNC:
+    bar.sync 0;
+    shr.u32 %r2, %r2, 1;
+    bra FSF_SUM_TREE;
+
+FSF_SUM_DONE:
+    mov.u64 %rd14, smem_fsf_r;
+    ld.shared.f32 %f14, [%rd14];   // tile_sum
+    fma.rn.f32 %f2, %f2, %f9, %f14; // l_i = l_i * alpha + tile_sum
+    mov.f32 %f1, %f8;              // m_i = m_new
+
+    // Accumulate O[qi, d] = O[qi, d] * alpha + sum(c=0..bc) smem_p[c] * V[j_start+c, d]
+    mov.u64 %rd22, %rd24;          // d = tid
+FSF_OUT_D:
+    setp.ge.u64 %p3, %rd22, %rd5;
+    @%p3 bra FSF_OUT_END;
+    shl.b64 %rd23, %rd22, 2;
+    add.u64 %rd14, %rd16, %rd23;   // &out_row[d]
+    mov.f32 %f15, 0f00000000;
+    setp.eq.u64 %p4, %rd19, 0;
+    @%p4 bra FSF_V_INIT;
+    ld.global.f32 %f15, [%rd14];
+    mul.f32 %f15, %f15, %f9;
+FSF_V_INIT:
+    mov.u64 %rd21, 0;              // c = 0
+FSF_V_LOOP:
+    setp.ge.u64 %p5, %rd21, %rd20;
+    @%p5 bra FSF_V_STORE;
+    shl.b64 %rd13, %rd21, 2;
+    mov.u64 %rd11, smem_fsf_p;
+    add.u64 %rd11, %rd11, %rd13;
+    ld.shared.f32 %f16, [%rd11];   // p_c
+    add.u64 %rd11, %rd19, %rd21;   // j_start + c
+    mul.lo.u64 %rd11, %rd11, %rd5;
+    add.u64 %rd11, %rd11, %rd22;
+    shl.b64 %rd11, %rd11, 2;
+    add.u64 %rd11, %rd18, %rd11;   // &v_head[(j_start+c)*D + d]
+    ld.global.f32 %f17, [%rd11];
+    fma.rn.f32 %f15, %f16, %f17, %f15;
+    add.u64 %rd21, %rd21, 1;
+    bra FSF_V_LOOP;
+FSF_V_STORE:
+    st.global.f32 [%rd14], %f15;
+    add.u64 %rd22, %rd22, 64;
+    bra FSF_OUT_D;
+
+FSF_OUT_END:
+    bar.sync 0;
+    add.u64 %rd19, %rd19, 64;
+    bra FSF_TILE;
+
+FSF_FINAL:
+    mov.f32 %f10, 0f3F800000;
+    div.rn.f32 %f11, %f10, %f2;    // inv_l = 1.0 / l_i
+    mov.u64 %rd22, %rd24;
+FSF_NORM_D:
+    setp.ge.u64 %p3, %rd22, %rd5;
+    @%p3 bra FSF_LSE;
+    shl.b64 %rd23, %rd22, 2;
+    add.u64 %rd14, %rd16, %rd23;
+    ld.global.f32 %f15, [%rd14];
+    mul.f32 %f15, %f15, %f11;
+    st.global.f32 [%rd14], %f15;
+    add.u64 %rd22, %rd22, 64;
+    bra FSF_NORM_D;
+
+FSF_LSE:
+    setp.ne.u32 %p3, %r1, 0;
+    @%p3 bra FSF_DONE;
+    lg2.approx.f32 %f12, %f2;
+    mov.f32 %f13, 0f3F317218;      // ln(2)
+    fma.rn.f32 %f12, %f12, %f13, %f1; // m_i + ln(l_i)
+    ld.param.u64 %rd20, [p_lse];
+    shl.b64 %rd21, %rd1, 2;
+    add.u64 %rd20, %rd20, %rd21;
+    st.global.f32 [%rd20], %f12;
+FSF_DONE:
+    ret;
+}
+
+.visible .entry ochre_flash_sdpa_bwd_dq_f32(
+    .param .u64 p_do,
+    .param .u64 p_q,
+    .param .u64 p_k,
+    .param .u64 p_v,
+    .param .u64 p_out,
+    .param .u64 p_lse,
+    .param .u64 p_d_row,
+    .param .u64 p_dq,
+    .param .u64 p_total_q_rows,
+    .param .u64 p_num_heads,
+    .param .u64 p_num_kv_heads,
+    .param .u64 p_q_len,
+    .param .u64 p_kv_len,
+    .param .u64 p_head_dim,
+    .param .u32 p_causal,
+    .param .u64 p_kv_offset,
+    .param .f32 p_scale
+)
+{
+    .shared .f32 smem_fsq_d[64];
+    .shared .f32 smem_fsq_ds[64];
+    .reg .pred %p<6>;
+    .reg .b32 %r<7>;
+    .reg .b64 %rd<28>;
+    .reg .f32 %f<16>;
+
+    mov.u32 %r4, %ctaid.x;         // row_idx = bh * q_len + qi
+    mov.u32 %r1, %tid.x;           // tid in 0..63
+    cvt.u64.u32 %rd1, %r4;
+    ld.param.u64 %rd2, [p_total_q_rows];
+    setp.ge.u64 %p1, %rd1, %rd2;
+    @%p1 bra FSQ_DONE;
+
+    ld.param.u64 %rd3, [p_q_len];
+    ld.param.u64 %rd4, [p_kv_len];
+    ld.param.u64 %rd5, [p_head_dim];
+    ld.param.u64 %rd6, [p_num_heads];
+    ld.param.u64 %rd7, [p_num_kv_heads];
+
+    div.u64 %rd8, %rd1, %rd3;      // bh
+    rem.u64 %rd9, %rd1, %rd3;      // qi
+    div.u64 %rd10, %rd8, %rd6;     // b
+    rem.u64 %rd11, %rd8, %rd6;     // h
+    div.u64 %rd12, %rd6, %rd7;     // group_size
+    div.u64 %rd11, %rd11, %rd12;   // kv_h
+    mul.lo.u64 %rd10, %rd10, %rd7;
+    add.u64 %rd10, %rd10, %rd11;   // kv_bh
+
+    // Base pointers
+    mul.lo.u64 %rd14, %rd1, %rd5;
+    shl.b64 %rd14, %rd14, 2;
+    ld.param.u64 %rd15, [p_q];
+    add.u64 %rd15, %rd15, %rd14;   // q_row
+    ld.param.u64 %rd16, [p_do];
+    add.u64 %rd16, %rd16, %rd14;   // do_row
+    ld.param.u64 %rd26, [p_out];
+    add.u64 %rd26, %rd26, %rd14;   // out_row
+    ld.param.u64 %rd27, [p_dq];
+    add.u64 %rd27, %rd27, %rd14;   // dq_row
+
+    cvt.u64.u32 %rd24, %r1;
+    shl.b64 %rd25, %rd24, 2;
+
+    // Step 1: Compute D_i = sum_d do_row[d] * out_row[d] and zero dq_row
+    mov.f32 %f1, 0f00000000;
+    mov.f32 %f2, 0f00000000;
+    mov.u64 %rd19, %rd24;
+FSQ_DI_LOOP:
+    setp.ge.u64 %p2, %rd19, %rd5;
+    @%p2 bra FSQ_DI_RED;
+    shl.b64 %rd20, %rd19, 2;
+    add.u64 %rd21, %rd16, %rd20;
+    ld.global.f32 %f3, [%rd21];
+    add.u64 %rd21, %rd26, %rd20;
+    ld.global.f32 %f4, [%rd21];
+    fma.rn.f32 %f1, %f3, %f4, %f1;
+    add.u64 %rd21, %rd27, %rd20;
+    st.global.f32 [%rd21], %f2;    // zero dq_row[d]
+    add.u64 %rd19, %rd19, 64;
+    bra FSQ_DI_LOOP;
+
+FSQ_DI_RED:
+    mov.u64 %rd22, smem_fsq_d;
+    add.u64 %rd22, %rd22, %rd25;
+    st.shared.f32 [%rd22], %f1;
+    bar.sync 0;
+
+    mov.u32 %r2, 32;
+FSQ_DI_TREE:
+    setp.eq.u32 %p3, %r2, 0;
+    @%p3 bra FSQ_DI_DONE;
+    setp.ge.u32 %p2, %r1, %r2;
+    @%p2 bra FSQ_DI_SYNC;
+    add.u32 %r3, %r1, %r2;
+    cvt.u64.u32 %rd20, %r3;
+    shl.b64 %rd20, %rd20, 2;
+    mov.u64 %rd21, smem_fsq_d;
+    add.u64 %rd21, %rd21, %rd20;
+    ld.shared.f32 %f3, [%rd21];
+    ld.shared.f32 %f4, [%rd22];
+    add.f32 %f4, %f4, %f3;
+    st.shared.f32 [%rd22], %f4;
+FSQ_DI_SYNC:
+    bar.sync 0;
+    shr.u32 %r2, %r2, 1;
+    bra FSQ_DI_TREE;
+
+FSQ_DI_DONE:
+    mov.u64 %rd21, smem_fsq_d;
+    ld.shared.f32 %f1, [%rd21];    // D_i
+    setp.ne.u32 %p2, %r1, 0;
+    @%p2 bra FSQ_CHECK_LSE;
+    ld.param.u64 %rd20, [p_d_row];
+    shl.b64 %rd21, %rd1, 2;
+    add.u64 %rd20, %rd20, %rd21;
+    st.global.f32 [%rd20], %f1;
+
+FSQ_CHECK_LSE:
+    ld.param.u64 %rd20, [p_lse];
+    shl.b64 %rd21, %rd1, 2;
+    add.u64 %rd20, %rd20, %rd21;
+    ld.global.f32 %f2, [%rd20];    // lse_i
+    mov.f32 %f3, 0fFC000000;       // -1.06e36 guard for -inf
+    setp.le.f32 %p2, %f2, %f3;
+    @%p2 bra FSQ_DONE;
+
+    // valid_kv = causal ? min(kv_offset + qi + 1, kv_len) : kv_len
+    mov.u64 %rd12, %rd4;
+    ld.param.u32 %r5, [p_causal];
+    setp.eq.u32 %p2, %r5, 0;
+    @%p2 bra FSQ_VKV_OK;
+    ld.param.u64 %rd13, [p_kv_offset];
+    add.u64 %rd13, %rd13, %rd9;
+    add.u64 %rd13, %rd13, 1;
+    min.u64 %rd12, %rd12, %rd13;
+FSQ_VKV_OK:
+    setp.eq.u64 %p2, %rd12, 0;
+    @%p2 bra FSQ_DONE;
+
+    mul.lo.u64 %rd14, %rd10, %rd4;
+    mul.lo.u64 %rd14, %rd14, %rd5;
+    shl.b64 %rd14, %rd14, 2;
+    ld.param.u64 %rd17, [p_k];
+    add.u64 %rd17, %rd17, %rd14;   // k_head
+    ld.param.u64 %rd18, [p_v];
+    add.u64 %rd18, %rd18, %rd14;   // v_head
+
+    ld.param.f32 %f3, [p_scale];
+    mov.u64 %rd19, 0;              // j_start
+
+FSQ_TILE:
+    setp.ge.u64 %p2, %rd19, %rd12;
+    @%p2 bra FSQ_DONE;
+
+    sub.u64 %rd20, %rd12, %rd19;
+    mov.u64 %rd21, 64;
+    min.u64 %rd20, %rd20, %rd21;   // bc
+
+    mov.f32 %f10, 0f00000000;      // ds_j = 0.0
+    setp.ge.u64 %p3, %rd24, %rd20;
+    @%p3 bra FSQ_STORE_DS;
+
+    add.u64 %rd21, %rd19, %rd24;   // kj
+    mul.lo.u64 %rd21, %rd21, %rd5;
+    shl.b64 %rd21, %rd21, 2;
+    add.u64 %rd22, %rd17, %rd21;   // k_kj
+    add.u64 %rd23, %rd18, %rd21;   // v_kj
+    mov.f32 %f4, 0f00000000;       // s_j
+    mov.f32 %f5, 0f00000000;       // dp_j
+    mov.u64 %rd13, 0;
+FSQ_DOT:
+    setp.ge.u64 %p4, %rd13, %rd5;
+    @%p4 bra FSQ_DOT_END;
+    shl.b64 %rd14, %rd13, 2;
+    add.u64 %rd11, %rd15, %rd14;
+    ld.global.f32 %f6, [%rd11];    // q
+    add.u64 %rd11, %rd22, %rd14;
+    ld.global.f32 %f7, [%rd11];    // k
+    fma.rn.f32 %f4, %f6, %f7, %f4;
+    add.u64 %rd11, %rd16, %rd14;
+    ld.global.f32 %f8, [%rd11];    // do
+    add.u64 %rd11, %rd23, %rd14;
+    ld.global.f32 %f9, [%rd11];    // v
+    fma.rn.f32 %f5, %f8, %f9, %f5;
+    add.u64 %rd13, %rd13, 1;
+    bra FSQ_DOT;
+FSQ_DOT_END:
+    mul.f32 %f4, %f4, %f3;         // s_j * scale
+    sub.f32 %f11, %f4, %f2;        // s_j - lse_i
+    mov.f32 %f12, 0fC2A00000;      // -80.0
+    mov.f32 %f13, 0f42A00000;      // +80.0
+    max.f32 %f11, %f11, %f12;
+    min.f32 %f11, %f11, %f13;
+    mov.f32 %f14, 0f3FB8AA3B;      // log2(e)
+    mul.f32 %f11, %f11, %f14;
+    ex2.approx.f32 %f11, %f11;     // p_j
+    sub.f32 %f15, %f5, %f1;        // dp_j - D_i
+    mul.f32 %f10, %f11, %f15;
+    mul.f32 %f10, %f10, %f3;       // ds_j = p_j * (dp_j - D_i) * scale
+
+FSQ_STORE_DS:
+    mov.u64 %rd21, smem_fsq_ds;
+    add.u64 %rd21, %rd21, %rd25;
+    st.shared.f32 [%rd21], %f10;
+    bar.sync 0;
+
+    // Accumulate dQ[qi, d] += sum(c=0..bc) smem_ds[c] * K[j_start + c, d]
+    mov.u64 %rd22, %rd24;
+FSQ_ACC_D:
+    setp.ge.u64 %p3, %rd22, %rd5;
+    @%p3 bra FSQ_ACC_END;
+    shl.b64 %rd23, %rd22, 2;
+    add.u64 %rd14, %rd27, %rd23;   // &dq_row[d]
+    ld.global.f32 %f15, [%rd14];
+    mov.u64 %rd21, 0;
+FSQ_K_LOOP:
+    setp.ge.u64 %p5, %rd21, %rd20;
+    @%p5 bra FSQ_K_STORE;
+    shl.b64 %rd13, %rd21, 2;
+    mov.u64 %rd11, smem_fsq_ds;
+    add.u64 %rd11, %rd11, %rd13;
+    ld.shared.f32 %f11, [%rd11];
+    add.u64 %rd11, %rd19, %rd21;
+    mul.lo.u64 %rd11, %rd11, %rd5;
+    add.u64 %rd11, %rd11, %rd22;
+    shl.b64 %rd11, %rd11, 2;
+    add.u64 %rd11, %rd17, %rd11;
+    ld.global.f32 %f12, [%rd11];
+    fma.rn.f32 %f15, %f11, %f12, %f15;
+    add.u64 %rd21, %rd21, 1;
+    bra FSQ_K_LOOP;
+FSQ_K_STORE:
+    st.global.f32 [%rd14], %f15;
+    add.u64 %rd22, %rd22, 64;
+    bra FSQ_ACC_D;
+
+FSQ_ACC_END:
+    bar.sync 0;
+    add.u64 %rd19, %rd19, 64;
+    bra FSQ_TILE;
+FSQ_DONE:
+    ret;
+}
+
+.visible .entry ochre_flash_sdpa_bwd_dkv_f32(
+    .param .u64 p_do,
+    .param .u64 p_q,
+    .param .u64 p_k,
+    .param .u64 p_v,
+    .param .u64 p_lse,
+    .param .u64 p_d_row,
+    .param .u64 p_dk,
+    .param .u64 p_dv,
+    .param .u64 p_total_kv_rows,
+    .param .u64 p_num_heads,
+    .param .u64 p_num_kv_heads,
+    .param .u64 p_q_len,
+    .param .u64 p_kv_len,
+    .param .u64 p_head_dim,
+    .param .u32 p_causal,
+    .param .u64 p_kv_offset,
+    .param .f32 p_scale
+)
+{
+    .shared .f32 smem_fsk_p[64];
+    .shared .f32 smem_fsk_ds[64];
+    .reg .pred %p<6>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<30>;
+    .reg .f32 %f<18>;
+
+    mov.u32 %r4, %ctaid.x;         // kv_row_idx = kv_bh * kv_len + kj
+    mov.u32 %r1, %tid.x;           // tid in 0..63
+    cvt.u64.u32 %rd1, %r4;
+    ld.param.u64 %rd2, [p_total_kv_rows];
+    setp.ge.u64 %p1, %rd1, %rd2;
+    @%p1 bra FSK_DONE;
+
+    ld.param.u64 %rd3, [p_q_len];
+    ld.param.u64 %rd4, [p_kv_len];
+    ld.param.u64 %rd5, [p_head_dim];
+    ld.param.u64 %rd6, [p_num_heads];
+    ld.param.u64 %rd7, [p_num_kv_heads];
+
+    div.u64 %rd8, %rd1, %rd4;      // kv_bh
+    rem.u64 %rd9, %rd1, %rd4;      // kj
+    div.u64 %rd10, %rd8, %rd7;     // b
+    rem.u64 %rd11, %rd8, %rd7;     // kv_h
+    div.u64 %rd12, %rd6, %rd7;     // group_size
+
+    // Base pointers for k_row, v_row, dk_row, dv_row
+    mul.lo.u64 %rd14, %rd1, %rd5;
+    shl.b64 %rd14, %rd14, 2;
+    ld.param.u64 %rd15, [p_k];
+    add.u64 %rd15, %rd15, %rd14;   // k_row
+    ld.param.u64 %rd16, [p_v];
+    add.u64 %rd16, %rd16, %rd14;   // v_row
+    ld.param.u64 %rd17, [p_dk];
+    add.u64 %rd17, %rd17, %rd14;   // dk_row
+    ld.param.u64 %rd18, [p_dv];
+    add.u64 %rd18, %rd18, %rd14;   // dv_row
+
+    cvt.u64.u32 %rd24, %r1;
+    shl.b64 %rd25, %rd24, 2;
+
+    // Zero dk_row and dv_row
+    mov.f32 %f1, 0f00000000;
+    mov.u64 %rd19, %rd24;
+FSK_ZERO:
+    setp.ge.u64 %p2, %rd19, %rd5;
+    @%p2 bra FSK_ZERO_DONE;
+    shl.b64 %rd20, %rd19, 2;
+    add.u64 %rd21, %rd17, %rd20;
+    st.global.f32 [%rd21], %f1;
+    add.u64 %rd21, %rd18, %rd20;
+    st.global.f32 [%rd21], %f1;
+    add.u64 %rd19, %rd19, 64;
+    bra FSK_ZERO;
+FSK_ZERO_DONE:
+
+    // qi_start = causal ? saturating_sub(kj, kv_offset) : 0
+    mov.u64 %rd13, 0;
+    ld.param.u32 %r5, [p_causal];
+    setp.eq.u32 %p2, %r5, 0;
+    @%p2 bra FSK_QI_OK;
+    ld.param.u64 %rd20, [p_kv_offset];
+    setp.le.u64 %p2, %rd9, %rd20;
+    @%p2 bra FSK_QI_OK;
+    sub.u64 %rd13, %rd9, %rd20;
+FSK_QI_OK:
+    setp.ge.u64 %p2, %rd13, %rd3;
+    @%p2 bra FSK_DONE;
+
+    ld.param.f32 %f3, [p_scale];
+    // First query head for this kv_h: bh_base = b * num_heads + kv_h * group_size
+    mul.lo.u64 %rd26, %rd10, %rd6;
+    mul.lo.u64 %rd20, %rd11, %rd12;
+    add.u64 %rd26, %rd26, %rd20;   // bh_base
+
+    mov.u64 %rd27, 0;              // g = 0..group_size
+FSK_G_LOOP:
+    setp.ge.u64 %p2, %rd27, %rd12;
+    @%p2 bra FSK_DONE;
+
+    add.u64 %rd28, %rd26, %rd27;   // bh = bh_base + g
+    mul.lo.u64 %rd29, %rd28, %rd3; // bh * q_len
+
+    mov.u64 %rd19, %rd13;          // i_start = qi_start
+FSK_I_TILE:
+    setp.ge.u64 %p2, %rd19, %rd3;
+    @%p2 bra FSK_G_NEXT;
+
+    sub.u64 %rd20, %rd3, %rd19;
+    mov.u64 %rd21, 64;
+    min.u64 %rd20, %rd20, %rd21;   // br
+
+    mov.f32 %f10, 0f00000000;      // p_i
+    mov.f32 %f11, 0f00000000;      // ds_i
+    setp.ge.u64 %p3, %rd24, %rd20;
+    @%p3 bra FSK_STORE_PDS;
+
+    add.u64 %rd21, %rd19, %rd24;   // qi = i_start + tid
+    add.u64 %rd21, %rd29, %rd21;   // row_idx = bh * q_len + qi
+    shl.b64 %rd22, %rd21, 2;
+    ld.param.u64 %rd23, [p_lse];
+    add.u64 %rd23, %rd23, %rd22;
+    ld.global.f32 %f2, [%rd23];    // lse_i
+    mov.f32 %f4, 0fFC000000;
+    setp.le.f32 %p4, %f2, %f4;
+    @%p4 bra FSK_STORE_PDS;
+
+    ld.param.u64 %rd23, [p_d_row];
+    add.u64 %rd23, %rd23, %rd22;
+    ld.global.f32 %f1, [%rd23];    // D_i
+
+    mul.lo.u64 %rd21, %rd21, %rd5;
+    shl.b64 %rd21, %rd21, 2;
+    ld.param.u64 %rd22, [p_q];
+    add.u64 %rd22, %rd22, %rd21;   // q_qi
+    ld.param.u64 %rd23, [p_do];
+    add.u64 %rd23, %rd23, %rd21;   // do_qi
+
+    mov.f32 %f4, 0f00000000;       // s_i
+    mov.f32 %f5, 0f00000000;       // dp_i
+    mov.u64 %rd14, 0;
+FSK_DOT:
+    setp.ge.u64 %p5, %rd14, %rd5;
+    @%p5 bra FSK_DOT_END;
+    shl.b64 %rd8, %rd14, 2;
+    add.u64 %rd10, %rd22, %rd8;
+    ld.global.f32 %f6, [%rd10];
+    add.u64 %rd10, %rd15, %rd8;
+    ld.global.f32 %f7, [%rd10];
+    fma.rn.f32 %f4, %f6, %f7, %f4;
+    add.u64 %rd10, %rd23, %rd8;
+    ld.global.f32 %f8, [%rd10];
+    add.u64 %rd10, %rd16, %rd8;
+    ld.global.f32 %f9, [%rd10];
+    fma.rn.f32 %f5, %f8, %f9, %f5;
+    add.u64 %rd14, %rd14, 1;
+    bra FSK_DOT;
+FSK_DOT_END:
+    mul.f32 %f4, %f4, %f3;
+    sub.f32 %f12, %f4, %f2;
+    mov.f32 %f13, 0fC2A00000;
+    mov.f32 %f14, 0f42A00000;
+    max.f32 %f12, %f12, %f13;
+    min.f32 %f12, %f12, %f14;
+    mov.f32 %f15, 0f3FB8AA3B;
+    mul.f32 %f12, %f12, %f15;
+    ex2.approx.f32 %f10, %f12;     // p_i
+    sub.f32 %f16, %f5, %f1;
+    mul.f32 %f11, %f10, %f16;
+    mul.f32 %f11, %f11, %f3;       // ds_i
+
+FSK_STORE_PDS:
+    mov.u64 %rd21, smem_fsk_p;
+    add.u64 %rd21, %rd21, %rd25;
+    st.shared.f32 [%rd21], %f10;
+    mov.u64 %rd21, smem_fsk_ds;
+    add.u64 %rd21, %rd21, %rd25;
+    st.shared.f32 [%rd21], %f11;
+    bar.sync 0;
+
+    // Accumulate dV[kj, d] and dK[kj, d]
+    mov.u64 %rd22, %rd24;
+FSK_ACC_D:
+    setp.ge.u64 %p3, %rd22, %rd5;
+    @%p3 bra FSK_ACC_END;
+    shl.b64 %rd23, %rd22, 2;
+    add.u64 %rd14, %rd17, %rd23;   // &dk_row[d]
+    add.u64 %rd8, %rd18, %rd23;    // &dv_row[d]
+    ld.global.f32 %f16, [%rd14];   // dk_acc
+    ld.global.f32 %f17, [%rd8];    // dv_acc
+
+    mov.u64 %rd21, 0;              // r = 0..br
+FSK_R_LOOP:
+    setp.ge.u64 %p5, %rd21, %rd20;
+    @%p5 bra FSK_R_STORE;
+    shl.b64 %rd10, %rd21, 2;
+    mov.u64 %rd11, smem_fsk_p;
+    add.u64 %rd11, %rd11, %rd10;
+    ld.shared.f32 %f10, [%rd11];   // p_r
+    mov.u64 %rd11, smem_fsk_ds;
+    add.u64 %rd11, %rd11, %rd10;
+    ld.shared.f32 %f11, [%rd11];   // ds_r
+
+    add.u64 %rd11, %rd19, %rd21;   // qi = i_start + r
+    add.u64 %rd11, %rd29, %rd11;   // bh * q_len + qi
+    mul.lo.u64 %rd11, %rd11, %rd5;
+    add.u64 %rd11, %rd11, %rd22;
+    shl.b64 %rd11, %rd11, 2;
+    ld.param.u64 %rd10, [p_q];
+    add.u64 %rd10, %rd10, %rd11;
+    ld.global.f32 %f12, [%rd10];   // Q[bh, qi, d]
+    fma.rn.f32 %f16, %f11, %f12, %f16;
+    ld.param.u64 %rd10, [p_do];
+    add.u64 %rd10, %rd10, %rd11;
+    ld.global.f32 %f13, [%rd10];   // dO[bh, qi, d]
+    fma.rn.f32 %f17, %f10, %f13, %f17;
+
+    add.u64 %rd21, %rd21, 1;
+    bra FSK_R_LOOP;
+FSK_R_STORE:
+    st.global.f32 [%rd14], %f16;
+    st.global.f32 [%rd8], %f17;
+    add.u64 %rd22, %rd22, 64;
+    bra FSK_ACC_D;
+
+FSK_ACC_END:
+    bar.sync 0;
+    add.u64 %rd19, %rd19, 64;
+    bra FSK_I_TILE;
+
+FSK_G_NEXT:
+    add.u64 %rd27, %rd27, 1;
+    bra FSK_G_LOOP;
+FSK_DONE:
+    ret;
+}
+
+.visible .entry ochre_embedding_scatter_add_f32(
+    .param .u64 p_dy,
+    .param .u64 p_ids,
+    .param .u64 p_dweight,
+    .param .u64 p_num_tokens,
+    .param .u64 p_d_model
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<3>;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
+    cvt.u64.u32 %rd1, %r1;
+    ld.param.u64 %rd2, [p_num_tokens];
+    ld.param.u64 %rd3, [p_d_model];
+    mul.lo.u64 %rd4, %rd2, %rd3;
+    setp.ge.u64 %p1, %rd1, %rd4;
+    @%p1 bra ESA_DONE;
+
+    div.u64 %rd5, %rd1, %rd3;      // tok
+    rem.u64 %rd6, %rd1, %rd3;      // col
+
+    ld.param.u64 %rd7, [p_ids];
+    shl.b64 %rd8, %rd5, 3;
+    add.u64 %rd7, %rd7, %rd8;
+    ld.global.u64 %rd9, [%rd7];    // vocab_id
+
+    ld.param.u64 %rd10, [p_dy];
+    shl.b64 %rd8, %rd1, 2;
+    add.u64 %rd10, %rd10, %rd8;
+    ld.global.f32 %f1, [%rd10];
+
+    mul.lo.u64 %rd11, %rd9, %rd3;
+    add.u64 %rd11, %rd11, %rd6;
+    shl.b64 %rd11, %rd11, 2;
+    ld.param.u64 %rd10, [p_dweight];
+    add.u64 %rd10, %rd10, %rd11;
+    atom.global.add.f32 %f2, [%rd10], %f1;
+ESA_DONE:
+    ret;
+}
+
+.visible .entry ochre_bshd_to_bhsd_f32(
+    .param .u64 p_src,
+    .param .u64 p_dst,
+    .param .u64 p_batch,
+    .param .u64 p_seq_len,
+    .param .u64 p_num_heads,
+    .param .u64 p_head_dim
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<15>;
+    .reg .f32 %f1;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
+    cvt.u64.u32 %rd1, %r1;         // flat src idx in [B, S, H, D]
+    ld.param.u64 %rd2, [p_batch];
+    ld.param.u64 %rd3, [p_seq_len];
+    ld.param.u64 %rd4, [p_num_heads];
+    ld.param.u64 %rd5, [p_head_dim];
+    mul.lo.u64 %rd6, %rd2, %rd3;
+    mul.lo.u64 %rd6, %rd6, %rd4;
+    mul.lo.u64 %rd6, %rd6, %rd5;
+    setp.ge.u64 %p1, %rd1, %rd6;
+    @%p1 bra BSHD_DONE;
+
+    rem.u64 %rd7, %rd1, %rd5;      // d
+    div.u64 %rd8, %rd1, %rd5;
+    rem.u64 %rd9, %rd8, %rd4;      // h
+    div.u64 %rd8, %rd8, %rd4;
+    rem.u64 %rd10, %rd8, %rd3;     // s
+    div.u64 %rd11, %rd8, %rd3;     // b
+
+    ld.param.u64 %rd12, [p_src];
+    shl.b64 %rd13, %rd1, 2;
+    add.u64 %rd12, %rd12, %rd13;
+    ld.global.f32 %f1, [%rd12];
+
+    // dst idx = ((b * H + h) * S + s) * D + d
+    mul.lo.u64 %rd14, %rd11, %rd4;
+    add.u64 %rd14, %rd14, %rd9;
+    mul.lo.u64 %rd14, %rd14, %rd3;
+    add.u64 %rd14, %rd14, %rd10;
+    mul.lo.u64 %rd14, %rd14, %rd5;
+    add.u64 %rd14, %rd14, %rd7;
+    shl.b64 %rd14, %rd14, 2;
+    ld.param.u64 %rd12, [p_dst];
+    add.u64 %rd12, %rd12, %rd14;
+    st.global.f32 [%rd12], %f1;
+BSHD_DONE:
+    ret;
+}
+
+.visible .entry ochre_bhsd_to_bshd_f32(
+    .param .u64 p_src,
+    .param .u64 p_dst,
+    .param .u64 p_batch,
+    .param .u64 p_num_heads,
+    .param .u64 p_seq_len,
+    .param .u64 p_head_dim
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<15>;
+    .reg .f32 %f1;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
+    cvt.u64.u32 %rd1, %r1;         // flat src idx in [B, H, S, D]
+    ld.param.u64 %rd2, [p_batch];
+    ld.param.u64 %rd3, [p_num_heads];
+    ld.param.u64 %rd4, [p_seq_len];
+    ld.param.u64 %rd5, [p_head_dim];
+    mul.lo.u64 %rd6, %rd2, %rd3;
+    mul.lo.u64 %rd6, %rd6, %rd4;
+    mul.lo.u64 %rd6, %rd6, %rd5;
+    setp.ge.u64 %p1, %rd1, %rd6;
+    @%p1 bra BHSD_DONE;
+
+    rem.u64 %rd7, %rd1, %rd5;      // d
+    div.u64 %rd8, %rd1, %rd5;
+    rem.u64 %rd9, %rd8, %rd4;      // s
+    div.u64 %rd8, %rd8, %rd4;
+    rem.u64 %rd10, %rd8, %rd3;     // h
+    div.u64 %rd11, %rd8, %rd3;     // b
+
+    ld.param.u64 %rd12, [p_src];
+    shl.b64 %rd13, %rd1, 2;
+    add.u64 %rd12, %rd12, %rd13;
+    ld.global.f32 %f1, [%rd12];
+
+    // dst idx = ((b * S + s) * H + h) * D + d
+    mul.lo.u64 %rd14, %rd11, %rd4;
+    add.u64 %rd14, %rd14, %rd9;
+    mul.lo.u64 %rd14, %rd14, %rd3;
+    add.u64 %rd14, %rd14, %rd10;
+    mul.lo.u64 %rd14, %rd14, %rd5;
+    add.u64 %rd14, %rd14, %rd7;
+    shl.b64 %rd14, %rd14, 2;
+    ld.param.u64 %rd12, [p_dst];
+    add.u64 %rd12, %rd12, %rd14;
+    st.global.f32 [%rd12], %f1;
+BHSD_DONE:
+    ret;
+}
 "#;
 
 fn load_cublas_library() -> Option<Library> {
@@ -3566,6 +5543,21 @@ fn load_ptx_funcs(rt: &CudaNnRuntime) -> Option<NnPtxFuncs> {
         row_rmsnorm_bwd_dx_f32: get_fn("ochre_row_rmsnorm_bwd_dx_f32")?,
         row_rmsnorm_bwd_dg_f32: get_fn("ochre_row_rmsnorm_bwd_dg_f32")?,
         dropout_fwd_f32: get_fn("ochre_dropout_fwd_f32")?,
+        rnn_step_fwd_f32: get_fn("ochre_rnn_step_fwd_f32")?,
+        rnn_step_bwd_f32: get_fn("ochre_rnn_step_bwd_f32")?,
+        gru_step_fwd_f32: get_fn("ochre_gru_step_fwd_f32")?,
+        gru_step_bwd_f32: get_fn("ochre_gru_step_bwd_f32")?,
+        lstm_step_fwd_f32: get_fn("ochre_lstm_step_fwd_f32")?,
+        lstm_step_bwd_f32: get_fn("ochre_lstm_step_bwd_f32")?,
+        rope_fwd_bwd_f32: get_fn("ochre_rope_fwd_bwd_f32")?,
+        swiglu_fwd_f32: get_fn("ochre_swiglu_fwd_f32")?,
+        swiglu_bwd_f32: get_fn("ochre_swiglu_bwd_f32")?,
+        flash_sdpa_fwd_f32: get_fn("ochre_flash_sdpa_fwd_f32")?,
+        flash_sdpa_bwd_dq_f32: get_fn("ochre_flash_sdpa_bwd_dq_f32")?,
+        flash_sdpa_bwd_dkv_f32: get_fn("ochre_flash_sdpa_bwd_dkv_f32")?,
+        embedding_scatter_add_f32: get_fn("ochre_embedding_scatter_add_f32")?,
+        bshd_to_bhsd_f32: get_fn("ochre_bshd_to_bhsd_f32")?,
+        bhsd_to_bshd_f32: get_fn("ochre_bhsd_to_bshd_f32")?,
     })
 }
 
@@ -4730,6 +6722,9 @@ pub struct CudaDeviceBuf {
 
 // SAFETY: `CudaDeviceBuf` owns a unique device pointer and binds its CUDA context on drop.
 unsafe impl Send for CudaDeviceBuf {}
+// SAFETY: `&CudaDeviceBuf` exposes only immutable pointer/size metadata; actual CUDA device operations
+// are serialized through the per-context Mutex inside `with_vram_session`.
+unsafe impl Sync for CudaDeviceBuf {}
 
 impl Drop for CudaDeviceBuf {
     fn drop(&mut self) {
@@ -6187,6 +8182,2268 @@ impl<'a> CudaVramSession<'a> {
         ];
         launch_1d_async(self.rt, func, n, 256, &mut params)
     }
+
+    /// Alias for `rmsnorm_fwd_dev_f32` (VRAM-resident RMSNorm forward).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_fwd_dev(
+        &self,
+        d_x: CuDevicePtr,
+        d_gamma: CuDevicePtr,
+        d_out: CuDevicePtr,
+        d_rstd: CuDevicePtr,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> OchreResult<()> {
+        self.rmsnorm_fwd_dev_f32(d_x, d_gamma, d_out, d_rstd, rows, cols, eps)
+    }
+
+    /// Alias for `rmsnorm_bwd_dev_f32` (VRAM-resident RMSNorm backward).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_bwd_dev(
+        &self,
+        d_dy: CuDevicePtr,
+        d_x: CuDevicePtr,
+        d_gamma: CuDevicePtr,
+        d_rstd: CuDevicePtr,
+        d_dx: CuDevicePtr,
+        d_dg: CuDevicePtr,
+        rows: usize,
+        cols: usize,
+        need_dx: bool,
+    ) -> OchreResult<()> {
+        self.rmsnorm_bwd_dev_f32(d_dy, d_x, d_gamma, d_rstd, d_dx, d_dg, rows, cols, need_dx)
+    }
+
+    /// VRAM-resident embedding gather: `d_out[tok, :] = d_weight[d_ids[tok], :]`.
+    pub fn embedding_gather_dev(
+        &self,
+        d_weight: CuDevicePtr,
+        d_ids: CuDevicePtr,
+        d_out: CuDevicePtr,
+        num_tokens: usize,
+        d_model: usize,
+    ) -> OchreResult<()> {
+        self.gather_rows_f32(d_weight, d_ids, d_out, num_tokens, d_model)
+    }
+
+    /// VRAM-resident embedding backward scatter-add: `d_dweight[d_ids[tok], :] += d_dy[tok, :]`.
+    /// Caller should zero `d_dweight` before accumulation unless accumulating gradients.
+    pub fn embedding_scatter_add_dev(
+        &self,
+        mut d_dy: CuDevicePtr,
+        mut d_ids: CuDevicePtr,
+        mut d_dweight: CuDevicePtr,
+        num_tokens: usize,
+        d_model: usize,
+    ) -> OchreResult<()> {
+        let func = self.ptx()?.embedding_scatter_add_f32;
+        let mut nt_u64 = num_tokens as u64;
+        let mut dm_u64 = d_model as u64;
+        let mut params: [*mut c_void; 5] = [
+            (&mut d_dy as *mut CuDevicePtr).cast(),
+            (&mut d_ids as *mut CuDevicePtr).cast(),
+            (&mut d_dweight as *mut CuDevicePtr).cast(),
+            (&mut nt_u64 as *mut u64).cast(),
+            (&mut dm_u64 as *mut u64).cast(),
+        ];
+        launch_1d_async(self.rt, func, num_tokens * d_model, 256, &mut params)
+    }
+
+    /// VRAM-resident transpose `[B, S, H, D]` -> `[B, H, S, D]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bshd_to_bhsd_dev(
+        &self,
+        mut d_src: CuDevicePtr,
+        mut d_dst: CuDevicePtr,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> OchreResult<()> {
+        let func = self.ptx()?.bshd_to_bhsd_f32;
+        let mut b_u64 = batch as u64;
+        let mut s_u64 = seq_len as u64;
+        let mut h_u64 = num_heads as u64;
+        let mut d_u64 = head_dim as u64;
+        let mut params: [*mut c_void; 6] = [
+            (&mut d_src as *mut CuDevicePtr).cast(),
+            (&mut d_dst as *mut CuDevicePtr).cast(),
+            (&mut b_u64 as *mut u64).cast(),
+            (&mut s_u64 as *mut u64).cast(),
+            (&mut h_u64 as *mut u64).cast(),
+            (&mut d_u64 as *mut u64).cast(),
+        ];
+        launch_1d_async(
+            self.rt,
+            func,
+            batch * seq_len * num_heads * head_dim,
+            256,
+            &mut params,
+        )
+    }
+
+    /// VRAM-resident transpose `[B, H, S, D]` -> `[B, S, H, D]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bhsd_to_bshd_dev(
+        &self,
+        mut d_src: CuDevicePtr,
+        mut d_dst: CuDevicePtr,
+        batch: usize,
+        num_heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+    ) -> OchreResult<()> {
+        let func = self.ptx()?.bhsd_to_bshd_f32;
+        let mut b_u64 = batch as u64;
+        let mut h_u64 = num_heads as u64;
+        let mut s_u64 = seq_len as u64;
+        let mut d_u64 = head_dim as u64;
+        let mut params: [*mut c_void; 6] = [
+            (&mut d_src as *mut CuDevicePtr).cast(),
+            (&mut d_dst as *mut CuDevicePtr).cast(),
+            (&mut b_u64 as *mut u64).cast(),
+            (&mut h_u64 as *mut u64).cast(),
+            (&mut s_u64 as *mut u64).cast(),
+            (&mut d_u64 as *mut u64).cast(),
+        ];
+        launch_1d_async(
+            self.rt,
+            func,
+            batch * num_heads * seq_len * head_dim,
+            256,
+            &mut params,
+        )
+    }
+
+    /// In-place VRAM-resident RoPE forward (`inverse=false`) or inverse/backward (`inverse=true`)
+    /// on `[batch, num_heads, seq_len, head_dim]` using precomputed `[max_seq_len, head_dim/2]` cos/sin tables.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope(
+        &self,
+        mut d_data: CuDevicePtr,
+        mut d_cos: CuDevicePtr,
+        mut d_sin: CuDevicePtr,
+        batch: usize,
+        num_heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+        offset: usize,
+        inverse: bool,
+    ) -> OchreResult<()> {
+        if head_dim == 0 || !head_dim.is_multiple_of(2) {
+            return Err(OchreError::InvalidParameter(format!(
+                "CUDA RoPE head_dim={head_dim} must be positive and even ( >_< )"
+            )));
+        }
+        let half = head_dim / 2;
+        let total_pairs = batch * num_heads * seq_len * half;
+        if total_pairs == 0 {
+            return Ok(());
+        }
+        let func = self.ptx()?.rope_fwd_bwd_f32;
+        let mut tp_u64 = total_pairs as u64;
+        let mut s_u64 = seq_len as u64;
+        let mut hd_u64 = half as u64;
+        let mut off_u64 = offset as u64;
+        let mut inv_u32 = u32::from(inverse);
+        let mut params: [*mut c_void; 8] = [
+            (&mut d_data as *mut CuDevicePtr).cast(),
+            (&mut d_cos as *mut CuDevicePtr).cast(),
+            (&mut d_sin as *mut CuDevicePtr).cast(),
+            (&mut tp_u64 as *mut u64).cast(),
+            (&mut s_u64 as *mut u64).cast(),
+            (&mut hd_u64 as *mut u64).cast(),
+            (&mut off_u64 as *mut u64).cast(),
+            (&mut inv_u32 as *mut u32).cast(),
+        ];
+        launch_1d_async(self.rt, func, total_pairs, 256, &mut params)
+    }
+
+    /// VRAM-resident fused SwiGLU forward: `d_out[i] = silu(d_gate[i]) * d_up[i]`.
+    pub fn swiglu_fwd(
+        &self,
+        mut d_gate: CuDevicePtr,
+        mut d_up: CuDevicePtr,
+        mut d_out: CuDevicePtr,
+        n: usize,
+    ) -> OchreResult<()> {
+        let func = self.ptx()?.swiglu_fwd_f32;
+        let mut n_u64 = n as u64;
+        let mut params: [*mut c_void; 4] = [
+            (&mut d_gate as *mut CuDevicePtr).cast(),
+            (&mut d_up as *mut CuDevicePtr).cast(),
+            (&mut d_out as *mut CuDevicePtr).cast(),
+            (&mut n_u64 as *mut u64).cast(),
+        ];
+        launch_1d_async(self.rt, func, n, 256, &mut params)
+    }
+
+    /// VRAM-resident fused SwiGLU backward computing both `d_dgate` and `d_dup` in one kernel.
+    pub fn swiglu_bwd(
+        &self,
+        mut d_dy: CuDevicePtr,
+        mut d_gate: CuDevicePtr,
+        mut d_up: CuDevicePtr,
+        mut d_dgate: CuDevicePtr,
+        mut d_dup: CuDevicePtr,
+        n: usize,
+    ) -> OchreResult<()> {
+        let func = self.ptx()?.swiglu_bwd_f32;
+        let mut n_u64 = n as u64;
+        let mut params: [*mut c_void; 6] = [
+            (&mut d_dy as *mut CuDevicePtr).cast(),
+            (&mut d_gate as *mut CuDevicePtr).cast(),
+            (&mut d_up as *mut CuDevicePtr).cast(),
+            (&mut d_dgate as *mut CuDevicePtr).cast(),
+            (&mut d_dup as *mut CuDevicePtr).cast(),
+            (&mut n_u64 as *mut u64).cast(),
+        ];
+        launch_1d_async(self.rt, func, n, 256, &mut params)
+    }
+
+    /// VRAM-resident tiled online-softmax FlashSDPA forward supporting GQA/MQA, causal masking, and `kv_offset`.
+    /// `d_q`/`d_out`: `[B, H, q_len, D]`, `d_k`/`d_v`: `[B, H_kv, kv_len, D]`, `d_lse`: `[B, H, q_len]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_sdpa_fwd(
+        &self,
+        mut d_q: CuDevicePtr,
+        mut d_k: CuDevicePtr,
+        mut d_v: CuDevicePtr,
+        mut d_out: CuDevicePtr,
+        mut d_lse: CuDevicePtr,
+        batch: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        q_len: usize,
+        kv_len: usize,
+        head_dim: usize,
+        causal: bool,
+        kv_offset: usize,
+    ) -> OchreResult<()> {
+        if batch == 0 || num_heads == 0 || num_kv_heads == 0 || head_dim == 0 || q_len == 0 {
+            return Ok(());
+        }
+        if !num_heads.is_multiple_of(num_kv_heads) {
+            return Err(OchreError::InvalidParameter(format!(
+                "CUDA flash_sdpa_fwd num_heads ({num_heads}) not divisible by num_kv_heads ({num_kv_heads}) ( >_< )"
+            )));
+        }
+        let total_q_rows = batch * num_heads * q_len;
+        let func = self.ptx()?.flash_sdpa_fwd_f32;
+        let mut tqr_u64 = total_q_rows as u64;
+        let mut nh_u64 = num_heads as u64;
+        let mut nkvh_u64 = num_kv_heads as u64;
+        let mut ql_u64 = q_len as u64;
+        let mut kvl_u64 = kv_len as u64;
+        let mut hd_u64 = head_dim as u64;
+        let mut causal_u32 = u32::from(causal);
+        let mut kvo_u64 = kv_offset as u64;
+        let mut scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut params: [*mut c_void; 14] = [
+            (&mut d_q as *mut CuDevicePtr).cast(),
+            (&mut d_k as *mut CuDevicePtr).cast(),
+            (&mut d_v as *mut CuDevicePtr).cast(),
+            (&mut d_out as *mut CuDevicePtr).cast(),
+            (&mut d_lse as *mut CuDevicePtr).cast(),
+            (&mut tqr_u64 as *mut u64).cast(),
+            (&mut nh_u64 as *mut u64).cast(),
+            (&mut nkvh_u64 as *mut u64).cast(),
+            (&mut ql_u64 as *mut u64).cast(),
+            (&mut kvl_u64 as *mut u64).cast(),
+            (&mut hd_u64 as *mut u64).cast(),
+            (&mut causal_u32 as *mut u32).cast(),
+            (&mut kvo_u64 as *mut u64).cast(),
+            (&mut scale as *mut f32).cast(),
+        ];
+        launch_grid_async(self.rt, func, total_q_rows as u32, 64, &mut params)
+    }
+
+    /// VRAM-resident tiled FlashSDPA backward supporting GQA/MQA, causal masking, and `kv_offset`.
+    /// `d_row_scratch` must have capacity for `batch * num_heads * q_len` `f32` elements.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_sdpa_bwd(
+        &self,
+        mut d_do: CuDevicePtr,
+        mut d_q: CuDevicePtr,
+        mut d_k: CuDevicePtr,
+        mut d_v: CuDevicePtr,
+        mut d_out: CuDevicePtr,
+        mut d_lse: CuDevicePtr,
+        mut d_row_scratch: CuDevicePtr,
+        mut d_dq: CuDevicePtr,
+        mut d_dk: CuDevicePtr,
+        mut d_dv: CuDevicePtr,
+        batch: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        q_len: usize,
+        kv_len: usize,
+        head_dim: usize,
+        causal: bool,
+        kv_offset: usize,
+    ) -> OchreResult<()> {
+        if batch == 0 || num_heads == 0 || num_kv_heads == 0 || head_dim == 0 {
+            return Ok(());
+        }
+        if !num_heads.is_multiple_of(num_kv_heads) {
+            return Err(OchreError::InvalidParameter(format!(
+                "CUDA flash_sdpa_bwd num_heads ({num_heads}) not divisible by num_kv_heads ({num_kv_heads}) ( >_< )"
+            )));
+        }
+        if q_len == 0 || kv_len == 0 {
+            self.fill_f32(d_dq, 0.0, batch * num_heads * q_len * head_dim)?;
+            self.fill_f32(d_dk, 0.0, batch * num_kv_heads * kv_len * head_dim)?;
+            self.fill_f32(d_dv, 0.0, batch * num_kv_heads * kv_len * head_dim)?;
+            return Ok(());
+        }
+        let ptx = self.ptx()?;
+        let total_q_rows = batch * num_heads * q_len;
+        let total_kv_rows = batch * num_kv_heads * kv_len;
+        let mut tqr_u64 = total_q_rows as u64;
+        let mut tkvr_u64 = total_kv_rows as u64;
+        let mut nh_u64 = num_heads as u64;
+        let mut nkvh_u64 = num_kv_heads as u64;
+        let mut ql_u64 = q_len as u64;
+        let mut kvl_u64 = kv_len as u64;
+        let mut hd_u64 = head_dim as u64;
+        let mut causal_u32 = u32::from(causal);
+        let mut kvo_u64 = kv_offset as u64;
+        let mut scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        let mut dq_params: [*mut c_void; 17] = [
+            (&mut d_do as *mut CuDevicePtr).cast(),
+            (&mut d_q as *mut CuDevicePtr).cast(),
+            (&mut d_k as *mut CuDevicePtr).cast(),
+            (&mut d_v as *mut CuDevicePtr).cast(),
+            (&mut d_out as *mut CuDevicePtr).cast(),
+            (&mut d_lse as *mut CuDevicePtr).cast(),
+            (&mut d_row_scratch as *mut CuDevicePtr).cast(),
+            (&mut d_dq as *mut CuDevicePtr).cast(),
+            (&mut tqr_u64 as *mut u64).cast(),
+            (&mut nh_u64 as *mut u64).cast(),
+            (&mut nkvh_u64 as *mut u64).cast(),
+            (&mut ql_u64 as *mut u64).cast(),
+            (&mut kvl_u64 as *mut u64).cast(),
+            (&mut hd_u64 as *mut u64).cast(),
+            (&mut causal_u32 as *mut u32).cast(),
+            (&mut kvo_u64 as *mut u64).cast(),
+            (&mut scale as *mut f32).cast(),
+        ];
+        launch_grid_async(
+            self.rt,
+            ptx.flash_sdpa_bwd_dq_f32,
+            total_q_rows as u32,
+            64,
+            &mut dq_params,
+        )?;
+
+        let mut dkv_params: [*mut c_void; 17] = [
+            (&mut d_do as *mut CuDevicePtr).cast(),
+            (&mut d_q as *mut CuDevicePtr).cast(),
+            (&mut d_k as *mut CuDevicePtr).cast(),
+            (&mut d_v as *mut CuDevicePtr).cast(),
+            (&mut d_lse as *mut CuDevicePtr).cast(),
+            (&mut d_row_scratch as *mut CuDevicePtr).cast(),
+            (&mut d_dk as *mut CuDevicePtr).cast(),
+            (&mut d_dv as *mut CuDevicePtr).cast(),
+            (&mut tkvr_u64 as *mut u64).cast(),
+            (&mut nh_u64 as *mut u64).cast(),
+            (&mut nkvh_u64 as *mut u64).cast(),
+            (&mut ql_u64 as *mut u64).cast(),
+            (&mut kvl_u64 as *mut u64).cast(),
+            (&mut hd_u64 as *mut u64).cast(),
+            (&mut causal_u32 as *mut u32).cast(),
+            (&mut kvo_u64 as *mut u64).cast(),
+            (&mut scale as *mut f32).cast(),
+        ];
+        launch_grid_async(
+            self.rt,
+            ptx.flash_sdpa_bwd_dkv_f32,
+            total_kv_rows as u32,
+            64,
+            &mut dkv_params,
+        )
+    }
+
+    /// VRAM-resident fused Elman RNN timestep forward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rnn_step_fwd_dev(
+        &self,
+        mut d_x_proj: CuDevicePtr,
+        mut d_h_proj: CuDevicePtr,
+        mut d_bias: CuDevicePtr,
+        mut d_h_cur: CuDevicePtr,
+        mut d_layer_out: CuDevicePtr,
+        batch: usize,
+        seq_len: usize,
+        h: usize,
+        out_dim: usize,
+        t: usize,
+        dir_off: usize,
+        is_relu: bool,
+        has_bias: bool,
+    ) -> OchreResult<()> {
+        let func = self.ptx()?.rnn_step_fwd_f32;
+        let mut b_u64 = batch as u64;
+        let mut s_u64 = seq_len as u64;
+        let mut h_u64 = h as u64;
+        let mut od_u64 = out_dim as u64;
+        let mut t_u64 = t as u64;
+        let mut doff_u64 = dir_off as u64;
+        let mut nonlin = u32::from(is_relu);
+        let mut hb = u32::from(has_bias);
+        let mut params: [*mut c_void; 13] = [
+            (&mut d_x_proj as *mut CuDevicePtr).cast(),
+            (&mut d_h_proj as *mut CuDevicePtr).cast(),
+            (&mut d_bias as *mut CuDevicePtr).cast(),
+            (&mut d_h_cur as *mut CuDevicePtr).cast(),
+            (&mut d_layer_out as *mut CuDevicePtr).cast(),
+            (&mut b_u64 as *mut u64).cast(),
+            (&mut s_u64 as *mut u64).cast(),
+            (&mut h_u64 as *mut u64).cast(),
+            (&mut od_u64 as *mut u64).cast(),
+            (&mut t_u64 as *mut u64).cast(),
+            (&mut doff_u64 as *mut u64).cast(),
+            (&mut nonlin as *mut u32).cast(),
+            (&mut hb as *mut u32).cast(),
+        ];
+        launch_1d_async(self.rt, func, batch * h, 256, &mut params)
+    }
+
+    /// VRAM-resident fused Elman RNN timestep backward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rnn_step_bwd_dev(
+        &self,
+        mut d_out: CuDevicePtr,
+        mut d_dh_next: CuDevicePtr,
+        mut d_h_cur: CuDevicePtr,
+        mut d_da_step: CuDevicePtr,
+        mut d_da_all: CuDevicePtr,
+        batch: usize,
+        seq_len: usize,
+        h: usize,
+        out_dim: usize,
+        t: usize,
+        dir_off: usize,
+        is_relu: bool,
+    ) -> OchreResult<()> {
+        let func = self.ptx()?.rnn_step_bwd_f32;
+        let mut b_u64 = batch as u64;
+        let mut s_u64 = seq_len as u64;
+        let mut h_u64 = h as u64;
+        let mut od_u64 = out_dim as u64;
+        let mut t_u64 = t as u64;
+        let mut doff_u64 = dir_off as u64;
+        let mut nonlin = u32::from(is_relu);
+        let mut params: [*mut c_void; 12] = [
+            (&mut d_out as *mut CuDevicePtr).cast(),
+            (&mut d_dh_next as *mut CuDevicePtr).cast(),
+            (&mut d_h_cur as *mut CuDevicePtr).cast(),
+            (&mut d_da_step as *mut CuDevicePtr).cast(),
+            (&mut d_da_all as *mut CuDevicePtr).cast(),
+            (&mut b_u64 as *mut u64).cast(),
+            (&mut s_u64 as *mut u64).cast(),
+            (&mut h_u64 as *mut u64).cast(),
+            (&mut od_u64 as *mut u64).cast(),
+            (&mut t_u64 as *mut u64).cast(),
+            (&mut doff_u64 as *mut u64).cast(),
+            (&mut nonlin as *mut u32).cast(),
+        ];
+        launch_1d_async(self.rt, func, batch * h, 256, &mut params)
+    }
+
+    /// VRAM-resident fused GRU 3-gate timestep forward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gru_step_fwd_dev(
+        &self,
+        mut d_gi_all: CuDevicePtr,
+        mut d_gh: CuDevicePtr,
+        mut d_biases: CuDevicePtr,
+        mut d_h_prev: CuDevicePtr,
+        mut d_h_cur: CuDevicePtr,
+        mut d_layer_out: CuDevicePtr,
+        mut d_r_out: CuDevicePtr,
+        mut d_z_out: CuDevicePtr,
+        mut d_n_out: CuDevicePtr,
+        mut d_ghn_out: CuDevicePtr,
+        batch: usize,
+        seq_len: usize,
+        h: usize,
+        out_dim: usize,
+        t: usize,
+        dir_off: usize,
+        save_cache: bool,
+    ) -> OchreResult<()> {
+        let func = self.ptx()?.gru_step_fwd_f32;
+        let mut b_u64 = batch as u64;
+        let mut s_u64 = seq_len as u64;
+        let mut h_u64 = h as u64;
+        let mut od_u64 = out_dim as u64;
+        let mut t_u64 = t as u64;
+        let mut doff_u64 = dir_off as u64;
+        let mut sc = u32::from(save_cache);
+        let mut params: [*mut c_void; 17] = [
+            (&mut d_gi_all as *mut CuDevicePtr).cast(),
+            (&mut d_gh as *mut CuDevicePtr).cast(),
+            (&mut d_biases as *mut CuDevicePtr).cast(),
+            (&mut d_h_prev as *mut CuDevicePtr).cast(),
+            (&mut d_h_cur as *mut CuDevicePtr).cast(),
+            (&mut d_layer_out as *mut CuDevicePtr).cast(),
+            (&mut d_r_out as *mut CuDevicePtr).cast(),
+            (&mut d_z_out as *mut CuDevicePtr).cast(),
+            (&mut d_n_out as *mut CuDevicePtr).cast(),
+            (&mut d_ghn_out as *mut CuDevicePtr).cast(),
+            (&mut b_u64 as *mut u64).cast(),
+            (&mut s_u64 as *mut u64).cast(),
+            (&mut h_u64 as *mut u64).cast(),
+            (&mut od_u64 as *mut u64).cast(),
+            (&mut t_u64 as *mut u64).cast(),
+            (&mut doff_u64 as *mut u64).cast(),
+            (&mut sc as *mut u32).cast(),
+        ];
+        launch_1d_async(self.rt, func, batch * h, 256, &mut params)
+    }
+
+    /// VRAM-resident fused GRU 3-gate timestep backward (updates `d_dh_next` in-place with `dh * z`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gru_step_bwd_dev(
+        &self,
+        mut d_out: CuDevicePtr,
+        mut d_dh_next: CuDevicePtr,
+        mut d_h_prev: CuDevicePtr,
+        mut d_r: CuDevicePtr,
+        mut d_z: CuDevicePtr,
+        mut d_n: CuDevicePtr,
+        mut d_ghn: CuDevicePtr,
+        mut d_dgi_all: CuDevicePtr,
+        mut d_dgh_step: CuDevicePtr,
+        batch: usize,
+        seq_len: usize,
+        h: usize,
+        out_dim: usize,
+        t: usize,
+        dir_off: usize,
+    ) -> OchreResult<()> {
+        let func = self.ptx()?.gru_step_bwd_f32;
+        let mut b_u64 = batch as u64;
+        let mut s_u64 = seq_len as u64;
+        let mut h_u64 = h as u64;
+        let mut od_u64 = out_dim as u64;
+        let mut t_u64 = t as u64;
+        let mut doff_u64 = dir_off as u64;
+        let mut params: [*mut c_void; 15] = [
+            (&mut d_out as *mut CuDevicePtr).cast(),
+            (&mut d_dh_next as *mut CuDevicePtr).cast(),
+            (&mut d_h_prev as *mut CuDevicePtr).cast(),
+            (&mut d_r as *mut CuDevicePtr).cast(),
+            (&mut d_z as *mut CuDevicePtr).cast(),
+            (&mut d_n as *mut CuDevicePtr).cast(),
+            (&mut d_ghn as *mut CuDevicePtr).cast(),
+            (&mut d_dgi_all as *mut CuDevicePtr).cast(),
+            (&mut d_dgh_step as *mut CuDevicePtr).cast(),
+            (&mut b_u64 as *mut u64).cast(),
+            (&mut s_u64 as *mut u64).cast(),
+            (&mut h_u64 as *mut u64).cast(),
+            (&mut od_u64 as *mut u64).cast(),
+            (&mut t_u64 as *mut u64).cast(),
+            (&mut doff_u64 as *mut u64).cast(),
+        ];
+        launch_1d_async(self.rt, func, batch * h, 256, &mut params)
+    }
+
+    /// VRAM-resident fused LSTM 4-gate timestep forward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lstm_step_fwd_dev(
+        &self,
+        mut d_gi_all: CuDevicePtr,
+        mut d_gh: CuDevicePtr,
+        mut d_b_total: CuDevicePtr,
+        mut d_c_prev: CuDevicePtr,
+        mut d_h_cur: CuDevicePtr,
+        mut d_c_cur: CuDevicePtr,
+        mut d_layer_out: CuDevicePtr,
+        mut d_i_out: CuDevicePtr,
+        mut d_f_out: CuDevicePtr,
+        mut d_g_out: CuDevicePtr,
+        mut d_o_out: CuDevicePtr,
+        mut d_tc_out: CuDevicePtr,
+        batch: usize,
+        seq_len: usize,
+        h: usize,
+        out_dim: usize,
+        t: usize,
+        dir_off: usize,
+        save_cache: bool,
+    ) -> OchreResult<()> {
+        let func = self.ptx()?.lstm_step_fwd_f32;
+        let mut b_u64 = batch as u64;
+        let mut s_u64 = seq_len as u64;
+        let mut h_u64 = h as u64;
+        let mut od_u64 = out_dim as u64;
+        let mut t_u64 = t as u64;
+        let mut doff_u64 = dir_off as u64;
+        let mut sc = u32::from(save_cache);
+        let mut params: [*mut c_void; 19] = [
+            (&mut d_gi_all as *mut CuDevicePtr).cast(),
+            (&mut d_gh as *mut CuDevicePtr).cast(),
+            (&mut d_b_total as *mut CuDevicePtr).cast(),
+            (&mut d_c_prev as *mut CuDevicePtr).cast(),
+            (&mut d_h_cur as *mut CuDevicePtr).cast(),
+            (&mut d_c_cur as *mut CuDevicePtr).cast(),
+            (&mut d_layer_out as *mut CuDevicePtr).cast(),
+            (&mut d_i_out as *mut CuDevicePtr).cast(),
+            (&mut d_f_out as *mut CuDevicePtr).cast(),
+            (&mut d_g_out as *mut CuDevicePtr).cast(),
+            (&mut d_o_out as *mut CuDevicePtr).cast(),
+            (&mut d_tc_out as *mut CuDevicePtr).cast(),
+            (&mut b_u64 as *mut u64).cast(),
+            (&mut s_u64 as *mut u64).cast(),
+            (&mut h_u64 as *mut u64).cast(),
+            (&mut od_u64 as *mut u64).cast(),
+            (&mut t_u64 as *mut u64).cast(),
+            (&mut doff_u64 as *mut u64).cast(),
+            (&mut sc as *mut u32).cast(),
+        ];
+        launch_1d_async(self.rt, func, batch * h, 256, &mut params)
+    }
+
+    /// VRAM-resident fused LSTM 4-gate timestep backward (updates `d_dc_next` in-place with `dc * fv`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn lstm_step_bwd_dev(
+        &self,
+        mut d_out: CuDevicePtr,
+        mut d_dh_next: CuDevicePtr,
+        mut d_dc_next: CuDevicePtr,
+        mut d_c_prev: CuDevicePtr,
+        mut d_i: CuDevicePtr,
+        mut d_f: CuDevicePtr,
+        mut d_g: CuDevicePtr,
+        mut d_o: CuDevicePtr,
+        mut d_tc: CuDevicePtr,
+        mut d_dg_all: CuDevicePtr,
+        mut d_dg_step: CuDevicePtr,
+        batch: usize,
+        seq_len: usize,
+        h: usize,
+        out_dim: usize,
+        t: usize,
+        dir_off: usize,
+    ) -> OchreResult<()> {
+        let func = self.ptx()?.lstm_step_bwd_f32;
+        let mut b_u64 = batch as u64;
+        let mut s_u64 = seq_len as u64;
+        let mut h_u64 = h as u64;
+        let mut od_u64 = out_dim as u64;
+        let mut t_u64 = t as u64;
+        let mut doff_u64 = dir_off as u64;
+        let mut params: [*mut c_void; 17] = [
+            (&mut d_out as *mut CuDevicePtr).cast(),
+            (&mut d_dh_next as *mut CuDevicePtr).cast(),
+            (&mut d_dc_next as *mut CuDevicePtr).cast(),
+            (&mut d_c_prev as *mut CuDevicePtr).cast(),
+            (&mut d_i as *mut CuDevicePtr).cast(),
+            (&mut d_f as *mut CuDevicePtr).cast(),
+            (&mut d_g as *mut CuDevicePtr).cast(),
+            (&mut d_o as *mut CuDevicePtr).cast(),
+            (&mut d_tc as *mut CuDevicePtr).cast(),
+            (&mut d_dg_all as *mut CuDevicePtr).cast(),
+            (&mut d_dg_step as *mut CuDevicePtr).cast(),
+            (&mut b_u64 as *mut u64).cast(),
+            (&mut s_u64 as *mut u64).cast(),
+            (&mut h_u64 as *mut u64).cast(),
+            (&mut od_u64 as *mut u64).cast(),
+            (&mut t_u64 as *mut u64).cast(),
+            (&mut doff_u64 as *mut u64).cast(),
+        ];
+        launch_1d_async(self.rt, func, batch * h, 256, &mut params)
+    }
+}
+
+// ============================================================================
+// High-Level VRAM-Resident FlashAttention & RNN / GRU / LSTM Runners
+// ============================================================================
+
+/// Host wrapper for VRAM-resident CUDA FlashAttention forward.
+/// Returns `None` if CUDA is unavailable (graceful CPU fallback).
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_flash_attention_fwd(
+    gpu_id: usize,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    causal: bool,
+    kv_offset: usize,
+) -> Option<OchreResult<(Vec<f32>, Vec<f32>)>> {
+    if batch == 0 || num_heads == 0 || num_kv_heads == 0 || head_dim == 0 || q_len == 0 {
+        return None;
+    }
+    with_vram_session(gpu_id, |sess| {
+        let d_q = sess.upload_f32(q)?;
+        let d_k = sess.upload_f32(k)?;
+        let d_v = sess.upload_f32(v)?;
+        let out_len = batch * num_heads * q_len * head_dim;
+        let lse_len = batch * num_heads * q_len;
+        let d_out = sess.alloc_f32(out_len)?;
+        let d_lse = sess.alloc_f32(lse_len)?;
+        sess.flash_sdpa_fwd(
+            d_q.ptr(),
+            d_k.ptr(),
+            d_v.ptr(),
+            d_out.ptr(),
+            d_lse.ptr(),
+            batch,
+            num_heads,
+            num_kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            causal,
+            kv_offset,
+        )?;
+        let mut out = vec![0.0f32; out_len];
+        let mut lse = vec![0.0f32; lse_len];
+        sess.dtoh_f32(&mut out, &d_out)?;
+        sess.dtoh_f32(&mut lse, &d_lse)?;
+        Ok((out, lse))
+    })
+}
+
+/// Host wrapper for VRAM-resident CUDA FlashAttention backward.
+/// Returns `None` if CUDA is unavailable (graceful CPU fallback).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn cuda_flash_attention_bwd(
+    gpu_id: usize,
+    d_out: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &[f32],
+    lse: &[f32],
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    causal: bool,
+    kv_offset: usize,
+) -> Option<OchreResult<(Vec<f32>, Vec<f32>, Vec<f32>)>> {
+    if batch == 0 || num_heads == 0 || num_kv_heads == 0 || head_dim == 0 {
+        return None;
+    }
+    with_vram_session(gpu_id, |sess| {
+        let d_do = sess.upload_f32(d_out)?;
+        let d_q = sess.upload_f32(q)?;
+        let d_k = sess.upload_f32(k)?;
+        let d_v = sess.upload_f32(v)?;
+        let d_o = sess.upload_f32(out)?;
+        let d_lse = sess.upload_f32(lse)?;
+        let d_row = sess.alloc_f32(batch * num_heads * q_len)?;
+        let d_dq = sess.alloc_f32(q.len())?;
+        let d_dk = sess.alloc_f32(k.len())?;
+        let d_dv = sess.alloc_f32(v.len())?;
+        sess.flash_sdpa_bwd(
+            d_do.ptr(),
+            d_q.ptr(),
+            d_k.ptr(),
+            d_v.ptr(),
+            d_o.ptr(),
+            d_lse.ptr(),
+            d_row.ptr(),
+            d_dq.ptr(),
+            d_dk.ptr(),
+            d_dv.ptr(),
+            batch,
+            num_heads,
+            num_kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            causal,
+            kv_offset,
+        )?;
+        let mut dq = vec![0.0f32; q.len()];
+        let mut dk = vec![0.0f32; k.len()];
+        let mut dv = vec![0.0f32; v.len()];
+        sess.dtoh_f32(&mut dq, &d_dq)?;
+        sess.dtoh_f32(&mut dk, &d_dk)?;
+        sess.dtoh_f32(&mut dv, &d_dv)?;
+        Ok((dq, dk, dv))
+    })
+}
+
+/// Gradient buffers downloaded once at the end of VRAM-resident RNN/GRU/LSTM backward.
+#[derive(Clone, Debug)]
+pub struct CudaSeqGradOutput {
+    pub d_input: Vec<f32>,
+    pub d_h0: Vec<f32>,
+    pub d_c0: Option<Vec<f32>>,
+    pub d_weight_ih: Vec<Vec<f32>>,
+    pub d_weight_hh: Vec<Vec<f32>>,
+    pub d_bias_ih: Vec<Option<Vec<f32>>>,
+    pub d_bias_hh: Vec<Option<Vec<f32>>>,
+}
+
+/// Device-resident activation & weight cache kept in VRAM between `cuda_rnn_forward` and `cuda_rnn_backward`.
+pub struct CudaRnnCache {
+    batch: usize,
+    seq_len: usize,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    is_relu: bool,
+    dtype: DType,
+    has_bias_ih: Vec<bool>,
+    has_bias_hh: Vec<bool>,
+    w_ih_lens: Vec<usize>,
+    w_hh_lens: Vec<usize>,
+    d_weight_ih: Vec<CudaDeviceBuf>,
+    d_weight_hh: Vec<CudaDeviceBuf>,
+    d_layer_inputs: Vec<CudaDeviceBuf>,
+    /// Per unit: `[(seq_len + 1) * B * H]` holding `[h_0, h_1, ..., h_T]` in VRAM.
+    d_unit_all_h: Vec<CudaDeviceBuf>,
+}
+
+/// Device-resident activation & weight cache kept in VRAM between `cuda_gru_forward` and `cuda_gru_backward`.
+pub struct CudaGruCache {
+    batch: usize,
+    seq_len: usize,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    dtype: DType,
+    has_bias_ih: Vec<bool>,
+    has_bias_hh: Vec<bool>,
+    w_ih_lens: Vec<usize>,
+    w_hh_lens: Vec<usize>,
+    d_weight_ih: Vec<CudaDeviceBuf>,
+    d_weight_hh: Vec<CudaDeviceBuf>,
+    d_layer_inputs: Vec<CudaDeviceBuf>,
+    d_unit_all_h: Vec<CudaDeviceBuf>,
+    d_unit_r: Vec<CudaDeviceBuf>,
+    d_unit_z: Vec<CudaDeviceBuf>,
+    d_unit_n: Vec<CudaDeviceBuf>,
+    d_unit_ghn: Vec<CudaDeviceBuf>,
+}
+
+/// Device-resident activation & weight cache kept in VRAM between `cuda_lstm_forward` and `cuda_lstm_backward`.
+pub struct CudaLstmCache {
+    batch: usize,
+    seq_len: usize,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    dtype: DType,
+    has_bias_ih: Vec<bool>,
+    has_bias_hh: Vec<bool>,
+    w_ih_lens: Vec<usize>,
+    w_hh_lens: Vec<usize>,
+    d_weight_ih: Vec<CudaDeviceBuf>,
+    d_weight_hh: Vec<CudaDeviceBuf>,
+    d_layer_inputs: Vec<CudaDeviceBuf>,
+    d_unit_all_h: Vec<CudaDeviceBuf>,
+    d_unit_all_c: Vec<CudaDeviceBuf>,
+    d_unit_i: Vec<CudaDeviceBuf>,
+    d_unit_f: Vec<CudaDeviceBuf>,
+    d_unit_g: Vec<CudaDeviceBuf>,
+    d_unit_o: Vec<CudaDeviceBuf>,
+    d_unit_tc: Vec<CudaDeviceBuf>,
+}
+
+/// 100% VRAM-resident multi-layer (optionally bidirectional) Elman RNN forward pass.
+/// Uploads `x`, `h0`, and weights once, runs all layers and timesteps in VRAM with zero per-step host copies,
+/// and downloads only `(output, h_n)`. When `save_cache == true`, keeps activations in VRAM inside `CudaRnnCache`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn cuda_rnn_forward(
+    gpu_id: usize,
+    x: &[f32],
+    h0: Option<&[f32]>,
+    weight_ih: &[&[f32]],
+    weight_hh: &[&[f32]],
+    bias_ih: &[Option<&[f32]>],
+    bias_hh: &[Option<&[f32]>],
+    batch: usize,
+    seq_len: usize,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    is_relu: bool,
+    dtype: DType,
+    save_cache: bool,
+) -> Option<OchreResult<(Vec<f32>, Vec<f32>, Option<CudaRnnCache>)>> {
+    let dirs = if bidirectional { 2 } else { 1 };
+    let units = num_layers * dirs;
+    let h = hidden_size;
+    let bh = batch * h;
+
+    with_vram_session(gpu_id, |sess| {
+        if x.len() != batch * seq_len * input_size {
+            return Err(OchreError::InvalidParameter(
+                "CUDA RNN input length mismatch ( >_< )".to_string(),
+            ));
+        }
+        if let Some(h_init) = h0
+            && h_init.len() != units * bh
+        {
+            return Err(OchreError::InvalidParameter(
+                "CUDA RNN h0 length mismatch ( >_< )".to_string(),
+            ));
+        }
+        if weight_ih.len() != units
+            || weight_hh.len() != units
+            || bias_ih.len() != units
+            || bias_hh.len() != units
+        {
+            return Err(OchreError::InvalidParameter(
+                "CUDA RNN weight/bias unit count mismatch ( >_< )".to_string(),
+            ));
+        }
+
+        let mut d_w_ih = Vec::with_capacity(units);
+        let mut d_w_hh = Vec::with_capacity(units);
+        let mut d_b_total = Vec::with_capacity(units);
+        let mut has_bias_any = Vec::with_capacity(units);
+        let mut has_bias_ih = Vec::with_capacity(units);
+        let mut has_bias_hh = Vec::with_capacity(units);
+        let mut w_ih_lens = Vec::with_capacity(units);
+        let mut w_hh_lens = Vec::with_capacity(units);
+
+        for u in 0..units {
+            w_ih_lens.push(weight_ih[u].len());
+            w_hh_lens.push(weight_hh[u].len());
+            d_w_ih.push(sess.upload_f32(weight_ih[u])?);
+            d_w_hh.push(sess.upload_f32(weight_hh[u])?);
+            has_bias_ih.push(bias_ih[u].is_some());
+            has_bias_hh.push(bias_hh[u].is_some());
+            let hb = bias_ih[u].is_some() || bias_hh[u].is_some();
+            has_bias_any.push(hb);
+            let mut bt = vec![0.0f32; h];
+            if let Some(b) = bias_ih[u] {
+                for (d, &s) in bt.iter_mut().zip(b.iter()) {
+                    *d += s;
+                }
+            }
+            if let Some(b) = bias_hh[u] {
+                for (d, &s) in bt.iter_mut().zip(b.iter()) {
+                    *d += s;
+                }
+            }
+            d_b_total.push(sess.upload_f32(&bt)?);
+        }
+
+        let d_h0 = match h0 {
+            Some(hi) => Some(sess.upload_f32(hi)?),
+            None => None,
+        };
+        let mut d_cur_input = sess.upload_f32(x)?;
+        let d_hn = sess.alloc_f32(units * bh)?;
+        let d_x_proj = sess.alloc_f32(batch * seq_len * h)?;
+        let d_h_proj = sess.alloc_f32(bh)?;
+
+        // Ping-pong buffers for eval mode (!save_cache)
+        let d_ping = if !save_cache {
+            Some(sess.alloc_f32(bh)?)
+        } else {
+            None
+        };
+        let d_pong = if !save_cache {
+            Some(sess.alloc_f32(bh)?)
+        } else {
+            None
+        };
+
+        let mut d_layer_inputs = Vec::with_capacity(if save_cache { num_layers } else { 0 });
+        let mut d_unit_all_h = Vec::with_capacity(if save_cache { units } else { 0 });
+
+        for layer in 0..num_layers {
+            let in_dim = if layer == 0 { input_size } else { h * dirs };
+            let out_dim = h * dirs;
+            let d_layer_out = sess.alloc_f32(batch * seq_len * out_dim)?;
+
+            for dir in 0..dirs {
+                let u = layer * dirs + dir;
+                sess.sgemm_dev(
+                    batch * seq_len,
+                    h,
+                    in_dim,
+                    d_cur_input.ptr(),
+                    d_w_ih[u].ptr(),
+                    d_x_proj.ptr(),
+                    false,
+                    true,
+                    1.0,
+                    0.0,
+                    dtype,
+                )?;
+
+                if save_cache {
+                    let d_all_h = sess.alloc_f32((seq_len + 1) * bh)?;
+                    if let Some(ref h0_buf) = d_h0 {
+                        sess.copy_f32(h0_buf.ptr_offset_f32(u * bh), d_all_h.ptr(), bh)?;
+                    } else {
+                        sess.fill_f32(d_all_h.ptr(), 0.0, bh)?;
+                    }
+
+                    for step in 0..seq_len {
+                        let t = if dir == 0 { step } else { seq_len - 1 - step };
+                        let p_prev = d_all_h.ptr_offset_f32(step * bh);
+                        let p_cur = d_all_h.ptr_offset_f32((step + 1) * bh);
+                        sess.sgemm_dev(
+                            batch,
+                            h,
+                            h,
+                            p_prev,
+                            d_w_hh[u].ptr(),
+                            d_h_proj.ptr(),
+                            false,
+                            true,
+                            1.0,
+                            0.0,
+                            dtype,
+                        )?;
+                        sess.rnn_step_fwd_dev(
+                            d_x_proj.ptr(),
+                            d_h_proj.ptr(),
+                            d_b_total[u].ptr(),
+                            p_cur,
+                            d_layer_out.ptr(),
+                            batch,
+                            seq_len,
+                            h,
+                            out_dim,
+                            t,
+                            dir * h,
+                            is_relu,
+                            has_bias_any[u],
+                        )?;
+                    }
+                    sess.copy_f32(
+                        d_all_h.ptr_offset_f32(seq_len * bh),
+                        d_hn.ptr_offset_f32(u * bh),
+                        bh,
+                    )?;
+                    d_unit_all_h.push(d_all_h);
+                } else {
+                    let (mut p_prev, mut p_cur) = match (&d_ping, &d_pong) {
+                        (Some(a), Some(b)) => (a.ptr(), b.ptr()),
+                        _ => unreachable!(),
+                    };
+                    if let Some(ref h0_buf) = d_h0 {
+                        sess.copy_f32(h0_buf.ptr_offset_f32(u * bh), p_prev, bh)?;
+                    } else {
+                        sess.fill_f32(p_prev, 0.0, bh)?;
+                    }
+                    for step in 0..seq_len {
+                        let t = if dir == 0 { step } else { seq_len - 1 - step };
+                        sess.sgemm_dev(
+                            batch,
+                            h,
+                            h,
+                            p_prev,
+                            d_w_hh[u].ptr(),
+                            d_h_proj.ptr(),
+                            false,
+                            true,
+                            1.0,
+                            0.0,
+                            dtype,
+                        )?;
+                        sess.rnn_step_fwd_dev(
+                            d_x_proj.ptr(),
+                            d_h_proj.ptr(),
+                            d_b_total[u].ptr(),
+                            p_cur,
+                            d_layer_out.ptr(),
+                            batch,
+                            seq_len,
+                            h,
+                            out_dim,
+                            t,
+                            dir * h,
+                            is_relu,
+                            has_bias_any[u],
+                        )?;
+                        std::mem::swap(&mut p_prev, &mut p_cur);
+                    }
+                    sess.copy_f32(p_prev, d_hn.ptr_offset_f32(u * bh), bh)?;
+                }
+            }
+
+            if save_cache {
+                d_layer_inputs.push(d_cur_input);
+            }
+            d_cur_input = d_layer_out;
+        }
+
+        let mut out = vec![0.0f32; batch * seq_len * h * dirs];
+        let mut hn = vec![0.0f32; units * bh];
+        sess.dtoh_f32(&mut out, &d_cur_input)?;
+        sess.dtoh_f32(&mut hn, &d_hn)?;
+
+        let cache = if save_cache {
+            Some(CudaRnnCache {
+                batch,
+                seq_len,
+                input_size,
+                hidden_size,
+                num_layers,
+                bidirectional,
+                is_relu,
+                dtype,
+                has_bias_ih,
+                has_bias_hh,
+                w_ih_lens,
+                w_hh_lens,
+                d_weight_ih: d_w_ih,
+                d_weight_hh: d_w_hh,
+                d_layer_inputs,
+                d_unit_all_h,
+            })
+        } else {
+            None
+        };
+        Ok((out, hn, cache))
+    })
+}
+
+/// 100% VRAM-resident BPTT backward pass for Elman RNN using `CudaRnnCache`.
+pub fn cuda_rnn_backward(
+    gpu_id: usize,
+    cache: &CudaRnnCache,
+    d_output: &[f32],
+    d_hn: &[f32],
+) -> Option<OchreResult<CudaSeqGradOutput>> {
+    let dirs = if cache.bidirectional { 2 } else { 1 };
+    let units = cache.num_layers * dirs;
+    let h = cache.hidden_size;
+    let batch = cache.batch;
+    let seq_len = cache.seq_len;
+    let bh = batch * h;
+
+    with_vram_session(gpu_id, |sess| {
+        let mut d_cur_out = sess.upload_f32(d_output)?;
+        let d_hn_in = sess.upload_f32(d_hn)?;
+        let d_h0_out = sess.alloc_f32(units * bh)?;
+        let d_dh_next = sess.alloc_f32(bh)?;
+        let d_da_all = sess.alloc_f32(batch * seq_len * h)?;
+        let d_da_steps = sess.alloc_f32(seq_len * bh)?;
+        let d_db_tmp = sess.alloc_f32(h)?;
+
+        let mut d_weight_ih: Vec<Vec<f32>> = cache
+            .w_ih_lens
+            .iter()
+            .map(|&len| vec![0.0f32; len])
+            .collect();
+        let mut d_weight_hh: Vec<Vec<f32>> = cache
+            .w_hh_lens
+            .iter()
+            .map(|&len| vec![0.0f32; len])
+            .collect();
+        let mut d_bias_ih: Vec<Option<Vec<f32>>> = vec![None; units];
+        let mut d_bias_hh: Vec<Option<Vec<f32>>> = vec![None; units];
+
+        for layer in (0..cache.num_layers).rev() {
+            let in_dim = if layer == 0 {
+                cache.input_size
+            } else {
+                h * dirs
+            };
+            let out_dim = h * dirs;
+            let d_layer_in = sess.alloc_f32(batch * seq_len * in_dim)?;
+            let d_x_layer = &cache.d_layer_inputs[layer];
+
+            for dir in 0..dirs {
+                let u = layer * dirs + dir;
+                sess.copy_f32(d_hn_in.ptr_offset_f32(u * bh), d_dh_next.ptr(), bh)?;
+
+                for step in (0..seq_len).rev() {
+                    let t = if dir == 0 { step } else { seq_len - 1 - step };
+                    let p_h_cur = cache.d_unit_all_h[u].ptr_offset_f32((step + 1) * bh);
+                    let p_da_step = d_da_steps.ptr_offset_f32(step * bh);
+                    sess.rnn_step_bwd_dev(
+                        d_cur_out.ptr(),
+                        d_dh_next.ptr(),
+                        p_h_cur,
+                        p_da_step,
+                        d_da_all.ptr(),
+                        batch,
+                        seq_len,
+                        h,
+                        out_dim,
+                        t,
+                        dir * h,
+                        cache.is_relu,
+                    )?;
+                    sess.sgemm_dev(
+                        batch,
+                        h,
+                        h,
+                        p_da_step,
+                        cache.d_weight_hh[u].ptr(),
+                        d_dh_next.ptr(),
+                        false,
+                        false,
+                        1.0,
+                        0.0,
+                        cache.dtype,
+                    )?;
+                }
+
+                sess.copy_f32(d_dh_next.ptr(), d_h0_out.ptr_offset_f32(u * bh), bh)?;
+
+                if cache.has_bias_ih[u] || cache.has_bias_hh[u] {
+                    sess.sum_rows_f32(d_da_steps.ptr(), d_db_tmp.ptr(), seq_len * batch, h)?;
+                    let mut db_host = vec![0.0f32; h];
+                    sess.dtoh_f32(&mut db_host, &d_db_tmp)?;
+                    if cache.has_bias_ih[u] {
+                        d_bias_ih[u] = Some(db_host.clone());
+                    }
+                    if cache.has_bias_hh[u] {
+                        d_bias_hh[u] = Some(db_host);
+                    }
+                }
+
+                let d_dw_hh = sess.alloc_f32(cache.w_hh_lens[u])?;
+                sess.sgemm_dev(
+                    h,
+                    h,
+                    seq_len * batch,
+                    d_da_steps.ptr(),
+                    cache.d_unit_all_h[u].ptr(),
+                    d_dw_hh.ptr(),
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                    cache.dtype,
+                )?;
+                let d_dw_ih = sess.alloc_f32(cache.w_ih_lens[u])?;
+                sess.sgemm_dev(
+                    h,
+                    in_dim,
+                    batch * seq_len,
+                    d_da_all.ptr(),
+                    d_x_layer.ptr(),
+                    d_dw_ih.ptr(),
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                    cache.dtype,
+                )?;
+                sess.sgemm_dev(
+                    batch * seq_len,
+                    in_dim,
+                    h,
+                    d_da_all.ptr(),
+                    cache.d_weight_ih[u].ptr(),
+                    d_layer_in.ptr(),
+                    false,
+                    false,
+                    1.0,
+                    if dir == 0 { 0.0 } else { 1.0 },
+                    cache.dtype,
+                )?;
+
+                sess.dtoh_f32(&mut d_weight_hh[u], &d_dw_hh)?;
+                sess.dtoh_f32(&mut d_weight_ih[u], &d_dw_ih)?;
+            }
+
+            d_cur_out = d_layer_in;
+        }
+
+        let mut d_input = vec![0.0f32; batch * seq_len * cache.input_size];
+        let mut d_h0 = vec![0.0f32; units * bh];
+        sess.dtoh_f32(&mut d_input, &d_cur_out)?;
+        sess.dtoh_f32(&mut d_h0, &d_h0_out)?;
+
+        Ok(CudaSeqGradOutput {
+            d_input,
+            d_h0,
+            d_c0: None,
+            d_weight_ih,
+            d_weight_hh,
+            d_bias_ih,
+            d_bias_hh,
+        })
+    })
+}
+
+/// 100% VRAM-resident multi-layer (optionally bidirectional) GRU forward pass.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn cuda_gru_forward(
+    gpu_id: usize,
+    x: &[f32],
+    h0: Option<&[f32]>,
+    weight_ih: &[&[f32]],
+    weight_hh: &[&[f32]],
+    bias_ih: &[Option<&[f32]>],
+    bias_hh: &[Option<&[f32]>],
+    batch: usize,
+    seq_len: usize,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    dtype: DType,
+    save_cache: bool,
+) -> Option<OchreResult<(Vec<f32>, Vec<f32>, Option<CudaGruCache>)>> {
+    let dirs = if bidirectional { 2 } else { 1 };
+    let units = num_layers * dirs;
+    let h = hidden_size;
+    let h3 = 3 * h;
+    let bh = batch * h;
+
+    with_vram_session(gpu_id, |sess| {
+        if x.len() != batch * seq_len * input_size {
+            return Err(OchreError::InvalidParameter(
+                "CUDA GRU input length mismatch ( >_< )".to_string(),
+            ));
+        }
+        if let Some(h_init) = h0
+            && h_init.len() != units * bh
+        {
+            return Err(OchreError::InvalidParameter(
+                "CUDA GRU h0 length mismatch ( >_< )".to_string(),
+            ));
+        }
+        if weight_ih.len() != units
+            || weight_hh.len() != units
+            || bias_ih.len() != units
+            || bias_hh.len() != units
+        {
+            return Err(OchreError::InvalidParameter(
+                "CUDA GRU weight/bias unit count mismatch ( >_< )".to_string(),
+            ));
+        }
+
+        let mut d_w_ih = Vec::with_capacity(units);
+        let mut d_w_hh = Vec::with_capacity(units);
+        let mut d_biases = Vec::with_capacity(units);
+        let mut has_bias_ih = Vec::with_capacity(units);
+        let mut has_bias_hh = Vec::with_capacity(units);
+        let mut w_ih_lens = Vec::with_capacity(units);
+        let mut w_hh_lens = Vec::with_capacity(units);
+
+        for u in 0..units {
+            w_ih_lens.push(weight_ih[u].len());
+            w_hh_lens.push(weight_hh[u].len());
+            d_w_ih.push(sess.upload_f32(weight_ih[u])?);
+            d_w_hh.push(sess.upload_f32(weight_hh[u])?);
+            has_bias_ih.push(bias_ih[u].is_some());
+            has_bias_hh.push(bias_hh[u].is_some());
+            // Pack [br_sum (H) | bz_sum (H) | bi_n (H) | bh_n (H)]
+            let mut packed = vec![0.0f32; 4 * h];
+            if let Some(v) = bias_ih[u] {
+                for j in 0..h {
+                    packed[j] += v[j];
+                    packed[h + j] += v[h + j];
+                    packed[2 * h + j] = v[2 * h + j];
+                }
+            }
+            if let Some(v) = bias_hh[u] {
+                for j in 0..h {
+                    packed[j] += v[j];
+                    packed[h + j] += v[h + j];
+                    packed[3 * h + j] = v[2 * h + j];
+                }
+            }
+            d_biases.push(sess.upload_f32(&packed)?);
+        }
+
+        let d_h0 = match h0 {
+            Some(hi) => Some(sess.upload_f32(hi)?),
+            None => None,
+        };
+        let mut d_cur_input = sess.upload_f32(x)?;
+        let d_hn = sess.alloc_f32(units * bh)?;
+        let d_gi_all = sess.alloc_f32(batch * seq_len * h3)?;
+        let d_gh = sess.alloc_f32(batch * h3)?;
+
+        let d_ping = if !save_cache {
+            Some(sess.alloc_f32(bh)?)
+        } else {
+            None
+        };
+        let d_pong = if !save_cache {
+            Some(sess.alloc_f32(bh)?)
+        } else {
+            None
+        };
+
+        let mut d_layer_inputs = Vec::with_capacity(if save_cache { num_layers } else { 0 });
+        let mut d_unit_all_h = Vec::with_capacity(if save_cache { units } else { 0 });
+        let mut d_unit_r = Vec::with_capacity(if save_cache { units } else { 0 });
+        let mut d_unit_z = Vec::with_capacity(if save_cache { units } else { 0 });
+        let mut d_unit_n = Vec::with_capacity(if save_cache { units } else { 0 });
+        let mut d_unit_ghn = Vec::with_capacity(if save_cache { units } else { 0 });
+
+        for layer in 0..num_layers {
+            let in_dim = if layer == 0 { input_size } else { h * dirs };
+            let out_dim = h * dirs;
+            let d_layer_out = sess.alloc_f32(batch * seq_len * out_dim)?;
+
+            for dir in 0..dirs {
+                let u = layer * dirs + dir;
+                sess.sgemm_dev(
+                    batch * seq_len,
+                    h3,
+                    in_dim,
+                    d_cur_input.ptr(),
+                    d_w_ih[u].ptr(),
+                    d_gi_all.ptr(),
+                    false,
+                    true,
+                    1.0,
+                    0.0,
+                    dtype,
+                )?;
+
+                if save_cache {
+                    let d_all_h = sess.alloc_f32((seq_len + 1) * bh)?;
+                    let d_r = sess.alloc_f32(seq_len * bh)?;
+                    let d_z = sess.alloc_f32(seq_len * bh)?;
+                    let d_n = sess.alloc_f32(seq_len * bh)?;
+                    let d_ghn = sess.alloc_f32(seq_len * bh)?;
+
+                    if let Some(ref h0_buf) = d_h0 {
+                        sess.copy_f32(h0_buf.ptr_offset_f32(u * bh), d_all_h.ptr(), bh)?;
+                    } else {
+                        sess.fill_f32(d_all_h.ptr(), 0.0, bh)?;
+                    }
+
+                    for step in 0..seq_len {
+                        let t = if dir == 0 { step } else { seq_len - 1 - step };
+                        let p_prev = d_all_h.ptr_offset_f32(step * bh);
+                        let p_cur = d_all_h.ptr_offset_f32((step + 1) * bh);
+                        sess.sgemm_dev(
+                            batch,
+                            h3,
+                            h,
+                            p_prev,
+                            d_w_hh[u].ptr(),
+                            d_gh.ptr(),
+                            false,
+                            true,
+                            1.0,
+                            0.0,
+                            dtype,
+                        )?;
+                        sess.gru_step_fwd_dev(
+                            d_gi_all.ptr(),
+                            d_gh.ptr(),
+                            d_biases[u].ptr(),
+                            p_prev,
+                            p_cur,
+                            d_layer_out.ptr(),
+                            d_r.ptr_offset_f32(step * bh),
+                            d_z.ptr_offset_f32(step * bh),
+                            d_n.ptr_offset_f32(step * bh),
+                            d_ghn.ptr_offset_f32(step * bh),
+                            batch,
+                            seq_len,
+                            h,
+                            out_dim,
+                            t,
+                            dir * h,
+                            true,
+                        )?;
+                    }
+
+                    sess.copy_f32(
+                        d_all_h.ptr_offset_f32(seq_len * bh),
+                        d_hn.ptr_offset_f32(u * bh),
+                        bh,
+                    )?;
+                    d_unit_all_h.push(d_all_h);
+                    d_unit_r.push(d_r);
+                    d_unit_z.push(d_z);
+                    d_unit_n.push(d_n);
+                    d_unit_ghn.push(d_ghn);
+                } else {
+                    let (mut p_prev, mut p_cur) = match (&d_ping, &d_pong) {
+                        (Some(a), Some(b)) => (a.ptr(), b.ptr()),
+                        _ => unreachable!(),
+                    };
+                    if let Some(ref h0_buf) = d_h0 {
+                        sess.copy_f32(h0_buf.ptr_offset_f32(u * bh), p_prev, bh)?;
+                    } else {
+                        sess.fill_f32(p_prev, 0.0, bh)?;
+                    }
+                    for step in 0..seq_len {
+                        let t = if dir == 0 { step } else { seq_len - 1 - step };
+                        sess.sgemm_dev(
+                            batch,
+                            h3,
+                            h,
+                            p_prev,
+                            d_w_hh[u].ptr(),
+                            d_gh.ptr(),
+                            false,
+                            true,
+                            1.0,
+                            0.0,
+                            dtype,
+                        )?;
+                        sess.gru_step_fwd_dev(
+                            d_gi_all.ptr(),
+                            d_gh.ptr(),
+                            d_biases[u].ptr(),
+                            p_prev,
+                            p_cur,
+                            d_layer_out.ptr(),
+                            0,
+                            0,
+                            0,
+                            0,
+                            batch,
+                            seq_len,
+                            h,
+                            out_dim,
+                            t,
+                            dir * h,
+                            false,
+                        )?;
+                        std::mem::swap(&mut p_prev, &mut p_cur);
+                    }
+                    sess.copy_f32(p_prev, d_hn.ptr_offset_f32(u * bh), bh)?;
+                }
+            }
+
+            if save_cache {
+                d_layer_inputs.push(d_cur_input);
+            }
+            d_cur_input = d_layer_out;
+        }
+
+        let mut out = vec![0.0f32; batch * seq_len * h * dirs];
+        let mut hn = vec![0.0f32; units * bh];
+        sess.dtoh_f32(&mut out, &d_cur_input)?;
+        sess.dtoh_f32(&mut hn, &d_hn)?;
+
+        let cache = if save_cache {
+            Some(CudaGruCache {
+                batch,
+                seq_len,
+                input_size,
+                hidden_size,
+                num_layers,
+                bidirectional,
+                dtype,
+                has_bias_ih,
+                has_bias_hh,
+                w_ih_lens,
+                w_hh_lens,
+                d_weight_ih: d_w_ih,
+                d_weight_hh: d_w_hh,
+                d_layer_inputs,
+                d_unit_all_h,
+                d_unit_r,
+                d_unit_z,
+                d_unit_n,
+                d_unit_ghn,
+            })
+        } else {
+            None
+        };
+        Ok((out, hn, cache))
+    })
+}
+
+/// 100% VRAM-resident BPTT backward pass for GRU using `CudaGruCache`.
+pub fn cuda_gru_backward(
+    gpu_id: usize,
+    cache: &CudaGruCache,
+    d_output: &[f32],
+    d_hn: &[f32],
+) -> Option<OchreResult<CudaSeqGradOutput>> {
+    let dirs = if cache.bidirectional { 2 } else { 1 };
+    let units = cache.num_layers * dirs;
+    let h = cache.hidden_size;
+    let h3 = 3 * h;
+    let batch = cache.batch;
+    let seq_len = cache.seq_len;
+    let bh = batch * h;
+    let bh3 = batch * h3;
+
+    with_vram_session(gpu_id, |sess| {
+        let mut d_cur_out = sess.upload_f32(d_output)?;
+        let d_hn_in = sess.upload_f32(d_hn)?;
+        let d_h0_out = sess.alloc_f32(units * bh)?;
+        let d_dh_next = sess.alloc_f32(bh)?;
+        let d_dgi_all = sess.alloc_f32(batch * seq_len * h3)?;
+        let d_dgh_steps = sess.alloc_f32(seq_len * bh3)?;
+        let d_db_tmp = sess.alloc_f32(h3)?;
+
+        let mut d_weight_ih: Vec<Vec<f32>> = cache
+            .w_ih_lens
+            .iter()
+            .map(|&len| vec![0.0f32; len])
+            .collect();
+        let mut d_weight_hh: Vec<Vec<f32>> = cache
+            .w_hh_lens
+            .iter()
+            .map(|&len| vec![0.0f32; len])
+            .collect();
+        let mut d_bias_ih: Vec<Option<Vec<f32>>> = vec![None; units];
+        let mut d_bias_hh: Vec<Option<Vec<f32>>> = vec![None; units];
+
+        for layer in (0..cache.num_layers).rev() {
+            let in_dim = if layer == 0 {
+                cache.input_size
+            } else {
+                h * dirs
+            };
+            let out_dim = h * dirs;
+            let d_layer_in = sess.alloc_f32(batch * seq_len * in_dim)?;
+            let d_x_layer = &cache.d_layer_inputs[layer];
+
+            for dir in 0..dirs {
+                let u = layer * dirs + dir;
+                sess.copy_f32(d_hn_in.ptr_offset_f32(u * bh), d_dh_next.ptr(), bh)?;
+
+                for step in (0..seq_len).rev() {
+                    let t = if dir == 0 { step } else { seq_len - 1 - step };
+                    let off = step * bh;
+                    let p_dgh = d_dgh_steps.ptr_offset_f32(step * bh3);
+                    sess.gru_step_bwd_dev(
+                        d_cur_out.ptr(),
+                        d_dh_next.ptr(),
+                        cache.d_unit_all_h[u].ptr_offset_f32(off),
+                        cache.d_unit_r[u].ptr_offset_f32(off),
+                        cache.d_unit_z[u].ptr_offset_f32(off),
+                        cache.d_unit_n[u].ptr_offset_f32(off),
+                        cache.d_unit_ghn[u].ptr_offset_f32(off),
+                        d_dgi_all.ptr(),
+                        p_dgh,
+                        batch,
+                        seq_len,
+                        h,
+                        out_dim,
+                        t,
+                        dir * h,
+                    )?;
+                    // gru_step_bwd_dev already wrote `dh * z` into d_dh_next, so accumulate beta = 1.0!
+                    sess.sgemm_dev(
+                        batch,
+                        h,
+                        h3,
+                        p_dgh,
+                        cache.d_weight_hh[u].ptr(),
+                        d_dh_next.ptr(),
+                        false,
+                        false,
+                        1.0,
+                        1.0,
+                        cache.dtype,
+                    )?;
+                }
+
+                sess.copy_f32(d_dh_next.ptr(), d_h0_out.ptr_offset_f32(u * bh), bh)?;
+
+                if cache.has_bias_ih[u] {
+                    sess.sum_rows_f32(d_dgi_all.ptr(), d_db_tmp.ptr(), batch * seq_len, h3)?;
+                    let mut db_host = vec![0.0f32; h3];
+                    sess.dtoh_f32(&mut db_host, &d_db_tmp)?;
+                    d_bias_ih[u] = Some(db_host);
+                }
+                if cache.has_bias_hh[u] {
+                    sess.sum_rows_f32(d_dgh_steps.ptr(), d_db_tmp.ptr(), seq_len * batch, h3)?;
+                    let mut db_host = vec![0.0f32; h3];
+                    sess.dtoh_f32(&mut db_host, &d_db_tmp)?;
+                    d_bias_hh[u] = Some(db_host);
+                }
+
+                let d_dw_hh = sess.alloc_f32(cache.w_hh_lens[u])?;
+                sess.sgemm_dev(
+                    h3,
+                    h,
+                    seq_len * batch,
+                    d_dgh_steps.ptr(),
+                    cache.d_unit_all_h[u].ptr(),
+                    d_dw_hh.ptr(),
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                    cache.dtype,
+                )?;
+                let d_dw_ih = sess.alloc_f32(cache.w_ih_lens[u])?;
+                sess.sgemm_dev(
+                    h3,
+                    in_dim,
+                    batch * seq_len,
+                    d_dgi_all.ptr(),
+                    d_x_layer.ptr(),
+                    d_dw_ih.ptr(),
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                    cache.dtype,
+                )?;
+                sess.sgemm_dev(
+                    batch * seq_len,
+                    in_dim,
+                    h3,
+                    d_dgi_all.ptr(),
+                    cache.d_weight_ih[u].ptr(),
+                    d_layer_in.ptr(),
+                    false,
+                    false,
+                    1.0,
+                    if dir == 0 { 0.0 } else { 1.0 },
+                    cache.dtype,
+                )?;
+
+                sess.dtoh_f32(&mut d_weight_hh[u], &d_dw_hh)?;
+                sess.dtoh_f32(&mut d_weight_ih[u], &d_dw_ih)?;
+            }
+
+            d_cur_out = d_layer_in;
+        }
+
+        let mut d_input = vec![0.0f32; batch * seq_len * cache.input_size];
+        let mut d_h0 = vec![0.0f32; units * bh];
+        sess.dtoh_f32(&mut d_input, &d_cur_out)?;
+        sess.dtoh_f32(&mut d_h0, &d_h0_out)?;
+
+        Ok(CudaSeqGradOutput {
+            d_input,
+            d_h0,
+            d_c0: None,
+            d_weight_ih,
+            d_weight_hh,
+            d_bias_ih,
+            d_bias_hh,
+        })
+    })
+}
+
+/// 100% VRAM-resident multi-layer (optionally bidirectional) LSTM forward pass.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn cuda_lstm_forward(
+    gpu_id: usize,
+    x: &[f32],
+    h0: Option<&[f32]>,
+    c0: Option<&[f32]>,
+    weight_ih: &[&[f32]],
+    weight_hh: &[&[f32]],
+    bias_ih: &[Option<&[f32]>],
+    bias_hh: &[Option<&[f32]>],
+    batch: usize,
+    seq_len: usize,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    dtype: DType,
+    save_cache: bool,
+) -> Option<OchreResult<(Vec<f32>, Vec<f32>, Vec<f32>, Option<CudaLstmCache>)>> {
+    let dirs = if bidirectional { 2 } else { 1 };
+    let units = num_layers * dirs;
+    let h = hidden_size;
+    let h4 = 4 * h;
+    let bh = batch * h;
+
+    with_vram_session(gpu_id, |sess| {
+        if x.len() != batch * seq_len * input_size {
+            return Err(OchreError::InvalidParameter(
+                "CUDA LSTM input length mismatch ( >_< )".to_string(),
+            ));
+        }
+        if let Some(h_init) = h0
+            && h_init.len() != units * bh
+        {
+            return Err(OchreError::InvalidParameter(
+                "CUDA LSTM h0 length mismatch ( >_< )".to_string(),
+            ));
+        }
+        if let Some(c_init) = c0
+            && c_init.len() != units * bh
+        {
+            return Err(OchreError::InvalidParameter(
+                "CUDA LSTM c0 length mismatch ( >_< )".to_string(),
+            ));
+        }
+        if weight_ih.len() != units
+            || weight_hh.len() != units
+            || bias_ih.len() != units
+            || bias_hh.len() != units
+        {
+            return Err(OchreError::InvalidParameter(
+                "CUDA LSTM weight/bias unit count mismatch ( >_< )".to_string(),
+            ));
+        }
+
+        let mut d_w_ih = Vec::with_capacity(units);
+        let mut d_w_hh = Vec::with_capacity(units);
+        let mut d_b_total = Vec::with_capacity(units);
+        let mut has_bias_ih = Vec::with_capacity(units);
+        let mut has_bias_hh = Vec::with_capacity(units);
+        let mut w_ih_lens = Vec::with_capacity(units);
+        let mut w_hh_lens = Vec::with_capacity(units);
+
+        for u in 0..units {
+            w_ih_lens.push(weight_ih[u].len());
+            w_hh_lens.push(weight_hh[u].len());
+            d_w_ih.push(sess.upload_f32(weight_ih[u])?);
+            d_w_hh.push(sess.upload_f32(weight_hh[u])?);
+            has_bias_ih.push(bias_ih[u].is_some());
+            has_bias_hh.push(bias_hh[u].is_some());
+            let mut bt = vec![0.0f32; h4];
+            if let Some(v) = bias_ih[u] {
+                for (d, &s) in bt.iter_mut().zip(v.iter()) {
+                    *d += s;
+                }
+            }
+            if let Some(v) = bias_hh[u] {
+                for (d, &s) in bt.iter_mut().zip(v.iter()) {
+                    *d += s;
+                }
+            }
+            d_b_total.push(sess.upload_f32(&bt)?);
+        }
+
+        let d_h0 = match h0 {
+            Some(hi) => Some(sess.upload_f32(hi)?),
+            None => None,
+        };
+        let d_c0 = match c0 {
+            Some(ci) => Some(sess.upload_f32(ci)?),
+            None => None,
+        };
+        let mut d_cur_input = sess.upload_f32(x)?;
+        let d_hn = sess.alloc_f32(units * bh)?;
+        let d_cn = sess.alloc_f32(units * bh)?;
+        let d_gi_all = sess.alloc_f32(batch * seq_len * h4)?;
+        let d_gh = sess.alloc_f32(batch * h4)?;
+
+        let d_h_ping = if !save_cache {
+            Some(sess.alloc_f32(bh)?)
+        } else {
+            None
+        };
+        let d_h_pong = if !save_cache {
+            Some(sess.alloc_f32(bh)?)
+        } else {
+            None
+        };
+        let d_c_ping = if !save_cache {
+            Some(sess.alloc_f32(bh)?)
+        } else {
+            None
+        };
+        let d_c_pong = if !save_cache {
+            Some(sess.alloc_f32(bh)?)
+        } else {
+            None
+        };
+
+        let mut d_layer_inputs = Vec::with_capacity(if save_cache { num_layers } else { 0 });
+        let mut d_unit_all_h = Vec::with_capacity(if save_cache { units } else { 0 });
+        let mut d_unit_all_c = Vec::with_capacity(if save_cache { units } else { 0 });
+        let mut d_unit_i = Vec::with_capacity(if save_cache { units } else { 0 });
+        let mut d_unit_f = Vec::with_capacity(if save_cache { units } else { 0 });
+        let mut d_unit_g = Vec::with_capacity(if save_cache { units } else { 0 });
+        let mut d_unit_o = Vec::with_capacity(if save_cache { units } else { 0 });
+        let mut d_unit_tc = Vec::with_capacity(if save_cache { units } else { 0 });
+
+        for layer in 0..num_layers {
+            let in_dim = if layer == 0 { input_size } else { h * dirs };
+            let out_dim = h * dirs;
+            let d_layer_out = sess.alloc_f32(batch * seq_len * out_dim)?;
+
+            for dir in 0..dirs {
+                let u = layer * dirs + dir;
+                sess.sgemm_dev(
+                    batch * seq_len,
+                    h4,
+                    in_dim,
+                    d_cur_input.ptr(),
+                    d_w_ih[u].ptr(),
+                    d_gi_all.ptr(),
+                    false,
+                    true,
+                    1.0,
+                    0.0,
+                    dtype,
+                )?;
+
+                if save_cache {
+                    let d_all_h = sess.alloc_f32((seq_len + 1) * bh)?;
+                    let d_all_c = sess.alloc_f32((seq_len + 1) * bh)?;
+                    let d_i = sess.alloc_f32(seq_len * bh)?;
+                    let d_f = sess.alloc_f32(seq_len * bh)?;
+                    let d_g = sess.alloc_f32(seq_len * bh)?;
+                    let d_o = sess.alloc_f32(seq_len * bh)?;
+                    let d_tc = sess.alloc_f32(seq_len * bh)?;
+
+                    if let Some(ref h0_buf) = d_h0 {
+                        sess.copy_f32(h0_buf.ptr_offset_f32(u * bh), d_all_h.ptr(), bh)?;
+                    } else {
+                        sess.fill_f32(d_all_h.ptr(), 0.0, bh)?;
+                    }
+                    if let Some(ref c0_buf) = d_c0 {
+                        sess.copy_f32(c0_buf.ptr_offset_f32(u * bh), d_all_c.ptr(), bh)?;
+                    } else {
+                        sess.fill_f32(d_all_c.ptr(), 0.0, bh)?;
+                    }
+
+                    for step in 0..seq_len {
+                        let t = if dir == 0 { step } else { seq_len - 1 - step };
+                        let p_hp = d_all_h.ptr_offset_f32(step * bh);
+                        let p_hc = d_all_h.ptr_offset_f32((step + 1) * bh);
+                        let p_cp = d_all_c.ptr_offset_f32(step * bh);
+                        let p_cc = d_all_c.ptr_offset_f32((step + 1) * bh);
+                        sess.sgemm_dev(
+                            batch,
+                            h4,
+                            h,
+                            p_hp,
+                            d_w_hh[u].ptr(),
+                            d_gh.ptr(),
+                            false,
+                            true,
+                            1.0,
+                            0.0,
+                            dtype,
+                        )?;
+                        sess.lstm_step_fwd_dev(
+                            d_gi_all.ptr(),
+                            d_gh.ptr(),
+                            d_b_total[u].ptr(),
+                            p_cp,
+                            p_hc,
+                            p_cc,
+                            d_layer_out.ptr(),
+                            d_i.ptr_offset_f32(step * bh),
+                            d_f.ptr_offset_f32(step * bh),
+                            d_g.ptr_offset_f32(step * bh),
+                            d_o.ptr_offset_f32(step * bh),
+                            d_tc.ptr_offset_f32(step * bh),
+                            batch,
+                            seq_len,
+                            h,
+                            out_dim,
+                            t,
+                            dir * h,
+                            true,
+                        )?;
+                    }
+
+                    sess.copy_f32(
+                        d_all_h.ptr_offset_f32(seq_len * bh),
+                        d_hn.ptr_offset_f32(u * bh),
+                        bh,
+                    )?;
+                    sess.copy_f32(
+                        d_all_c.ptr_offset_f32(seq_len * bh),
+                        d_cn.ptr_offset_f32(u * bh),
+                        bh,
+                    )?;
+                    d_unit_all_h.push(d_all_h);
+                    d_unit_all_c.push(d_all_c);
+                    d_unit_i.push(d_i);
+                    d_unit_f.push(d_f);
+                    d_unit_g.push(d_g);
+                    d_unit_o.push(d_o);
+                    d_unit_tc.push(d_tc);
+                } else {
+                    let (mut p_hp, mut p_hc) = match (&d_h_ping, &d_h_pong) {
+                        (Some(a), Some(b)) => (a.ptr(), b.ptr()),
+                        _ => unreachable!(),
+                    };
+                    let (mut p_cp, mut p_cc) = match (&d_c_ping, &d_c_pong) {
+                        (Some(a), Some(b)) => (a.ptr(), b.ptr()),
+                        _ => unreachable!(),
+                    };
+                    if let Some(ref h0_buf) = d_h0 {
+                        sess.copy_f32(h0_buf.ptr_offset_f32(u * bh), p_hp, bh)?;
+                    } else {
+                        sess.fill_f32(p_hp, 0.0, bh)?;
+                    }
+                    if let Some(ref c0_buf) = d_c0 {
+                        sess.copy_f32(c0_buf.ptr_offset_f32(u * bh), p_cp, bh)?;
+                    } else {
+                        sess.fill_f32(p_cp, 0.0, bh)?;
+                    }
+
+                    for step in 0..seq_len {
+                        let t = if dir == 0 { step } else { seq_len - 1 - step };
+                        sess.sgemm_dev(
+                            batch,
+                            h4,
+                            h,
+                            p_hp,
+                            d_w_hh[u].ptr(),
+                            d_gh.ptr(),
+                            false,
+                            true,
+                            1.0,
+                            0.0,
+                            dtype,
+                        )?;
+                        sess.lstm_step_fwd_dev(
+                            d_gi_all.ptr(),
+                            d_gh.ptr(),
+                            d_b_total[u].ptr(),
+                            p_cp,
+                            p_hc,
+                            p_cc,
+                            d_layer_out.ptr(),
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            batch,
+                            seq_len,
+                            h,
+                            out_dim,
+                            t,
+                            dir * h,
+                            false,
+                        )?;
+                        std::mem::swap(&mut p_hp, &mut p_hc);
+                        std::mem::swap(&mut p_cp, &mut p_cc);
+                    }
+                    sess.copy_f32(p_hp, d_hn.ptr_offset_f32(u * bh), bh)?;
+                    sess.copy_f32(p_cp, d_cn.ptr_offset_f32(u * bh), bh)?;
+                }
+            }
+
+            if save_cache {
+                d_layer_inputs.push(d_cur_input);
+            }
+            d_cur_input = d_layer_out;
+        }
+
+        let mut out = vec![0.0f32; batch * seq_len * h * dirs];
+        let mut hn = vec![0.0f32; units * bh];
+        let mut cn = vec![0.0f32; units * bh];
+        sess.dtoh_f32(&mut out, &d_cur_input)?;
+        sess.dtoh_f32(&mut hn, &d_hn)?;
+        sess.dtoh_f32(&mut cn, &d_cn)?;
+
+        let cache = if save_cache {
+            Some(CudaLstmCache {
+                batch,
+                seq_len,
+                input_size,
+                hidden_size,
+                num_layers,
+                bidirectional,
+                dtype,
+                has_bias_ih,
+                has_bias_hh,
+                w_ih_lens,
+                w_hh_lens,
+                d_weight_ih: d_w_ih,
+                d_weight_hh: d_w_hh,
+                d_layer_inputs,
+                d_unit_all_h,
+                d_unit_all_c,
+                d_unit_i,
+                d_unit_f,
+                d_unit_g,
+                d_unit_o,
+                d_unit_tc,
+            })
+        } else {
+            None
+        };
+        Ok((out, hn, cn, cache))
+    })
+}
+
+/// 100% VRAM-resident BPTT backward pass for LSTM using `CudaLstmCache`.
+pub fn cuda_lstm_backward(
+    gpu_id: usize,
+    cache: &CudaLstmCache,
+    d_output: &[f32],
+    d_hn: &[f32],
+    d_cn: &[f32],
+) -> Option<OchreResult<CudaSeqGradOutput>> {
+    let dirs = if cache.bidirectional { 2 } else { 1 };
+    let units = cache.num_layers * dirs;
+    let h = cache.hidden_size;
+    let h4 = 4 * h;
+    let batch = cache.batch;
+    let seq_len = cache.seq_len;
+    let bh = batch * h;
+    let bh4 = batch * h4;
+
+    with_vram_session(gpu_id, |sess| {
+        let mut d_cur_out = sess.upload_f32(d_output)?;
+        let d_hn_in = sess.upload_f32(d_hn)?;
+        let d_cn_in = sess.upload_f32(d_cn)?;
+        let d_h0_out = sess.alloc_f32(units * bh)?;
+        let d_c0_out = sess.alloc_f32(units * bh)?;
+        let d_dh_next = sess.alloc_f32(bh)?;
+        let d_dc_next = sess.alloc_f32(bh)?;
+        let d_dg_all = sess.alloc_f32(batch * seq_len * h4)?;
+        let d_dg_steps = sess.alloc_f32(seq_len * bh4)?;
+        let d_db_tmp = sess.alloc_f32(h4)?;
+
+        let mut d_weight_ih: Vec<Vec<f32>> = cache
+            .w_ih_lens
+            .iter()
+            .map(|&len| vec![0.0f32; len])
+            .collect();
+        let mut d_weight_hh: Vec<Vec<f32>> = cache
+            .w_hh_lens
+            .iter()
+            .map(|&len| vec![0.0f32; len])
+            .collect();
+        let mut d_bias_ih: Vec<Option<Vec<f32>>> = vec![None; units];
+        let mut d_bias_hh: Vec<Option<Vec<f32>>> = vec![None; units];
+
+        for layer in (0..cache.num_layers).rev() {
+            let in_dim = if layer == 0 {
+                cache.input_size
+            } else {
+                h * dirs
+            };
+            let out_dim = h * dirs;
+            let d_layer_in = sess.alloc_f32(batch * seq_len * in_dim)?;
+            let d_x_layer = &cache.d_layer_inputs[layer];
+
+            for dir in 0..dirs {
+                let u = layer * dirs + dir;
+                sess.copy_f32(d_hn_in.ptr_offset_f32(u * bh), d_dh_next.ptr(), bh)?;
+                sess.copy_f32(d_cn_in.ptr_offset_f32(u * bh), d_dc_next.ptr(), bh)?;
+
+                for step in (0..seq_len).rev() {
+                    let t = if dir == 0 { step } else { seq_len - 1 - step };
+                    let off = step * bh;
+                    let p_dg_step = d_dg_steps.ptr_offset_f32(step * bh4);
+                    sess.lstm_step_bwd_dev(
+                        d_cur_out.ptr(),
+                        d_dh_next.ptr(),
+                        d_dc_next.ptr(),
+                        cache.d_unit_all_c[u].ptr_offset_f32(off),
+                        cache.d_unit_i[u].ptr_offset_f32(off),
+                        cache.d_unit_f[u].ptr_offset_f32(off),
+                        cache.d_unit_g[u].ptr_offset_f32(off),
+                        cache.d_unit_o[u].ptr_offset_f32(off),
+                        cache.d_unit_tc[u].ptr_offset_f32(off),
+                        d_dg_all.ptr(),
+                        p_dg_step,
+                        batch,
+                        seq_len,
+                        h,
+                        out_dim,
+                        t,
+                        dir * h,
+                    )?;
+                    sess.sgemm_dev(
+                        batch,
+                        h,
+                        h4,
+                        p_dg_step,
+                        cache.d_weight_hh[u].ptr(),
+                        d_dh_next.ptr(),
+                        false,
+                        false,
+                        1.0,
+                        0.0,
+                        cache.dtype,
+                    )?;
+                }
+
+                sess.copy_f32(d_dh_next.ptr(), d_h0_out.ptr_offset_f32(u * bh), bh)?;
+                sess.copy_f32(d_dc_next.ptr(), d_c0_out.ptr_offset_f32(u * bh), bh)?;
+
+                if cache.has_bias_ih[u] || cache.has_bias_hh[u] {
+                    sess.sum_rows_f32(d_dg_steps.ptr(), d_db_tmp.ptr(), seq_len * batch, h4)?;
+                    let mut db_host = vec![0.0f32; h4];
+                    sess.dtoh_f32(&mut db_host, &d_db_tmp)?;
+                    if cache.has_bias_ih[u] {
+                        d_bias_ih[u] = Some(db_host.clone());
+                    }
+                    if cache.has_bias_hh[u] {
+                        d_bias_hh[u] = Some(db_host);
+                    }
+                }
+
+                let d_dw_hh = sess.alloc_f32(cache.w_hh_lens[u])?;
+                sess.sgemm_dev(
+                    h4,
+                    h,
+                    seq_len * batch,
+                    d_dg_steps.ptr(),
+                    cache.d_unit_all_h[u].ptr(),
+                    d_dw_hh.ptr(),
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                    cache.dtype,
+                )?;
+                let d_dw_ih = sess.alloc_f32(cache.w_ih_lens[u])?;
+                sess.sgemm_dev(
+                    h4,
+                    in_dim,
+                    batch * seq_len,
+                    d_dg_all.ptr(),
+                    d_x_layer.ptr(),
+                    d_dw_ih.ptr(),
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                    cache.dtype,
+                )?;
+                sess.sgemm_dev(
+                    batch * seq_len,
+                    in_dim,
+                    h4,
+                    d_dg_all.ptr(),
+                    cache.d_weight_ih[u].ptr(),
+                    d_layer_in.ptr(),
+                    false,
+                    false,
+                    1.0,
+                    if dir == 0 { 0.0 } else { 1.0 },
+                    cache.dtype,
+                )?;
+
+                sess.dtoh_f32(&mut d_weight_hh[u], &d_dw_hh)?;
+                sess.dtoh_f32(&mut d_weight_ih[u], &d_dw_ih)?;
+            }
+
+            d_cur_out = d_layer_in;
+        }
+
+        let mut d_input = vec![0.0f32; batch * seq_len * cache.input_size];
+        let mut d_h0 = vec![0.0f32; units * bh];
+        let mut d_c0 = vec![0.0f32; units * bh];
+        sess.dtoh_f32(&mut d_input, &d_cur_out)?;
+        sess.dtoh_f32(&mut d_h0, &d_h0_out)?;
+        sess.dtoh_f32(&mut d_c0, &d_c0_out)?;
+
+        Ok(CudaSeqGradOutput {
+            d_input,
+            d_h0,
+            d_c0: Some(d_c0),
+            d_weight_ih,
+            d_weight_hh,
+            d_bias_ih,
+            d_bias_hh,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -6241,6 +10498,21 @@ mod tests {
             "ochre_row_rmsnorm_bwd_dx_f32",
             "ochre_row_rmsnorm_bwd_dg_f32",
             "ochre_dropout_fwd_f32",
+            "ochre_rnn_step_fwd_f32",
+            "ochre_rnn_step_bwd_f32",
+            "ochre_gru_step_fwd_f32",
+            "ochre_gru_step_bwd_f32",
+            "ochre_lstm_step_fwd_f32",
+            "ochre_lstm_step_bwd_f32",
+            "ochre_rope_fwd_bwd_f32",
+            "ochre_swiglu_fwd_f32",
+            "ochre_swiglu_bwd_f32",
+            "ochre_flash_sdpa_fwd_f32",
+            "ochre_flash_sdpa_bwd_dq_f32",
+            "ochre_flash_sdpa_bwd_dkv_f32",
+            "ochre_embedding_scatter_add_f32",
+            "ochre_bshd_to_bhsd_f32",
+            "ochre_bhsd_to_bshd_f32",
         ];
         for entry in required_entries {
             assert!(

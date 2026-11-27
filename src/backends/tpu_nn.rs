@@ -800,88 +800,60 @@ impl TpuStepGraph {
     pub fn emit_mlir(&self) -> OchreResult<String> {
         emit_mlp_train_step_mlir(self)
     }
+
+    /// Emit a single StableHLO MLIR program wrapping `num_steps` consecutive training steps
+    /// inside a `stablehlo.while` loop with zero host round-trips per step.
+    pub fn emit_multi_step_while_mlir(&self, num_steps: usize) -> String {
+        emit_mlp_multi_step_while_mlir(self, num_steps)
+    }
 }
 
-/// Emit a single fused StableHLO MLIR program implementing Forward + Loss + Backward + AdamW.
-///
-/// Function signature:
-/// `%x`, `%targets` (one-hot `[B, C]` for CE or `[B, C]` for MSE), `%inv_bc1`, `%inv_bc2`,
-/// followed by per-layer `%w_i`, `%b_i`, `%mw_i`, `%vw_i`, `%mb_i`, `%vb_i`.
-/// Returns `(loss_scalar, updated w_i..., updated b_i..., updated mw_i..., updated vw_i..., updated mb_i..., updated vb_i...)`.
-pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn emit_mlp_step_ops(
+    graph: &TpuStepGraph,
+    body: &mut String,
+    indent: &str,
+    id_counter: &mut usize,
+    x_var: &str,
+    targets_var: &str,
+    inv_bc1_var: &str,
+    inv_bc2_var: &str,
+    w_vars: &[String],
+    b_vars: &[String],
+    mw_vars: &[String],
+    vw_vars: &[String],
+    mb_vars: &[String],
+    vb_vars: &[String],
+) -> (
+    String,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+) {
     let n_layers = graph.num_layers();
     let b = graph.batch_size;
     let in_dim = graph.layer_dims[0];
     let out_dim = graph.layer_dims[n_layers];
-    let elem = match graph.dtype {
-        TpuDType::F32 => "f32",
-        TpuDType::BF16 => "bf16",
-    };
 
-    let mut args = Vec::new();
-    args.push(format!("%x: tensor<{b}x{in_dim}x{elem}>"));
-    args.push(format!("%targets: tensor<{b}x{out_dim}xf32>"));
-    args.push("%inv_bc1: tensor<f32>".to_string());
-    args.push("%inv_bc2: tensor<f32>".to_string());
-
-    for l in 0..n_layers {
-        let d_in = graph.layer_dims[l];
-        let d_out = graph.layer_dims[l + 1];
-        args.push(format!("%w{l}: tensor<{d_in}x{d_out}xf32>"));
-        args.push(format!("%b{l}: tensor<{d_out}xf32>"));
-        args.push(format!("%mw{l}: tensor<{d_in}x{d_out}xf32>"));
-        args.push(format!("%vw{l}: tensor<{d_in}x{d_out}xf32>"));
-        args.push(format!("%mb{l}: tensor<{d_out}xf32>"));
-        args.push(format!("%vb{l}: tensor<{d_out}xf32>"));
-    }
-
-    let mut ret_types = vec!["tensor<f32>".to_string()];
-    for l in 0..n_layers {
-        let d_in = graph.layer_dims[l];
-        let d_out = graph.layer_dims[l + 1];
-        ret_types.push(format!("tensor<{d_in}x{d_out}xf32>"));
-    }
-    for l in 0..n_layers {
-        let d_out = graph.layer_dims[l + 1];
-        ret_types.push(format!("tensor<{d_out}xf32>"));
-    }
-    for l in 0..n_layers {
-        let d_in = graph.layer_dims[l];
-        let d_out = graph.layer_dims[l + 1];
-        ret_types.push(format!("tensor<{d_in}x{d_out}xf32>"));
-    }
-    for l in 0..n_layers {
-        let d_in = graph.layer_dims[l];
-        let d_out = graph.layer_dims[l + 1];
-        ret_types.push(format!("tensor<{d_in}x{d_out}xf32>"));
-    }
-    for l in 0..n_layers {
-        let d_out = graph.layer_dims[l + 1];
-        ret_types.push(format!("tensor<{d_out}xf32>"));
-    }
-    for l in 0..n_layers {
-        let d_out = graph.layer_dims[l + 1];
-        ret_types.push(format!("tensor<{d_out}xf32>"));
-    }
-
-    let mut body = String::new();
-    let mut id_counter: usize = 0;
     let mut next_id = |prefix: &str| -> String {
-        let s = format!("%{prefix}_{id_counter}");
-        id_counter += 1;
+        let s = format!("%{prefix}_{}", *id_counter);
+        *id_counter += 1;
         s
     };
 
-    // Convert input to f32 if bf16 for unified residual/loss math (dot_general uses `elem` for BF16 MXU).
+    // Convert input to f32 if bf16 for unified residual/loss math (dot_general uses BF16 MXU).
     let mut cur_act_f32 = if graph.dtype == TpuDType::BF16 {
         let v = next_id("x_f32");
         let _ = writeln!(
             body,
-            "    {v} = stablehlo.convert %x : (tensor<{b}x{in_dim}xbf16>) -> tensor<{b}x{in_dim}xf32>"
+            "{indent}{v} = stablehlo.convert {x_var} : (tensor<{b}x{in_dim}xbf16>) -> tensor<{b}x{in_dim}xf32>"
         );
         v
     } else {
-        "%x".to_string()
+        x_var.to_string()
     };
 
     // --- 1. Forward pass ---
@@ -892,6 +864,8 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
     for l in 0..n_layers {
         let d_in = graph.layer_dims[l];
         let d_out = graph.layer_dims[l + 1];
+        let wl = &w_vars[l];
+        let bl = &b_vars[l];
         layer_inputs.push(cur_act_f32.clone());
 
         let mm = if graph.dtype == TpuDType::BF16 {
@@ -900,22 +874,22 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
             let dot = next_id("dot");
             let _ = writeln!(
                 body,
-                "    {lhs} = stablehlo.convert {cur_act_f32} : (tensor<{b}x{d_in}xf32>) -> tensor<{b}x{d_in}xbf16>"
+                "{indent}{lhs} = stablehlo.convert {cur_act_f32} : (tensor<{b}x{d_in}xf32>) -> tensor<{b}x{d_in}xbf16>"
             );
             let _ = writeln!(
                 body,
-                "    {rhs} = stablehlo.convert %w{l} : (tensor<{d_in}x{d_out}xf32>) -> tensor<{d_in}x{d_out}xbf16>"
+                "{indent}{rhs} = stablehlo.convert {wl} : (tensor<{d_in}x{d_out}xf32>) -> tensor<{d_in}x{d_out}xbf16>"
             );
             let _ = writeln!(
                 body,
-                "    {dot} = stablehlo.dot_general {lhs}, {rhs}, contracting_dims = [1] x [0] : (tensor<{b}x{d_in}xbf16>, tensor<{d_in}x{d_out}xbf16>) -> tensor<{b}x{d_out}xf32>"
+                "{indent}{dot} = stablehlo.dot_general {lhs}, {rhs}, contracting_dims = [1] x [0] : (tensor<{b}x{d_in}xbf16>, tensor<{d_in}x{d_out}xbf16>) -> tensor<{b}x{d_out}xf32>"
             );
             dot
         } else {
             let dot = next_id("dot");
             let _ = writeln!(
                 body,
-                "    {dot} = stablehlo.dot_general {cur_act_f32}, %w{l}, contracting_dims = [1] x [0], precision = [HIGHEST, HIGHEST] : (tensor<{b}x{d_in}xf32>, tensor<{d_in}x{d_out}xf32>) -> tensor<{b}x{d_out}xf32>"
+                "{indent}{dot} = stablehlo.dot_general {cur_act_f32}, {wl}, contracting_dims = [1] x [0], precision = [HIGHEST, HIGHEST] : (tensor<{b}x{d_in}xf32>, tensor<{d_in}x{d_out}xf32>) -> tensor<{b}x{d_out}xf32>"
             );
             dot
         };
@@ -924,11 +898,11 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
         let pre = next_id("pre");
         let _ = writeln!(
             body,
-            "    {b_bcast} = stablehlo.broadcast_in_dim %b{l}, dims = [1] : (tensor<{d_out}xf32>) -> tensor<{b}x{d_out}xf32>"
+            "{indent}{b_bcast} = stablehlo.broadcast_in_dim {bl}, dims = [1] : (tensor<{d_out}xf32>) -> tensor<{b}x{d_out}xf32>"
         );
         let _ = writeln!(
             body,
-            "    {pre} = stablehlo.add {mm}, {b_bcast} : tensor<{b}x{d_out}xf32>"
+            "{indent}{pre} = stablehlo.add {mm}, {b_bcast} : tensor<{b}x{d_out}xf32>"
         );
         layer_pre_acts.push(pre.clone());
 
@@ -938,20 +912,23 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
                 TpuActivation::Relu => {
                     let z = next_id("zero");
                     let out = next_id("relu");
-                    let _ = writeln!(body, "    {z} = stablehlo.constant dense<0.0> : {ty}");
-                    let _ = writeln!(body, "    {out} = stablehlo.maximum {pre}, {z} : {ty}");
+                    let _ = writeln!(body, "{indent}{z} = stablehlo.constant dense<0.0> : {ty}");
+                    let _ = writeln!(body, "{indent}{out} = stablehlo.maximum {pre}, {z} : {ty}");
                     out
                 }
                 TpuActivation::Tanh => {
                     let out = next_id("tanh");
-                    let _ = writeln!(body, "    {out} = stablehlo.tanh {pre} : {ty}");
+                    let _ = writeln!(body, "{indent}{out} = stablehlo.tanh {pre} : {ty}");
                     out
                 }
                 TpuActivation::Silu => {
                     let sig = next_id("sig");
                     let out = next_id("silu");
-                    let _ = writeln!(body, "    {sig} = stablehlo.logistic {pre} : {ty}");
-                    let _ = writeln!(body, "    {out} = stablehlo.multiply {pre}, {sig} : {ty}");
+                    let _ = writeln!(body, "{indent}{sig} = stablehlo.logistic {pre} : {ty}");
+                    let _ = writeln!(
+                        body,
+                        "{indent}{out} = stablehlo.multiply {pre}, {sig} : {ty}"
+                    );
                     out
                 }
                 TpuActivation::Gelu => {
@@ -968,25 +945,37 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
                     let one_p = next_id("one_p");
                     let hx = next_id("hx");
                     let out = next_id("gelu");
-                    let _ = writeln!(body, "    {x2} = stablehlo.multiply {pre}, {pre} : {ty}");
-                    let _ = writeln!(body, "    {x3} = stablehlo.multiply {x2}, {pre} : {ty}");
                     let _ = writeln!(
                         body,
-                        "    {k} = stablehlo.constant dense<4.471500e-02> : {ty}"
+                        "{indent}{x2} = stablehlo.multiply {pre}, {pre} : {ty}"
                     );
-                    let _ = writeln!(body, "    {kx3} = stablehlo.multiply {k}, {x3} : {ty}");
-                    let _ = writeln!(body, "    {inner} = stablehlo.add {pre}, {kx3} : {ty}");
+                    let _ = writeln!(body, "{indent}{x3} = stablehlo.multiply {x2}, {pre} : {ty}");
                     let _ = writeln!(
                         body,
-                        "    {c} = stablehlo.constant dense<7.978846e-01> : {ty}"
+                        "{indent}{k} = stablehlo.constant dense<4.471500e-02> : {ty}"
                     );
-                    let _ = writeln!(body, "    {u} = stablehlo.multiply {c}, {inner} : {ty}");
-                    let _ = writeln!(body, "    {th} = stablehlo.tanh {u} : {ty}");
-                    let _ = writeln!(body, "    {one} = stablehlo.constant dense<1.0> : {ty}");
-                    let _ = writeln!(body, "    {half} = stablehlo.constant dense<0.5> : {ty}");
-                    let _ = writeln!(body, "    {one_p} = stablehlo.add {one}, {th} : {ty}");
-                    let _ = writeln!(body, "    {hx} = stablehlo.multiply {half}, {pre} : {ty}");
-                    let _ = writeln!(body, "    {out} = stablehlo.multiply {hx}, {one_p} : {ty}");
+                    let _ = writeln!(body, "{indent}{kx3} = stablehlo.multiply {k}, {x3} : {ty}");
+                    let _ = writeln!(body, "{indent}{inner} = stablehlo.add {pre}, {kx3} : {ty}");
+                    let _ = writeln!(
+                        body,
+                        "{indent}{c} = stablehlo.constant dense<7.978846e-01> : {ty}"
+                    );
+                    let _ = writeln!(body, "{indent}{u} = stablehlo.multiply {c}, {inner} : {ty}");
+                    let _ = writeln!(body, "{indent}{th} = stablehlo.tanh {u} : {ty}");
+                    let _ = writeln!(body, "{indent}{one} = stablehlo.constant dense<1.0> : {ty}");
+                    let _ = writeln!(
+                        body,
+                        "{indent}{half} = stablehlo.constant dense<0.5> : {ty}"
+                    );
+                    let _ = writeln!(body, "{indent}{one_p} = stablehlo.add {one}, {th} : {ty}");
+                    let _ = writeln!(
+                        body,
+                        "{indent}{hx} = stablehlo.multiply {half}, {pre} : {ty}"
+                    );
+                    let _ = writeln!(
+                        body,
+                        "{indent}{out} = stablehlo.multiply {hx}, {one_p} : {ty}"
+                    );
                     out
                 }
             };
@@ -1015,40 +1004,40 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
             let n_elems = (b * out_dim) as f32;
             let _ = writeln!(
                 body,
-                "    {diff} = stablehlo.subtract {cur_act_f32}, %targets : {logits_ty}"
+                "{indent}{diff} = stablehlo.subtract {cur_act_f32}, {targets_var} : {logits_ty}"
             );
             let _ = writeln!(
                 body,
-                "    {sq} = stablehlo.multiply {diff}, {diff} : {logits_ty}"
+                "{indent}{sq} = stablehlo.multiply {diff}, {diff} : {logits_ty}"
             );
             let _ = writeln!(
                 body,
-                "    {z0} = stablehlo.constant dense<0.0> : tensor<f32>"
+                "{indent}{z0} = stablehlo.constant dense<0.0> : tensor<f32>"
             );
             let _ = writeln!(
                 body,
-                "    {sum_all} = stablehlo.reduce({sq} init: {z0}) across dimensions = [0, 1] : ({logits_ty}, tensor<f32>) -> tensor<f32> reducer(%a: tensor<f32>, %b: tensor<f32>) {{ %s = stablehlo.add %a, %b : tensor<f32>; stablehlo.return %s : tensor<f32> }}"
+                "{indent}{sum_all} = stablehlo.reduce({sq} init: {z0}) across dimensions = [0, 1] : ({logits_ty}, tensor<f32>) -> tensor<f32> reducer(%a: tensor<f32>, %b: tensor<f32>) {{ %s = stablehlo.add %a, %b : tensor<f32>; stablehlo.return %s : tensor<f32> }}"
             );
             let _ = writeln!(
                 body,
-                "    {denom} = stablehlo.constant dense<{n_elems:.8e}> : tensor<f32>"
+                "{indent}{denom} = stablehlo.constant dense<{n_elems:.8e}> : tensor<f32>"
             );
             let _ = writeln!(
                 body,
-                "    {loss} = stablehlo.divide {sum_all}, {denom} : tensor<f32>"
+                "{indent}{loss} = stablehlo.divide {sum_all}, {denom} : tensor<f32>"
             );
             let _ = writeln!(
                 body,
-                "    {two_denom} = stablehlo.constant dense<{:.8e}> : tensor<f32>",
+                "{indent}{two_denom} = stablehlo.constant dense<{:.8e}> : tensor<f32>",
                 2.0 / n_elems
             );
             let _ = writeln!(
                 body,
-                "    {scale_b} = stablehlo.broadcast_in_dim {two_denom}, dims = [] : (tensor<f32>) -> {logits_ty}"
+                "{indent}{scale_b} = stablehlo.broadcast_in_dim {two_denom}, dims = [] : (tensor<f32>) -> {logits_ty}"
             );
             let _ = writeln!(
                 body,
-                "    {dlogits} = stablehlo.multiply {diff}, {scale_b} : {logits_ty}"
+                "{indent}{dlogits} = stablehlo.multiply {diff}, {scale_b} : {logits_ty}"
             );
             (loss, dlogits)
         }
@@ -1076,82 +1065,85 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
 
             let _ = writeln!(
                 body,
-                "    {ninf} = stablehlo.constant dense<-3.4028234e+38> : tensor<f32>"
+                "{indent}{ninf} = stablehlo.constant dense<-3.4028234e+38> : tensor<f32>"
             );
             let _ = writeln!(
                 body,
-                "    {max_r} = stablehlo.reduce({cur_act_f32} init: {ninf}) across dimensions = [1] : ({logits_ty}, tensor<f32>) -> {row_ty} reducer(%a: tensor<f32>, %b: tensor<f32>) {{ %m = stablehlo.maximum %a, %b : tensor<f32>; stablehlo.return %m : tensor<f32> }}"
+                "{indent}{max_r} = stablehlo.reduce({cur_act_f32} init: {ninf}) across dimensions = [1] : ({logits_ty}, tensor<f32>) -> {row_ty} reducer(%a: tensor<f32>, %b: tensor<f32>) {{ %m = stablehlo.maximum %a, %b : tensor<f32>; stablehlo.return %m : tensor<f32> }}"
             );
             let _ = writeln!(
                 body,
-                "    {max_b} = stablehlo.broadcast_in_dim {max_r}, dims = [0] : ({row_ty}) -> {logits_ty}"
+                "{indent}{max_b} = stablehlo.broadcast_in_dim {max_r}, dims = [0] : ({row_ty}) -> {logits_ty}"
             );
             let _ = writeln!(
                 body,
-                "    {shifted} = stablehlo.subtract {cur_act_f32}, {max_b} : {logits_ty}"
+                "{indent}{shifted} = stablehlo.subtract {cur_act_f32}, {max_b} : {logits_ty}"
             );
             let _ = writeln!(
                 body,
-                "    {exps} = stablehlo.exponential {shifted} : {logits_ty}"
+                "{indent}{exps} = stablehlo.exponential {shifted} : {logits_ty}"
             );
             let _ = writeln!(
                 body,
-                "    {z0} = stablehlo.constant dense<0.0> : tensor<f32>"
+                "{indent}{z0} = stablehlo.constant dense<0.0> : tensor<f32>"
             );
             let _ = writeln!(
                 body,
-                "    {sum_exp} = stablehlo.reduce({exps} init: {z0}) across dimensions = [1] : ({logits_ty}, tensor<f32>) -> {row_ty} reducer(%a: tensor<f32>, %b: tensor<f32>) {{ %s = stablehlo.add %a, %b : tensor<f32>; stablehlo.return %s : tensor<f32> }}"
+                "{indent}{sum_exp} = stablehlo.reduce({exps} init: {z0}) across dimensions = [1] : ({logits_ty}, tensor<f32>) -> {row_ty} reducer(%a: tensor<f32>, %b: tensor<f32>) {{ %s = stablehlo.add %a, %b : tensor<f32>; stablehlo.return %s : tensor<f32> }}"
             );
             let _ = writeln!(
                 body,
-                "    {sum_b} = stablehlo.broadcast_in_dim {sum_exp}, dims = [0] : ({row_ty}) -> {logits_ty}"
+                "{indent}{sum_b} = stablehlo.broadcast_in_dim {sum_exp}, dims = [0] : ({row_ty}) -> {logits_ty}"
             );
             let _ = writeln!(
                 body,
-                "    {probs} = stablehlo.divide {exps}, {sum_b} : {logits_ty}"
-            );
-            let _ = writeln!(body, "    {log_sum} = stablehlo.log {sum_exp} : {row_ty}");
-            let _ = writeln!(
-                body,
-                "    {log_b} = stablehlo.broadcast_in_dim {log_sum}, dims = [0] : ({row_ty}) -> {logits_ty}"
+                "{indent}{probs} = stablehlo.divide {exps}, {sum_b} : {logits_ty}"
             );
             let _ = writeln!(
                 body,
-                "    {log_sm} = stablehlo.subtract {shifted}, {log_b} : {logits_ty}"
+                "{indent}{log_sum} = stablehlo.log {sum_exp} : {row_ty}"
             );
             let _ = writeln!(
                 body,
-                "    {prod} = stablehlo.multiply %targets, {log_sm} : {logits_ty}"
+                "{indent}{log_b} = stablehlo.broadcast_in_dim {log_sum}, dims = [0] : ({row_ty}) -> {logits_ty}"
             );
             let _ = writeln!(
                 body,
-                "    {sum_loss} = stablehlo.reduce({prod} init: {z0}) across dimensions = [0, 1] : ({logits_ty}, tensor<f32>) -> tensor<f32> reducer(%a: tensor<f32>, %b: tensor<f32>) {{ %s = stablehlo.add %a, %b : tensor<f32>; stablehlo.return %s : tensor<f32> }}"
+                "{indent}{log_sm} = stablehlo.subtract {shifted}, {log_b} : {logits_ty}"
             );
             let _ = writeln!(
                 body,
-                "    {neg_inv_b} = stablehlo.constant dense<{:.8e}> : tensor<f32>",
+                "{indent}{prod} = stablehlo.multiply {targets_var}, {log_sm} : {logits_ty}"
+            );
+            let _ = writeln!(
+                body,
+                "{indent}{sum_loss} = stablehlo.reduce({prod} init: {z0}) across dimensions = [0, 1] : ({logits_ty}, tensor<f32>) -> tensor<f32> reducer(%a: tensor<f32>, %b: tensor<f32>) {{ %s = stablehlo.add %a, %b : tensor<f32>; stablehlo.return %s : tensor<f32> }}"
+            );
+            let _ = writeln!(
+                body,
+                "{indent}{neg_inv_b} = stablehlo.constant dense<{:.8e}> : tensor<f32>",
                 -1.0 / (b as f32)
             );
             let _ = writeln!(
                 body,
-                "    {loss} = stablehlo.multiply {sum_loss}, {neg_inv_b} : tensor<f32>"
+                "{indent}{loss} = stablehlo.multiply {sum_loss}, {neg_inv_b} : tensor<f32>"
             );
             let _ = writeln!(
                 body,
-                "    {p_minus_t} = stablehlo.subtract {probs}, %targets : {logits_ty}"
+                "{indent}{p_minus_t} = stablehlo.subtract {probs}, {targets_var} : {logits_ty}"
             );
             let _ = writeln!(
                 body,
-                "    {inv_b} = stablehlo.constant dense<{:.8e}> : tensor<f32>",
+                "{indent}{inv_b} = stablehlo.constant dense<{:.8e}> : tensor<f32>",
                 1.0 / (b as f32)
             );
             let _ = writeln!(
                 body,
-                "    {inv_b_bcast} = stablehlo.broadcast_in_dim {inv_b}, dims = [] : (tensor<f32>) -> {logits_ty}"
+                "{indent}{inv_b_bcast} = stablehlo.broadcast_in_dim {inv_b}, dims = [] : (tensor<f32>) -> {logits_ty}"
             );
             let _ = writeln!(
                 body,
-                "    {dlogits} = stablehlo.multiply {p_minus_t}, {inv_b_bcast} : {logits_ty}"
+                "{indent}{dlogits} = stablehlo.multiply {p_minus_t}, {inv_b_bcast} : {logits_ty}"
             );
             (loss, dlogits)
         }
@@ -1165,11 +1157,12 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
         let d_in = graph.layer_dims[l];
         let d_out_dim = graph.layer_dims[l + 1];
         let h_in = &layer_inputs[l];
+        let wl = &w_vars[l];
 
         let dw = next_id("dw");
         let _ = writeln!(
             body,
-            "    {dw} = stablehlo.dot_general {h_in}, {d_out}, contracting_dims = [0] x [0], precision = [HIGHEST, HIGHEST] : (tensor<{b}x{d_in}xf32>, tensor<{b}x{d_out_dim}xf32>) -> tensor<{d_in}x{d_out_dim}xf32>"
+            "{indent}{dw} = stablehlo.dot_general {h_in}, {d_out}, contracting_dims = [0] x [0], precision = [HIGHEST, HIGHEST] : (tensor<{b}x{d_in}xf32>, tensor<{b}x{d_out_dim}xf32>) -> tensor<{d_in}x{d_out_dim}xf32>"
         );
         dw_vars[l] = dw;
 
@@ -1177,11 +1170,11 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
         let db = next_id("db");
         let _ = writeln!(
             body,
-            "    {zb} = stablehlo.constant dense<0.0> : tensor<f32>"
+            "{indent}{zb} = stablehlo.constant dense<0.0> : tensor<f32>"
         );
         let _ = writeln!(
             body,
-            "    {db} = stablehlo.reduce({d_out} init: {zb}) across dimensions = [0] : (tensor<{b}x{d_out_dim}xf32>, tensor<f32>) -> tensor<{d_out_dim}xf32> reducer(%a: tensor<f32>, %b: tensor<f32>) {{ %s = stablehlo.add %a, %b : tensor<f32>; stablehlo.return %s : tensor<f32> }}"
+            "{indent}{db} = stablehlo.reduce({d_out} init: {zb}) across dimensions = [0] : (tensor<{b}x{d_out_dim}xf32>, tensor<f32>) -> tensor<{d_out_dim}xf32> reducer(%a: tensor<f32>, %b: tensor<f32>) {{ %s = stablehlo.add %a, %b : tensor<f32>; stablehlo.return %s : tensor<f32> }}"
         );
         db_vars[l] = db;
 
@@ -1189,7 +1182,7 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
             let dh = next_id("dh");
             let _ = writeln!(
                 body,
-                "    {dh} = stablehlo.dot_general {d_out}, %w{l}, contracting_dims = [1] x [1], precision = [HIGHEST, HIGHEST] : (tensor<{b}x{d_out_dim}xf32>, tensor<{d_in}x{d_out_dim}xf32>) -> tensor<{b}x{d_in}xf32>"
+                "{indent}{dh} = stablehlo.dot_general {d_out}, {wl}, contracting_dims = [1] x [1], precision = [HIGHEST, HIGHEST] : (tensor<{b}x{d_out_dim}xf32>, tensor<{d_in}x{d_out_dim}xf32>) -> tensor<{b}x{d_in}xf32>"
             );
             let pre_prev = &layer_pre_acts[l - 1];
             let post_prev = &layer_post_acts[l - 1];
@@ -1201,14 +1194,17 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
                     let z = next_id("z_bwd");
                     let mask = next_id("mask");
                     let out = next_id("dpre");
-                    let _ = writeln!(body, "    {z} = stablehlo.constant dense<0.0> : {ty_prev}");
                     let _ = writeln!(
                         body,
-                        "    {mask} = stablehlo.compare GT, {pre_prev}, {z}, FLOAT : ({ty_prev}, {ty_prev}) -> {pred_ty}"
+                        "{indent}{z} = stablehlo.constant dense<0.0> : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {out} = stablehlo.select {mask}, {dh}, {z} : {pred_ty}, {ty_prev}"
+                        "{indent}{mask} = stablehlo.compare GT, {pre_prev}, {z}, FLOAT : ({ty_prev}, {ty_prev}) -> {pred_ty}"
+                    );
+                    let _ = writeln!(
+                        body,
+                        "{indent}{out} = stablehlo.select {mask}, {dh}, {z} : {pred_ty}, {ty_prev}"
                     );
                     out
                 }
@@ -1219,19 +1215,19 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
                     let out = next_id("dpre");
                     let _ = writeln!(
                         body,
-                        "    {one} = stablehlo.constant dense<1.0> : {ty_prev}"
+                        "{indent}{one} = stablehlo.constant dense<1.0> : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {sq} = stablehlo.multiply {post_prev}, {post_prev} : {ty_prev}"
+                        "{indent}{sq} = stablehlo.multiply {post_prev}, {post_prev} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {deriv} = stablehlo.subtract {one}, {sq} : {ty_prev}"
+                        "{indent}{deriv} = stablehlo.subtract {one}, {sq} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {out} = stablehlo.multiply {dh}, {deriv} : {ty_prev}"
+                        "{indent}{out} = stablehlo.multiply {dh}, {deriv} : {ty_prev}"
                     );
                     out
                 }
@@ -1245,31 +1241,31 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
                     let out = next_id("dpre");
                     let _ = writeln!(
                         body,
-                        "    {sig} = stablehlo.logistic {pre_prev} : {ty_prev}"
+                        "{indent}{sig} = stablehlo.logistic {pre_prev} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {one} = stablehlo.constant dense<1.0> : {ty_prev}"
+                        "{indent}{one} = stablehlo.constant dense<1.0> : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {oms} = stablehlo.subtract {one}, {sig} : {ty_prev}"
+                        "{indent}{oms} = stablehlo.subtract {one}, {sig} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {xoms} = stablehlo.multiply {pre_prev}, {oms} : {ty_prev}"
+                        "{indent}{xoms} = stablehlo.multiply {pre_prev}, {oms} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {inner} = stablehlo.add {one}, {xoms} : {ty_prev}"
+                        "{indent}{inner} = stablehlo.add {one}, {xoms} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {deriv} = stablehlo.multiply {sig}, {inner} : {ty_prev}"
+                        "{indent}{deriv} = stablehlo.multiply {sig}, {inner} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {out} = stablehlo.multiply {dh}, {deriv} : {ty_prev}"
+                        "{indent}{out} = stablehlo.multiply {dh}, {deriv} : {ty_prev}"
                     );
                     out
                 }
@@ -1293,81 +1289,94 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
                     let term1 = next_id("gt1");
                     let term2 = next_id("gt2");
                     let term2h = next_id("gt2h");
+                    let deriv_sum = next_id("gderiv_s");
                     let deriv = next_id("gderiv");
                     let out = next_id("dpre");
 
                     let _ = writeln!(
                         body,
-                        "    {x2} = stablehlo.multiply {pre_prev}, {pre_prev} : {ty_prev}"
+                        "{indent}{x2} = stablehlo.multiply {pre_prev}, {pre_prev} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {x3} = stablehlo.multiply {x2}, {pre_prev} : {ty_prev}"
+                        "{indent}{x3} = stablehlo.multiply {x2}, {pre_prev} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {k} = stablehlo.constant dense<4.471500e-02> : {ty_prev}"
-                    );
-                    let _ = writeln!(body, "    {kx3} = stablehlo.multiply {k}, {x3} : {ty_prev}");
-                    let _ = writeln!(
-                        body,
-                        "    {inner} = stablehlo.add {pre_prev}, {kx3} : {ty_prev}"
+                        "{indent}{k} = stablehlo.constant dense<4.471500e-02> : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {c} = stablehlo.constant dense<7.978846e-01> : {ty_prev}"
+                        "{indent}{kx3} = stablehlo.multiply {k}, {x3} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {u} = stablehlo.multiply {c}, {inner} : {ty_prev}"
-                    );
-                    let _ = writeln!(body, "    {th} = stablehlo.tanh {u} : {ty_prev}");
-                    let _ = writeln!(
-                        body,
-                        "    {one} = stablehlo.constant dense<1.0> : {ty_prev}"
+                        "{indent}{inner} = stablehlo.add {pre_prev}, {kx3} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {half} = stablehlo.constant dense<0.5> : {ty_prev}"
+                        "{indent}{c} = stablehlo.constant dense<7.978846e-01> : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {th2} = stablehlo.multiply {th}, {th} : {ty_prev}"
+                        "{indent}{u} = stablehlo.multiply {c}, {inner} : {ty_prev}"
+                    );
+                    let _ = writeln!(body, "{indent}{th} = stablehlo.tanh {u} : {ty_prev}");
+                    let _ = writeln!(
+                        body,
+                        "{indent}{one} = stablehlo.constant dense<1.0> : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {sech2} = stablehlo.subtract {one}, {th2} : {ty_prev}"
+                        "{indent}{half} = stablehlo.constant dense<0.5> : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {k3} = stablehlo.constant dense<1.341450e-01> : {ty_prev}"
+                        "{indent}{th2} = stablehlo.multiply {th}, {th} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {k3x2} = stablehlo.multiply {k3}, {x2} : {ty_prev}"
-                    );
-                    let _ = writeln!(body, "    {du1} = stablehlo.add {one}, {k3x2} : {ty_prev}");
-                    let _ = writeln!(body, "    {du} = stablehlo.multiply {c}, {du1} : {ty_prev}");
-                    let _ = writeln!(body, "    {term1} = stablehlo.add {one}, {th} : {ty_prev}");
-                    let _ = writeln!(
-                        body,
-                        "    {term2} = stablehlo.multiply {sech2}, {du} : {ty_prev}"
+                        "{indent}{sech2} = stablehlo.subtract {one}, {th2} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {term2h} = stablehlo.multiply {pre_prev}, {term2} : {ty_prev}"
+                        "{indent}{k3} = stablehlo.constant dense<1.341450e-01> : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {deriv} = stablehlo.add {term1}, {term2h} : {ty_prev}"
+                        "{indent}{k3x2} = stablehlo.multiply {k3}, {x2} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {deriv} = stablehlo.multiply {half}, {deriv} : {ty_prev}"
+                        "{indent}{du1} = stablehlo.add {one}, {k3x2} : {ty_prev}"
                     );
                     let _ = writeln!(
                         body,
-                        "    {out} = stablehlo.multiply {dh}, {deriv} : {ty_prev}"
+                        "{indent}{du} = stablehlo.multiply {c}, {du1} : {ty_prev}"
+                    );
+                    let _ = writeln!(
+                        body,
+                        "{indent}{term1} = stablehlo.add {one}, {th} : {ty_prev}"
+                    );
+                    let _ = writeln!(
+                        body,
+                        "{indent}{term2} = stablehlo.multiply {sech2}, {du} : {ty_prev}"
+                    );
+                    let _ = writeln!(
+                        body,
+                        "{indent}{term2h} = stablehlo.multiply {pre_prev}, {term2} : {ty_prev}"
+                    );
+                    let _ = writeln!(
+                        body,
+                        "{indent}{deriv_sum} = stablehlo.add {term1}, {term2h} : {ty_prev}"
+                    );
+                    let _ = writeln!(
+                        body,
+                        "{indent}{deriv} = stablehlo.multiply {half}, {deriv_sum} : {ty_prev}"
+                    );
+                    let _ = writeln!(
+                        body,
+                        "{indent}{out} = stablehlo.multiply {dh}, {deriv} : {ty_prev}"
                     );
                     out
                 }
@@ -1410,80 +1419,98 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
 
         let _ = writeln!(
             body,
-            "    {b1} = stablehlo.constant dense<{:.8e}> : {ty}",
+            "{indent}{b1} = stablehlo.constant dense<{:.8e}> : {ty}",
             graph.beta1
         );
         let _ = writeln!(
             body,
-            "    {omb1} = stablehlo.constant dense<{:.8e}> : {ty}",
+            "{indent}{omb1} = stablehlo.constant dense<{:.8e}> : {ty}",
             1.0 - graph.beta1
         );
         let _ = writeln!(
             body,
-            "    {b2} = stablehlo.constant dense<{:.8e}> : {ty}",
+            "{indent}{b2} = stablehlo.constant dense<{:.8e}> : {ty}",
             graph.beta2
         );
         let _ = writeln!(
             body,
-            "    {omb2} = stablehlo.constant dense<{:.8e}> : {ty}",
+            "{indent}{omb2} = stablehlo.constant dense<{:.8e}> : {ty}",
             1.0 - graph.beta2
         );
-        let _ = writeln!(body, "    {m1} = stablehlo.multiply {b1}, {m_var} : {ty}");
-        let _ = writeln!(body, "    {m2} = stablehlo.multiply {omb1}, {grad} : {ty}");
-        let _ = writeln!(body, "    {m_new} = stablehlo.add {m1}, {m2} : {ty}");
-        let _ = writeln!(body, "    {g2} = stablehlo.multiply {grad}, {grad} : {ty}");
-        let _ = writeln!(body, "    {v1} = stablehlo.multiply {b2}, {v_var} : {ty}");
-        let _ = writeln!(body, "    {v2} = stablehlo.multiply {omb2}, {g2} : {ty}");
-        let _ = writeln!(body, "    {v_new} = stablehlo.add {v1}, {v2} : {ty}");
+        let _ = writeln!(
+            body,
+            "{indent}{m1} = stablehlo.multiply {b1}, {m_var} : {ty}"
+        );
+        let _ = writeln!(
+            body,
+            "{indent}{m2} = stablehlo.multiply {omb1}, {grad} : {ty}"
+        );
+        let _ = writeln!(body, "{indent}{m_new} = stablehlo.add {m1}, {m2} : {ty}");
+        let _ = writeln!(
+            body,
+            "{indent}{g2} = stablehlo.multiply {grad}, {grad} : {ty}"
+        );
+        let _ = writeln!(
+            body,
+            "{indent}{v1} = stablehlo.multiply {b2}, {v_var} : {ty}"
+        );
+        let _ = writeln!(
+            body,
+            "{indent}{v2} = stablehlo.multiply {omb2}, {g2} : {ty}"
+        );
+        let _ = writeln!(body, "{indent}{v_new} = stablehlo.add {v1}, {v2} : {ty}");
 
         let _ = writeln!(
             body,
-            "    {ib1_b} = stablehlo.broadcast_in_dim %inv_bc1, dims = [] : (tensor<f32>) -> {ty}"
+            "{indent}{ib1_b} = stablehlo.broadcast_in_dim {inv_bc1_var}, dims = [] : (tensor<f32>) -> {ty}"
         );
         let _ = writeln!(
             body,
-            "    {ib2_b} = stablehlo.broadcast_in_dim %inv_bc2, dims = [] : (tensor<f32>) -> {ty}"
+            "{indent}{ib2_b} = stablehlo.broadcast_in_dim {inv_bc2_var}, dims = [] : (tensor<f32>) -> {ty}"
         );
         let _ = writeln!(
             body,
-            "    {m_hat} = stablehlo.multiply {m_new}, {ib1_b} : {ty}"
+            "{indent}{m_hat} = stablehlo.multiply {m_new}, {ib1_b} : {ty}"
         );
         let _ = writeln!(
             body,
-            "    {v_hat} = stablehlo.multiply {v_new}, {ib2_b} : {ty}"
+            "{indent}{v_hat} = stablehlo.multiply {v_new}, {ib2_b} : {ty}"
         );
-        let _ = writeln!(body, "    {sqv} = stablehlo.sqrt {v_hat} : {ty}");
+        let _ = writeln!(body, "{indent}{sqv} = stablehlo.sqrt {v_hat} : {ty}");
         let _ = writeln!(
             body,
-            "    {eps_c} = stablehlo.constant dense<{:.8e}> : {ty}",
+            "{indent}{eps_c} = stablehlo.constant dense<{:.8e}> : {ty}",
             graph.eps
         );
-        let _ = writeln!(body, "    {denom} = stablehlo.add {sqv}, {eps_c} : {ty}");
         let _ = writeln!(
             body,
-            "    {step_ratio} = stablehlo.divide {m_hat}, {denom} : {ty}"
+            "{indent}{denom} = stablehlo.add {sqv}, {eps_c} : {ty}"
         );
         let _ = writeln!(
             body,
-            "    {lr_c} = stablehlo.constant dense<{:.8e}> : {ty}",
+            "{indent}{step_ratio} = stablehlo.divide {m_hat}, {denom} : {ty}"
+        );
+        let _ = writeln!(
+            body,
+            "{indent}{lr_c} = stablehlo.constant dense<{:.8e}> : {ty}",
             graph.lr
         );
         let _ = writeln!(
             body,
-            "    {delta} = stablehlo.multiply {lr_c}, {step_ratio} : {ty}"
+            "{indent}{delta} = stablehlo.multiply {lr_c}, {step_ratio} : {ty}"
         );
         let _ = writeln!(
             body,
-            "    {decay_c} = stablehlo.constant dense<{:.8e}> : {ty}",
+            "{indent}{decay_c} = stablehlo.constant dense<{:.8e}> : {ty}",
             1.0 - graph.lr * wd
         );
         let _ = writeln!(
             body,
-            "    {p_dec} = stablehlo.multiply {param}, {decay_c} : {ty}"
+            "{indent}{p_dec} = stablehlo.multiply {param}, {decay_c} : {ty}"
         );
         let _ = writeln!(
             body,
-            "    {p_new} = stablehlo.subtract {p_dec}, {delta} : {ty}"
+            "{indent}{p_new} = stablehlo.subtract {p_dec}, {delta} : {ty}"
         );
         (p_new, m_new, v_new)
     };
@@ -1501,18 +1528,18 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
         let w_ty = format!("tensor<{d_in}x{d_out_dim}xf32>");
         let b_ty = format!("tensor<{d_out_dim}xf32>");
         let (wn, mwn, vwn) = emit_adamw(
-            &format!("%w{l}"),
+            &w_vars[l],
             &dw_vars[l],
-            &format!("%mw{l}"),
-            &format!("%vw{l}"),
+            &mw_vars[l],
+            &vw_vars[l],
             &w_ty,
             graph.weight_decay,
         );
         let (bn, mbn, vbn) = emit_adamw(
-            &format!("%b{l}"),
+            &b_vars[l],
             &db_vars[l],
-            &format!("%mb{l}"),
-            &format!("%vb{l}"),
+            &mb_vars[l],
+            &vb_vars[l],
             &b_ty,
             0.0,
         );
@@ -1523,6 +1550,103 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
         new_mb.push(mbn);
         new_vb.push(vbn);
     }
+
+    (loss_var, new_w, new_b, new_mw, new_vw, new_mb, new_vb)
+}
+
+/// Emit a single fused StableHLO MLIR program implementing Forward + Loss + Backward + AdamW.
+///
+/// Function signature:
+/// `%x`, `%targets` (one-hot `[B, C]` for CE or `[B, C]` for MSE), `%inv_bc1`, `%inv_bc2`,
+/// followed by per-layer `%w_i`, `%b_i`, `%mw_i`, `%vw_i`, `%mb_i`, `%vb_i`.
+/// Returns `(loss_scalar, updated w_i..., updated b_i..., updated mw_i..., updated vw_i..., updated mb_i..., updated vb_i...)`.
+pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
+    let n_layers = graph.num_layers();
+    let b = graph.batch_size;
+    let in_dim = graph.layer_dims[0];
+    let out_dim = graph.layer_dims[n_layers];
+    let elem = match graph.dtype {
+        TpuDType::F32 => "f32",
+        TpuDType::BF16 => "bf16",
+    };
+
+    let mut args = Vec::new();
+    args.push(format!("%x: tensor<{b}x{in_dim}x{elem}>"));
+    args.push(format!("%targets: tensor<{b}x{out_dim}xf32>"));
+    args.push("%inv_bc1: tensor<f32>".to_string());
+    args.push("%inv_bc2: tensor<f32>".to_string());
+
+    let mut w_vars = Vec::with_capacity(n_layers);
+    let mut b_vars = Vec::with_capacity(n_layers);
+    let mut mw_vars = Vec::with_capacity(n_layers);
+    let mut vw_vars = Vec::with_capacity(n_layers);
+    let mut mb_vars = Vec::with_capacity(n_layers);
+    let mut vb_vars = Vec::with_capacity(n_layers);
+
+    for l in 0..n_layers {
+        let d_in = graph.layer_dims[l];
+        let d_out = graph.layer_dims[l + 1];
+        args.push(format!("%w{l}: tensor<{d_in}x{d_out}xf32>"));
+        args.push(format!("%b{l}: tensor<{d_out}xf32>"));
+        args.push(format!("%mw{l}: tensor<{d_in}x{d_out}xf32>"));
+        args.push(format!("%vw{l}: tensor<{d_in}x{d_out}xf32>"));
+        args.push(format!("%mb{l}: tensor<{d_out}xf32>"));
+        args.push(format!("%vb{l}: tensor<{d_out}xf32>"));
+        w_vars.push(format!("%w{l}"));
+        b_vars.push(format!("%b{l}"));
+        mw_vars.push(format!("%mw{l}"));
+        vw_vars.push(format!("%vw{l}"));
+        mb_vars.push(format!("%mb{l}"));
+        vb_vars.push(format!("%vb{l}"));
+    }
+
+    let mut ret_types = vec!["tensor<f32>".to_string()];
+    for l in 0..n_layers {
+        let d_in = graph.layer_dims[l];
+        let d_out = graph.layer_dims[l + 1];
+        ret_types.push(format!("tensor<{d_in}x{d_out}xf32>"));
+    }
+    for l in 0..n_layers {
+        let d_out = graph.layer_dims[l + 1];
+        ret_types.push(format!("tensor<{d_out}xf32>"));
+    }
+    for l in 0..n_layers {
+        let d_in = graph.layer_dims[l];
+        let d_out = graph.layer_dims[l + 1];
+        ret_types.push(format!("tensor<{d_in}x{d_out}xf32>"));
+    }
+    for l in 0..n_layers {
+        let d_in = graph.layer_dims[l];
+        let d_out = graph.layer_dims[l + 1];
+        ret_types.push(format!("tensor<{d_in}x{d_out}xf32>"));
+    }
+    for l in 0..n_layers {
+        let d_out = graph.layer_dims[l + 1];
+        ret_types.push(format!("tensor<{d_out}xf32>"));
+    }
+    for l in 0..n_layers {
+        let d_out = graph.layer_dims[l + 1];
+        ret_types.push(format!("tensor<{d_out}xf32>"));
+    }
+
+    let mut body = String::new();
+    let mut id_counter: usize = 0;
+    let (loss_var, new_w, new_b, new_mw, new_vw, new_mb, new_vb) = emit_mlp_step_ops(
+        graph,
+        &mut body,
+        "    ",
+        &mut id_counter,
+        "%x",
+        "%targets",
+        "%inv_bc1",
+        "%inv_bc2",
+        &w_vars,
+        &b_vars,
+        &mw_vars,
+        &vw_vars,
+        &mb_vars,
+        &vb_vars,
+    );
 
     let mut ret_vals = vec![loss_var];
     ret_vals.extend(new_w);
@@ -1540,6 +1664,265 @@ pub fn emit_mlp_train_step_mlir(graph: &TpuStepGraph) -> OchreResult<String> {
         ret_vals.join(", "),
         ret_types.join(", "),
     ))
+}
+
+/// Emit a single StableHLO MLIR program wrapping `num_steps` consecutive MLP training steps
+/// inside a `stablehlo.while` loop so TPU executes multiple steps per PJRT invocation with
+/// zero host round-trips per step.
+///
+/// Function signature:
+/// `%x_steps: tensor<N x B x D_in x {f32|bf16}>`,
+/// `%target_steps: tensor<N x B x D_out x f32>`,
+/// `%init_b1_pow: tensor<f32>`, `%init_b2_pow: tensor<f32>`,
+/// followed by per-layer `%w_i`, `%b_i`, `%mw_i`, `%vw_i`, `%mb_i`, `%vb_i`.
+/// Returns `(mean_loss, updated w_i..., updated b_i..., updated mw_i..., updated vw_i..., updated mb_i..., updated vb_i...)`.
+pub fn emit_mlp_multi_step_while_mlir(graph: &TpuStepGraph, num_steps: usize) -> String {
+    let steps = num_steps.max(1);
+    let n_layers = graph.num_layers();
+    let b = graph.batch_size;
+    let in_dim = graph.layer_dims[0];
+    let out_dim = graph.layer_dims[n_layers];
+    let elem = match graph.dtype {
+        TpuDType::F32 => "f32",
+        TpuDType::BF16 => "bf16",
+    };
+
+    let mut args = Vec::new();
+    args.push(format!("%x_steps: tensor<{steps}x{b}x{in_dim}x{elem}>"));
+    args.push(format!("%target_steps: tensor<{steps}x{b}x{out_dim}xf32>"));
+    args.push("%init_b1_pow: tensor<f32>".to_string());
+    args.push("%init_b2_pow: tensor<f32>".to_string());
+
+    for l in 0..n_layers {
+        let d_in = graph.layer_dims[l];
+        let d_out = graph.layer_dims[l + 1];
+        args.push(format!("%w{l}: tensor<{d_in}x{d_out}xf32>"));
+        args.push(format!("%b{l}: tensor<{d_out}xf32>"));
+        args.push(format!("%mw{l}: tensor<{d_in}x{d_out}xf32>"));
+        args.push(format!("%vw{l}: tensor<{d_in}x{d_out}xf32>"));
+        args.push(format!("%mb{l}: tensor<{d_out}xf32>"));
+        args.push(format!("%vb{l}: tensor<{d_out}xf32>"));
+    }
+
+    // Loop-carried state:
+    // (iter: i32, loss_sum: f32, b1_pow: f32, b2_pow: f32, w0.., b0.., mw0.., vw0.., mb0.., vb0..)
+    let mut state_bindings = vec![
+        "%iter = %c0_i32".to_string(),
+        "%loss_sum = %c0_f32".to_string(),
+        "%b1_pow = %init_b1_pow".to_string(),
+        "%b2_pow = %init_b2_pow".to_string(),
+    ];
+    let mut state_types = vec![
+        "tensor<i32>".to_string(),
+        "tensor<f32>".to_string(),
+        "tensor<f32>".to_string(),
+        "tensor<f32>".to_string(),
+    ];
+    let mut ret_types = vec!["tensor<f32>".to_string()];
+
+    let mut lw_vars = Vec::with_capacity(n_layers);
+    let mut lb_vars = Vec::with_capacity(n_layers);
+    let mut lmw_vars = Vec::with_capacity(n_layers);
+    let mut lvw_vars = Vec::with_capacity(n_layers);
+    let mut lmb_vars = Vec::with_capacity(n_layers);
+    let mut lvb_vars = Vec::with_capacity(n_layers);
+
+    for l in 0..n_layers {
+        let d_in = graph.layer_dims[l];
+        let d_out = graph.layer_dims[l + 1];
+        let ty = format!("tensor<{d_in}x{d_out}xf32>");
+        state_bindings.push(format!("%lw{l} = %w{l}"));
+        state_types.push(ty.clone());
+        ret_types.push(ty);
+        lw_vars.push(format!("%lw{l}"));
+    }
+    for l in 0..n_layers {
+        let d_out = graph.layer_dims[l + 1];
+        let ty = format!("tensor<{d_out}xf32>");
+        state_bindings.push(format!("%lb{l} = %b{l}"));
+        state_types.push(ty.clone());
+        ret_types.push(ty);
+        lb_vars.push(format!("%lb{l}"));
+    }
+    for l in 0..n_layers {
+        let d_in = graph.layer_dims[l];
+        let d_out = graph.layer_dims[l + 1];
+        let ty = format!("tensor<{d_in}x{d_out}xf32>");
+        state_bindings.push(format!("%lmw{l} = %mw{l}"));
+        state_types.push(ty.clone());
+        ret_types.push(ty);
+        lmw_vars.push(format!("%lmw{l}"));
+    }
+    for l in 0..n_layers {
+        let d_in = graph.layer_dims[l];
+        let d_out = graph.layer_dims[l + 1];
+        let ty = format!("tensor<{d_in}x{d_out}xf32>");
+        state_bindings.push(format!("%lvw{l} = %vw{l}"));
+        state_types.push(ty.clone());
+        ret_types.push(ty);
+        lvw_vars.push(format!("%lvw{l}"));
+    }
+    for l in 0..n_layers {
+        let d_out = graph.layer_dims[l + 1];
+        let ty = format!("tensor<{d_out}xf32>");
+        state_bindings.push(format!("%lmb{l} = %mb{l}"));
+        state_types.push(ty.clone());
+        ret_types.push(ty);
+        lmb_vars.push(format!("%lmb{l}"));
+    }
+    for l in 0..n_layers {
+        let d_out = graph.layer_dims[l + 1];
+        let ty = format!("tensor<{d_out}xf32>");
+        state_bindings.push(format!("%lvb{l} = %vb{l}"));
+        state_types.push(ty.clone());
+        ret_types.push(ty);
+        lvb_vars.push(format!("%lvb{l}"));
+    }
+
+    let n_state = state_types.len();
+    let mut do_body = String::new();
+    let mut id_counter: usize = 0;
+
+    // Slice step batch from 3D [steps, B, D] -> 2D [B, D]
+    let _ = writeln!(
+        do_body,
+        "      %zero_idx = stablehlo.constant dense<0> : tensor<i32>"
+    );
+    let _ = writeln!(
+        do_body,
+        "      %x_slice3 = stablehlo.dynamic_slice %x_steps, %iter, %zero_idx, %zero_idx, sizes = [1, {b}, {in_dim}] : (tensor<{steps}x{b}x{in_dim}x{elem}>, tensor<i32>, tensor<i32>, tensor<i32>) -> tensor<1x{b}x{in_dim}x{elem}>"
+    );
+    let _ = writeln!(
+        do_body,
+        "      %x_step = stablehlo.reshape %x_slice3 : (tensor<1x{b}x{in_dim}x{elem}>) -> tensor<{b}x{in_dim}x{elem}>"
+    );
+    let _ = writeln!(
+        do_body,
+        "      %t_slice3 = stablehlo.dynamic_slice %target_steps, %iter, %zero_idx, %zero_idx, sizes = [1, {b}, {out_dim}] : (tensor<{steps}x{b}x{out_dim}xf32>, tensor<i32>, tensor<i32>, tensor<i32>) -> tensor<1x{b}x{out_dim}xf32>"
+    );
+    let _ = writeln!(
+        do_body,
+        "      %t_step = stablehlo.reshape %t_slice3 : (tensor<1x{b}x{out_dim}xf32>) -> tensor<{b}x{out_dim}xf32>"
+    );
+
+    // Update AdamW bias-correction powers inside the while loop
+    let _ = writeln!(
+        do_body,
+        "      %c_one_f32 = stablehlo.constant dense<1.0> : tensor<f32>"
+    );
+    let _ = writeln!(
+        do_body,
+        "      %c_beta1 = stablehlo.constant dense<{:.8e}> : tensor<f32>",
+        graph.beta1
+    );
+    let _ = writeln!(
+        do_body,
+        "      %c_beta2 = stablehlo.constant dense<{:.8e}> : tensor<f32>",
+        graph.beta2
+    );
+    let _ = writeln!(
+        do_body,
+        "      %b1_pow_next = stablehlo.multiply %b1_pow, %c_beta1 : tensor<f32>"
+    );
+    let _ = writeln!(
+        do_body,
+        "      %b2_pow_next = stablehlo.multiply %b2_pow, %c_beta2 : tensor<f32>"
+    );
+    let _ = writeln!(
+        do_body,
+        "      %bc1_den = stablehlo.subtract %c_one_f32, %b1_pow_next : tensor<f32>"
+    );
+    let _ = writeln!(
+        do_body,
+        "      %bc2_den = stablehlo.subtract %c_one_f32, %b2_pow_next : tensor<f32>"
+    );
+    let _ = writeln!(
+        do_body,
+        "      %step_inv_bc1 = stablehlo.divide %c_one_f32, %bc1_den : tensor<f32>"
+    );
+    let _ = writeln!(
+        do_body,
+        "      %step_inv_bc2 = stablehlo.divide %c_one_f32, %bc2_den : tensor<f32>"
+    );
+
+    let (step_loss, new_w, new_b, new_mw, new_vw, new_mb, new_vb) = emit_mlp_step_ops(
+        graph,
+        &mut do_body,
+        "      ",
+        &mut id_counter,
+        "%x_step",
+        "%t_step",
+        "%step_inv_bc1",
+        "%step_inv_bc2",
+        &lw_vars,
+        &lb_vars,
+        &lmw_vars,
+        &lvw_vars,
+        &lmb_vars,
+        &lvb_vars,
+    );
+
+    let _ = writeln!(
+        do_body,
+        "      %loss_sum_next = stablehlo.add %loss_sum, {step_loss} : tensor<f32>"
+    );
+    let _ = writeln!(
+        do_body,
+        "      %c1_i32 = stablehlo.constant dense<1> : tensor<i32>"
+    );
+    let _ = writeln!(
+        do_body,
+        "      %iter_next = stablehlo.add %iter, %c1_i32 : tensor<i32>"
+    );
+
+    let mut yield_vals = vec![
+        "%iter_next".to_string(),
+        "%loss_sum_next".to_string(),
+        "%b1_pow_next".to_string(),
+        "%b2_pow_next".to_string(),
+    ];
+    yield_vals.extend(new_w);
+    yield_vals.extend(new_b);
+    yield_vals.extend(new_mw);
+    yield_vals.extend(new_vw);
+    yield_vals.extend(new_mb);
+    yield_vals.extend(new_vb);
+
+    let mut final_ret_vals = vec!["%mean_loss".to_string()];
+    for idx in 4..n_state {
+        final_ret_vals.push(format!("%while_res#{idx}"));
+    }
+
+    format!(
+        "module @ochreml_tpu_multi_step {{\n\
+         \x20 func.func @main({}) -> ({}) {{\n\
+         \x20   %c0_i32 = stablehlo.constant dense<0> : tensor<i32>\n\
+         \x20   %c0_f32 = stablehlo.constant dense<0.0> : tensor<f32>\n\
+         \x20   %while_res:{n_state} = stablehlo.while({}) : {}\n\
+         \x20   cond {{\n\
+         \x20     %c_steps = stablehlo.constant dense<{steps}> : tensor<i32>\n\
+         \x20     %cond = stablehlo.compare LT, %iter, %c_steps, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>\n\
+         \x20     stablehlo.return %cond : tensor<i1>\n\
+         \x20   }} do {{\n\
+         {}\
+         \x20     stablehlo.return {} : {}\n\
+         \x20   }}\n\
+         \x20   %c_steps_f32 = stablehlo.constant dense<{:.8e}> : tensor<f32>\n\
+         \x20   %mean_loss = stablehlo.divide %while_res#1, %c_steps_f32 : tensor<f32>\n\
+         \x20   return {} : {}\n\
+         \x20 }}\n\
+         }}\n",
+        args.join(", "),
+        ret_types.join(", "),
+        state_bindings.join(", "),
+        state_types.join(", "),
+        do_body,
+        yield_vals.join(", "),
+        state_types.join(", "),
+        steps as f32,
+        final_ret_vals.join(", "),
+        ret_types.join(", "),
+    )
 }
 
 /// Execute a 1-graph compiled MLP training step on TPU via PJRT.
@@ -1877,6 +2260,58 @@ mod tests {
         assert!(mlir_mse.contains("stablehlo.maximum"));
         assert!(mlir_mse.contains("stablehlo.subtract"));
         assert!(mlir_mse.contains("stablehlo.select"));
+    }
+
+    #[test]
+    fn test_emit_mlp_multi_step_while_mlir() {
+        let graph_ce = TpuStepGraph::new(
+            64,
+            vec![784, 256, 10],
+            TpuActivation::Gelu,
+            TpuLossKind::CrossEntropy,
+            TpuDType::BF16,
+            1e-3,
+            0.9,
+            0.999,
+            1e-8,
+            0.01,
+        )
+        .unwrap();
+        let mlir = emit_mlp_multi_step_while_mlir(&graph_ce, 8);
+        assert!(mlir.contains("module @ochreml_tpu_multi_step"));
+        assert!(mlir.contains("stablehlo.while("));
+        assert!(mlir.contains("cond {"));
+        assert!(mlir.contains("} do {"));
+        assert!(mlir.contains("stablehlo.compare LT, %iter, %c_steps, SIGNED"));
+        assert!(mlir.contains("dense<8> : tensor<i32>"));
+        assert!(mlir.contains("stablehlo.dynamic_slice %x_steps"));
+        assert!(mlir.contains("stablehlo.dynamic_slice %target_steps"));
+        assert!(mlir.contains("tensor<8x64x784xbf16>"));
+        assert!(mlir.contains("tensor<8x64x10xf32>"));
+        assert!(mlir.contains("stablehlo.reshape %x_slice3"));
+        assert!(mlir.contains("stablehlo.dot_general"));
+        assert!(mlir.contains("stablehlo.divide %while_res#1, %c_steps_f32"));
+        assert_eq!(mlir.matches('{').count(), mlir.matches('}').count());
+
+        let graph_mse = TpuStepGraph::new(
+            32,
+            vec![16, 32, 4],
+            TpuActivation::Silu,
+            TpuLossKind::Mse,
+            TpuDType::F32,
+            1e-2,
+            0.9,
+            0.999,
+            1e-8,
+            0.0,
+        )
+        .unwrap();
+        let mlir_mse = graph_mse.emit_multi_step_while_mlir(4);
+        assert!(mlir_mse.contains("stablehlo.while("));
+        assert!(mlir_mse.contains("dense<4> : tensor<i32>"));
+        assert!(mlir_mse.contains("stablehlo.logistic"));
+        assert!(mlir_mse.contains("tensor<4x32x16xf32>"));
+        assert_eq!(mlir_mse.matches('{').count(), mlir_mse.matches('}').count());
     }
 
     #[test]
