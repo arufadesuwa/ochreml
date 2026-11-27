@@ -7,12 +7,212 @@ use crate::device::DeviceType;
 use crate::error::{OchreError, OchreResult};
 use crate::nn::autograd::{AutogradTape, CustomBackward, Op};
 use crate::nn::dtype::{DType, TensorStorage};
-use crate::nn::gemm_f32::sgemm;
+use crate::nn::gemm_f32::{sgemm, sgemm_serial};
 use crate::nn::tensor::{Tensor, compute_strides};
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 const PAR_ELEMS_THRESHOLD: usize = 16_384;
+const CONV_PAR_FLOPS_THRESHOLD: usize = 65_536;
+
+thread_local! {
+    static IM2COL_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static DCOL_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+#[inline]
+fn with_tls_scratch<R>(
+    tls: &'static std::thread::LocalKey<RefCell<Vec<f32>>>,
+    needed: usize,
+    f: impl FnOnce(&mut [f32]) -> R,
+) -> R {
+    tls.with(|cell| {
+        if let Ok(mut buf) = cell.try_borrow_mut() {
+            if buf.len() < needed {
+                buf.resize(needed, 0.0);
+            }
+            f(&mut buf[..needed])
+        } else {
+            let mut fallback = vec![0.0f32; needed];
+            f(&mut fallback)
+        }
+    })
+}
+
+/// Per-sample `im2col` writing `[in_c * kh * kw, out_h * out_w]` layout directly into `col`.
+#[allow(clippy::too_many_arguments)]
+fn im2col_sample_chw(
+    x_sample: &[f32],
+    in_c: usize,
+    in_h: usize,
+    in_w: usize,
+    kh: usize,
+    kw: usize,
+    stride: (usize, usize),
+    padding: (usize, usize),
+    dilation: (usize, usize),
+    out_h: usize,
+    out_w: usize,
+    col: &mut [f32],
+) {
+    let in_plane = in_h * in_w;
+    let spatial_out = out_h * out_w;
+    let (sh, sw) = stride;
+    let (ph, pw) = padding;
+    let (dh, dw) = dilation;
+
+    let mut row_idx = 0usize;
+    if sw == 1 && dw == 1 {
+        for ic in 0..in_c {
+            let x_c = &x_sample[ic * in_plane..(ic + 1) * in_plane];
+            for ky in 0..kh {
+                let ky_off = ky * dh;
+                for kx in 0..kw {
+                    let shift = kx as isize - pw as isize;
+                    let ow_start = (-shift).max(0) as usize;
+                    let ow_end = ((in_w as isize) - shift).clamp(0, out_w as isize) as usize;
+                    let col_row = &mut col[row_idx * spatial_out..(row_idx + 1) * spatial_out];
+                    for oh in 0..out_h {
+                        let dst_oh = &mut col_row[oh * out_w..(oh + 1) * out_w];
+                        let iy = (oh * sh + ky_off) as isize - ph as isize;
+                        if iy < 0 || iy >= in_h as isize {
+                            dst_oh.fill(0.0);
+                            continue;
+                        }
+                        let x_row = &x_c[(iy as usize) * in_w..(iy as usize + 1) * in_w];
+                        if ow_start > 0 {
+                            dst_oh[..ow_start.min(out_w)].fill(0.0);
+                        }
+                        if ow_start < ow_end {
+                            let ix_start = (ow_start as isize + shift) as usize;
+                            let len = ow_end - ow_start;
+                            dst_oh[ow_start..ow_end]
+                                .copy_from_slice(&x_row[ix_start..ix_start + len]);
+                        }
+                        if ow_end < out_w {
+                            dst_oh[ow_end..].fill(0.0);
+                        }
+                    }
+                    row_idx += 1;
+                }
+            }
+        }
+    } else {
+        for ic in 0..in_c {
+            let x_c = &x_sample[ic * in_plane..(ic + 1) * in_plane];
+            for ky in 0..kh {
+                let ky_off = ky * dh;
+                for kx in 0..kw {
+                    let kx_off = kx * dw;
+                    let col_row = &mut col[row_idx * spatial_out..(row_idx + 1) * spatial_out];
+                    for oh in 0..out_h {
+                        let dst_oh = &mut col_row[oh * out_w..(oh + 1) * out_w];
+                        let iy = (oh * sh + ky_off) as isize - ph as isize;
+                        if iy < 0 || iy >= in_h as isize {
+                            dst_oh.fill(0.0);
+                            continue;
+                        }
+                        let x_row = &x_c[(iy as usize) * in_w..(iy as usize + 1) * in_w];
+                        for (ow, dst_val) in dst_oh.iter_mut().enumerate() {
+                            let ix = (ow * sw + kx_off) as isize - pw as isize;
+                            if ix >= 0 && ix < in_w as isize {
+                                *dst_val = x_row[ix as usize];
+                            } else {
+                                *dst_val = 0.0;
+                            }
+                        }
+                    }
+                    row_idx += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Per-sample `col2im` accumulating `[in_c * kh * kw, out_h * out_w]` into zeroed `dx_sample`.
+#[allow(clippy::too_many_arguments)]
+fn col2im_sample_chw(
+    dcol: &[f32],
+    in_c: usize,
+    in_h: usize,
+    in_w: usize,
+    kh: usize,
+    kw: usize,
+    stride: (usize, usize),
+    padding: (usize, usize),
+    dilation: (usize, usize),
+    out_h: usize,
+    out_w: usize,
+    dx_sample: &mut [f32],
+) {
+    let in_plane = in_h * in_w;
+    let spatial_out = out_h * out_w;
+    let (sh, sw) = stride;
+    let (ph, pw) = padding;
+    let (dh, dw) = dilation;
+
+    dx_sample[..in_c * in_plane].fill(0.0);
+
+    let mut row_idx = 0usize;
+    if sw == 1 && dw == 1 {
+        for ic in 0..in_c {
+            let dx_c = &mut dx_sample[ic * in_plane..(ic + 1) * in_plane];
+            for ky in 0..kh {
+                let ky_off = ky * dh;
+                for kx in 0..kw {
+                    let shift = kx as isize - pw as isize;
+                    let ow_start = (-shift).max(0) as usize;
+                    let ow_end = ((in_w as isize) - shift).clamp(0, out_w as isize) as usize;
+                    let dcol_row = &dcol[row_idx * spatial_out..(row_idx + 1) * spatial_out];
+                    if ow_start < ow_end {
+                        let ix_start = (ow_start as isize + shift) as usize;
+                        let len = ow_end - ow_start;
+                        for oh in 0..out_h {
+                            let iy = (oh * sh + ky_off) as isize - ph as isize;
+                            if iy < 0 || iy >= in_h as isize {
+                                continue;
+                            }
+                            let dx_row = &mut dx_c[(iy as usize) * in_w..(iy as usize + 1) * in_w];
+                            let src_oh = &dcol_row[oh * out_w + ow_start..oh * out_w + ow_end];
+                            let dst_oh = &mut dx_row[ix_start..ix_start + len];
+                            for (d, &s) in dst_oh.iter_mut().zip(src_oh.iter()) {
+                                *d += s;
+                            }
+                        }
+                    }
+                    row_idx += 1;
+                }
+            }
+        }
+    } else {
+        for ic in 0..in_c {
+            let dx_c = &mut dx_sample[ic * in_plane..(ic + 1) * in_plane];
+            for ky in 0..kh {
+                let ky_off = ky * dh;
+                for kx in 0..kw {
+                    let kx_off = kx * dw;
+                    let dcol_row = &dcol[row_idx * spatial_out..(row_idx + 1) * spatial_out];
+                    for oh in 0..out_h {
+                        let iy = (oh * sh + ky_off) as isize - ph as isize;
+                        if iy < 0 || iy >= in_h as isize {
+                            continue;
+                        }
+                        let dx_row = &mut dx_c[(iy as usize) * in_w..(iy as usize + 1) * in_w];
+                        let src_oh = &dcol_row[oh * out_w..(oh + 1) * out_w];
+                        for (ow, &val) in src_oh.iter().enumerate() {
+                            let ix = (ow * sw + kx_off) as isize - pw as isize;
+                            if ix >= 0 && ix < in_w as isize {
+                                dx_row[ix as usize] += val;
+                            }
+                        }
+                    }
+                    row_idx += 1;
+                }
+            }
+        }
+    }
+}
 
 #[inline]
 fn quantize_vec(data: Vec<f32>, dtype: DType) -> Vec<f32> {
@@ -399,6 +599,166 @@ impl Conv2d {
         Ok((out, saved_cols, out_h, out_w))
     }
 
+    /// Fast CPU forward pass: parallelizes across batch items with L2-resident per-sample
+    /// `im2col` into thread-local scratchpad + `W_g @ col_n` writing directly into NCHW `out`.
+    fn forward_cpu_into(
+        &self,
+        x: &[f32],
+        batch: usize,
+        in_h: usize,
+        in_w: usize,
+        out: &mut [f32],
+    ) -> OchreResult<(usize, usize)> {
+        let expected_in = batch * self.in_channels * in_h * in_w;
+        if x.len() != expected_in {
+            return Err(OchreError::InvalidParameter(format!(
+                "Conv2d expected {expected_in} input elements, got {} ( >_< )",
+                x.len()
+            )));
+        }
+        let (out_h, out_w) = self.output_shape(in_h, in_w)?;
+        let spatial_out = out_h * out_w;
+        let expected_out = batch * self.out_channels * spatial_out;
+        if out.len() != expected_out {
+            return Err(OchreError::InvalidParameter(format!(
+                "Conv2d::forward_raw output buffer len {} != expected {expected_out} ( >_< )",
+                out.len()
+            )));
+        }
+
+        let (kh, kw) = self.kernel_size;
+        let in_per_g = self.in_channels / self.groups;
+        let out_per_g = self.out_channels / self.groups;
+        let patch_per_g = in_per_g * kh * kw;
+        let in_plane = in_h * in_w;
+        let is_1x1_unit = kh == 1
+            && kw == 1
+            && self.stride == (1, 1)
+            && self.padding == (0, 0)
+            && self.dilation == (1, 1);
+
+        let total_flops = batch
+            .saturating_mul(self.out_channels)
+            .saturating_mul(spatial_out)
+            .saturating_mul(patch_per_g);
+        let use_par_batch = batch >= 2
+            && total_flops >= CONV_PAR_FLOPS_THRESHOLD
+            && rayon::current_num_threads() > 1;
+
+        let weight = &self.weight.data;
+        let bias = self.bias.as_ref().map(|b| b.data.as_slice());
+
+        let compute_sample = |n: usize, out_n: &mut [f32]| -> OchreResult<()> {
+            for g in 0..self.groups {
+                let x_off = (n * self.in_channels + g * in_per_g) * in_plane;
+                let x_g = &x[x_off..x_off + in_per_g * in_plane];
+                let w_off = g * out_per_g * patch_per_g;
+                let w_g = &weight[w_off..w_off + out_per_g * patch_per_g];
+                let o_off = g * out_per_g * spatial_out;
+                let out_g = &mut out_n[o_off..o_off + out_per_g * spatial_out];
+
+                if is_1x1_unit {
+                    if use_par_batch {
+                        sgemm_serial(
+                            out_per_g,
+                            spatial_out,
+                            in_per_g,
+                            w_g,
+                            x_g,
+                            out_g,
+                            false,
+                            false,
+                            1.0,
+                            0.0,
+                        )?;
+                    } else {
+                        sgemm(
+                            out_per_g,
+                            spatial_out,
+                            in_per_g,
+                            w_g,
+                            x_g,
+                            out_g,
+                            false,
+                            false,
+                            1.0,
+                            0.0,
+                        )?;
+                    }
+                } else {
+                    with_tls_scratch(&IM2COL_SCRATCH, patch_per_g * spatial_out, |col_n| {
+                        im2col_sample_chw(
+                            x_g,
+                            in_per_g,
+                            in_h,
+                            in_w,
+                            kh,
+                            kw,
+                            self.stride,
+                            self.padding,
+                            self.dilation,
+                            out_h,
+                            out_w,
+                            col_n,
+                        );
+                        if use_par_batch {
+                            sgemm_serial(
+                                out_per_g,
+                                spatial_out,
+                                patch_per_g,
+                                w_g,
+                                col_n,
+                                out_g,
+                                false,
+                                false,
+                                1.0,
+                                0.0,
+                            )
+                        } else {
+                            sgemm(
+                                out_per_g,
+                                spatial_out,
+                                patch_per_g,
+                                w_g,
+                                col_n,
+                                out_g,
+                                false,
+                                false,
+                                1.0,
+                                0.0,
+                            )
+                        }
+                    })?;
+                }
+
+                if let Some(b_slice) = bias {
+                    let oc_start = g * out_per_g;
+                    for oc_local in 0..out_per_g {
+                        let bv = b_slice[oc_start + oc_local];
+                        let dst = &mut out_g[oc_local * spatial_out..(oc_local + 1) * spatial_out];
+                        for v in dst.iter_mut() {
+                            *v += bv;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        };
+
+        let sample_out_stride = self.out_channels * spatial_out;
+        if use_par_batch {
+            out.par_chunks_mut(sample_out_stride)
+                .enumerate()
+                .try_for_each(|(n, out_n)| compute_sample(n, out_n))?;
+        } else {
+            for (n, out_n) in out.chunks_mut(sample_out_stride).enumerate() {
+                compute_sample(n, out_n)?;
+            }
+        }
+
+        Ok((out_h, out_w))
+    }
+
     /// Raw slice forward pass writing `[batch, out_channels, out_h, out_w]` into `out`.
     pub fn forward_raw(
         &self,
@@ -408,6 +768,10 @@ impl Conv2d {
         in_w: usize,
         out: &mut [f32],
     ) -> OchreResult<()> {
+        if matches!(self.device, DeviceType::Cpu) {
+            self.forward_cpu_into(x, batch, in_h, in_w, out)?;
+            return Ok(());
+        }
         let (out_h, out_w) = self.output_shape(in_h, in_w)?;
         let expected_out = batch * self.out_channels * out_h * out_w;
         if out.len() != expected_out {
@@ -447,69 +811,94 @@ impl Conv2d {
         let (kh, kw) = self.kernel_size;
         let in_per_g = self.in_channels / self.groups;
         let patch_per_g = in_per_g * kh * kw;
-        let backend = get_backend(&self.device);
 
-        let mut cols = Vec::with_capacity(self.groups);
-        let mut x_group_buf = if self.groups > 1 {
-            vec![0.0f32; batch * in_per_g * in_h * in_w]
-        } else {
-            Vec::new()
-        };
-        for g in 0..self.groups {
-            let x_slice: &[f32] = if self.groups == 1 {
-                x
-            } else {
-                let hw = in_h * in_w;
-                let c_start = g * in_per_g;
-                for b in 0..batch {
-                    let src_off = (b * self.in_channels + c_start) * hw;
-                    let dst_off = b * in_per_g * hw;
-                    x_group_buf[dst_off..dst_off + in_per_g * hw]
-                        .copy_from_slice(&x[src_off..src_off + in_per_g * hw]);
-                }
-                &x_group_buf
-            };
-            let (col_g, _, _) = backend.im2col_f32(
-                x_slice,
+        let (dx_vec, dw_vec, db_vec) = if matches!(self.device, DeviceType::Cpu) {
+            conv2d_backward_cpu(
+                x,
+                dy,
+                &self.weight.data,
                 batch,
-                in_per_g,
+                self.in_channels,
                 in_h,
                 in_w,
+                self.out_channels,
                 kh,
                 kw,
-                self.stride.0,
-                self.stride.1,
-                self.padding.0,
-                self.padding.1,
-                self.dilation.0,
-                self.dilation.1,
-            )?;
-            cols.push(col_g);
-        }
+                self.stride,
+                self.padding,
+                self.dilation,
+                self.groups,
+                out_h,
+                out_w,
+                dx.is_some(),
+                true,
+                db.is_some() && self.bias.is_some(),
+                patch_per_g,
+            )?
+        } else {
+            let backend = get_backend(&self.device);
+            let mut cols = Vec::with_capacity(self.groups);
+            let mut x_group_buf = if self.groups > 1 {
+                vec![0.0f32; batch * in_per_g * in_h * in_w]
+            } else {
+                Vec::new()
+            };
+            for g in 0..self.groups {
+                let x_slice: &[f32] = if self.groups == 1 {
+                    x
+                } else {
+                    let hw = in_h * in_w;
+                    let c_start = g * in_per_g;
+                    for b in 0..batch {
+                        let src_off = (b * self.in_channels + c_start) * hw;
+                        let dst_off = b * in_per_g * hw;
+                        x_group_buf[dst_off..dst_off + in_per_g * hw]
+                            .copy_from_slice(&x[src_off..src_off + in_per_g * hw]);
+                    }
+                    &x_group_buf
+                };
+                let (col_g, _, _) = backend.im2col_f32(
+                    x_slice,
+                    batch,
+                    in_per_g,
+                    in_h,
+                    in_w,
+                    kh,
+                    kw,
+                    self.stride.0,
+                    self.stride.1,
+                    self.padding.0,
+                    self.padding.1,
+                    self.dilation.0,
+                    self.dilation.1,
+                )?;
+                cols.push(col_g);
+            }
 
-        let (dx_vec, dw_vec, db_vec) = conv2d_backward_core(
-            dy,
-            &cols,
-            &self.weight.data,
-            batch,
-            self.in_channels,
-            in_h,
-            in_w,
-            self.out_channels,
-            kh,
-            kw,
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
-            out_h,
-            out_w,
-            &self.device,
-            dx.is_some(),
-            true,
-            db.is_some() && self.bias.is_some(),
-            patch_per_g,
-        )?;
+            conv2d_backward_core(
+                dy,
+                &cols,
+                &self.weight.data,
+                batch,
+                self.in_channels,
+                in_h,
+                in_w,
+                self.out_channels,
+                kh,
+                kw,
+                self.stride,
+                self.padding,
+                self.dilation,
+                self.groups,
+                out_h,
+                out_w,
+                &self.device,
+                dx.is_some(),
+                true,
+                db.is_some() && self.bias.is_some(),
+                patch_per_g,
+            )?
+        };
 
         if let Some(dx_buf) = dx {
             if dx_buf.len() != expected_in {
@@ -539,13 +928,21 @@ impl Conv2d {
                 || self.weight.requires_grad
                 || self.bias.as_ref().is_some_and(|b| b.requires_grad));
 
-        let (raw_out, cols, out_h, out_w) = self.forward_with_cols(
-            &x.data,
-            batch,
-            in_h,
-            in_w,
-            need_grad && (x.requires_grad || self.weight.requires_grad),
-        )?;
+        let is_cpu = matches!(self.device, DeviceType::Cpu);
+        let (raw_out, cols, out_h, out_w) = if is_cpu {
+            let (oh, ow) = self.output_shape(in_h, in_w)?;
+            let mut out = vec![0.0f32; batch * self.out_channels * oh * ow];
+            self.forward_cpu_into(&x.data, batch, in_h, in_w, &mut out)?;
+            (out, Vec::new(), oh, ow)
+        } else {
+            self.forward_with_cols(
+                &x.data,
+                batch,
+                in_h,
+                in_w,
+                need_grad && (x.requires_grad || self.weight.requires_grad),
+            )?
+        };
         let out_data = quantize_vec(raw_out, self.dtype);
         let out_shape = vec![batch, self.out_channels, out_h, out_w];
 
@@ -560,6 +957,11 @@ impl Conv2d {
                 .bias
                 .as_ref()
                 .and_then(|b| if b.requires_grad { b.node_id } else { None });
+            let x_saved = if is_cpu && w_id.is_some() {
+                x.data.clone()
+            } else {
+                Vec::new()
+            };
             let w_data = if x_id.is_some() {
                 self.weight.data.clone()
             } else {
@@ -576,29 +978,54 @@ impl Conv2d {
             let dev = self.device.clone();
 
             let bwd = CustomBackward(Arc::new(move |dy: &[f32]| {
-                let (dx, dw, db) = conv2d_backward_core(
-                    dy,
-                    &cols,
-                    &w_data,
-                    batch,
-                    in_c,
-                    in_h,
-                    in_w,
-                    out_c,
-                    kh,
-                    kw,
-                    stride,
-                    padding,
-                    dilation,
-                    groups,
-                    out_h,
-                    out_w,
-                    &dev,
-                    x_id.is_some(),
-                    w_id.is_some(),
-                    b_id.is_some(),
-                    patch_per_g,
-                )?;
+                let (dx, dw, db) = if is_cpu {
+                    conv2d_backward_cpu(
+                        &x_saved,
+                        dy,
+                        &w_data,
+                        batch,
+                        in_c,
+                        in_h,
+                        in_w,
+                        out_c,
+                        kh,
+                        kw,
+                        stride,
+                        padding,
+                        dilation,
+                        groups,
+                        out_h,
+                        out_w,
+                        x_id.is_some(),
+                        w_id.is_some(),
+                        b_id.is_some(),
+                        patch_per_g,
+                    )?
+                } else {
+                    conv2d_backward_core(
+                        dy,
+                        &cols,
+                        &w_data,
+                        batch,
+                        in_c,
+                        in_h,
+                        in_w,
+                        out_c,
+                        kh,
+                        kw,
+                        stride,
+                        padding,
+                        dilation,
+                        groups,
+                        out_h,
+                        out_w,
+                        &dev,
+                        x_id.is_some(),
+                        w_id.is_some(),
+                        b_id.is_some(),
+                        patch_per_g,
+                    )?
+                };
                 let mut res = Vec::with_capacity(3);
                 if let Some(id) = x_id {
                     res.push((id, dx));
@@ -629,6 +1056,294 @@ impl Conv2d {
             requires_grad: need_grad,
             node_id,
         })
+    }
+}
+
+/// Fast CPU backward pass for `Conv2d`: parallelizes across batch items with L2-resident
+/// per-sample `im2col`/`col2im` + `sgemm_serial`, accumulating `dw` and `db` via Rayon fold+reduce.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn conv2d_backward_cpu(
+    x: &[f32],
+    dy: &[f32],
+    weight_data: &[f32],
+    batch: usize,
+    in_c: usize,
+    in_h: usize,
+    in_w: usize,
+    out_c: usize,
+    kh: usize,
+    kw: usize,
+    stride: (usize, usize),
+    padding: (usize, usize),
+    dilation: (usize, usize),
+    groups: usize,
+    out_h: usize,
+    out_w: usize,
+    need_dx: bool,
+    need_dw: bool,
+    need_db: bool,
+    patch_per_g: usize,
+) -> OchreResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let spatial_out = out_h * out_w;
+    let in_plane = in_h * in_w;
+    let in_per_g = in_c / groups;
+    let out_per_g = out_c / groups;
+    let dw_len = if need_dw { out_c * patch_per_g } else { 0 };
+    let db_len = if need_db { out_c } else { 0 };
+    let is_1x1_unit =
+        kh == 1 && kw == 1 && stride == (1, 1) && padding == (0, 0) && dilation == (1, 1);
+
+    let total_flops = batch
+        .saturating_mul(out_c)
+        .saturating_mul(spatial_out)
+        .saturating_mul(patch_per_g);
+    let use_par_batch =
+        batch >= 2 && total_flops >= CONV_PAR_FLOPS_THRESHOLD && rayon::current_num_threads() > 1;
+
+    let process_sample = |n: usize,
+                          mut dx_n: Option<&mut [f32]>,
+                          dw_acc: &mut [f32],
+                          db_acc: &mut [f32]|
+     -> OchreResult<()> {
+        let dy_n_off = n * out_c * spatial_out;
+        let dy_n = &dy[dy_n_off..dy_n_off + out_c * spatial_out];
+
+        if need_db {
+            for (oc, db_slot) in db_acc.iter_mut().enumerate().take(out_c) {
+                let s: f32 = dy_n[oc * spatial_out..(oc + 1) * spatial_out]
+                    .iter()
+                    .copied()
+                    .sum();
+                *db_slot += s;
+            }
+        }
+
+        if !need_dx && !need_dw {
+            return Ok(());
+        }
+
+        for g in 0..groups {
+            let dy_g_off = g * out_per_g * spatial_out;
+            let dy_g = &dy_n[dy_g_off..dy_g_off + out_per_g * spatial_out];
+            let w_off = g * out_per_g * patch_per_g;
+
+            if need_dw {
+                let x_off = (n * in_c + g * in_per_g) * in_plane;
+                let x_g = &x[x_off..x_off + in_per_g * in_plane];
+                let dw_g = &mut dw_acc[w_off..w_off + out_per_g * patch_per_g];
+                if is_1x1_unit {
+                    if use_par_batch {
+                        sgemm_serial(
+                            out_per_g,
+                            in_per_g,
+                            spatial_out,
+                            dy_g,
+                            x_g,
+                            dw_g,
+                            false,
+                            true,
+                            1.0,
+                            1.0,
+                        )?;
+                    } else {
+                        sgemm(
+                            out_per_g,
+                            in_per_g,
+                            spatial_out,
+                            dy_g,
+                            x_g,
+                            dw_g,
+                            false,
+                            true,
+                            1.0,
+                            1.0,
+                        )?;
+                    }
+                } else {
+                    with_tls_scratch(&IM2COL_SCRATCH, patch_per_g * spatial_out, |col_n| {
+                        im2col_sample_chw(
+                            x_g, in_per_g, in_h, in_w, kh, kw, stride, padding, dilation, out_h,
+                            out_w, col_n,
+                        );
+                        if use_par_batch {
+                            sgemm_serial(
+                                out_per_g,
+                                patch_per_g,
+                                spatial_out,
+                                dy_g,
+                                col_n,
+                                dw_g,
+                                false,
+                                true,
+                                1.0,
+                                1.0,
+                            )
+                        } else {
+                            sgemm(
+                                out_per_g,
+                                patch_per_g,
+                                spatial_out,
+                                dy_g,
+                                col_n,
+                                dw_g,
+                                false,
+                                true,
+                                1.0,
+                                1.0,
+                            )
+                        }
+                    })?;
+                }
+            }
+
+            if let Some(ref mut dx_sample) = dx_n {
+                let w_g = &weight_data[w_off..w_off + out_per_g * patch_per_g];
+                let dx_g_off = g * in_per_g * in_plane;
+                let dx_g = &mut dx_sample[dx_g_off..dx_g_off + in_per_g * in_plane];
+                if is_1x1_unit {
+                    if use_par_batch {
+                        sgemm_serial(
+                            in_per_g,
+                            spatial_out,
+                            out_per_g,
+                            w_g,
+                            dy_g,
+                            dx_g,
+                            true,
+                            false,
+                            1.0,
+                            0.0,
+                        )?;
+                    } else {
+                        sgemm(
+                            in_per_g,
+                            spatial_out,
+                            out_per_g,
+                            w_g,
+                            dy_g,
+                            dx_g,
+                            true,
+                            false,
+                            1.0,
+                            0.0,
+                        )?;
+                    }
+                } else {
+                    with_tls_scratch(&DCOL_SCRATCH, patch_per_g * spatial_out, |dcol_n| {
+                        if use_par_batch {
+                            sgemm_serial(
+                                patch_per_g,
+                                spatial_out,
+                                out_per_g,
+                                w_g,
+                                dy_g,
+                                dcol_n,
+                                true,
+                                false,
+                                1.0,
+                                0.0,
+                            )?;
+                        } else {
+                            sgemm(
+                                patch_per_g,
+                                spatial_out,
+                                out_per_g,
+                                w_g,
+                                dy_g,
+                                dcol_n,
+                                true,
+                                false,
+                                1.0,
+                                0.0,
+                            )?;
+                        }
+                        col2im_sample_chw(
+                            dcol_n, in_per_g, in_h, in_w, kh, kw, stride, padding, dilation, out_h,
+                            out_w, dx_g,
+                        );
+                        Ok(())
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    };
+
+    let sample_in_stride = in_c * in_plane;
+    if use_par_batch {
+        let mut dx = if need_dx {
+            vec![0.0f32; batch * sample_in_stride]
+        } else {
+            Vec::new()
+        };
+
+        let (dw, db) = if need_dx {
+            dx.par_chunks_mut(sample_in_stride)
+                .enumerate()
+                .fold(
+                    || Ok((vec![0.0f32; dw_len], vec![0.0f32; db_len])),
+                    |acc: OchreResult<(Vec<f32>, Vec<f32>)>, (n, dx_n)| {
+                        let (mut dw_l, mut db_l) = acc?;
+                        process_sample(n, Some(dx_n), &mut dw_l, &mut db_l)?;
+                        Ok((dw_l, db_l))
+                    },
+                )
+                .try_reduce(
+                    || (vec![0.0f32; dw_len], vec![0.0f32; db_len]),
+                    |(mut dw_a, mut db_a), (dw_b, db_b)| {
+                        for (a, &b) in dw_a.iter_mut().zip(dw_b.iter()) {
+                            *a += b;
+                        }
+                        for (a, &b) in db_a.iter_mut().zip(db_b.iter()) {
+                            *a += b;
+                        }
+                        Ok((dw_a, db_a))
+                    },
+                )?
+        } else {
+            (0..batch)
+                .into_par_iter()
+                .fold(
+                    || Ok((vec![0.0f32; dw_len], vec![0.0f32; db_len])),
+                    |acc: OchreResult<(Vec<f32>, Vec<f32>)>, n| {
+                        let (mut dw_l, mut db_l) = acc?;
+                        process_sample(n, None, &mut dw_l, &mut db_l)?;
+                        Ok((dw_l, db_l))
+                    },
+                )
+                .try_reduce(
+                    || (vec![0.0f32; dw_len], vec![0.0f32; db_len]),
+                    |(mut dw_a, mut db_a), (dw_b, db_b)| {
+                        for (a, &b) in dw_a.iter_mut().zip(dw_b.iter()) {
+                            *a += b;
+                        }
+                        for (a, &b) in db_a.iter_mut().zip(db_b.iter()) {
+                            *a += b;
+                        }
+                        Ok((dw_a, db_a))
+                    },
+                )?
+        };
+        Ok((dx, dw, db))
+    } else {
+        let mut dx = if need_dx {
+            vec![0.0f32; batch * sample_in_stride]
+        } else {
+            Vec::new()
+        };
+        let mut dw = vec![0.0f32; dw_len];
+        let mut db = vec![0.0f32; db_len];
+
+        if need_dx {
+            for (n, dx_n) in dx.chunks_mut(sample_in_stride).enumerate() {
+                process_sample(n, Some(dx_n), &mut dw, &mut db)?;
+            }
+        } else {
+            for n in 0..batch {
+                process_sample(n, None, &mut dw, &mut db)?;
+            }
+        }
+        Ok((dx, dw, db))
     }
 }
 
@@ -1315,19 +2030,32 @@ impl MaxPool2d {
         out: &mut [f32],
         device: &DeviceType,
     ) -> OchreResult<Vec<usize>> {
-        let (res, argmax, _, _) = get_backend(device).max_pool2d_f32(
-            x,
-            batch,
-            channels,
-            in_h,
-            in_w,
-            self.kernel_size.0,
-            self.kernel_size.1,
-            self.stride.0,
-            self.stride.1,
-            self.padding.0,
-            self.padding.1,
-        )?;
+        let (res, argmax, _, _) = if matches!(device, DeviceType::Cpu) {
+            max_pool2d_cpu(
+                x,
+                batch,
+                channels,
+                in_h,
+                in_w,
+                self.kernel_size,
+                self.stride,
+                self.padding,
+            )?
+        } else {
+            get_backend(device).max_pool2d_f32(
+                x,
+                batch,
+                channels,
+                in_h,
+                in_w,
+                self.kernel_size.0,
+                self.kernel_size.1,
+                self.stride.0,
+                self.stride.1,
+                self.padding.0,
+                self.padding.1,
+            )?
+        };
         if out.len() != res.len() {
             return Err(OchreError::InvalidParameter(format!(
                 "MaxPool2d::forward_raw output buffer len {} != expected {} ( >_< )",
@@ -1360,19 +2088,32 @@ impl MaxPool2d {
     /// Autograd-compatible forward pass on an NCHW `Tensor`.
     pub fn forward(&self, x: &Tensor) -> OchreResult<Tensor> {
         let (batch, c, h, w) = validate_nchw_tensor(x, None, "MaxPool2d")?;
-        let (raw_out, argmax, out_h, out_w) = get_backend(&x.device).max_pool2d_f32(
-            &x.data,
-            batch,
-            c,
-            h,
-            w,
-            self.kernel_size.0,
-            self.kernel_size.1,
-            self.stride.0,
-            self.stride.1,
-            self.padding.0,
-            self.padding.1,
-        )?;
+        let (raw_out, argmax, out_h, out_w) = if matches!(x.device, DeviceType::Cpu) {
+            max_pool2d_cpu(
+                &x.data,
+                batch,
+                c,
+                h,
+                w,
+                self.kernel_size,
+                self.stride,
+                self.padding,
+            )?
+        } else {
+            get_backend(&x.device).max_pool2d_f32(
+                &x.data,
+                batch,
+                c,
+                h,
+                w,
+                self.kernel_size.0,
+                self.kernel_size.1,
+                self.stride.0,
+                self.stride.1,
+                self.padding.0,
+                self.padding.1,
+            )?
+        };
         let out_data = quantize_vec(raw_out, x.dtype);
         let out_shape = vec![batch, c, out_h, out_w];
         let need_grad = AutogradTape::is_grad_enabled() && x.requires_grad;
@@ -1382,7 +2123,11 @@ impl MaxPool2d {
             let dev = x.device.clone();
             let bwd = CustomBackward(Arc::new(move |dy: &[f32]| {
                 if let Some(id) = x_id {
-                    let dx = get_backend(&dev).max_pool2d_bwd_f32(dy, &argmax, total_in);
+                    let dx = if matches!(dev, DeviceType::Cpu) {
+                        max_pool2d_bwd_cpu(dy, &argmax, batch * c, h * w, out_h * out_w, total_in)
+                    } else {
+                        get_backend(&dev).max_pool2d_bwd_f32(dy, &argmax, total_in)
+                    };
                     Ok(vec![(id, dx)])
                 } else {
                     Ok(Vec::new())
@@ -1405,6 +2150,117 @@ impl MaxPool2d {
             node_id,
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn max_pool2d_cpu(
+    x: &[f32],
+    batch: usize,
+    channels: usize,
+    in_h: usize,
+    in_w: usize,
+    kernel_size: (usize, usize),
+    stride: (usize, usize),
+    padding: (usize, usize),
+) -> OchreResult<(Vec<f32>, Vec<usize>, usize, usize)> {
+    let (kh, kw) = kernel_size;
+    let (sh, sw) = stride;
+    let (ph, pw) = padding;
+    let (out_h, out_w) = compute_conv_out_dims(in_h, in_w, kh, kw, sh, sw, ph, pw, 1, 1)?;
+    let in_plane = in_h * in_w;
+    let out_plane = out_h * out_w;
+    let bc_total = batch * channels;
+    let total_out = bc_total * out_plane;
+    if x.len() != bc_total * in_plane {
+        return Err(OchreError::InvalidParameter(
+            "MaxPool2d input length mismatch ( >_< )".to_string(),
+        ));
+    }
+
+    let mut out = vec![0.0f32; total_out];
+    let mut argmax = vec![0usize; total_out];
+
+    let compute_plane = |bc: usize, dst_out: &mut [f32], dst_arg: &mut [usize]| {
+        let base_in = bc * in_plane;
+        for oh in 0..out_h {
+            let ih_start = (oh * sh) as isize - ph as isize;
+            for ow in 0..out_w {
+                let iw_start = (ow * sw) as isize - pw as isize;
+                let mut best_val = f32::NEG_INFINITY;
+                let mut best_idx = 0usize;
+                for ky in 0..kh {
+                    let iy = ih_start + ky as isize;
+                    if iy < 0 || iy >= in_h as isize {
+                        continue;
+                    }
+                    let row_base = base_in + (iy as usize) * in_w;
+                    for kx in 0..kw {
+                        let ix = iw_start + kx as isize;
+                        if ix >= 0 && ix < in_w as isize {
+                            let idx = row_base + (ix as usize);
+                            let v = x[idx];
+                            if v > best_val {
+                                best_val = v;
+                                best_idx = idx;
+                            }
+                        }
+                    }
+                }
+                let o_idx = oh * out_w + ow;
+                dst_out[o_idx] = best_val;
+                dst_arg[o_idx] = best_idx;
+            }
+        }
+    };
+
+    if total_out >= PAR_ELEMS_THRESHOLD && bc_total >= 2 {
+        out.par_chunks_mut(out_plane)
+            .zip(argmax.par_chunks_mut(out_plane))
+            .enumerate()
+            .for_each(|(bc, (o_p, a_p))| compute_plane(bc, o_p, a_p));
+    } else {
+        for (bc, (o_p, a_p)) in out
+            .chunks_mut(out_plane)
+            .zip(argmax.chunks_mut(out_plane))
+            .enumerate()
+        {
+            compute_plane(bc, o_p, a_p);
+        }
+    }
+
+    Ok((out, argmax, out_h, out_w))
+}
+
+fn max_pool2d_bwd_cpu(
+    dy: &[f32],
+    argmax: &[usize],
+    bc_total: usize,
+    in_plane: usize,
+    out_plane: usize,
+    total_in: usize,
+) -> Vec<f32> {
+    let mut dx = vec![0.0f32; total_in];
+    if total_in >= PAR_ELEMS_THRESHOLD && bc_total >= 2 {
+        dx.par_chunks_mut(in_plane)
+            .enumerate()
+            .for_each(|(bc, dx_p)| {
+                let base_in = bc * in_plane;
+                let dy_p = &dy[bc * out_plane..(bc + 1) * out_plane];
+                let arg_p = &argmax[bc * out_plane..(bc + 1) * out_plane];
+                for (&g, &idx) in dy_p.iter().zip(arg_p.iter()) {
+                    if idx >= base_in && idx < base_in + in_plane {
+                        dx_p[idx - base_in] += g;
+                    }
+                }
+            });
+    } else {
+        for (&g, &idx) in dy.iter().zip(argmax.iter()) {
+            if idx < total_in {
+                dx[idx] += g;
+            }
+        }
+    }
+    dx
 }
 
 /// 2D Average Pooling layer over NCHW tensors backed by `Backend::avg_pool2d_f32`.
@@ -1462,19 +2318,32 @@ impl AvgPool2d {
         out: &mut [f32],
         device: &DeviceType,
     ) -> OchreResult<()> {
-        let (res, _, _) = get_backend(device).avg_pool2d_f32(
-            x,
-            batch,
-            channels,
-            in_h,
-            in_w,
-            self.kernel_size.0,
-            self.kernel_size.1,
-            self.stride.0,
-            self.stride.1,
-            self.padding.0,
-            self.padding.1,
-        )?;
+        let (res, _, _) = if matches!(device, DeviceType::Cpu) {
+            avg_pool2d_cpu(
+                x,
+                batch,
+                channels,
+                in_h,
+                in_w,
+                self.kernel_size,
+                self.stride,
+                self.padding,
+            )?
+        } else {
+            get_backend(device).avg_pool2d_f32(
+                x,
+                batch,
+                channels,
+                in_h,
+                in_w,
+                self.kernel_size.0,
+                self.kernel_size.1,
+                self.stride.0,
+                self.stride.1,
+                self.padding.0,
+                self.padding.1,
+            )?
+        };
         if out.len() != res.len() {
             return Err(OchreError::InvalidParameter(format!(
                 "AvgPool2d::forward_raw output buffer len {} != expected {} ( >_< )",
@@ -1500,21 +2369,36 @@ impl AvgPool2d {
         dx: &mut [f32],
         device: &DeviceType,
     ) -> OchreResult<()> {
-        let res = get_backend(device).avg_pool2d_bwd_f32(
-            dy,
-            batch,
-            channels,
-            in_h,
-            in_w,
-            self.kernel_size.0,
-            self.kernel_size.1,
-            self.stride.0,
-            self.stride.1,
-            self.padding.0,
-            self.padding.1,
-            out_h,
-            out_w,
-        )?;
+        let res = if matches!(device, DeviceType::Cpu) {
+            avg_pool2d_bwd_cpu(
+                dy,
+                batch,
+                channels,
+                in_h,
+                in_w,
+                self.kernel_size,
+                self.stride,
+                self.padding,
+                out_h,
+                out_w,
+            )?
+        } else {
+            get_backend(device).avg_pool2d_bwd_f32(
+                dy,
+                batch,
+                channels,
+                in_h,
+                in_w,
+                self.kernel_size.0,
+                self.kernel_size.1,
+                self.stride.0,
+                self.stride.1,
+                self.padding.0,
+                self.padding.1,
+                out_h,
+                out_w,
+            )?
+        };
         if dx.len() != res.len() {
             return Err(OchreError::InvalidParameter(
                 "AvgPool2d::backward_raw dx length mismatch ( >_< )".to_string(),
@@ -1527,19 +2411,32 @@ impl AvgPool2d {
     /// Autograd-compatible forward pass on an NCHW `Tensor`.
     pub fn forward(&self, x: &Tensor) -> OchreResult<Tensor> {
         let (batch, c, h, w) = validate_nchw_tensor(x, None, "AvgPool2d")?;
-        let (raw_out, out_h, out_w) = get_backend(&x.device).avg_pool2d_f32(
-            &x.data,
-            batch,
-            c,
-            h,
-            w,
-            self.kernel_size.0,
-            self.kernel_size.1,
-            self.stride.0,
-            self.stride.1,
-            self.padding.0,
-            self.padding.1,
-        )?;
+        let (raw_out, out_h, out_w) = if matches!(x.device, DeviceType::Cpu) {
+            avg_pool2d_cpu(
+                &x.data,
+                batch,
+                c,
+                h,
+                w,
+                self.kernel_size,
+                self.stride,
+                self.padding,
+            )?
+        } else {
+            get_backend(&x.device).avg_pool2d_f32(
+                &x.data,
+                batch,
+                c,
+                h,
+                w,
+                self.kernel_size.0,
+                self.kernel_size.1,
+                self.stride.0,
+                self.stride.1,
+                self.padding.0,
+                self.padding.1,
+            )?
+        };
         let out_data = quantize_vec(raw_out, x.dtype);
         let out_shape = vec![batch, c, out_h, out_w];
         let need_grad = AutogradTape::is_grad_enabled() && x.requires_grad;
@@ -1551,9 +2448,24 @@ impl AvgPool2d {
             let dev = x.device.clone();
             let bwd = CustomBackward(Arc::new(move |dy: &[f32]| {
                 if let Some(id) = x_id {
-                    let dx = get_backend(&dev).avg_pool2d_bwd_f32(
-                        dy, batch, c, h, w, kh, kw, sh, sw, ph, pw, out_h, out_w,
-                    )?;
+                    let dx = if matches!(dev, DeviceType::Cpu) {
+                        avg_pool2d_bwd_cpu(
+                            dy,
+                            batch,
+                            c,
+                            h,
+                            w,
+                            (kh, kw),
+                            (sh, sw),
+                            (ph, pw),
+                            out_h,
+                            out_w,
+                        )?
+                    } else {
+                        get_backend(&dev).avg_pool2d_bwd_f32(
+                            dy, batch, c, h, w, kh, kw, sh, sw, ph, pw, out_h, out_w,
+                        )?
+                    };
                     Ok(vec![(id, dx)])
                 } else {
                     Ok(Vec::new())
@@ -1576,6 +2488,137 @@ impl AvgPool2d {
             node_id,
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn avg_pool2d_cpu(
+    x: &[f32],
+    batch: usize,
+    channels: usize,
+    in_h: usize,
+    in_w: usize,
+    kernel_size: (usize, usize),
+    stride: (usize, usize),
+    padding: (usize, usize),
+) -> OchreResult<(Vec<f32>, usize, usize)> {
+    let (kh, kw) = kernel_size;
+    let (sh, sw) = stride;
+    let (ph, pw) = padding;
+    let (out_h, out_w) = compute_conv_out_dims(in_h, in_w, kh, kw, sh, sw, ph, pw, 1, 1)?;
+    let in_plane = in_h * in_w;
+    let out_plane = out_h * out_w;
+    let bc_total = batch * channels;
+    let total_out = bc_total * out_plane;
+    if x.len() != bc_total * in_plane {
+        return Err(OchreError::InvalidParameter(
+            "AvgPool2d input length mismatch ( >_< )".to_string(),
+        ));
+    }
+
+    let inv_area = 1.0f32 / ((kh * kw) as f32);
+    let mut out = vec![0.0f32; total_out];
+
+    let compute_plane = |bc: usize, dst_out: &mut [f32]| {
+        let x_p = &x[bc * in_plane..(bc + 1) * in_plane];
+        for oh in 0..out_h {
+            let ih_start = (oh * sh) as isize - ph as isize;
+            for ow in 0..out_w {
+                let iw_start = (ow * sw) as isize - pw as isize;
+                let mut sum = 0.0f32;
+                for ky in 0..kh {
+                    let iy = ih_start + ky as isize;
+                    if iy < 0 || iy >= in_h as isize {
+                        continue;
+                    }
+                    let row = &x_p[(iy as usize) * in_w..(iy as usize + 1) * in_w];
+                    for kx in 0..kw {
+                        let ix = iw_start + kx as isize;
+                        if ix >= 0 && ix < in_w as isize {
+                            sum += row[ix as usize];
+                        }
+                    }
+                }
+                dst_out[oh * out_w + ow] = sum * inv_area;
+            }
+        }
+    };
+
+    if total_out >= PAR_ELEMS_THRESHOLD && bc_total >= 2 {
+        out.par_chunks_mut(out_plane)
+            .enumerate()
+            .for_each(|(bc, o_p)| compute_plane(bc, o_p));
+    } else {
+        for (bc, o_p) in out.chunks_mut(out_plane).enumerate() {
+            compute_plane(bc, o_p);
+        }
+    }
+
+    Ok((out, out_h, out_w))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn avg_pool2d_bwd_cpu(
+    dy: &[f32],
+    batch: usize,
+    channels: usize,
+    in_h: usize,
+    in_w: usize,
+    kernel_size: (usize, usize),
+    stride: (usize, usize),
+    padding: (usize, usize),
+    out_h: usize,
+    out_w: usize,
+) -> OchreResult<Vec<f32>> {
+    let (kh, kw) = kernel_size;
+    let (sh, sw) = stride;
+    let (ph, pw) = padding;
+    let in_plane = in_h * in_w;
+    let out_plane = out_h * out_w;
+    let bc_total = batch * channels;
+    if dy.len() != bc_total * out_plane {
+        return Err(OchreError::InvalidParameter(
+            "AvgPool2d backward dy length mismatch ( >_< )".to_string(),
+        ));
+    }
+
+    let inv_area = 1.0f32 / ((kh * kw) as f32);
+    let mut dx = vec![0.0f32; bc_total * in_plane];
+
+    let compute_plane = |bc: usize, dx_p: &mut [f32]| {
+        let dy_p = &dy[bc * out_plane..(bc + 1) * out_plane];
+        for oh in 0..out_h {
+            let ih_start = (oh * sh) as isize - ph as isize;
+            for ow in 0..out_w {
+                let iw_start = (ow * sw) as isize - pw as isize;
+                let g = dy_p[oh * out_w + ow] * inv_area;
+                for ky in 0..kh {
+                    let iy = ih_start + ky as isize;
+                    if iy < 0 || iy >= in_h as isize {
+                        continue;
+                    }
+                    let row = &mut dx_p[(iy as usize) * in_w..(iy as usize + 1) * in_w];
+                    for kx in 0..kw {
+                        let ix = iw_start + kx as isize;
+                        if ix >= 0 && ix < in_w as isize {
+                            row[ix as usize] += g;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    if bc_total * in_plane >= PAR_ELEMS_THRESHOLD && bc_total >= 2 {
+        dx.par_chunks_mut(in_plane)
+            .enumerate()
+            .for_each(|(bc, dx_p)| compute_plane(bc, dx_p));
+    } else {
+        for (bc, dx_p) in dx.chunks_mut(in_plane).enumerate() {
+            compute_plane(bc, dx_p);
+        }
+    }
+
+    Ok(dx)
 }
 
 /// Global Average Pooling over spatial `(H, W)` dimensions: `[N, C, H, W] -> [N, C, 1, 1]` or `[N, C]`.
@@ -1621,10 +2664,19 @@ impl GlobalAvgPool2d {
             ));
         }
         let inv = 1.0f64 / (plane as f64);
-        for (bc, dst) in out.iter_mut().enumerate() {
-            let slice = &x[bc * plane..(bc + 1) * plane];
-            let sum: f64 = slice.iter().map(|&v| v as f64).sum();
-            *dst = (sum * inv) as f32;
+        let bc_total = batch * channels;
+        if bc_total * plane >= PAR_ELEMS_THRESHOLD && bc_total >= 2 {
+            out.par_iter_mut().enumerate().for_each(|(bc, dst)| {
+                let slice = &x[bc * plane..(bc + 1) * plane];
+                let sum: f64 = slice.iter().map(|&v| v as f64).sum();
+                *dst = (sum * inv) as f32;
+            });
+        } else {
+            for (bc, dst) in out.iter_mut().enumerate() {
+                let slice = &x[bc * plane..(bc + 1) * plane];
+                let sum: f64 = slice.iter().map(|&v| v as f64).sum();
+                *dst = (sum * inv) as f32;
+            }
         }
         Ok(())
     }
@@ -1649,8 +2701,17 @@ impl GlobalAvgPool2d {
             ));
         }
         let inv = 1.0f32 / (plane as f32);
-        for (bc, &g) in dy.iter().enumerate() {
-            dx[bc * plane..(bc + 1) * plane].fill(g * inv);
+        let bc_total = batch * channels;
+        if bc_total * plane >= PAR_ELEMS_THRESHOLD && bc_total >= 2 {
+            dx.par_chunks_mut(plane)
+                .zip(dy.par_iter())
+                .for_each(|(dst, &g)| {
+                    dst.fill(g * inv);
+                });
+        } else {
+            for (bc, &g) in dy.iter().enumerate() {
+                dx[bc * plane..(bc + 1) * plane].fill(g * inv);
+            }
         }
         Ok(())
     }
@@ -1674,9 +2735,18 @@ impl GlobalAvgPool2d {
             let inv = 1.0f32 / (plane as f32);
             let bwd = CustomBackward(Arc::new(move |dy: &[f32]| {
                 if let Some(id) = x_id {
-                    let mut dx = vec![0.0f32; batch * c * plane];
-                    for (bc, &g) in dy.iter().enumerate() {
-                        dx[bc * plane..(bc + 1) * plane].fill(g * inv);
+                    let bc_total = batch * c;
+                    let mut dx = vec![0.0f32; bc_total * plane];
+                    if bc_total * plane >= PAR_ELEMS_THRESHOLD && bc_total >= 2 {
+                        dx.par_chunks_mut(plane)
+                            .zip(dy.par_iter())
+                            .for_each(|(dst, &g)| {
+                                dst.fill(g * inv);
+                            });
+                    } else {
+                        for (bc, &g) in dy.iter().enumerate() {
+                            dx[bc * plane..(bc + 1) * plane].fill(g * inv);
+                        }
                     }
                     Ok(vec![(id, dx)])
                 } else {
@@ -1825,52 +2895,73 @@ impl BatchNorm2d {
 
         let mut mean = vec![0.0f32; c];
         let mut inv_std = vec![0.0f32; c];
+        let mut scale = vec![0.0f32; c];
+        let mut shift = vec![0.0f32; c];
         let gamma = self.weight.as_ref().map(|t| t.data.as_slice());
         let beta = self.bias.as_ref().map(|t| t.data.as_slice());
+        let total_elems = batch * c * plane;
+        let use_par_c = total_elems >= PAR_ELEMS_THRESHOLD && c >= 2;
+        let use_par_b = total_elems >= PAR_ELEMS_THRESHOLD && batch >= 2;
 
         if self.training {
             let inv_m = 1.0f64 / (m as f64);
             let eps_d = self.eps as f64;
             let mom = self.momentum as f64;
 
-            for ch in 0..c {
-                let mut sum = 0.0f64;
-                for b in 0..batch {
-                    let base = (b * c + ch) * plane;
-                    for &v in &x[base..base + plane] {
-                        sum += v as f64;
+            let compute_ch_stats =
+                |ch: usize, old_rm: f32, old_rv: f32| -> (f32, f32, f32, f32, f32, f32) {
+                    let mut sum = 0.0f64;
+                    for b in 0..batch {
+                        let base = (b * c + ch) * plane;
+                        for &v in &x[base..base + plane] {
+                            sum += v as f64;
+                        }
                     }
+                    let mu = sum * inv_m;
+
+                    let mut sq = 0.0f64;
+                    for b in 0..batch {
+                        let base = (b * c + ch) * plane;
+                        for &v in &x[base..base + plane] {
+                            let d = (v as f64) - mu;
+                            sq += d * d;
+                        }
+                    }
+                    let var = sq * inv_m;
+                    let istd = 1.0 / (var + eps_d).sqrt();
+                    let unbiased_var = if m > 1 { sq / ((m - 1) as f64) } else { var };
+                    let rm = ((1.0 - mom) * (old_rm as f64) + mom * mu) as f32;
+                    let rv = ((1.0 - mom) * (old_rv as f64) + mom * unbiased_var) as f32;
+                    let g = gamma.map_or(1.0f64, |gd| gd[ch] as f64);
+                    let bt = beta.map_or(0.0f64, |bd| bd[ch] as f64);
+                    let sc = (g * istd) as f32;
+                    let sh = (bt - g * mu * istd) as f32;
+                    (mu as f32, istd as f32, rm, rv, sc, sh)
+                };
+
+            if use_par_c {
+                let stats: Vec<(f32, f32, f32, f32, f32, f32)> = (0..c)
+                    .into_par_iter()
+                    .map(|ch| compute_ch_stats(ch, self.running_mean[ch], self.running_var[ch]))
+                    .collect();
+                for (ch, (mu, istd, rm, rv, sc, sh)) in stats.into_iter().enumerate() {
+                    mean[ch] = mu;
+                    inv_std[ch] = istd;
+                    self.running_mean[ch] = rm;
+                    self.running_var[ch] = rv;
+                    scale[ch] = sc;
+                    shift[ch] = sh;
                 }
-                let mu = sum * inv_m;
-
-                let mut sq = 0.0f64;
-                for b in 0..batch {
-                    let base = (b * c + ch) * plane;
-                    for &v in &x[base..base + plane] {
-                        let d = (v as f64) - mu;
-                        sq += d * d;
-                    }
-                }
-                let var = sq * inv_m;
-                let istd = 1.0 / (var + eps_d).sqrt();
-
-                mean[ch] = mu as f32;
-                inv_std[ch] = istd as f32;
-
-                let unbiased_var = if m > 1 { sq / ((m - 1) as f64) } else { var };
-                self.running_mean[ch] =
-                    ((1.0 - mom) * (self.running_mean[ch] as f64) + mom * mu) as f32;
-                self.running_var[ch] =
-                    ((1.0 - mom) * (self.running_var[ch] as f64) + mom * unbiased_var) as f32;
-
-                let g = gamma.map_or(1.0f64, |gd| gd[ch] as f64);
-                let bt = beta.map_or(0.0f64, |bd| bd[ch] as f64);
-                for b in 0..batch {
-                    let base = (b * c + ch) * plane;
-                    for idx in 0..plane {
-                        let x_hat = ((x[base + idx] as f64) - mu) * istd;
-                        out[base + idx] = (g * x_hat + bt) as f32;
-                    }
+            } else {
+                for ch in 0..c {
+                    let (mu, istd, rm, rv, sc, sh) =
+                        compute_ch_stats(ch, self.running_mean[ch], self.running_var[ch]);
+                    mean[ch] = mu;
+                    inv_std[ch] = istd;
+                    self.running_mean[ch] = rm;
+                    self.running_var[ch] = rv;
+                    scale[ch] = sc;
+                    shift[ch] = sh;
                 }
             }
         } else {
@@ -1883,13 +2974,33 @@ impl BatchNorm2d {
                 inv_std[ch] = istd as f32;
                 let g = gamma.map_or(1.0f64, |gd| gd[ch] as f64);
                 let bt = beta.map_or(0.0f64, |bd| bd[ch] as f64);
-                for b in 0..batch {
-                    let base = (b * c + ch) * plane;
-                    for idx in 0..plane {
-                        let x_hat = ((x[base + idx] as f64) - mu) * istd;
-                        out[base + idx] = (g * x_hat + bt) as f32;
-                    }
+                scale[ch] = (g * istd) as f32;
+                shift[ch] = (bt - g * mu * istd) as f32;
+            }
+        }
+
+        // Pass 2: cache-friendly sequential NCHW affine normalization.
+        let sample_stride = c * plane;
+        let apply_sample = |b: usize, dst_b: &mut [f32]| {
+            let src_b = &x[b * sample_stride..(b + 1) * sample_stride];
+            for ch in 0..c {
+                let sc = scale[ch];
+                let sh = shift[ch];
+                let dst_c = &mut dst_b[ch * plane..(ch + 1) * plane];
+                let src_c = &src_b[ch * plane..(ch + 1) * plane];
+                for (d, &s) in dst_c.iter_mut().zip(src_c.iter()) {
+                    *d = s * sc + sh;
                 }
+            }
+        };
+
+        if use_par_b {
+            out.par_chunks_mut(sample_stride)
+                .enumerate()
+                .for_each(|(b, dst_b)| apply_sample(b, dst_b));
+        } else {
+            for (b, dst_b) in out.chunks_mut(sample_stride).enumerate() {
+                apply_sample(b, dst_b);
             }
         }
 
@@ -2064,56 +3175,130 @@ fn batchnorm2d_backward_core(
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let plane = h * w;
     let m = (batch * plane) as f64;
+    let total_elems = batch * c * plane;
+    let use_par_c = total_elems >= PAR_ELEMS_THRESHOLD && c >= 2;
+    let use_par_b = total_elems >= PAR_ELEMS_THRESHOLD && batch >= 2;
+
     let mut dx = if need_dx {
-        vec![0.0f32; batch * c * plane]
+        vec![0.0f32; total_elems]
     } else {
         Vec::new()
     };
     let mut dgamma = if need_dg { vec![0.0f32; c] } else { Vec::new() };
     let mut dbeta = if need_db { vec![0.0f32; c] } else { Vec::new() };
 
-    for ch in 0..c {
+    let need_xhat = need_dg || (need_dx && is_training);
+    let reduce_ch = |ch: usize| -> (f64, f64) {
         let mu = mean[ch] as f64;
         let istd = inv_std[ch] as f64;
-        let g = gamma.map_or(1.0f64, |gd| gd[ch] as f64);
-
         let mut sum_dy = 0.0f64;
         let mut sum_dy_xhat = 0.0f64;
         for b in 0..batch {
             let base = (b * c + ch) * plane;
-            for idx in 0..plane {
-                let dyv = dy[base + idx] as f64;
-                sum_dy += dyv;
-                if need_dg || (need_dx && is_training) {
-                    let x_hat = ((x[base + idx] as f64) - mu) * istd;
-                    sum_dy_xhat += dyv * x_hat;
+            let dy_slice = &dy[base..base + plane];
+            if need_xhat {
+                let x_slice = &x[base..base + plane];
+                for (&dyv, &xv) in dy_slice.iter().zip(x_slice.iter()) {
+                    let dy_d = dyv as f64;
+                    sum_dy += dy_d;
+                    sum_dy_xhat += dy_d * ((xv as f64) - mu) * istd;
+                }
+            } else {
+                for &dyv in dy_slice {
+                    sum_dy += dyv as f64;
                 }
             }
         }
-        if need_dg {
+        (sum_dy, sum_dy_xhat)
+    };
+
+    let ch_sums: Vec<(f64, f64)> = if use_par_c {
+        (0..c).into_par_iter().map(reduce_ch).collect()
+    } else {
+        (0..c).map(reduce_ch).collect()
+    };
+
+    if need_dg {
+        for (ch, &(_, sum_dy_xhat)) in ch_sums.iter().enumerate() {
             dgamma[ch] = sum_dy_xhat as f32;
         }
-        if need_db {
+    }
+    if need_db {
+        for (ch, &(sum_dy, _)) in ch_sums.iter().enumerate() {
             dbeta[ch] = sum_dy as f32;
         }
-        if need_dx {
-            if is_training {
-                let scale = g * istd / m;
-                for b in 0..batch {
-                    let base = (b * c + ch) * plane;
-                    for idx in 0..plane {
-                        let dyv = dy[base + idx] as f64;
-                        let x_hat = ((x[base + idx] as f64) - mu) * istd;
-                        dx[base + idx] = (scale * (m * dyv - sum_dy - x_hat * sum_dy_xhat)) as f32;
+    }
+
+    if need_dx {
+        let sample_stride = c * plane;
+        if is_training {
+            let mut a_c = vec![0.0f32; c];
+            let mut b_c = vec![0.0f32; c];
+            let mut c_c = vec![0.0f32; c];
+            for ch in 0..c {
+                let mu = mean[ch] as f64;
+                let istd = inv_std[ch] as f64;
+                let g = gamma.map_or(1.0f64, |gd| gd[ch] as f64);
+                let (sum_dy, sum_dy_xhat) = ch_sums[ch];
+                let scale = g * istd;
+                a_c[ch] = scale as f32;
+                b_c[ch] = (-scale * istd * sum_dy_xhat / m) as f32;
+                c_c[ch] = (scale * (-sum_dy + mu * istd * sum_dy_xhat) / m) as f32;
+            }
+
+            let apply_dx_train = |b: usize, dx_b: &mut [f32]| {
+                let dy_b = &dy[b * sample_stride..(b + 1) * sample_stride];
+                let x_b = &x[b * sample_stride..(b + 1) * sample_stride];
+                for ch in 0..c {
+                    let av = a_c[ch];
+                    let bv = b_c[ch];
+                    let cv = c_c[ch];
+                    let dst = &mut dx_b[ch * plane..(ch + 1) * plane];
+                    let dy_s = &dy_b[ch * plane..(ch + 1) * plane];
+                    let x_s = &x_b[ch * plane..(ch + 1) * plane];
+                    for ((d, &dyv), &xv) in dst.iter_mut().zip(dy_s.iter()).zip(x_s.iter()) {
+                        *d = av * dyv + bv * xv + cv;
                     }
                 }
+            };
+
+            if use_par_b {
+                dx.par_chunks_mut(sample_stride)
+                    .enumerate()
+                    .for_each(|(b, dx_b)| apply_dx_train(b, dx_b));
             } else {
-                let scale = g * istd;
-                for b in 0..batch {
-                    let base = (b * c + ch) * plane;
-                    for idx in 0..plane {
-                        dx[base + idx] = ((dy[base + idx] as f64) * scale) as f32;
+                for (b, dx_b) in dx.chunks_mut(sample_stride).enumerate() {
+                    apply_dx_train(b, dx_b);
+                }
+            }
+        } else {
+            let scales: Vec<f32> = (0..c)
+                .map(|ch| {
+                    let istd = inv_std[ch] as f64;
+                    let g = gamma.map_or(1.0f64, |gd| gd[ch] as f64);
+                    (g * istd) as f32
+                })
+                .collect();
+
+            let apply_dx_eval = |b: usize, dx_b: &mut [f32]| {
+                let dy_b = &dy[b * sample_stride..(b + 1) * sample_stride];
+                for ch in 0..c {
+                    let sc = scales[ch];
+                    let dst = &mut dx_b[ch * plane..(ch + 1) * plane];
+                    let dy_s = &dy_b[ch * plane..(ch + 1) * plane];
+                    for (d, &dyv) in dst.iter_mut().zip(dy_s.iter()) {
+                        *d = dyv * sc;
                     }
+                }
+            };
+
+            if use_par_b {
+                dx.par_chunks_mut(sample_stride)
+                    .enumerate()
+                    .for_each(|(b, dx_b)| apply_dx_eval(b, dx_b));
+            } else {
+                for (b, dx_b) in dx.chunks_mut(sample_stride).enumerate() {
+                    apply_dx_eval(b, dx_b);
                 }
             }
         }
