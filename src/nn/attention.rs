@@ -85,6 +85,16 @@ fn axpy_f32(y: &mut [f32], x: &[f32], alpha: f32) {
     }
 }
 
+#[cfg(feature = "cuda-dynamic")]
+#[inline]
+fn cuda_gpu_id(device: &DeviceType) -> Option<usize> {
+    match device {
+        DeviceType::Gpu(id) => Some(*id),
+        DeviceType::MultiGpu(ids) => ids.first().copied(),
+        _ => None,
+    }
+}
+
 #[inline]
 fn maybe_quantize(data: Vec<f32>, dtype: DType) -> Vec<f32> {
     match dtype {
@@ -295,8 +305,21 @@ impl RoPE {
         offset: usize,
     ) -> OchreResult<Vec<f32>> {
         let mut dx = dy.to_vec();
+        self.apply_backward_inplace(&mut dx, batch, num_heads, seq_len, offset)?;
+        Ok(dx)
+    }
+
+    /// Zero-allocation in-place backward pass for RoPE on `[batch, num_heads, seq_len, head_dim]`.
+    pub fn apply_backward_inplace(
+        &self,
+        dy: &mut [f32],
+        batch: usize,
+        num_heads: usize,
+        seq_len: usize,
+        offset: usize,
+    ) -> OchreResult<()> {
         apply_rope_slice(
-            &mut dx,
+            dy,
             &self.cos_table,
             &self.sin_table,
             self.head_dim,
@@ -306,8 +329,7 @@ impl RoPE {
             seq_len,
             offset,
             true,
-        )?;
-        Ok(dx)
+        )
     }
 
     /// Autograd-compatible RoPE forward on a 4D tensor `[batch, num_heads, seq_len, head_dim]`.
@@ -580,7 +602,7 @@ fn flash_attention_forward_strided(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn flash_attention_forward_strided_into(
+pub(crate) fn flash_attention_forward_strided_into(
     q: &[f32],
     k: &[f32],
     v: &[f32],
@@ -882,6 +904,134 @@ fn flash_attention_forward_strided_into(
     Ok(())
 }
 
+/// Device-dispatched FlashAttention forward (uses CUDA `flash_sdpa_fwd` on GPU with CPU fallback).
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attention_forward_on_device(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    causal: bool,
+    kv_offset: usize,
+    device: &DeviceType,
+) -> OchreResult<(Vec<f32>, Vec<f32>)> {
+    validate_flash_dims(
+        q.len(),
+        k.len(),
+        v.len(),
+        batch,
+        num_heads,
+        num_kv_heads,
+        q_len,
+        kv_len,
+        head_dim,
+    )?;
+
+    #[cfg(feature = "cuda-dynamic")]
+    if let Some(gpu_id) = cuda_gpu_id(device)
+        && let Some(Ok(res)) = crate::backends::cuda_nn::cuda_flash_attention_fwd(
+            gpu_id,
+            q,
+            k,
+            v,
+            batch,
+            num_heads,
+            num_kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            causal,
+            kv_offset,
+        )
+    {
+        return Ok(res);
+    }
+    let _ = device;
+
+    flash_attention_forward(
+        q,
+        k,
+        v,
+        batch,
+        num_heads,
+        num_kv_heads,
+        q_len,
+        kv_len,
+        head_dim,
+        causal,
+        kv_offset,
+    )
+}
+
+/// Device-dispatched FlashAttention backward (uses CUDA `flash_sdpa_bwd` on GPU with CPU fallback).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn flash_attention_backward_on_device(
+    d_out: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &[f32],
+    lse: &[f32],
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    causal: bool,
+    kv_offset: usize,
+    device: &DeviceType,
+) -> OchreResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    #[cfg(feature = "cuda-dynamic")]
+    if let Some(gpu_id) = cuda_gpu_id(device)
+        && d_out.len() == q.len()
+        && out.len() == q.len()
+        && lse.len() == batch * num_heads * q_len
+        && let Some(Ok(grads)) = crate::backends::cuda_nn::cuda_flash_attention_bwd(
+            gpu_id,
+            d_out,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            batch,
+            num_heads,
+            num_kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            causal,
+            kv_offset,
+        )
+    {
+        return Ok(grads);
+    }
+    let _ = device;
+
+    flash_attention_backward(
+        d_out,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        batch,
+        num_heads,
+        num_kv_heads,
+        q_len,
+        kv_len,
+        head_dim,
+        causal,
+        kv_offset,
+    )
+}
+
 /// FlashAttention-2 style tiled backward pass recomputing attention weights from `lse` in O(S) memory.
 /// Returns `(dq [B, H, q_len, D], dk [B, H_kv, kv_len, D], dv [B, H_kv, kv_len, D])`.
 #[allow(clippy::too_many_arguments)]
@@ -901,6 +1051,52 @@ pub fn flash_attention_backward(
     causal: bool,
     kv_offset: usize,
 ) -> OchreResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let mut dq = vec![0.0f32; q.len()];
+    let mut dk = vec![0.0f32; k.len()];
+    let mut dv = vec![0.0f32; v.len()];
+    flash_attention_backward_into(
+        d_out,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        batch,
+        num_heads,
+        num_kv_heads,
+        q_len,
+        kv_len,
+        head_dim,
+        causal,
+        kv_offset,
+        &mut dq,
+        &mut dk,
+        &mut dv,
+    )?;
+    Ok((dq, dk, dv))
+}
+
+/// Zero-allocation FlashAttention-2 tiled backward pass writing into pre-allocated `dq`, `dk`, `dv`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flash_attention_backward_into(
+    d_out: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &[f32],
+    lse: &[f32],
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    causal: bool,
+    kv_offset: usize,
+    dq: &mut [f32],
+    dk: &mut [f32],
+    dv: &mut [f32],
+) -> OchreResult<()> {
     validate_flash_dims(
         q.len(),
         k.len(),
@@ -920,6 +1116,11 @@ pub fn flash_attention_backward(
             q.len()
         )));
     }
+    if dq.len() != q.len() || dk.len() != k.len() || dv.len() != v.len() {
+        return Err(OchreError::InvalidParameter(
+            "FlashAttention backward output gradient buffer size mismatch ( >_< )".to_string(),
+        ));
+    }
     let expected_lse = batch * num_heads * q_len;
     if lse.len() != expected_lse {
         return Err(OchreError::InvalidParameter(format!(
@@ -928,11 +1129,11 @@ pub fn flash_attention_backward(
         )));
     }
 
-    let mut dq = vec![0.0f32; q.len()];
-    let mut dk = vec![0.0f32; k.len()];
-    let mut dv = vec![0.0f32; v.len()];
+    dq.fill(0.0);
+    dk.fill(0.0);
+    dv.fill(0.0);
     if q_len == 0 || kv_len == 0 {
-        return Ok((dq, dk, dv));
+        return Ok(());
     }
 
     let group_size = num_heads / num_kv_heads;
@@ -1150,7 +1351,7 @@ pub fn flash_attention_backward(
         }
     }
 
-    Ok((dq, dk, dv))
+    Ok(())
 }
 
 /// Flash-Style Scaled Dot-Product Attention layer with `Tensor` autograd.
@@ -1188,7 +1389,7 @@ impl ScaledDotProductAttention {
             )));
         }
 
-        let (raw_out, lse) = flash_attention_forward(
+        let (raw_out, lse) = flash_attention_forward_on_device(
             &q.data,
             &k.data,
             &v.data,
@@ -1200,6 +1401,7 @@ impl ScaledDotProductAttention {
             head_dim,
             causal,
             kv_offset,
+            &q.device,
         )?;
         let out_shape = vec![batch, num_heads, q_len, head_dim];
 
@@ -1214,8 +1416,9 @@ impl ScaledDotProductAttention {
             let q_saved = q.data.clone();
             let k_saved = k.data.clone();
             let v_saved = v.data.clone();
+            let dev_saved = q.device.clone();
             let bwd = CustomBackward(Arc::new(move |d_out: &[f32]| {
-                let (dq, dk, dv) = flash_attention_backward(
+                let (dq, dk, dv) = flash_attention_backward_on_device(
                     d_out,
                     &q_saved,
                     &k_saved,
@@ -1230,6 +1433,7 @@ impl ScaledDotProductAttention {
                     head_dim,
                     causal,
                     kv_offset,
+                    &dev_saved,
                 )?;
                 let mut pairs = Vec::with_capacity(3);
                 if let Some(id) = q_id {
@@ -1801,7 +2005,7 @@ fn extract_bsd(t: &Tensor) -> OchreResult<(usize, usize, usize)> {
     }
 }
 
-fn transpose_bshd_to_bhsd_into(
+pub(crate) fn transpose_bshd_to_bhsd_into(
     src: &[f32],
     dst: &mut [f32],
     batch: usize,
@@ -1841,7 +2045,7 @@ fn transpose_bshd_to_bhsd_into(
     }
 }
 
-fn transpose_bhsd_to_bshd_into(
+pub(crate) fn transpose_bhsd_to_bshd_into(
     src: &[f32],
     dst: &mut [f32],
     batch: usize,
@@ -2346,5 +2550,81 @@ mod tests {
         assert_eq!(g.get(q.node_id.unwrap()).unwrap().len(), 32);
         assert_eq!(g.get(k.node_id.unwrap()).unwrap().len(), 16);
         assert_eq!(g.get(v.node_id.unwrap()).unwrap().len(), 16);
+    }
+
+    #[test]
+    fn test_sdpa_gpu_dispatch_with_cpu_fallback_parity() {
+        AutogradTape::clear();
+        let q_data: Vec<f32> = (0..2 * 4 * 6 * 8)
+            .map(|i| ((i as f32) * 0.11).sin())
+            .collect();
+        let k_data: Vec<f32> = (0..2 * 2 * 6 * 8)
+            .map(|i| ((i as f32) * 0.17).cos())
+            .collect();
+        let v_data: Vec<f32> = (0..2 * 2 * 6 * 8)
+            .map(|i| ((i as f32) * 0.07).sin() * 0.5)
+            .collect();
+
+        let q_cpu = Tensor::parameter(
+            q_data.clone(),
+            vec![2, 4, 6, 8],
+            DType::F32,
+            DeviceType::Cpu,
+        )
+        .unwrap();
+        let k_cpu = Tensor::parameter(
+            k_data.clone(),
+            vec![2, 2, 6, 8],
+            DType::F32,
+            DeviceType::Cpu,
+        )
+        .unwrap();
+        let v_cpu = Tensor::parameter(
+            v_data.clone(),
+            vec![2, 2, 6, 8],
+            DType::F32,
+            DeviceType::Cpu,
+        )
+        .unwrap();
+        let out_cpu = ScaledDotProductAttention::new()
+            .forward(&q_cpu, &k_cpu, &v_cpu, true, 0)
+            .unwrap();
+        let g_cpu = out_cpu.sum(None).unwrap().backward().unwrap();
+
+        AutogradTape::clear();
+        let q_gpu =
+            Tensor::parameter(q_data, vec![2, 4, 6, 8], DType::F32, DeviceType::Gpu(0)).unwrap();
+        let k_gpu =
+            Tensor::parameter(k_data, vec![2, 2, 6, 8], DType::F32, DeviceType::Gpu(0)).unwrap();
+        let v_gpu =
+            Tensor::parameter(v_data, vec![2, 2, 6, 8], DType::F32, DeviceType::Gpu(0)).unwrap();
+        let out_gpu = ScaledDotProductAttention::new()
+            .forward(&q_gpu, &k_gpu, &v_gpu, true, 0)
+            .unwrap();
+        let g_gpu = out_gpu.sum(None).unwrap().backward().unwrap();
+
+        for (&a, &b) in out_cpu.data.iter().zip(out_gpu.data.iter()) {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "SDPA GPU/CPU fwd mismatch: {a} vs {b}"
+            );
+        }
+        for (cid, gid) in [
+            (q_cpu.node_id.unwrap(), q_gpu.node_id.unwrap()),
+            (k_cpu.node_id.unwrap(), k_gpu.node_id.unwrap()),
+            (v_cpu.node_id.unwrap(), v_gpu.node_id.unwrap()),
+        ] {
+            for (&a, &b) in g_cpu
+                .get(cid)
+                .unwrap()
+                .iter()
+                .zip(g_gpu.get(gid).unwrap().iter())
+            {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "SDPA GPU/CPU bwd mismatch: {a} vs {b}"
+                );
+            }
+        }
     }
 }

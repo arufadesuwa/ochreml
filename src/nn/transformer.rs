@@ -3,15 +3,24 @@
 // with GQA, RoPE, KVCache generation, and DIT\x01 tag 101 serialization.
 
 use crate::backend::get_backend;
+#[cfg(feature = "cuda-dynamic")]
+use crate::backends::cuda_nn::{self, CudaDeviceBuf};
 use crate::device::DeviceType;
 use crate::dit_io::{
     ByteReader, check_magic_and_tag, write_bool, write_header, write_u8, write_usize,
 };
 use crate::error::{OchreError, OchreResult};
-use crate::nn::attention::{KVCache, MultiHeadAttention, RoPE};
-use crate::nn::dtype::DType;
+use crate::nn::attention::{
+    KVCache, MultiHeadAttention, RoPE, flash_attention_backward_into,
+    flash_attention_forward_strided_into, transpose_bhsd_to_bshd_into, transpose_bshd_to_bhsd_into,
+};
+use crate::nn::dtype::{DType, TensorStorage};
+use crate::nn::gemm_f32::sgemm;
 use crate::nn::layers::{Embedding, Linear};
 use crate::nn::norm::{LayerNorm, RMSNorm};
+use crate::nn::simd_math::{
+    simd_adamw_step_f32, simd_exp_sub_max_sum, simd_silu_bwd_into, simd_silu_fwd_into,
+};
 use crate::nn::tensor::{FastRng, Tensor};
 use std::cell::RefCell;
 
@@ -67,6 +76,133 @@ fn rmsnorm_into_cpu(x: &[f32], gamma: &[f32], rows: usize, cols: usize, eps: f32
         let inv_rms = 1.0f32 / (sum_sq * inv_cols + eps).sqrt();
         for ((dst, &xv), &gv) in o_row.iter_mut().zip(x_row.iter()).zip(gamma.iter()) {
             *dst = xv * inv_rms * gv;
+        }
+    }
+}
+
+#[inline]
+fn rmsnorm_fwd_with_rstd_into_cpu(
+    x: &[f32],
+    gamma: &[f32],
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    out: &mut [f32],
+    rstd: &mut [f32],
+) {
+    let inv_cols = 1.0f32 / (cols as f32);
+    for r in 0..rows {
+        let x_row = &x[r * cols..(r + 1) * cols];
+        let o_row = &mut out[r * cols..(r + 1) * cols];
+        let chunks = cols / 4;
+        let mut s0 = 0.0f32;
+        let mut s1 = 0.0f32;
+        let mut s2 = 0.0f32;
+        let mut s3 = 0.0f32;
+        for i in 0..chunks {
+            let off = i * 4;
+            let a = x_row[off];
+            let b = x_row[off + 1];
+            let c = x_row[off + 2];
+            let d = x_row[off + 3];
+            s0 += a * a;
+            s1 += b * b;
+            s2 += c * c;
+            s3 += d * d;
+        }
+        let mut sum_sq = (s0 + s1) + (s2 + s3);
+        for &v in &x_row[chunks * 4..] {
+            sum_sq += v * v;
+        }
+        let inv_rms = 1.0f32 / (sum_sq * inv_cols + eps).sqrt();
+        rstd[r] = inv_rms;
+        for ((dst, &xv), &gv) in o_row.iter_mut().zip(x_row.iter()).zip(gamma.iter()) {
+            *dst = xv * inv_rms * gv;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rmsnorm_bwd_into_cpu(
+    dy: &[f32],
+    x: &[f32],
+    gamma: &[f32],
+    rstd: &[f32],
+    rows: usize,
+    cols: usize,
+    dx: &mut [f32],
+    dgamma: &mut [f32],
+    dgamma_accum: &mut [f64],
+) {
+    let inv_cols = 1.0f64 / (cols as f64);
+    dgamma_accum.fill(0.0);
+    for r in 0..rows {
+        let dy_row = &dy[r * cols..(r + 1) * cols];
+        let x_row = &x[r * cols..(r + 1) * cols];
+        let dx_row = &mut dx[r * cols..(r + 1) * cols];
+        let rs = rstd[r] as f64;
+        let mut dot = 0.0f64;
+        for j in 0..cols {
+            let dyv = dy_row[j] as f64;
+            let g = gamma[j] as f64;
+            let x_hat = (x_row[j] as f64) * rs;
+            dot += (dyv * g) * x_hat;
+            dgamma_accum[j] += dyv * x_hat;
+        }
+        for j in 0..cols {
+            let g = gamma[j] as f64;
+            let dy_g = (dy_row[j] as f64) * g;
+            let x_hat = (x_row[j] as f64) * rs;
+            dx_row[j] = (rs * (dy_g - x_hat * dot * inv_cols)) as f32;
+        }
+    }
+    for (dst, &acc) in dgamma.iter_mut().zip(dgamma_accum.iter()) {
+        *dst = acc as f32;
+    }
+}
+
+fn cross_entropy_grad_into_cpu(
+    logits: &[f32],
+    targets: &[usize],
+    rows: usize,
+    cols: usize,
+    d_logits: &mut [f32],
+) -> f32 {
+    let inv_rows = 1.0f64 / (rows as f64);
+    let inv_rows_f32 = inv_rows as f32;
+    let mut total_loss = 0.0f64;
+    for r in 0..rows {
+        let row = &logits[r * cols..(r + 1) * cols];
+        let drow = &mut d_logits[r * cols..(r + 1) * cols];
+        let tgt = targets[r];
+        let (max_v, sum_exp) = simd_exp_sub_max_sum(row, drow);
+        let sum_exp_d = sum_exp as f64;
+        let log_z = (max_v as f64) + sum_exp_d.ln();
+        total_loss += log_z - (row[tgt] as f64);
+        let scale = (inv_rows / sum_exp_d) as f32;
+        for dst in drow.iter_mut() {
+            *dst *= scale;
+        }
+        drow[tgt] -= inv_rows_f32;
+    }
+    (total_loss * inv_rows) as f32
+}
+
+fn clip_grad_vecs_inplace(grads: &mut [Vec<f32>], max_norm: f32) {
+    let mut sum_sq = 0.0f64;
+    for g in grads.iter() {
+        for &v in g.iter() {
+            let vf = v as f64;
+            sum_sq += vf * vf;
+        }
+    }
+    let total_norm = sum_sq.sqrt() as f32;
+    if max_norm > 0.0 && total_norm > max_norm {
+        let scale = max_norm / (total_norm + 1e-6);
+        for g in grads.iter_mut() {
+            for v in g.iter_mut() {
+                *v *= scale;
+            }
         }
     }
 }
@@ -1214,6 +1350,1652 @@ impl CausalLM {
         Ok(output)
     }
 
+    /// Zero-GIL, pre-allocated multi-step training loop for `CausalLM` using AdamW + CrossEntropy.
+    ///
+    /// On `DeviceType::Gpu(_)` / `MultiGpu(_)` (with `cuda-dynamic`), runs 100% resident in VRAM
+    /// via `CudaVramSession` (uploading weights/tokens once before the loop, downloading only 1
+    /// scalar loss per step, and downloading weights once at the end), falling back cleanly to
+    /// the zero-allocation CPU path if CUDA is unavailable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_steps(
+        &mut self,
+        input_ids: &[usize],
+        targets: &[usize],
+        batch: usize,
+        seq_len: usize,
+        steps: usize,
+        lr: f32,
+        weight_decay: f32,
+        grad_clip: Option<f32>,
+    ) -> OchreResult<Vec<f32>> {
+        if batch == 0 || seq_len == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        if steps == 0 {
+            return Err(OchreError::InvalidParameter(
+                "CausalLM::train_steps steps must be > 0 ( >_< )".to_string(),
+            ));
+        }
+        if !lr.is_finite() || lr < 0.0 {
+            return Err(OchreError::InvalidParameter(format!(
+                "CausalLM::train_steps lr={lr} must be finite and >= 0 ( >_< )"
+            )));
+        }
+        if !weight_decay.is_finite() || weight_decay < 0.0 {
+            return Err(OchreError::InvalidParameter(format!(
+                "CausalLM::train_steps weight_decay={weight_decay} must be finite and >= 0 ( >_< )"
+            )));
+        }
+        if let Some(gc) = grad_clip
+            && (!gc.is_finite() || gc < 0.0)
+        {
+            return Err(OchreError::InvalidParameter(format!(
+                "CausalLM::train_steps grad_clip={gc} must be finite and >= 0 ( >_< )"
+            )));
+        }
+        if seq_len > self.config.max_seq_len {
+            return Err(OchreError::InvalidParameter(format!(
+                "CausalLM::train_steps seq_len={seq_len} exceeds max_seq_len={} ( >_< )",
+                self.config.max_seq_len
+            )));
+        }
+        let n_tokens = batch.checked_mul(seq_len).ok_or_else(|| {
+            OchreError::InvalidParameter(
+                "CausalLM::train_steps token count overflow ( >_< )".to_string(),
+            )
+        })?;
+        if input_ids.len() != n_tokens || targets.len() != n_tokens {
+            return Err(OchreError::InvalidParameter(format!(
+                "CausalLM::train_steps expected {n_tokens} tokens ({batch}x{seq_len}), got inputs={} targets={} ( >_< )",
+                input_ids.len(),
+                targets.len()
+            )));
+        }
+        for &id in input_ids {
+            if id >= self.config.vocab_size {
+                return Err(OchreError::InvalidParameter(format!(
+                    "CausalLM::train_steps input token ID {id} >= vocab_size {} ( >_< )",
+                    self.config.vocab_size
+                )));
+            }
+        }
+        for &id in targets {
+            if id >= self.config.vocab_size {
+                return Err(OchreError::InvalidParameter(format!(
+                    "CausalLM::train_steps target token ID {id} >= vocab_size {} ( >_< )",
+                    self.config.vocab_size
+                )));
+            }
+        }
+        let has_unexpected_bias = self.lm_head.bias.is_some()
+            || self.layers.iter().any(|b| {
+                b.attn.q_proj.bias.is_some()
+                    || b.attn.k_proj.bias.is_some()
+                    || b.attn.v_proj.bias.is_some()
+                    || b.attn.o_proj.bias.is_some()
+                    || b.ffn.w_gate.bias.is_some()
+                    || b.ffn.w_up.bias.is_some()
+                    || b.ffn.w_down.bias.is_some()
+            });
+        if has_unexpected_bias {
+            return Err(OchreError::InvalidParameter(
+                "CausalLM::train_steps does not support biased Linear layers ( >_< )".to_string(),
+            ));
+        }
+
+        #[cfg(feature = "cuda-dynamic")]
+        if matches!(self.device, DeviceType::Gpu(_) | DeviceType::MultiGpu(_)) {
+            let gpu_id = match &self.device {
+                DeviceType::Gpu(id) => *id,
+                DeviceType::MultiGpu(ids) => ids.first().copied().unwrap_or(0),
+                _ => 0,
+            };
+            if let Some(res) = self.train_steps_cuda_vram(
+                gpu_id,
+                input_ids,
+                targets,
+                batch,
+                seq_len,
+                steps,
+                lr,
+                weight_decay,
+                grad_clip,
+            ) {
+                return res;
+            }
+        }
+
+        self.train_steps_cpu(
+            input_ids,
+            targets,
+            batch,
+            seq_len,
+            steps,
+            lr,
+            weight_decay,
+            grad_clip,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn train_steps_cpu(
+        &mut self,
+        input_ids: &[usize],
+        targets: &[usize],
+        batch: usize,
+        seq_len: usize,
+        steps: usize,
+        lr: f32,
+        weight_decay: f32,
+        grad_clip: Option<f32>,
+    ) -> OchreResult<Vec<f32>> {
+        let rows = batch * seq_len;
+        let d_model = self.config.d_model;
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = d_model / num_heads;
+        let kv_dim = num_kv_heads * head_dim;
+        let hidden_dim = self.config.ffn_hidden_dim;
+        let vocab_size = self.config.vocab_size;
+        let num_layers = self.layers.len();
+        let dtype = self.config.dtype;
+
+        let n_params = 3 + 9 * num_layers;
+        let mut grads: Vec<Vec<f32>> = Vec::with_capacity(n_params);
+        let mut opt_m: Vec<Vec<f32>> = Vec::with_capacity(n_params);
+        let mut opt_v: Vec<Vec<f32>> = Vec::with_capacity(n_params);
+        let mut master_weights: Vec<Option<Vec<f32>>> = Vec::with_capacity(n_params);
+        {
+            let params = self.parameters();
+            for p in params {
+                let len = p.data.len();
+                grads.push(vec![0.0f32; len]);
+                opt_m.push(vec![0.0f32; len]);
+                opt_v.push(vec![0.0f32; len]);
+                master_weights.push(if dtype != DType::F32 {
+                    Some(p.data.clone())
+                } else {
+                    None
+                });
+            }
+        }
+
+        // Pre-allocate all per-layer activation & scratch buffers ONCE outside the step loop.
+        let mut layer_x_in: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| vec![0.0f32; rows * d_model])
+            .collect();
+        let mut layer_xn1: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| vec![0.0f32; rows * d_model])
+            .collect();
+        let mut layer_rstd1: Vec<Vec<f32>> = (0..num_layers).map(|_| vec![0.0f32; rows]).collect();
+        let mut layer_q_bhsd: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| vec![0.0f32; rows * d_model])
+            .collect();
+        let mut layer_k_bhsd: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| vec![0.0f32; rows * kv_dim])
+            .collect();
+        let mut layer_v_bhsd: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| vec![0.0f32; rows * kv_dim])
+            .collect();
+        let mut layer_attn_bhsd: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| vec![0.0f32; rows * d_model])
+            .collect();
+        let mut layer_lse: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| vec![0.0f32; batch * num_heads * seq_len])
+            .collect();
+        let mut layer_attn_merged: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| vec![0.0f32; rows * d_model])
+            .collect();
+        let mut layer_h_mid: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| vec![0.0f32; rows * d_model])
+            .collect();
+        let mut layer_xn2: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| vec![0.0f32; rows * d_model])
+            .collect();
+        let mut layer_rstd2: Vec<Vec<f32>> = (0..num_layers).map(|_| vec![0.0f32; rows]).collect();
+        let mut layer_gate: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| vec![0.0f32; rows * hidden_dim])
+            .collect();
+        let mut layer_up: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| vec![0.0f32; rows * hidden_dim])
+            .collect();
+        let mut layer_swiglu_out: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| vec![0.0f32; rows * hidden_dim])
+            .collect();
+
+        let mut x_after_layers = vec![0.0f32; rows * d_model];
+        let mut final_norm_out = vec![0.0f32; rows * d_model];
+        let mut final_rstd = vec![0.0f32; rows];
+        let mut logits = vec![0.0f32; rows * vocab_size];
+        let mut d_logits = vec![0.0f32; rows * vocab_size];
+
+        let mut q_bshd_tmp = vec![0.0f32; rows * d_model];
+        let mut k_bshd_tmp = vec![0.0f32; rows * kv_dim];
+        let mut v_bshd_tmp = vec![0.0f32; rows * kv_dim];
+
+        let mut d_h = vec![0.0f32; rows * d_model];
+        let mut d_norm_tmp = vec![0.0f32; rows * d_model];
+        let mut d_norm_dx = vec![0.0f32; rows * d_model];
+        let mut d_attn_merged = vec![0.0f32; rows * d_model];
+        let mut d_attn_bhsd = vec![0.0f32; rows * d_model];
+        let mut d_q_bhsd = vec![0.0f32; rows * d_model];
+        let mut d_k_bhsd = vec![0.0f32; rows * kv_dim];
+        let mut d_v_bhsd = vec![0.0f32; rows * kv_dim];
+        let mut d_swiglu_out = vec![0.0f32; rows * hidden_dim];
+        let mut d_gate = vec![0.0f32; rows * hidden_dim];
+        let mut d_up = vec![0.0f32; rows * hidden_dim];
+        let mut ffn_tmp = vec![0.0f32; rows * hidden_dim];
+        let mut dgamma_accum = vec![0.0f64; d_model];
+
+        let final_norm_g_idx = 1 + 9 * num_layers;
+        let lm_head_w_idx = final_norm_g_idx + 1;
+        let mut loss_history = Vec::with_capacity(steps);
+
+        for step in 0..steps {
+            // 1. Token embedding lookup
+            self.tok_embeddings
+                .forward_raw(input_ids, &mut layer_x_in[0])?;
+
+            // 2. Transformer blocks forward
+            for l in 0..num_layers {
+                let block = &self.layers[l];
+                rmsnorm_fwd_with_rstd_into_cpu(
+                    &layer_x_in[l],
+                    &block.attn_norm.gamma.data,
+                    rows,
+                    d_model,
+                    block.attn_norm.eps,
+                    &mut layer_xn1[l],
+                    &mut layer_rstd1[l],
+                );
+
+                sgemm(
+                    rows,
+                    d_model,
+                    d_model,
+                    &layer_xn1[l],
+                    &block.attn.q_proj.weight.data,
+                    &mut q_bshd_tmp,
+                    false,
+                    true,
+                    1.0,
+                    0.0,
+                )?;
+                sgemm(
+                    rows,
+                    kv_dim,
+                    d_model,
+                    &layer_xn1[l],
+                    &block.attn.k_proj.weight.data,
+                    &mut k_bshd_tmp,
+                    false,
+                    true,
+                    1.0,
+                    0.0,
+                )?;
+                sgemm(
+                    rows,
+                    kv_dim,
+                    d_model,
+                    &layer_xn1[l],
+                    &block.attn.v_proj.weight.data,
+                    &mut v_bshd_tmp,
+                    false,
+                    true,
+                    1.0,
+                    0.0,
+                )?;
+
+                transpose_bshd_to_bhsd_into(
+                    &q_bshd_tmp,
+                    &mut layer_q_bhsd[l],
+                    batch,
+                    seq_len,
+                    num_heads,
+                    head_dim,
+                );
+                transpose_bshd_to_bhsd_into(
+                    &k_bshd_tmp,
+                    &mut layer_k_bhsd[l],
+                    batch,
+                    seq_len,
+                    num_kv_heads,
+                    head_dim,
+                );
+                transpose_bshd_to_bhsd_into(
+                    &v_bshd_tmp,
+                    &mut layer_v_bhsd[l],
+                    batch,
+                    seq_len,
+                    num_kv_heads,
+                    head_dim,
+                );
+
+                if let Some(ref rope) = block.attn.rope {
+                    rope.apply_inplace(&mut layer_q_bhsd[l], batch, num_heads, seq_len, 0)?;
+                    rope.apply_inplace(&mut layer_k_bhsd[l], batch, num_kv_heads, seq_len, 0)?;
+                }
+
+                flash_attention_forward_strided_into(
+                    &layer_q_bhsd[l],
+                    &layer_k_bhsd[l],
+                    &layer_v_bhsd[l],
+                    batch,
+                    num_heads,
+                    num_kv_heads,
+                    seq_len,
+                    seq_len,
+                    seq_len,
+                    head_dim,
+                    true,
+                    0,
+                    &mut layer_attn_bhsd[l],
+                    Some(&mut layer_lse[l]),
+                )?;
+
+                transpose_bhsd_to_bshd_into(
+                    &layer_attn_bhsd[l],
+                    &mut layer_attn_merged[l],
+                    batch,
+                    num_heads,
+                    seq_len,
+                    head_dim,
+                );
+
+                sgemm(
+                    rows,
+                    d_model,
+                    d_model,
+                    &layer_attn_merged[l],
+                    &block.attn.o_proj.weight.data,
+                    &mut layer_h_mid[l],
+                    false,
+                    true,
+                    1.0,
+                    0.0,
+                )?;
+                for (hm, &xi) in layer_h_mid[l].iter_mut().zip(layer_x_in[l].iter()) {
+                    *hm += xi;
+                }
+
+                rmsnorm_fwd_with_rstd_into_cpu(
+                    &layer_h_mid[l],
+                    &block.ffn_norm.gamma.data,
+                    rows,
+                    d_model,
+                    block.ffn_norm.eps,
+                    &mut layer_xn2[l],
+                    &mut layer_rstd2[l],
+                );
+
+                sgemm(
+                    rows,
+                    hidden_dim,
+                    d_model,
+                    &layer_xn2[l],
+                    &block.ffn.w_gate.weight.data,
+                    &mut layer_gate[l],
+                    false,
+                    true,
+                    1.0,
+                    0.0,
+                )?;
+                sgemm(
+                    rows,
+                    hidden_dim,
+                    d_model,
+                    &layer_xn2[l],
+                    &block.ffn.w_up.weight.data,
+                    &mut layer_up[l],
+                    false,
+                    true,
+                    1.0,
+                    0.0,
+                )?;
+
+                simd_silu_fwd_into(&layer_gate[l], &mut layer_swiglu_out[l]);
+                for (sg, &uv) in layer_swiglu_out[l].iter_mut().zip(layer_up[l].iter()) {
+                    *sg *= uv;
+                }
+
+                let next_x: &mut [f32] = if l + 1 < num_layers {
+                    &mut layer_x_in[l + 1]
+                } else {
+                    &mut x_after_layers
+                };
+                sgemm(
+                    rows,
+                    d_model,
+                    hidden_dim,
+                    &layer_swiglu_out[l],
+                    &block.ffn.w_down.weight.data,
+                    next_x,
+                    false,
+                    true,
+                    1.0,
+                    0.0,
+                )?;
+                for (nx, &hm) in next_x.iter_mut().zip(layer_h_mid[l].iter()) {
+                    *nx += hm;
+                }
+            }
+
+            // 3. Final norm + LM head + CrossEntropy
+            rmsnorm_fwd_with_rstd_into_cpu(
+                &x_after_layers,
+                &self.final_norm.gamma.data,
+                rows,
+                d_model,
+                self.final_norm.eps,
+                &mut final_norm_out,
+                &mut final_rstd,
+            );
+            sgemm(
+                rows,
+                vocab_size,
+                d_model,
+                &final_norm_out,
+                &self.lm_head.weight.data,
+                &mut logits,
+                false,
+                true,
+                1.0,
+                0.0,
+            )?;
+
+            let loss =
+                cross_entropy_grad_into_cpu(&logits, targets, rows, vocab_size, &mut d_logits);
+            loss_history.push(loss);
+
+            // 4. Backward pass
+            sgemm(
+                vocab_size,
+                d_model,
+                rows,
+                &d_logits,
+                &final_norm_out,
+                &mut grads[lm_head_w_idx],
+                true,
+                false,
+                1.0,
+                0.0,
+            )?;
+            sgemm(
+                rows,
+                d_model,
+                vocab_size,
+                &d_logits,
+                &self.lm_head.weight.data,
+                &mut d_norm_tmp,
+                false,
+                false,
+                1.0,
+                0.0,
+            )?;
+            rmsnorm_bwd_into_cpu(
+                &d_norm_tmp,
+                &x_after_layers,
+                &self.final_norm.gamma.data,
+                &final_rstd,
+                rows,
+                d_model,
+                &mut d_h,
+                &mut grads[final_norm_g_idx],
+                &mut dgamma_accum,
+            );
+
+            for l in (0..num_layers).rev() {
+                let block = &self.layers[l];
+                let base = 1 + 9 * l;
+                let an_g_idx = base;
+                let wq_idx = base + 1;
+                let wk_idx = base + 2;
+                let wv_idx = base + 3;
+                let wo_idx = base + 4;
+                let fn_g_idx = base + 5;
+                let wg_idx = base + 6;
+                let wu_idx = base + 7;
+                let wd_idx = base + 8;
+
+                // w_down backward
+                sgemm(
+                    d_model,
+                    hidden_dim,
+                    rows,
+                    &d_h,
+                    &layer_swiglu_out[l],
+                    &mut grads[wd_idx],
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                )?;
+                sgemm(
+                    rows,
+                    hidden_dim,
+                    d_model,
+                    &d_h,
+                    &block.ffn.w_down.weight.data,
+                    &mut d_swiglu_out,
+                    false,
+                    false,
+                    1.0,
+                    0.0,
+                )?;
+
+                // SwiGLU backward
+                simd_silu_fwd_into(&layer_gate[l], &mut d_up);
+                for (du, &dy) in d_up.iter_mut().zip(d_swiglu_out.iter()) {
+                    *du *= dy;
+                }
+                for (tmp, (&dy, &uv)) in ffn_tmp
+                    .iter_mut()
+                    .zip(d_swiglu_out.iter().zip(layer_up[l].iter()))
+                {
+                    *tmp = dy * uv;
+                }
+                simd_silu_bwd_into(&ffn_tmp, &layer_gate[l], &mut d_gate);
+
+                // w_gate + w_up backward
+                sgemm(
+                    hidden_dim,
+                    d_model,
+                    rows,
+                    &d_gate,
+                    &layer_xn2[l],
+                    &mut grads[wg_idx],
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                )?;
+                sgemm(
+                    hidden_dim,
+                    d_model,
+                    rows,
+                    &d_up,
+                    &layer_xn2[l],
+                    &mut grads[wu_idx],
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                )?;
+                sgemm(
+                    rows,
+                    d_model,
+                    hidden_dim,
+                    &d_gate,
+                    &block.ffn.w_gate.weight.data,
+                    &mut d_norm_tmp,
+                    false,
+                    false,
+                    1.0,
+                    0.0,
+                )?;
+                sgemm(
+                    rows,
+                    d_model,
+                    hidden_dim,
+                    &d_up,
+                    &block.ffn.w_up.weight.data,
+                    &mut d_norm_tmp,
+                    false,
+                    false,
+                    1.0,
+                    1.0,
+                )?;
+
+                // ffn_norm backward + residual add into d_h
+                rmsnorm_bwd_into_cpu(
+                    &d_norm_tmp,
+                    &layer_h_mid[l],
+                    &block.ffn_norm.gamma.data,
+                    &layer_rstd2[l],
+                    rows,
+                    d_model,
+                    &mut d_norm_dx,
+                    &mut grads[fn_g_idx],
+                    &mut dgamma_accum,
+                );
+                for (dhv, &dxv) in d_h.iter_mut().zip(d_norm_dx.iter()) {
+                    *dhv += dxv;
+                }
+
+                // o_proj backward
+                sgemm(
+                    d_model,
+                    d_model,
+                    rows,
+                    &d_h,
+                    &layer_attn_merged[l],
+                    &mut grads[wo_idx],
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                )?;
+                sgemm(
+                    rows,
+                    d_model,
+                    d_model,
+                    &d_h,
+                    &block.attn.o_proj.weight.data,
+                    &mut d_attn_merged,
+                    false,
+                    false,
+                    1.0,
+                    0.0,
+                )?;
+
+                transpose_bshd_to_bhsd_into(
+                    &d_attn_merged,
+                    &mut d_attn_bhsd,
+                    batch,
+                    seq_len,
+                    num_heads,
+                    head_dim,
+                );
+                flash_attention_backward_into(
+                    &d_attn_bhsd,
+                    &layer_q_bhsd[l],
+                    &layer_k_bhsd[l],
+                    &layer_v_bhsd[l],
+                    &layer_attn_bhsd[l],
+                    &layer_lse[l],
+                    batch,
+                    num_heads,
+                    num_kv_heads,
+                    seq_len,
+                    seq_len,
+                    head_dim,
+                    true,
+                    0,
+                    &mut d_q_bhsd,
+                    &mut d_k_bhsd,
+                    &mut d_v_bhsd,
+                )?;
+
+                if let Some(ref rope) = block.attn.rope {
+                    rope.apply_backward_inplace(&mut d_q_bhsd, batch, num_heads, seq_len, 0)?;
+                    rope.apply_backward_inplace(&mut d_k_bhsd, batch, num_kv_heads, seq_len, 0)?;
+                }
+
+                transpose_bhsd_to_bshd_into(
+                    &d_q_bhsd,
+                    &mut q_bshd_tmp,
+                    batch,
+                    num_heads,
+                    seq_len,
+                    head_dim,
+                );
+                transpose_bhsd_to_bshd_into(
+                    &d_k_bhsd,
+                    &mut k_bshd_tmp,
+                    batch,
+                    num_kv_heads,
+                    seq_len,
+                    head_dim,
+                );
+                transpose_bhsd_to_bshd_into(
+                    &d_v_bhsd,
+                    &mut v_bshd_tmp,
+                    batch,
+                    num_kv_heads,
+                    seq_len,
+                    head_dim,
+                );
+
+                // Q, K, V projection backward
+                sgemm(
+                    d_model,
+                    d_model,
+                    rows,
+                    &q_bshd_tmp,
+                    &layer_xn1[l],
+                    &mut grads[wq_idx],
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                )?;
+                sgemm(
+                    kv_dim,
+                    d_model,
+                    rows,
+                    &k_bshd_tmp,
+                    &layer_xn1[l],
+                    &mut grads[wk_idx],
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                )?;
+                sgemm(
+                    kv_dim,
+                    d_model,
+                    rows,
+                    &v_bshd_tmp,
+                    &layer_xn1[l],
+                    &mut grads[wv_idx],
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                )?;
+
+                sgemm(
+                    rows,
+                    d_model,
+                    d_model,
+                    &q_bshd_tmp,
+                    &block.attn.q_proj.weight.data,
+                    &mut d_norm_tmp,
+                    false,
+                    false,
+                    1.0,
+                    0.0,
+                )?;
+                sgemm(
+                    rows,
+                    d_model,
+                    kv_dim,
+                    &k_bshd_tmp,
+                    &block.attn.k_proj.weight.data,
+                    &mut d_norm_tmp,
+                    false,
+                    false,
+                    1.0,
+                    1.0,
+                )?;
+                sgemm(
+                    rows,
+                    d_model,
+                    kv_dim,
+                    &v_bshd_tmp,
+                    &block.attn.v_proj.weight.data,
+                    &mut d_norm_tmp,
+                    false,
+                    false,
+                    1.0,
+                    1.0,
+                )?;
+
+                // attn_norm backward + residual add into d_h
+                rmsnorm_bwd_into_cpu(
+                    &d_norm_tmp,
+                    &layer_x_in[l],
+                    &block.attn_norm.gamma.data,
+                    &layer_rstd1[l],
+                    rows,
+                    d_model,
+                    &mut d_norm_dx,
+                    &mut grads[an_g_idx],
+                    &mut dgamma_accum,
+                );
+                for (dhv, &dxv) in d_h.iter_mut().zip(d_norm_dx.iter()) {
+                    *dhv += dxv;
+                }
+            }
+
+            // Embedding scatter-add backward
+            grads[0].fill(0.0);
+            self.tok_embeddings
+                .backward_raw(input_ids, &d_h, &mut grads[0])?;
+
+            if let Some(max_norm) = grad_clip {
+                clip_grad_vecs_inplace(&mut grads, max_norm);
+            }
+
+            // 5. Vectorized SIMD AdamW step
+            let mut params_mut = self.parameters_mut();
+            for (i, p) in params_mut.iter_mut().enumerate() {
+                if let Some(ref mut mw) = master_weights[i] {
+                    simd_adamw_step_f32(
+                        mw,
+                        &grads[i],
+                        &mut opt_m[i],
+                        &mut opt_v[i],
+                        lr,
+                        0.9,
+                        0.999,
+                        1e-8,
+                        weight_decay,
+                        step + 1,
+                    );
+                    let q = TensorStorage::from_f32_slice(mw, dtype).to_f32_vec();
+                    p.data.copy_from_slice(&q);
+                } else {
+                    simd_adamw_step_f32(
+                        &mut p.data,
+                        &grads[i],
+                        &mut opt_m[i],
+                        &mut opt_v[i],
+                        lr,
+                        0.9,
+                        0.999,
+                        1e-8,
+                        weight_decay,
+                        step + 1,
+                    );
+                }
+            }
+        }
+
+        Ok(loss_history)
+    }
+
+    #[cfg(feature = "cuda-dynamic")]
+    #[allow(clippy::too_many_arguments)]
+    fn train_steps_cuda_vram(
+        &mut self,
+        gpu_id: usize,
+        input_ids: &[usize],
+        targets: &[usize],
+        batch: usize,
+        seq_len: usize,
+        steps: usize,
+        lr: f32,
+        weight_decay: f32,
+        grad_clip: Option<f32>,
+    ) -> Option<OchreResult<Vec<f32>>> {
+        let rows = batch * seq_len;
+        let d_model = self.config.d_model;
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = d_model / num_heads;
+        let kv_dim = num_kv_heads * head_dim;
+        let hidden_dim = self.config.ffn_hidden_dim;
+        let vocab_size = self.config.vocab_size;
+        let num_layers = self.layers.len();
+        let dtype = self.config.dtype;
+
+        cuda_nn::with_vram_session(gpu_id, |sess| {
+            // 1. Upload token IDs, targets, and RoPE tables ONCE.
+            let ids_u64: Vec<u64> = input_ids.iter().map(|&v| v as u64).collect();
+            let tgt_u64: Vec<u64> = targets.iter().map(|&v| v as u64).collect();
+            let d_input_ids = sess.upload_u64(&ids_u64)?;
+            let d_targets = sess.upload_u64(&tgt_u64)?;
+
+            let mut d_rope_tables: Vec<Option<(CudaDeviceBuf, CudaDeviceBuf)>> =
+                Vec::with_capacity(num_layers);
+            for layer in &self.layers {
+                if let Some(ref rope) = layer.attn.rope {
+                    d_rope_tables.push(Some((
+                        sess.upload_f32(&rope.cos_table)?,
+                        sess.upload_f32(&rope.sin_table)?,
+                    )));
+                } else {
+                    d_rope_tables.push(None);
+                }
+            }
+
+            // 2. Upload all trainable parameters & allocate grads/AdamW moments ONCE.
+            let params_host = self.parameters();
+            let n_params = params_host.len();
+            let mut param_lens = Vec::with_capacity(n_params);
+            let mut d_params = Vec::with_capacity(n_params);
+            let mut d_grads = Vec::with_capacity(n_params);
+            let mut d_opt_m = Vec::with_capacity(n_params);
+            let mut d_opt_v = Vec::with_capacity(n_params);
+            for p in params_host {
+                let len = p.data.len();
+                param_lens.push(len);
+                d_params.push(sess.upload_f32(&p.data)?);
+                d_grads.push(sess.alloc_zeros_f32(len)?);
+                d_opt_m.push(sess.alloc_zeros_f32(len)?);
+                d_opt_v.push(sess.alloc_zeros_f32(len)?);
+            }
+
+            // 3. Pre-allocate per-layer activations and shared scratch buffers ONCE.
+            struct CudaLayerActs {
+                x_in: CudaDeviceBuf,
+                xn1: CudaDeviceBuf,
+                rstd1: CudaDeviceBuf,
+                q_bhsd: CudaDeviceBuf,
+                k_bhsd: CudaDeviceBuf,
+                v_bhsd: CudaDeviceBuf,
+                attn_bhsd: CudaDeviceBuf,
+                lse: CudaDeviceBuf,
+                attn_merged: CudaDeviceBuf,
+                h_mid: CudaDeviceBuf,
+                xn2: CudaDeviceBuf,
+                rstd2: CudaDeviceBuf,
+                gate: CudaDeviceBuf,
+                up: CudaDeviceBuf,
+                swiglu_out: CudaDeviceBuf,
+            }
+
+            let mut layer_acts = Vec::with_capacity(num_layers);
+            for _ in 0..num_layers {
+                layer_acts.push(CudaLayerActs {
+                    x_in: sess.alloc_f32(rows * d_model)?,
+                    xn1: sess.alloc_f32(rows * d_model)?,
+                    rstd1: sess.alloc_f32(rows)?,
+                    q_bhsd: sess.alloc_f32(rows * d_model)?,
+                    k_bhsd: sess.alloc_f32(rows * kv_dim)?,
+                    v_bhsd: sess.alloc_f32(rows * kv_dim)?,
+                    attn_bhsd: sess.alloc_f32(rows * d_model)?,
+                    lse: sess.alloc_f32(batch * num_heads * seq_len)?,
+                    attn_merged: sess.alloc_f32(rows * d_model)?,
+                    h_mid: sess.alloc_f32(rows * d_model)?,
+                    xn2: sess.alloc_f32(rows * d_model)?,
+                    rstd2: sess.alloc_f32(rows)?,
+                    gate: sess.alloc_f32(rows * hidden_dim)?,
+                    up: sess.alloc_f32(rows * hidden_dim)?,
+                    swiglu_out: sess.alloc_f32(rows * hidden_dim)?,
+                });
+            }
+
+            let d_x_after_layers = sess.alloc_f32(rows * d_model)?;
+            let d_final_norm_out = sess.alloc_f32(rows * d_model)?;
+            let d_final_rstd = sess.alloc_f32(rows)?;
+            let d_logits = sess.alloc_f32(rows * vocab_size)?;
+            let d_dlogits = sess.alloc_f32(rows * vocab_size)?;
+            let d_losses = sess.alloc_f32(rows)?;
+            let d_step_loss = sess.alloc_zeros_f32(1)?;
+            let d_norm_sq = sess.alloc_zeros_f32(1)?;
+
+            let d_q_bshd_tmp = sess.alloc_f32(rows * d_model)?;
+            let d_k_bshd_tmp = sess.alloc_f32(rows * kv_dim)?;
+            let d_v_bshd_tmp = sess.alloc_f32(rows * kv_dim)?;
+
+            let d_h = sess.alloc_f32(rows * d_model)?;
+            let d_norm_tmp = sess.alloc_f32(rows * d_model)?;
+            let d_norm_dx = sess.alloc_f32(rows * d_model)?;
+            let d_attn_merged = sess.alloc_f32(rows * d_model)?;
+            let d_attn_bhsd = sess.alloc_f32(rows * d_model)?;
+            let d_dq_bhsd = sess.alloc_f32(rows * d_model)?;
+            let d_dk_bhsd = sess.alloc_f32(rows * kv_dim)?;
+            let d_dv_bhsd = sess.alloc_f32(rows * kv_dim)?;
+            let d_row_scratch = sess.alloc_f32(batch * num_heads * seq_len)?;
+            let d_swiglu_out = sess.alloc_f32(rows * hidden_dim)?;
+            let d_dgate = sess.alloc_f32(rows * hidden_dim)?;
+            let d_dup = sess.alloc_f32(rows * hidden_dim)?;
+
+            let final_norm_g_idx = 1 + 9 * num_layers;
+            let lm_head_w_idx = final_norm_g_idx + 1;
+            let mut loss_history = Vec::with_capacity(steps);
+            let mut host_step_loss = [0.0f32; 1];
+
+            // 4. Training loop 100% resident in VRAM (downloading only 1 scalar loss per step).
+            for step in 0..steps {
+                sess.embedding_gather_dev(
+                    d_params[0].ptr(),
+                    d_input_ids.ptr(),
+                    layer_acts[0].x_in.ptr(),
+                    rows,
+                    d_model,
+                )?;
+
+                for l in 0..num_layers {
+                    let base = 1 + 9 * l;
+                    let an_g_idx = base;
+                    let wq_idx = base + 1;
+                    let wk_idx = base + 2;
+                    let wv_idx = base + 3;
+                    let wo_idx = base + 4;
+                    let fn_g_idx = base + 5;
+                    let wg_idx = base + 6;
+                    let wu_idx = base + 7;
+                    let wd_idx = base + 8;
+
+                    let an_eps = self.layers[l].attn_norm.eps;
+                    let fn_eps = self.layers[l].ffn_norm.eps;
+
+                    sess.rmsnorm_fwd_dev(
+                        layer_acts[l].x_in.ptr(),
+                        d_params[an_g_idx].ptr(),
+                        layer_acts[l].xn1.ptr(),
+                        layer_acts[l].rstd1.ptr(),
+                        rows,
+                        d_model,
+                        an_eps,
+                    )?;
+
+                    sess.sgemm_dev(
+                        rows,
+                        d_model,
+                        d_model,
+                        layer_acts[l].xn1.ptr(),
+                        d_params[wq_idx].ptr(),
+                        d_q_bshd_tmp.ptr(),
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        rows,
+                        kv_dim,
+                        d_model,
+                        layer_acts[l].xn1.ptr(),
+                        d_params[wk_idx].ptr(),
+                        d_k_bshd_tmp.ptr(),
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        rows,
+                        kv_dim,
+                        d_model,
+                        layer_acts[l].xn1.ptr(),
+                        d_params[wv_idx].ptr(),
+                        d_v_bshd_tmp.ptr(),
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+
+                    sess.bshd_to_bhsd_dev(
+                        d_q_bshd_tmp.ptr(),
+                        layer_acts[l].q_bhsd.ptr(),
+                        batch,
+                        seq_len,
+                        num_heads,
+                        head_dim,
+                    )?;
+                    sess.bshd_to_bhsd_dev(
+                        d_k_bshd_tmp.ptr(),
+                        layer_acts[l].k_bhsd.ptr(),
+                        batch,
+                        seq_len,
+                        num_kv_heads,
+                        head_dim,
+                    )?;
+                    sess.bshd_to_bhsd_dev(
+                        d_v_bshd_tmp.ptr(),
+                        layer_acts[l].v_bhsd.ptr(),
+                        batch,
+                        seq_len,
+                        num_kv_heads,
+                        head_dim,
+                    )?;
+
+                    if let Some((d_cos, d_sin)) = &d_rope_tables[l] {
+                        sess.rope(
+                            layer_acts[l].q_bhsd.ptr(),
+                            d_cos.ptr(),
+                            d_sin.ptr(),
+                            batch,
+                            num_heads,
+                            seq_len,
+                            head_dim,
+                            0,
+                            false,
+                        )?;
+                        sess.rope(
+                            layer_acts[l].k_bhsd.ptr(),
+                            d_cos.ptr(),
+                            d_sin.ptr(),
+                            batch,
+                            num_kv_heads,
+                            seq_len,
+                            head_dim,
+                            0,
+                            false,
+                        )?;
+                    }
+
+                    sess.flash_sdpa_fwd(
+                        layer_acts[l].q_bhsd.ptr(),
+                        layer_acts[l].k_bhsd.ptr(),
+                        layer_acts[l].v_bhsd.ptr(),
+                        layer_acts[l].attn_bhsd.ptr(),
+                        layer_acts[l].lse.ptr(),
+                        batch,
+                        num_heads,
+                        num_kv_heads,
+                        seq_len,
+                        seq_len,
+                        head_dim,
+                        true,
+                        0,
+                    )?;
+
+                    sess.bhsd_to_bshd_dev(
+                        layer_acts[l].attn_bhsd.ptr(),
+                        layer_acts[l].attn_merged.ptr(),
+                        batch,
+                        num_heads,
+                        seq_len,
+                        head_dim,
+                    )?;
+
+                    sess.sgemm_dev(
+                        rows,
+                        d_model,
+                        d_model,
+                        layer_acts[l].attn_merged.ptr(),
+                        d_params[wo_idx].ptr(),
+                        layer_acts[l].h_mid.ptr(),
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.add_inplace_dev_f32(
+                        layer_acts[l].h_mid.ptr(),
+                        layer_acts[l].x_in.ptr(),
+                        rows * d_model,
+                    )?;
+
+                    sess.rmsnorm_fwd_dev(
+                        layer_acts[l].h_mid.ptr(),
+                        d_params[fn_g_idx].ptr(),
+                        layer_acts[l].xn2.ptr(),
+                        layer_acts[l].rstd2.ptr(),
+                        rows,
+                        d_model,
+                        fn_eps,
+                    )?;
+
+                    sess.sgemm_dev(
+                        rows,
+                        hidden_dim,
+                        d_model,
+                        layer_acts[l].xn2.ptr(),
+                        d_params[wg_idx].ptr(),
+                        layer_acts[l].gate.ptr(),
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        rows,
+                        hidden_dim,
+                        d_model,
+                        layer_acts[l].xn2.ptr(),
+                        d_params[wu_idx].ptr(),
+                        layer_acts[l].up.ptr(),
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.swiglu_fwd(
+                        layer_acts[l].gate.ptr(),
+                        layer_acts[l].up.ptr(),
+                        layer_acts[l].swiglu_out.ptr(),
+                        rows * hidden_dim,
+                    )?;
+
+                    let next_ptr = if l + 1 < num_layers {
+                        layer_acts[l + 1].x_in.ptr()
+                    } else {
+                        d_x_after_layers.ptr()
+                    };
+                    sess.sgemm_dev(
+                        rows,
+                        d_model,
+                        hidden_dim,
+                        layer_acts[l].swiglu_out.ptr(),
+                        d_params[wd_idx].ptr(),
+                        next_ptr,
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.add_inplace_dev_f32(next_ptr, layer_acts[l].h_mid.ptr(), rows * d_model)?;
+                }
+
+                sess.rmsnorm_fwd_dev(
+                    d_x_after_layers.ptr(),
+                    d_params[final_norm_g_idx].ptr(),
+                    d_final_norm_out.ptr(),
+                    d_final_rstd.ptr(),
+                    rows,
+                    d_model,
+                    self.final_norm.eps,
+                )?;
+                sess.sgemm_dev(
+                    rows,
+                    vocab_size,
+                    d_model,
+                    d_final_norm_out.ptr(),
+                    d_params[lm_head_w_idx].ptr(),
+                    d_logits.ptr(),
+                    false,
+                    true,
+                    1.0,
+                    0.0,
+                    dtype,
+                )?;
+
+                sess.fill_f32(d_step_loss.ptr(), 0.0, 1)?;
+                sess.cross_entropy_grad_dev_f32(
+                    d_logits.ptr(),
+                    d_targets.ptr(),
+                    d_dlogits.ptr(),
+                    d_losses.ptr(),
+                    d_step_loss.ptr(),
+                    rows,
+                    vocab_size,
+                )?;
+
+                // Backward in VRAM
+                sess.sgemm_dev(
+                    vocab_size,
+                    d_model,
+                    rows,
+                    d_dlogits.ptr(),
+                    d_final_norm_out.ptr(),
+                    d_grads[lm_head_w_idx].ptr(),
+                    true,
+                    false,
+                    1.0,
+                    0.0,
+                    dtype,
+                )?;
+                sess.sgemm_dev(
+                    rows,
+                    d_model,
+                    vocab_size,
+                    d_dlogits.ptr(),
+                    d_params[lm_head_w_idx].ptr(),
+                    d_norm_tmp.ptr(),
+                    false,
+                    false,
+                    1.0,
+                    0.0,
+                    dtype,
+                )?;
+                sess.rmsnorm_bwd_dev(
+                    d_norm_tmp.ptr(),
+                    d_x_after_layers.ptr(),
+                    d_params[final_norm_g_idx].ptr(),
+                    d_final_rstd.ptr(),
+                    d_h.ptr(),
+                    d_grads[final_norm_g_idx].ptr(),
+                    rows,
+                    d_model,
+                    true,
+                )?;
+
+                for l in (0..num_layers).rev() {
+                    let base = 1 + 9 * l;
+                    let an_g_idx = base;
+                    let wq_idx = base + 1;
+                    let wk_idx = base + 2;
+                    let wv_idx = base + 3;
+                    let wo_idx = base + 4;
+                    let fn_g_idx = base + 5;
+                    let wg_idx = base + 6;
+                    let wu_idx = base + 7;
+                    let wd_idx = base + 8;
+
+                    sess.sgemm_dev(
+                        d_model,
+                        hidden_dim,
+                        rows,
+                        d_h.ptr(),
+                        layer_acts[l].swiglu_out.ptr(),
+                        d_grads[wd_idx].ptr(),
+                        true,
+                        false,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        rows,
+                        hidden_dim,
+                        d_model,
+                        d_h.ptr(),
+                        d_params[wd_idx].ptr(),
+                        d_swiglu_out.ptr(),
+                        false,
+                        false,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+
+                    sess.swiglu_bwd(
+                        d_swiglu_out.ptr(),
+                        layer_acts[l].gate.ptr(),
+                        layer_acts[l].up.ptr(),
+                        d_dgate.ptr(),
+                        d_dup.ptr(),
+                        rows * hidden_dim,
+                    )?;
+
+                    sess.sgemm_dev(
+                        hidden_dim,
+                        d_model,
+                        rows,
+                        d_dgate.ptr(),
+                        layer_acts[l].xn2.ptr(),
+                        d_grads[wg_idx].ptr(),
+                        true,
+                        false,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        hidden_dim,
+                        d_model,
+                        rows,
+                        d_dup.ptr(),
+                        layer_acts[l].xn2.ptr(),
+                        d_grads[wu_idx].ptr(),
+                        true,
+                        false,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        rows,
+                        d_model,
+                        hidden_dim,
+                        d_dgate.ptr(),
+                        d_params[wg_idx].ptr(),
+                        d_norm_tmp.ptr(),
+                        false,
+                        false,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        rows,
+                        d_model,
+                        hidden_dim,
+                        d_dup.ptr(),
+                        d_params[wu_idx].ptr(),
+                        d_norm_tmp.ptr(),
+                        false,
+                        false,
+                        1.0,
+                        1.0,
+                        dtype,
+                    )?;
+
+                    sess.rmsnorm_bwd_dev(
+                        d_norm_tmp.ptr(),
+                        layer_acts[l].h_mid.ptr(),
+                        d_params[fn_g_idx].ptr(),
+                        layer_acts[l].rstd2.ptr(),
+                        d_norm_dx.ptr(),
+                        d_grads[fn_g_idx].ptr(),
+                        rows,
+                        d_model,
+                        true,
+                    )?;
+                    sess.add_inplace_dev_f32(d_h.ptr(), d_norm_dx.ptr(), rows * d_model)?;
+
+                    sess.sgemm_dev(
+                        d_model,
+                        d_model,
+                        rows,
+                        d_h.ptr(),
+                        layer_acts[l].attn_merged.ptr(),
+                        d_grads[wo_idx].ptr(),
+                        true,
+                        false,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        rows,
+                        d_model,
+                        d_model,
+                        d_h.ptr(),
+                        d_params[wo_idx].ptr(),
+                        d_attn_merged.ptr(),
+                        false,
+                        false,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+
+                    sess.bshd_to_bhsd_dev(
+                        d_attn_merged.ptr(),
+                        d_attn_bhsd.ptr(),
+                        batch,
+                        seq_len,
+                        num_heads,
+                        head_dim,
+                    )?;
+                    sess.flash_sdpa_bwd(
+                        d_attn_bhsd.ptr(),
+                        layer_acts[l].q_bhsd.ptr(),
+                        layer_acts[l].k_bhsd.ptr(),
+                        layer_acts[l].v_bhsd.ptr(),
+                        layer_acts[l].attn_bhsd.ptr(),
+                        layer_acts[l].lse.ptr(),
+                        d_row_scratch.ptr(),
+                        d_dq_bhsd.ptr(),
+                        d_dk_bhsd.ptr(),
+                        d_dv_bhsd.ptr(),
+                        batch,
+                        num_heads,
+                        num_kv_heads,
+                        seq_len,
+                        seq_len,
+                        head_dim,
+                        true,
+                        0,
+                    )?;
+
+                    if let Some((d_cos, d_sin)) = &d_rope_tables[l] {
+                        sess.rope(
+                            d_dq_bhsd.ptr(),
+                            d_cos.ptr(),
+                            d_sin.ptr(),
+                            batch,
+                            num_heads,
+                            seq_len,
+                            head_dim,
+                            0,
+                            true,
+                        )?;
+                        sess.rope(
+                            d_dk_bhsd.ptr(),
+                            d_cos.ptr(),
+                            d_sin.ptr(),
+                            batch,
+                            num_kv_heads,
+                            seq_len,
+                            head_dim,
+                            0,
+                            true,
+                        )?;
+                    }
+
+                    sess.bhsd_to_bshd_dev(
+                        d_dq_bhsd.ptr(),
+                        d_q_bshd_tmp.ptr(),
+                        batch,
+                        num_heads,
+                        seq_len,
+                        head_dim,
+                    )?;
+                    sess.bhsd_to_bshd_dev(
+                        d_dk_bhsd.ptr(),
+                        d_k_bshd_tmp.ptr(),
+                        batch,
+                        num_kv_heads,
+                        seq_len,
+                        head_dim,
+                    )?;
+                    sess.bhsd_to_bshd_dev(
+                        d_dv_bhsd.ptr(),
+                        d_v_bshd_tmp.ptr(),
+                        batch,
+                        num_kv_heads,
+                        seq_len,
+                        head_dim,
+                    )?;
+
+                    sess.sgemm_dev(
+                        d_model,
+                        d_model,
+                        rows,
+                        d_q_bshd_tmp.ptr(),
+                        layer_acts[l].xn1.ptr(),
+                        d_grads[wq_idx].ptr(),
+                        true,
+                        false,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        kv_dim,
+                        d_model,
+                        rows,
+                        d_k_bshd_tmp.ptr(),
+                        layer_acts[l].xn1.ptr(),
+                        d_grads[wk_idx].ptr(),
+                        true,
+                        false,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        kv_dim,
+                        d_model,
+                        rows,
+                        d_v_bshd_tmp.ptr(),
+                        layer_acts[l].xn1.ptr(),
+                        d_grads[wv_idx].ptr(),
+                        true,
+                        false,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+
+                    sess.sgemm_dev(
+                        rows,
+                        d_model,
+                        d_model,
+                        d_q_bshd_tmp.ptr(),
+                        d_params[wq_idx].ptr(),
+                        d_norm_tmp.ptr(),
+                        false,
+                        false,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        rows,
+                        d_model,
+                        kv_dim,
+                        d_k_bshd_tmp.ptr(),
+                        d_params[wk_idx].ptr(),
+                        d_norm_tmp.ptr(),
+                        false,
+                        false,
+                        1.0,
+                        1.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        rows,
+                        d_model,
+                        kv_dim,
+                        d_v_bshd_tmp.ptr(),
+                        d_params[wv_idx].ptr(),
+                        d_norm_tmp.ptr(),
+                        false,
+                        false,
+                        1.0,
+                        1.0,
+                        dtype,
+                    )?;
+
+                    sess.rmsnorm_bwd_dev(
+                        d_norm_tmp.ptr(),
+                        layer_acts[l].x_in.ptr(),
+                        d_params[an_g_idx].ptr(),
+                        layer_acts[l].rstd1.ptr(),
+                        d_norm_dx.ptr(),
+                        d_grads[an_g_idx].ptr(),
+                        rows,
+                        d_model,
+                        true,
+                    )?;
+                    sess.add_inplace_dev_f32(d_h.ptr(), d_norm_dx.ptr(), rows * d_model)?;
+                }
+
+                sess.fill_f32(d_grads[0].ptr(), 0.0, vocab_size * d_model)?;
+                sess.embedding_scatter_add_dev(
+                    d_h.ptr(),
+                    d_input_ids.ptr(),
+                    d_grads[0].ptr(),
+                    rows,
+                    d_model,
+                )?;
+
+                if let Some(max_norm) = grad_clip
+                    && max_norm > 0.0
+                {
+                    sess.fill_f32(d_norm_sq.ptr(), 0.0, 1)?;
+                    for (dg, &len) in d_grads.iter().zip(param_lens.iter()) {
+                        sess.reduce_sum_sq_add_f32(dg.ptr(), d_norm_sq.ptr(), len)?;
+                    }
+                    for (dg, &len) in d_grads.iter().zip(param_lens.iter()) {
+                        sess.clip_scale_dev_f32(dg.ptr(), d_norm_sq.ptr(), max_norm, len)?;
+                    }
+                }
+
+                for i in 0..n_params {
+                    sess.adamw_step_dev_f32(
+                        d_params[i].ptr(),
+                        d_grads[i].ptr(),
+                        d_opt_m[i].ptr(),
+                        d_opt_v[i].ptr(),
+                        param_lens[i],
+                        lr,
+                        0.9,
+                        0.999,
+                        1e-8,
+                        weight_decay,
+                        step + 1,
+                    )?;
+                }
+
+                sess.dtoh_f32(&mut host_step_loss, &d_step_loss)?;
+                loss_history.push(host_step_loss[0] / (rows as f32));
+            }
+
+            // 5. Download updated weights back into `self` ONCE at the end.
+            let mut params_mut = self.parameters_mut();
+            for (i, p) in params_mut.iter_mut().enumerate() {
+                let mut host_p = vec![0.0f32; param_lens[i]];
+                sess.dtoh_f32(&mut host_p, &d_params[i])?;
+                let final_p = if dtype != DType::F32 {
+                    TensorStorage::from_f32_slice(&host_p, dtype).to_f32_vec()
+                } else {
+                    host_p
+                };
+                p.data.copy_from_slice(&final_p);
+            }
+
+            Ok(loss_history)
+        })
+    }
+
     /// Returns references to all trainable parameters in the `CausalLM`.
     pub fn parameters(&self) -> Vec<&Tensor> {
         let mut params = vec![&self.tok_embeddings.weight];
@@ -1779,5 +3561,149 @@ mod tests {
 
         let loaded_greedy = loaded.generate(&[1, 5, 12], 5, 0.0, 0, 1.0, 7).unwrap();
         assert_eq!(gen_greedy, loaded_greedy);
+    }
+
+    #[test]
+    fn test_causallm_train_steps_parity_and_loss_reduction() {
+        use crate::nn::losses::CrossEntropyLoss;
+        use crate::nn::optim::{AdamW, clip_grad_store_norm_};
+
+        let cfg = CausalLMConfig {
+            vocab_size: 16,
+            d_model: 8,
+            num_layers: 2,
+            num_heads: 2,
+            num_kv_heads: 1,
+            ffn_hidden_dim: 16,
+            max_seq_len: 16,
+            rope_theta: 10_000.0,
+            norm_eps: 1e-5,
+            dtype: DType::F32,
+        };
+
+        let mut lm_fast = CausalLM::new(cfg.clone(), DeviceType::Cpu, 123).unwrap();
+        let mut lm_ref = lm_fast.clone();
+
+        let batch = 2usize;
+        let seq_len = 5usize;
+        let input_ids = [1usize, 3, 5, 7, 9, 2, 4, 6, 8, 10];
+        let targets = [3usize, 5, 7, 9, 11, 4, 6, 8, 10, 12];
+        let steps = 8usize;
+        let lr = 0.03f32;
+        let wd = 0.01f32;
+
+        let fast_losses = lm_fast
+            .train_steps(
+                &input_ids,
+                &targets,
+                batch,
+                seq_len,
+                steps,
+                lr,
+                wd,
+                Some(1.0),
+            )
+            .unwrap();
+        assert_eq!(fast_losses.len(), steps);
+
+        let ce = CrossEntropyLoss::default();
+        let mut adamw = AdamW::with_lr(lr, wd, DeviceType::Cpu).unwrap();
+        let mut ref_losses = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            AutogradTape::clear();
+            let logits = lm_ref
+                .forward_ids(&input_ids, batch, seq_len, None)
+                .unwrap();
+            let loss_t = ce.forward_tensor(&logits, &targets).unwrap();
+            ref_losses.push(loss_t.data[0]);
+            let mut grads = loss_t.backward().unwrap();
+            let mut params = lm_ref.parameters_mut();
+            let node_ids: Vec<usize> = params.iter().filter_map(|p| p.node_id).collect();
+            clip_grad_store_norm_(&mut grads, &node_ids, 1.0);
+            adamw.step(&mut params, &grads).unwrap();
+        }
+
+        for (step, (&fl, &rl)) in fast_losses.iter().zip(ref_losses.iter()).enumerate() {
+            assert!(
+                (fl - rl).abs() < 2e-4,
+                "CausalLM::train_steps loss mismatch at step {step}: {fl} vs {rl}"
+            );
+        }
+
+        let fast_params = lm_fast.parameters();
+        let ref_params = lm_ref.parameters();
+        assert_eq!(fast_params.len(), ref_params.len());
+        for (pi, (fp, rp)) in fast_params.iter().zip(ref_params.iter()).enumerate() {
+            let max_diff = fp
+                .data
+                .iter()
+                .zip(rp.data.iter())
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 2e-4,
+                "CausalLM::train_steps param[{pi}] max_diff={max_diff}"
+            );
+        }
+
+        // Loss reduction + GPU fallback test
+        let mut lm_gpu = CausalLM::new(cfg, DeviceType::Gpu(0), 123).unwrap();
+        let gpu_losses = lm_gpu
+            .train_steps(
+                &input_ids,
+                &targets,
+                batch,
+                seq_len,
+                25,
+                0.05,
+                0.0,
+                Some(1.0),
+            )
+            .unwrap();
+        assert_eq!(gpu_losses.len(), 25);
+        assert!(gpu_losses.iter().all(|v| v.is_finite()));
+        assert!(
+            gpu_losses[24] < gpu_losses[0],
+            "expected loss to drop: {} -> {}",
+            gpu_losses[0],
+            gpu_losses[24]
+        );
+    }
+
+    #[test]
+    fn test_causallm_train_steps_validation_errors() {
+        let cfg = CausalLMConfig {
+            vocab_size: 8,
+            d_model: 4,
+            num_layers: 1,
+            num_heads: 2,
+            num_kv_heads: 1,
+            ffn_hidden_dim: 8,
+            max_seq_len: 8,
+            rope_theta: 10_000.0,
+            norm_eps: 1e-5,
+            dtype: DType::F32,
+        };
+        let mut lm = CausalLM::new(cfg, DeviceType::Cpu, 1).unwrap();
+        assert!(
+            lm.train_steps(&[0, 1], &[1, 2], 1, 2, 0, 0.01, 0.0, None)
+                .is_err()
+        );
+        assert!(
+            lm.train_steps(&[0, 1], &[1, 2], 1, 2, 2, -0.1, 0.0, None)
+                .is_err()
+        );
+        assert!(
+            lm.train_steps(&[0, 1], &[1], 1, 2, 2, 0.01, 0.0, None)
+                .is_err()
+        );
+        assert!(
+            lm.train_steps(&[0, 8], &[1, 2], 1, 2, 2, 0.01, 0.0, None)
+                .is_err()
+        );
+        assert!(
+            lm.train_steps(&[0, 1], &[1, 8], 1, 2, 2, 0.01, 0.0, None)
+                .is_err()
+        );
     }
 }

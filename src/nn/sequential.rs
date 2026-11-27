@@ -15,11 +15,15 @@ use crate::nn::cnn::{
     ResidualBlock,
 };
 use crate::nn::dtype::{DType, TensorStorage};
-use crate::nn::gemm_f32::sgemm;
+use crate::nn::gemm_f32::sgemm_bias_act;
 use crate::nn::layers::{Activation, Dropout, Embedding, Linear};
 use crate::nn::losses::{MSELoss, Reduction};
 use crate::nn::norm::{LayerNorm, RMSNorm};
 use crate::nn::optim::{Adam, AdamW, SGD, clip_grad_norm_};
+use crate::nn::simd_math::{
+    EpilogueAct, simd_exp_sub_max_sum, simd_gelu_bwd_into, simd_gelu_fwd_into, simd_relu_inplace,
+    simd_sigmoid_into, simd_silu_bwd_into, simd_silu_fwd_into, simd_tanh_into,
+};
 use crate::nn::tensor::{FastRng, Tensor};
 
 /// Binary serialization tag for `Sequential` in `.dit` files.
@@ -899,22 +903,17 @@ impl Sequential {
 
                 let mut li = 0usize;
                 while li < self.layers.len() {
-                    // Fuse Linear + (ReLU | Sigmoid | Tanh) in a single pass on CPU
+                    // Fuse Linear + ANY Activation in a single loop step on CPU.
+                    // ReLU/Sigmoid/Tanh compute their backward from post-activation y_act, so
+                    // sgemm_bias_act writes directly to acts[li + 2].
+                    // GELU/SiLU backward needs pre-activation z = Wx + b in acts[li + 1], so we
+                    // fuse Linear+bias into acts[li + 1] via sgemm_bias_act(..., EpilogueAct::None)
+                    // and immediately apply vectorized SIMD GELU/SiLU into acts[li + 2].
                     if is_cpu
                         && li + 1 < self.layers.len()
                         && let SequentialLayer::Linear(ref lin) = self.layers[li]
-                        && matches!(
-                            self.layers[li + 1],
-                            SequentialLayer::ReLU
-                                | SequentialLayer::Sigmoid
-                                | SequentialLayer::Tanh
-                        )
+                        && let Some(act_kind) = self.layers[li + 1].as_activation()
                     {
-                        let act_kind = match self.layers[li + 1] {
-                            SequentialLayer::ReLU => Activation::ReLU,
-                            SequentialLayer::Sigmoid => Activation::Sigmoid,
-                            _ => Activation::Tanh,
-                        };
                         let in_d = if li == 0 {
                             in_dim
                         } else {
@@ -922,9 +921,35 @@ impl Sequential {
                         };
                         let out_d = plan.layer_out_states[li + 1].elems();
                         let (left, right) = acts.split_at_mut(li + 2);
-                        let in_slice = &left[li][..bs * in_d];
+                        let (l0, l1) = left.split_at_mut(li + 1);
+                        let in_slice = &l0[li][..bs * in_d];
                         let out_slice = &mut right[0][..bs * out_d];
-                        linear_fused_act_cpu(lin, act_kind, in_slice, bs, out_slice)?;
+                        match act_kind {
+                            Activation::ReLU | Activation::Sigmoid | Activation::Tanh => {
+                                linear_fused_act_cpu(lin, act_kind, in_slice, bs, out_slice)?;
+                            }
+                            Activation::GELU | Activation::SiLU => {
+                                let pre_act = &mut l1[0][..bs * out_d];
+                                let bias = lin.bias.as_ref().map(|b| b.data.as_slice());
+                                sgemm_bias_act(
+                                    bs,
+                                    lin.out_features,
+                                    lin.in_features,
+                                    in_slice,
+                                    &lin.weight.data,
+                                    bias,
+                                    EpilogueAct::None,
+                                    pre_act,
+                                    false,
+                                    true,
+                                )?;
+                                if act_kind == Activation::GELU {
+                                    simd_gelu_fwd_into(pre_act, out_slice);
+                                } else {
+                                    simd_silu_fwd_into(pre_act, out_slice);
+                                }
+                            }
+                        }
                         li += 2;
                         continue;
                     }
@@ -1204,6 +1229,34 @@ impl Sequential {
         }
 
         Ok((outputs, out_dim))
+    }
+
+    /// Runs batched inference in eval mode and computes per-row `argmax` class predictions
+    /// directly in Rust without computing `exp()` softmax.
+    pub fn predict_classes(
+        &self,
+        x: &[f32],
+        n_samples: usize,
+        sample_shape: &[usize],
+        batch_size: usize,
+    ) -> OchreResult<Vec<usize>> {
+        let (logits, out_dim) = self.predict_nd(x, n_samples, sample_shape, batch_size)?;
+        if out_dim == 0 {
+            return Err(OchreError::EmptyData);
+        }
+        let mut classes = Vec::with_capacity(n_samples);
+        for row in logits.chunks_exact(out_dim) {
+            let mut best_idx = 0usize;
+            let mut best_val = row[0];
+            for (c, &val) in row.iter().enumerate().skip(1) {
+                if val > best_val {
+                    best_val = val;
+                    best_idx = c;
+                }
+            }
+            classes.push(best_idx);
+        }
+        Ok(classes)
     }
 
     /// Serializes the `Sequential` model into `DIT\x01` format with `TAG_NN_SEQUENTIAL` (100).
@@ -1644,7 +1697,25 @@ fn forward_layer_raw(
     backend: &Backend<'_>,
 ) -> OchreResult<()> {
     match layer {
-        SequentialLayer::Linear(lin) => lin.forward_raw(in_slice, bs, out_slice),
+        SequentialLayer::Linear(lin) => {
+            if matches!(backend, Backend::Cpu) {
+                let bias = lin.bias.as_ref().map(|b| b.data.as_slice());
+                sgemm_bias_act(
+                    bs,
+                    lin.out_features,
+                    lin.in_features,
+                    in_slice,
+                    &lin.weight.data,
+                    bias,
+                    EpilogueAct::None,
+                    out_slice,
+                    false,
+                    true,
+                )
+            } else {
+                lin.forward_raw(in_slice, bs, out_slice)
+            }
+        }
         SequentialLayer::Dropout(drop) => {
             drop.forward_raw(in_slice, out_slice, mask_slice, training)
         }
@@ -1655,17 +1726,33 @@ fn forward_layer_raw(
             emb.forward_raw(indices_buf, out_slice)
         }
         SequentialLayer::ReLU => {
-            Activation::ReLU.forward_raw(in_slice, out_slice, &DeviceType::Cpu)
+            if matches!(backend, Backend::Cpu) {
+                out_slice.copy_from_slice(in_slice);
+                simd_relu_inplace(out_slice);
+                Ok(())
+            } else {
+                Activation::ReLU.forward_raw(in_slice, out_slice, &DeviceType::Cpu)
+            }
         }
         SequentialLayer::Sigmoid => {
-            Activation::Sigmoid.forward_raw(in_slice, out_slice, &DeviceType::Cpu)
+            if matches!(backend, Backend::Cpu) {
+                simd_sigmoid_into(in_slice, out_slice);
+                Ok(())
+            } else {
+                Activation::Sigmoid.forward_raw(in_slice, out_slice, &DeviceType::Cpu)
+            }
         }
         SequentialLayer::Tanh => {
-            Activation::Tanh.forward_raw(in_slice, out_slice, &DeviceType::Cpu)
+            if matches!(backend, Backend::Cpu) {
+                simd_tanh_into(in_slice, out_slice);
+                Ok(())
+            } else {
+                Activation::Tanh.forward_raw(in_slice, out_slice, &DeviceType::Cpu)
+            }
         }
         SequentialLayer::GELU => {
             if matches!(backend, Backend::Cpu) {
-                cpu_gelu_fwd_into(in_slice, out_slice);
+                simd_gelu_fwd_into(in_slice, out_slice);
             } else {
                 let res = backend.gelu_f32(in_slice);
                 out_slice.copy_from_slice(&res);
@@ -1674,7 +1761,7 @@ fn forward_layer_raw(
         }
         SequentialLayer::SiLU => {
             if matches!(backend, Backend::Cpu) {
-                cpu_silu_fwd_into(in_slice, out_slice);
+                simd_silu_fwd_into(in_slice, out_slice);
             } else {
                 let res = backend.silu_f32(in_slice);
                 out_slice.copy_from_slice(&res);
@@ -1838,7 +1925,7 @@ fn backward_layer_raw(
         SequentialLayer::GELU => {
             if let Some(dx) = dx_slice {
                 if matches!(device, DeviceType::Cpu) {
-                    cpu_gelu_bwd_into(dy_slice, x_act, dx);
+                    simd_gelu_bwd_into(dy_slice, x_act, dx);
                 } else {
                     Activation::GELU.backward_raw(x_act, y_act, dy_slice, dx, device)?;
                 }
@@ -1848,7 +1935,7 @@ fn backward_layer_raw(
         SequentialLayer::SiLU => {
             if let Some(dx) = dx_slice {
                 if matches!(device, DeviceType::Cpu) {
-                    cpu_silu_bwd_into(dy_slice, x_act, dx);
+                    simd_silu_bwd_into(dy_slice, x_act, dx);
                 } else {
                     Activation::SiLU.backward_raw(x_act, y_act, dy_slice, dx, device)?;
                 }
@@ -2386,48 +2473,8 @@ fn read_batchnorm2d(
 // CPU Hot-Path Fused & Zero-Allocation Helpers
 // ============================================================================
 
-#[inline]
-fn cpu_gelu_fwd_into(x: &[f32], out: &mut [f32]) {
-    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
-    const K: f32 = 0.044_715;
-    for (o, &v) in out.iter_mut().zip(x.iter()) {
-        let u = SQRT_2_OVER_PI * (v + K * v * v * v);
-        *o = 0.5 * v * (1.0 + u.tanh());
-    }
-}
-
-#[inline]
-fn cpu_gelu_bwd_into(dy: &[f32], x: &[f32], dx: &mut [f32]) {
-    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
-    const K: f32 = 0.044_715;
-    const THREE_K: f32 = 3.0 * K;
-    for ((dst, &g), &v) in dx.iter_mut().zip(dy.iter()).zip(x.iter()) {
-        let v2 = v * v;
-        let u = SQRT_2_OVER_PI * (v + K * v2 * v);
-        let t = u.tanh();
-        let sech2 = 1.0 - t * t;
-        let du_dx = SQRT_2_OVER_PI * (1.0 + THREE_K * v2);
-        *dst = g * 0.5 * ((1.0 + t) + v * sech2 * du_dx);
-    }
-}
-
-#[inline]
-fn cpu_silu_fwd_into(x: &[f32], out: &mut [f32]) {
-    for (o, &v) in out.iter_mut().zip(x.iter()) {
-        let sig = 1.0 / (1.0 + (-v).exp());
-        *o = v * sig;
-    }
-}
-
-#[inline]
-fn cpu_silu_bwd_into(dy: &[f32], x: &[f32], dx: &mut [f32]) {
-    for ((dst, &g), &v) in dx.iter_mut().zip(dy.iter()).zip(x.iter()) {
-        let sig = 1.0 / (1.0 + (-v).exp());
-        *dst = g * sig * (1.0 + v * (1.0 - sig));
-    }
-}
-
-/// Zero-allocation CPU CrossEntropy forward + backward writing gradients into `d_logits`.
+/// Zero-allocation CPU CrossEntropy forward + backward writing gradients into `d_logits`
+/// using vectorized `simd_exp_sub_max_sum` (single pass, no duplicate `exp()` calls).
 fn cpu_cross_entropy_grad_into(
     logits: &[f32],
     targets: &[usize],
@@ -2435,37 +2482,27 @@ fn cpu_cross_entropy_grad_into(
     cols: usize,
     d_logits: &mut [f32],
 ) -> f32 {
-    let inv_rows = 1.0f32 / (rows as f32);
+    let inv_rows = 1.0f64 / (rows as f64);
+    let inv_rows_f32 = inv_rows as f32;
     let mut total_loss = 0.0f64;
     for r in 0..rows {
         let row = &logits[r * cols..(r + 1) * cols];
         let drow = &mut d_logits[r * cols..(r + 1) * cols];
         let tgt = targets[r];
-        let mut max_v = f32::NEG_INFINITY;
-        for &v in row {
-            if v > max_v {
-                max_v = v;
-            }
+        let (max_v, sum_exp) = simd_exp_sub_max_sum(row, drow);
+        let sum_exp_d = sum_exp as f64;
+        let log_z = (max_v as f64) + sum_exp_d.ln();
+        total_loss += log_z - (row[tgt] as f64);
+        let scale = (inv_rows / sum_exp_d) as f32;
+        for dst in drow.iter_mut() {
+            *dst *= scale;
         }
-        let mut sum_exp = 0.0f32;
-        for (dst, &v) in drow.iter_mut().zip(row.iter()) {
-            let e = (v - max_v).exp();
-            *dst = e;
-            sum_exp += e;
-        }
-        let inv_sum = 1.0f32 / sum_exp;
-        let log_z = max_v + sum_exp.ln();
-        total_loss += (log_z - row[tgt]) as f64;
-        for (c, dst) in drow.iter_mut().enumerate() {
-            let prob = *dst * inv_sum;
-            let q = if c == tgt { 1.0f32 } else { 0.0f32 };
-            *dst = (prob - q) * inv_rows;
-        }
+        drow[tgt] -= inv_rows_f32;
     }
-    (total_loss / (rows as f64)) as f32
+    (total_loss * inv_rows) as f32
 }
 
-/// Fuses `Linear` (`sgemm` + `add_bias`) + `Activation` in a single pass over `out` on CPU.
+/// Fuses `Linear` (`sgemm` + `add_bias`) + `Activation` inside the L1-hot GEMM epilogue on CPU.
 fn linear_fused_act_cpu(
     lin: &Linear,
     act: Activation,
@@ -2473,85 +2510,26 @@ fn linear_fused_act_cpu(
     batch: usize,
     out: &mut [f32],
 ) -> OchreResult<()> {
-    sgemm(
+    let epilogue_act = match act {
+        Activation::ReLU => EpilogueAct::ReLU,
+        Activation::Sigmoid => EpilogueAct::Sigmoid,
+        Activation::Tanh => EpilogueAct::Tanh,
+        Activation::GELU => EpilogueAct::GELU,
+        Activation::SiLU => EpilogueAct::SiLU,
+    };
+    let bias = lin.bias.as_ref().map(|b| b.data.as_slice());
+    sgemm_bias_act(
         batch,
         lin.out_features,
         lin.in_features,
         x,
         &lin.weight.data,
+        bias,
+        epilogue_act,
         out,
         false,
         true,
-        1.0,
-        0.0,
-    )?;
-    let cols = lin.out_features;
-    let bias = lin.bias.as_ref().map(|b| b.data.as_slice());
-    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
-    const K: f32 = 0.044_715;
-    for r in 0..batch {
-        let row = &mut out[r * cols..(r + 1) * cols];
-        match (bias, act) {
-            (Some(b), Activation::ReLU) => {
-                for (v, &bv) in row.iter_mut().zip(b.iter()) {
-                    *v = (*v + bv).max(0.0);
-                }
-            }
-            (None, Activation::ReLU) => {
-                for v in row.iter_mut() {
-                    *v = v.max(0.0);
-                }
-            }
-            (Some(b), Activation::Sigmoid) => {
-                for (v, &bv) in row.iter_mut().zip(b.iter()) {
-                    let z = *v + bv;
-                    *v = 1.0 / (1.0 + (-z).exp());
-                }
-            }
-            (None, Activation::Sigmoid) => {
-                for v in row.iter_mut() {
-                    *v = 1.0 / (1.0 + (-*v).exp());
-                }
-            }
-            (Some(b), Activation::Tanh) => {
-                for (v, &bv) in row.iter_mut().zip(b.iter()) {
-                    *v = (*v + bv).tanh();
-                }
-            }
-            (None, Activation::Tanh) => {
-                for v in row.iter_mut() {
-                    *v = v.tanh();
-                }
-            }
-            (Some(b), Activation::GELU) => {
-                for (v, &bv) in row.iter_mut().zip(b.iter()) {
-                    let z = *v + bv;
-                    let u = SQRT_2_OVER_PI * (z + K * z * z * z);
-                    *v = 0.5 * z * (1.0 + u.tanh());
-                }
-            }
-            (None, Activation::GELU) => {
-                for v in row.iter_mut() {
-                    let z = *v;
-                    let u = SQRT_2_OVER_PI * (z + K * z * z * z);
-                    *v = 0.5 * z * (1.0 + u.tanh());
-                }
-            }
-            (Some(b), Activation::SiLU) => {
-                for (v, &bv) in row.iter_mut().zip(b.iter()) {
-                    let z = *v + bv;
-                    *v = z / (1.0 + (-z).exp());
-                }
-            }
-            (None, Activation::SiLU) => {
-                for v in row.iter_mut() {
-                    let z = *v;
-                    *v = z / (1.0 + (-z).exp());
-                }
-            }
-        }
-    }
-    Ok(())
+    )
 }
 
 /// Eval-mode BatchNorm2d forward without mutating or cloning `BatchNorm2d`.
@@ -2591,7 +2569,25 @@ fn forward_layer_eval_ref(
     backend: &Backend<'_>,
 ) -> OchreResult<()> {
     match layer {
-        SequentialLayer::Linear(lin) => lin.forward_raw(in_slice, bs, out_slice),
+        SequentialLayer::Linear(lin) => {
+            if matches!(backend, Backend::Cpu) {
+                let bias = lin.bias.as_ref().map(|b| b.data.as_slice());
+                sgemm_bias_act(
+                    bs,
+                    lin.out_features,
+                    lin.in_features,
+                    in_slice,
+                    &lin.weight.data,
+                    bias,
+                    EpilogueAct::None,
+                    out_slice,
+                    false,
+                    true,
+                )
+            } else {
+                lin.forward_raw(in_slice, bs, out_slice)
+            }
+        }
         SequentialLayer::Dropout(_) | SequentialLayer::Flatten(_) => {
             out_slice.copy_from_slice(in_slice);
             Ok(())
@@ -2603,17 +2599,33 @@ fn forward_layer_eval_ref(
             emb.forward_raw(indices_buf, out_slice)
         }
         SequentialLayer::ReLU => {
-            Activation::ReLU.forward_raw(in_slice, out_slice, &DeviceType::Cpu)
+            if matches!(backend, Backend::Cpu) {
+                out_slice.copy_from_slice(in_slice);
+                simd_relu_inplace(out_slice);
+                Ok(())
+            } else {
+                Activation::ReLU.forward_raw(in_slice, out_slice, &DeviceType::Cpu)
+            }
         }
         SequentialLayer::Sigmoid => {
-            Activation::Sigmoid.forward_raw(in_slice, out_slice, &DeviceType::Cpu)
+            if matches!(backend, Backend::Cpu) {
+                simd_sigmoid_into(in_slice, out_slice);
+                Ok(())
+            } else {
+                Activation::Sigmoid.forward_raw(in_slice, out_slice, &DeviceType::Cpu)
+            }
         }
         SequentialLayer::Tanh => {
-            Activation::Tanh.forward_raw(in_slice, out_slice, &DeviceType::Cpu)
+            if matches!(backend, Backend::Cpu) {
+                simd_tanh_into(in_slice, out_slice);
+                Ok(())
+            } else {
+                Activation::Tanh.forward_raw(in_slice, out_slice, &DeviceType::Cpu)
+            }
         }
         SequentialLayer::GELU => {
             if matches!(backend, Backend::Cpu) {
-                cpu_gelu_fwd_into(in_slice, out_slice);
+                simd_gelu_fwd_into(in_slice, out_slice);
             } else {
                 let res = backend.gelu_f32(in_slice);
                 out_slice.copy_from_slice(&res);
@@ -2622,7 +2634,7 @@ fn forward_layer_eval_ref(
         }
         SequentialLayer::SiLU => {
             if matches!(backend, Backend::Cpu) {
-                cpu_silu_fwd_into(in_slice, out_slice);
+                simd_silu_fwd_into(in_slice, out_slice);
             } else {
                 let res = backend.silu_f32(in_slice);
                 out_slice.copy_from_slice(&res);
@@ -4931,5 +4943,118 @@ mod tests {
         let (gpu_preds, out_d) = gpu_model.predict(&x, 4, 2, 4).unwrap();
         assert_eq!(out_d, 2);
         assert_eq!(gpu_preds.len(), 8);
+    }
+
+    #[test]
+    fn test_sequential_fused_gelu_silu_fit_parity_and_predict_classes() {
+        use crate::nn::autograd::AutogradTape;
+        use crate::nn::losses::CrossEntropyLoss;
+
+        let specs = [
+            LayerSpec::Linear {
+                in_features: 6,
+                out_features: 12,
+                bias: true,
+            },
+            LayerSpec::GELU,
+            LayerSpec::Linear {
+                in_features: 12,
+                out_features: 10,
+                bias: true,
+            },
+            LayerSpec::SiLU,
+            LayerSpec::Linear {
+                in_features: 10,
+                out_features: 4,
+                bias: true,
+            },
+        ];
+
+        let mut fast_model =
+            Sequential::from_specs(&specs, DType::F32, DeviceType::Cpu, 101).unwrap();
+        let mut ag_model = fast_model.clone();
+
+        let n_samples = 8;
+        let in_dim = 6;
+        let out_dim = 4;
+        let mut x = Vec::with_capacity(n_samples * in_dim);
+        let mut y_class = Vec::with_capacity(n_samples);
+        for i in 0..n_samples {
+            y_class.push(i % out_dim);
+            for j in 0..in_dim {
+                x.push((((i * 7 + j * 3) % 13) as f32 - 6.0) * 0.2);
+            }
+        }
+
+        let lr = 0.05;
+        let wd = 0.01;
+        let epochs = 15;
+        let fast_losses = fast_model
+            .fit_nd(
+                &x,
+                n_samples,
+                &[in_dim],
+                Some(&y_class),
+                None,
+                out_dim,
+                epochs,
+                n_samples,
+                lr,
+                OptimKind::AdamW,
+                LossKind::CrossEntropy,
+                wd,
+                Some(2.0),
+                false,
+                1,
+            )
+            .unwrap();
+
+        let ce = CrossEntropyLoss::default();
+        let mut adamw = AdamW::with_lr(lr, wd, DeviceType::Cpu).unwrap();
+        let x_t = Tensor::new(
+            x.clone(),
+            vec![n_samples, in_dim],
+            DType::F32,
+            DeviceType::Cpu,
+            false,
+        )
+        .unwrap();
+        let mut ag_losses = Vec::with_capacity(epochs);
+        for _ in 0..epochs {
+            AutogradTape::clear();
+            let logits = ag_model.forward(&x_t).unwrap();
+            let loss = ce.forward_tensor(&logits, &y_class).unwrap();
+            ag_losses.push(loss.data[0]);
+            let mut grads = loss.backward().unwrap();
+            let mut params = ag_model.parameters_mut();
+            let node_ids: Vec<usize> = params.iter().filter_map(|p| p.node_id).collect();
+            crate::nn::optim::clip_grad_store_norm_(&mut grads, &node_ids, 2.0);
+            adamw.step(&mut params, &grads).unwrap();
+        }
+
+        assert!(fast_losses.last().unwrap() < fast_losses.first().unwrap());
+        for (step, (&fl, &al)) in fast_losses.iter().zip(ag_losses.iter()).enumerate() {
+            assert!(
+                (fl - al).abs() < 5e-4,
+                "fused GELU/SiLU fit_nd loss mismatch at epoch {step}: {fl} vs {al}"
+            );
+        }
+
+        let (logits, od) = fast_model.predict_nd(&x, n_samples, &[in_dim], 3).unwrap();
+        assert_eq!(od, out_dim);
+        let classes = fast_model
+            .predict_classes(&x, n_samples, &[in_dim], 3)
+            .unwrap();
+        assert_eq!(classes.len(), n_samples);
+        for (i, &cls) in classes.iter().enumerate() {
+            let row = &logits[i * out_dim..(i + 1) * out_dim];
+            let expected = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0;
+            assert_eq!(cls, expected);
+        }
     }
 }
