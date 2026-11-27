@@ -4,14 +4,21 @@
 // gradient norm clipping helper, and Tensor autograd support.
 
 use crate::backend::get_backend;
+#[cfg(feature = "cuda-dynamic")]
+use crate::backends::cuda_nn::{
+    CudaSeqGradOutput, cuda_gru_backward, cuda_gru_forward, cuda_lstm_backward, cuda_lstm_forward,
+    cuda_rnn_backward, cuda_rnn_forward,
+};
 use crate::device::DeviceType;
 use crate::error::{OchreError, OchreResult};
 use crate::nn::autograd::{AutogradTape, CustomBackward, CustomBackwardFn, GradStore, Op};
 use crate::nn::dtype::{DType, TensorStorage};
-use crate::nn::gemm_f32::sgemm;
+use crate::nn::gemm_f32::{sgemm, sgemm_serial};
 use crate::nn::optim::{clip_grad_norm_, clip_grad_store_norm_};
 use crate::nn::tensor::{Tensor, compute_strides};
 use std::sync::Arc;
+
+const STEP_SERIAL_GEMM_THRESHOLD: usize = 4_000_000;
 
 #[inline]
 fn quantize_vec(data: Vec<f32>, dtype: DType) -> Vec<f32> {
@@ -21,13 +28,33 @@ fn quantize_vec(data: Vec<f32>, dtype: DType) -> Vec<f32> {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn sigmoid_f32(x: f32) -> f32 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
+    let xc = x.clamp(-80.0, 80.0);
+    1.0 / (1.0 + (-xc).exp())
+}
+
+#[cfg(feature = "cuda-dynamic")]
+#[inline]
+fn cuda_gpu_id(device: &DeviceType) -> Option<usize> {
+    match device {
+        DeviceType::Gpu(id) => Some(*id),
+        DeviceType::MultiGpu(ids) => ids.first().copied(),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "cuda-dynamic")]
+#[inline]
+fn from_cuda_grads(g: CudaSeqGradOutput) -> SeqGradOutput {
+    SeqGradOutput {
+        d_input: g.d_input,
+        d_h0: g.d_h0,
+        d_c0: g.d_c0,
+        d_weight_ih: g.d_weight_ih,
+        d_weight_hh: g.d_weight_hh,
+        d_bias_ih: g.d_bias_ih,
+        d_bias_hh: g.d_bias_hh,
     }
 }
 
@@ -57,6 +84,33 @@ fn gemm_dispatch(
             }
         }
         Ok(())
+    }
+}
+
+/// Timestep-loop GEMM dispatcher: avoids Rayon thread-pool barrier stalls on small
+/// per-step `[batch, gates*H] x [H]` products inside `for step in 0..seq_len`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn gemm_step_dispatch(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    trans_a: bool,
+    trans_b: bool,
+    beta: f32,
+    device: &DeviceType,
+) -> OchreResult<()> {
+    if matches!(device, DeviceType::Cpu) {
+        if m.saturating_mul(n).saturating_mul(k) < STEP_SERIAL_GEMM_THRESHOLD {
+            sgemm_serial(m, n, k, a, b, c, trans_a, trans_b, 1.0, beta)
+        } else {
+            sgemm(m, n, k, a, b, c, trans_a, trans_b, 1.0, beta)
+        }
+    } else {
+        gemm_dispatch(m, n, k, a, b, c, trans_a, trans_b, beta, device)
     }
 }
 
@@ -218,6 +272,73 @@ impl SeqWeights {
         ids
     }
 
+    fn as_ref(&self) -> WeightsRef<'_> {
+        WeightsRef {
+            weight_ih: self.weight_ih.iter().map(|t| t.data.as_slice()).collect(),
+            weight_hh: self.weight_hh.iter().map(|t| t.data.as_slice()).collect(),
+            bias_ih: self
+                .bias_ih
+                .iter()
+                .map(|o| o.as_ref().map(|t| t.data.as_slice()))
+                .collect(),
+            bias_hh: self
+                .bias_hh
+                .iter()
+                .map(|o| o.as_ref().map(|t| t.data.as_slice()))
+                .collect(),
+        }
+    }
+
+    fn any_requires_grad(&self) -> bool {
+        self.weight_ih
+            .iter()
+            .any(|t| t.requires_grad && t.node_id.is_some())
+            || self
+                .weight_hh
+                .iter()
+                .any(|t| t.requires_grad && t.node_id.is_some())
+            || self.bias_ih.iter().any(|o| {
+                o.as_ref()
+                    .is_some_and(|t| t.requires_grad && t.node_id.is_some())
+            })
+            || self.bias_hh.iter().any(|o| {
+                o.as_ref()
+                    .is_some_and(|t| t.requires_grad && t.node_id.is_some())
+            })
+    }
+
+    #[cfg(feature = "cuda-dynamic")]
+    fn grad_ids(&self) -> WeightGradIds {
+        WeightGradIds {
+            w_ih_ids: self
+                .weight_ih
+                .iter()
+                .map(|t| if t.requires_grad { t.node_id } else { None })
+                .collect(),
+            w_hh_ids: self
+                .weight_hh
+                .iter()
+                .map(|t| if t.requires_grad { t.node_id } else { None })
+                .collect(),
+            b_ih_ids: self
+                .bias_ih
+                .iter()
+                .map(|o| {
+                    o.as_ref()
+                        .and_then(|t| if t.requires_grad { t.node_id } else { None })
+                })
+                .collect(),
+            b_hh_ids: self
+                .bias_hh
+                .iter()
+                .map(|o| {
+                    o.as_ref()
+                        .and_then(|t| if t.requires_grad { t.node_id } else { None })
+                })
+                .collect(),
+        }
+    }
+
     fn snapshot(&self) -> WeightsSnapshot {
         WeightsSnapshot {
             weight_ih: self.weight_ih.iter().map(|t| t.data.clone()).collect(),
@@ -262,6 +383,23 @@ impl SeqWeights {
     }
 }
 
+/// Zero-clone borrowed view of sequence weights for `no_grad()` inference & raw passes.
+struct WeightsRef<'a> {
+    weight_ih: Vec<&'a [f32]>,
+    weight_hh: Vec<&'a [f32]>,
+    bias_ih: Vec<Option<&'a [f32]>>,
+    bias_hh: Vec<Option<&'a [f32]>>,
+}
+
+#[cfg(feature = "cuda-dynamic")]
+#[derive(Clone, Debug)]
+struct WeightGradIds {
+    w_ih_ids: Vec<Option<usize>>,
+    w_hh_ids: Vec<Option<usize>>,
+    b_ih_ids: Vec<Option<usize>>,
+    b_hh_ids: Vec<Option<usize>>,
+}
+
 #[derive(Clone, Debug)]
 struct WeightsSnapshot {
     weight_ih: Vec<Vec<f32>>,
@@ -275,11 +413,13 @@ struct WeightsSnapshot {
 }
 
 impl WeightsSnapshot {
-    fn any_requires_grad(&self) -> bool {
-        self.w_ih_ids.iter().any(Option::is_some)
-            || self.w_hh_ids.iter().any(Option::is_some)
-            || self.b_ih_ids.iter().any(Option::is_some)
-            || self.b_hh_ids.iter().any(Option::is_some)
+    fn as_ref(&self) -> WeightsRef<'_> {
+        WeightsRef {
+            weight_ih: self.weight_ih.iter().map(Vec::as_slice).collect(),
+            weight_hh: self.weight_hh.iter().map(Vec::as_slice).collect(),
+            bias_ih: self.bias_ih.iter().map(|o| o.as_deref()).collect(),
+            bias_hh: self.bias_hh.iter().map(|o| o.as_deref()).collect(),
+        }
     }
 }
 
@@ -486,11 +626,36 @@ impl RNN {
         batch: usize,
         seq_len: usize,
     ) -> OchreResult<(Vec<f32>, Vec<f32>)> {
-        let snap = self.weights.snapshot();
+        let wref = self.weights.as_ref();
+        #[cfg(feature = "cuda-dynamic")]
+        if let Some(gpu_id) = cuda_gpu_id(&self.cfg.device)
+            && let Some(res) = cuda_rnn_forward(
+                gpu_id,
+                x,
+                h0,
+                &wref.weight_ih,
+                &wref.weight_hh,
+                &wref.bias_ih,
+                &wref.bias_hh,
+                batch,
+                seq_len,
+                self.cfg.input_size,
+                self.cfg.hidden_size,
+                self.cfg.num_layers,
+                self.cfg.bidirectional,
+                self.nonlinearity == RnnNonlinearity::Relu,
+                self.cfg.dtype,
+                false,
+            )
+        {
+            let (out, hn, _) = res?;
+            return Ok((out, hn));
+        }
+
         let (out, hn, _) = rnn_forward_core(
             &self.cfg,
             self.nonlinearity,
-            &snap,
+            &wref,
             x,
             h0,
             batch,
@@ -510,18 +675,47 @@ impl RNN {
         batch: usize,
         seq_len: usize,
     ) -> OchreResult<SeqGradOutput> {
-        let snap = self.weights.snapshot();
+        let wref = self.weights.as_ref();
+        #[cfg(feature = "cuda-dynamic")]
+        if let Some(gpu_id) = cuda_gpu_id(&self.cfg.device)
+            && let Some(fwd_res) = cuda_rnn_forward(
+                gpu_id,
+                x,
+                h0,
+                &wref.weight_ih,
+                &wref.weight_hh,
+                &wref.bias_ih,
+                &wref.bias_hh,
+                batch,
+                seq_len,
+                self.cfg.input_size,
+                self.cfg.hidden_size,
+                self.cfg.num_layers,
+                self.cfg.bidirectional,
+                self.nonlinearity == RnnNonlinearity::Relu,
+                self.cfg.dtype,
+                true,
+            )
+        {
+            let (_, _, cache_opt) = fwd_res?;
+            if let Some(cache) = cache_opt
+                && let Some(bwd_res) = cuda_rnn_backward(gpu_id, &cache, d_output, d_hn)
+            {
+                return Ok(from_cuda_grads(bwd_res?));
+            }
+        }
+
         let (_, _, cache) = rnn_forward_core(
             &self.cfg,
             self.nonlinearity,
-            &snap,
+            &wref,
             x,
             h0,
             batch,
             seq_len,
             true,
         )?;
-        rnn_backward_core(&self.cfg, self.nonlinearity, &snap, &cache, d_output, d_hn)
+        rnn_backward_core(&self.cfg, self.nonlinearity, &wref, &cache, d_output, d_hn)
     }
 
     /// Autograd-compatible forward pass returning `(output, h_n)`.
@@ -533,7 +727,6 @@ impl RNN {
             validate_state_tensor(h, units, batch, self.hidden_size, "RNN h0")?;
         }
 
-        let snap = self.weights.snapshot();
         let x_id = if input.requires_grad {
             input.node_id
         } else {
@@ -541,12 +734,121 @@ impl RNN {
         };
         let h0_id = h0.and_then(|h| if h.requires_grad { h.node_id } else { None });
         let need_grad = AutogradTape::is_grad_enabled()
-            && (x_id.is_some() || h0_id.is_some() || snap.any_requires_grad());
+            && (x_id.is_some() || h0_id.is_some() || self.weights.any_requires_grad());
 
+        let out_shape = vec![batch, seq_len, self.hidden_size * dirs];
+        let hn_shape = vec![units, batch, self.hidden_size];
+
+        #[cfg(feature = "cuda-dynamic")]
+        if let Some(gpu_id) = cuda_gpu_id(&self.cfg.device) {
+            let wref = self.weights.as_ref();
+            if let Some(cuda_res) = cuda_rnn_forward(
+                gpu_id,
+                &input.data,
+                h0.map(|h| h.data.as_slice()),
+                &wref.weight_ih,
+                &wref.weight_hh,
+                &wref.bias_ih,
+                &wref.bias_hh,
+                batch,
+                seq_len,
+                self.cfg.input_size,
+                self.cfg.hidden_size,
+                self.cfg.num_layers,
+                self.cfg.bidirectional,
+                self.nonlinearity == RnnNonlinearity::Relu,
+                self.cfg.dtype,
+                need_grad,
+            ) {
+                let (raw_out, raw_hn, cache_opt) = cuda_res?;
+                let out_data = quantize_vec(raw_out, self.dtype);
+                let hn_data = quantize_vec(raw_hn, self.dtype);
+
+                let (out_id, hn_id) = if need_grad {
+                    let out_len = out_data.len();
+                    let hn_len = hn_data.len();
+                    let ids = self.weights.grad_ids();
+                    let mut all_inputs = vec![x_id, h0_id];
+                    for u in 0..units {
+                        all_inputs.push(ids.w_ih_ids[u]);
+                        all_inputs.push(ids.w_hh_ids[u]);
+                        all_inputs.push(ids.b_ih_ids[u]);
+                        all_inputs.push(ids.b_hh_ids[u]);
+                    }
+                    let cuda_cache = cache_opt.ok_or_else(|| {
+                        OchreError::DeviceError(
+                            "Missing CUDA RNN cache for BPTT ( >_< )".to_string(),
+                        )
+                    })?;
+                    let bptt_fn = Arc::new(move |d_joint: &[f32]| {
+                        let d_output = &d_joint[..out_len];
+                        let d_hn = &d_joint[out_len..out_len + hn_len];
+                        let grad_out = cuda_rnn_backward(gpu_id, &cuda_cache, d_output, d_hn)
+                            .ok_or_else(|| {
+                                OchreError::DeviceError(
+                                    "CUDA RNN backward session unavailable ( >_< )".to_string(),
+                                )
+                            })??;
+                        let mut res = Vec::new();
+                        if let Some(id) = x_id {
+                            res.push((id, grad_out.d_input));
+                        }
+                        if let Some(id) = h0_id {
+                            res.push((id, grad_out.d_h0));
+                        }
+                        for u in 0..units {
+                            if let Some(id) = ids.w_ih_ids[u] {
+                                res.push((id, grad_out.d_weight_ih[u].clone()));
+                            }
+                            if let Some(id) = ids.w_hh_ids[u] {
+                                res.push((id, grad_out.d_weight_hh[u].clone()));
+                            }
+                            if let (Some(id), Some(db)) = (ids.b_ih_ids[u], &grad_out.d_bias_ih[u])
+                            {
+                                res.push((id, db.clone()));
+                            }
+                            if let (Some(id), Some(db)) = (ids.b_hh_ids[u], &grad_out.d_bias_hh[u])
+                            {
+                                res.push((id, db.clone()));
+                            }
+                        }
+                        Ok(res)
+                    });
+                    let (oid, hid, _) =
+                        record_multi_output_bptt(all_inputs, out_len, hn_len, None, bptt_fn);
+                    (oid, hid)
+                } else {
+                    (None, None)
+                };
+
+                return Ok((
+                    Tensor {
+                        strides: compute_strides(&out_shape),
+                        shape: out_shape,
+                        data: out_data,
+                        dtype: self.dtype,
+                        device: self.device.clone(),
+                        requires_grad: need_grad,
+                        node_id: out_id,
+                    },
+                    Tensor {
+                        strides: compute_strides(&hn_shape),
+                        shape: hn_shape,
+                        data: hn_data,
+                        dtype: self.dtype,
+                        device: self.device.clone(),
+                        requires_grad: need_grad,
+                        node_id: hn_id,
+                    },
+                ));
+            }
+        }
+
+        let wref = self.weights.as_ref();
         let (raw_out, raw_hn, cache) = rnn_forward_core(
             &self.cfg,
             self.nonlinearity,
-            &snap,
+            &wref,
             &input.data,
             h0.map(|h| h.data.as_slice()),
             batch,
@@ -554,8 +856,6 @@ impl RNN {
             need_grad,
         )?;
 
-        let out_shape = vec![batch, seq_len, self.hidden_size * dirs];
-        let hn_shape = vec![units, batch, self.hidden_size];
         let out_data = quantize_vec(raw_out, self.dtype);
         let hn_data = quantize_vec(raw_hn, self.dtype);
 
@@ -564,20 +864,21 @@ impl RNN {
             let hn_len = hn_data.len();
             let cfg = self.cfg.clone();
             let nonlin = self.nonlinearity;
+            let snap_bwd = self.weights.snapshot();
 
             let mut all_inputs = vec![x_id, h0_id];
             for u in 0..units {
-                all_inputs.push(snap.w_ih_ids[u]);
-                all_inputs.push(snap.w_hh_ids[u]);
-                all_inputs.push(snap.b_ih_ids[u]);
-                all_inputs.push(snap.b_hh_ids[u]);
+                all_inputs.push(snap_bwd.w_ih_ids[u]);
+                all_inputs.push(snap_bwd.w_hh_ids[u]);
+                all_inputs.push(snap_bwd.b_ih_ids[u]);
+                all_inputs.push(snap_bwd.b_hh_ids[u]);
             }
 
-            let snap_bwd = snap.clone();
             let bptt_fn = Arc::new(move |d_joint: &[f32]| {
                 let d_output = &d_joint[..out_len];
                 let d_hn = &d_joint[out_len..out_len + hn_len];
-                let grad_out = rnn_backward_core(&cfg, nonlin, &snap_bwd, &cache, d_output, d_hn)?;
+                let wref_bwd = snap_bwd.as_ref();
+                let grad_out = rnn_backward_core(&cfg, nonlin, &wref_bwd, &cache, d_output, d_hn)?;
                 let mut res = Vec::new();
                 if let Some(id) = x_id {
                     res.push((id, grad_out.d_input));
@@ -644,7 +945,7 @@ struct RnnCache {
 fn rnn_forward_core(
     cfg: &SeqCoreConfig,
     nonlin: RnnNonlinearity,
-    snap: &WeightsSnapshot,
+    weights: &WeightsRef<'_>,
     x: &[f32],
     h0: Option<&[f32]>,
     batch: usize,
@@ -669,23 +970,27 @@ fn rnn_forward_core(
         ));
     }
 
-    let mut cur_input = x.to_vec();
+    let mut prev_layer_out: Option<Vec<f32>> = None;
     let mut hn = vec![0.0f32; units * bh];
     let mut layer_inputs = Vec::with_capacity(if save_cache { cfg.num_layers } else { 0 });
     let mut unit_h_prev = Vec::with_capacity(if save_cache { units } else { 0 });
     let mut unit_h_states = Vec::with_capacity(if save_cache { units } else { 0 });
 
+    let mut x_proj = vec![0.0f32; batch * seq_len * h];
+    let mut h_proj = vec![0.0f32; bh];
+
     for layer in 0..cfg.num_layers {
         let in_dim = if layer == 0 { cfg.input_size } else { h * dirs };
         let out_dim = h * dirs;
+        let cur_in: &[f32] = match prev_layer_out.as_deref() {
+            Some(buf) => buf,
+            None => x,
+        };
         let mut layer_out = vec![0.0f32; batch * seq_len * out_dim];
 
         if save_cache {
-            layer_inputs.push(cur_input.clone());
+            layer_inputs.push(cur_in.to_vec());
         }
-
-        let mut x_proj = vec![0.0f32; batch * seq_len * h];
-        let mut h_proj = vec![0.0f32; bh];
 
         for dir in 0..dirs {
             let u = layer * dirs + dir;
@@ -693,8 +998,8 @@ fn rnn_forward_core(
                 batch * seq_len,
                 h,
                 in_dim,
-                &cur_input,
-                &snap.weight_ih[u],
+                cur_in,
+                weights.weight_ih[u],
                 &mut x_proj,
                 false,
                 true,
@@ -719,8 +1024,8 @@ fn rnn_forward_core(
                 Vec::new()
             };
 
-            let b_ih = snap.bias_ih[u].as_deref();
-            let b_hh = snap.bias_hh[u].as_deref();
+            let b_ih = weights.bias_ih[u];
+            let b_hh = weights.bias_hh[u];
             let mut b_total = vec![0.0f32; h];
             if let Some(v) = b_ih {
                 for (d, &s) in b_total.iter_mut().zip(v.iter()) {
@@ -740,12 +1045,12 @@ fn rnn_forward_core(
                     all_prev[step * bh..(step + 1) * bh].copy_from_slice(&h_prev);
                 }
 
-                gemm_dispatch(
+                gemm_step_dispatch(
                     batch,
                     h,
                     h,
                     &h_prev,
-                    &snap.weight_hh[u],
+                    weights.weight_hh[u],
                     &mut h_proj,
                     false,
                     true,
@@ -794,11 +1099,11 @@ fn rnn_forward_core(
             }
         }
 
-        cur_input = layer_out;
+        prev_layer_out = Some(layer_out);
     }
 
     Ok((
-        cur_input,
+        prev_layer_out.unwrap_or_default(),
         hn,
         RnnCache {
             batch,
@@ -813,7 +1118,7 @@ fn rnn_forward_core(
 fn rnn_backward_core(
     cfg: &SeqCoreConfig,
     nonlin: RnnNonlinearity,
-    snap: &WeightsSnapshot,
+    weights: &WeightsRef<'_>,
     cache: &RnnCache,
     d_output: &[f32],
     d_hn: &[f32],
@@ -825,25 +1130,25 @@ fn rnn_backward_core(
     let seq_len = cache.seq_len;
     let bh = batch * h;
 
-    let mut d_weight_ih: Vec<Vec<f32>> = snap
+    let mut d_weight_ih: Vec<Vec<f32>> = weights
         .weight_ih
         .iter()
         .map(|w| vec![0.0f32; w.len()])
         .collect();
-    let mut d_weight_hh: Vec<Vec<f32>> = snap
+    let mut d_weight_hh: Vec<Vec<f32>> = weights
         .weight_hh
         .iter()
         .map(|w| vec![0.0f32; w.len()])
         .collect();
-    let mut d_bias_ih: Vec<Option<Vec<f32>>> = snap
+    let mut d_bias_ih: Vec<Option<Vec<f32>>> = weights
         .bias_ih
         .iter()
-        .map(|o| o.as_ref().map(|b| vec![0.0f32; b.len()]))
+        .map(|o| o.map(|b| vec![0.0f32; b.len()]))
         .collect();
-    let mut d_bias_hh: Vec<Option<Vec<f32>>> = snap
+    let mut d_bias_hh: Vec<Option<Vec<f32>>> = weights
         .bias_hh
         .iter()
-        .map(|o| o.as_ref().map(|b| vec![0.0f32; b.len()]))
+        .map(|o| o.map(|b| vec![0.0f32; b.len()]))
         .collect();
     let mut d_h0 = vec![0.0f32; units * bh];
     let mut d_cur_out = d_output.to_vec();
@@ -895,12 +1200,12 @@ fn rnn_backward_core(
                     }
                 }
 
-                gemm_dispatch(
+                gemm_step_dispatch(
                     batch,
                     h,
                     h,
                     da_step,
-                    &snap.weight_hh[u],
+                    weights.weight_hh[u],
                     &mut dh_next,
                     false,
                     false,
@@ -959,7 +1264,7 @@ fn rnn_backward_core(
                 in_dim,
                 h,
                 &da_all,
-                &snap.weight_ih[u],
+                weights.weight_ih[u],
                 &mut d_layer_in,
                 false,
                 false,
@@ -1072,8 +1377,32 @@ impl GRU {
         batch: usize,
         seq_len: usize,
     ) -> OchreResult<(Vec<f32>, Vec<f32>)> {
-        let snap = self.weights.snapshot();
-        let (out, hn, _) = gru_forward_core(&self.cfg, &snap, x, h0, batch, seq_len, false)?;
+        let wref = self.weights.as_ref();
+        #[cfg(feature = "cuda-dynamic")]
+        if let Some(gpu_id) = cuda_gpu_id(&self.cfg.device)
+            && let Some(res) = cuda_gru_forward(
+                gpu_id,
+                x,
+                h0,
+                &wref.weight_ih,
+                &wref.weight_hh,
+                &wref.bias_ih,
+                &wref.bias_hh,
+                batch,
+                seq_len,
+                self.cfg.input_size,
+                self.cfg.hidden_size,
+                self.cfg.num_layers,
+                self.cfg.bidirectional,
+                self.cfg.dtype,
+                false,
+            )
+        {
+            let (out, hn, _) = res?;
+            return Ok((out, hn));
+        }
+
+        let (out, hn, _) = gru_forward_core(&self.cfg, &wref, x, h0, batch, seq_len, false)?;
         Ok((out, hn))
     }
 
@@ -1087,9 +1416,37 @@ impl GRU {
         batch: usize,
         seq_len: usize,
     ) -> OchreResult<SeqGradOutput> {
-        let snap = self.weights.snapshot();
-        let (_, _, cache) = gru_forward_core(&self.cfg, &snap, x, h0, batch, seq_len, true)?;
-        gru_backward_core(&self.cfg, &snap, &cache, d_output, d_hn)
+        let wref = self.weights.as_ref();
+        #[cfg(feature = "cuda-dynamic")]
+        if let Some(gpu_id) = cuda_gpu_id(&self.cfg.device)
+            && let Some(fwd_res) = cuda_gru_forward(
+                gpu_id,
+                x,
+                h0,
+                &wref.weight_ih,
+                &wref.weight_hh,
+                &wref.bias_ih,
+                &wref.bias_hh,
+                batch,
+                seq_len,
+                self.cfg.input_size,
+                self.cfg.hidden_size,
+                self.cfg.num_layers,
+                self.cfg.bidirectional,
+                self.cfg.dtype,
+                true,
+            )
+        {
+            let (_, _, cache_opt) = fwd_res?;
+            if let Some(cache) = cache_opt
+                && let Some(bwd_res) = cuda_gru_backward(gpu_id, &cache, d_output, d_hn)
+            {
+                return Ok(from_cuda_grads(bwd_res?));
+            }
+        }
+
+        let (_, _, cache) = gru_forward_core(&self.cfg, &wref, x, h0, batch, seq_len, true)?;
+        gru_backward_core(&self.cfg, &wref, &cache, d_output, d_hn)
     }
 
     /// Autograd-compatible forward pass returning `(output, h_n)`.
@@ -1101,7 +1458,6 @@ impl GRU {
             validate_state_tensor(h, units, batch, self.hidden_size, "GRU h0")?;
         }
 
-        let snap = self.weights.snapshot();
         let x_id = if input.requires_grad {
             input.node_id
         } else {
@@ -1109,11 +1465,119 @@ impl GRU {
         };
         let h0_id = h0.and_then(|h| if h.requires_grad { h.node_id } else { None });
         let need_grad = AutogradTape::is_grad_enabled()
-            && (x_id.is_some() || h0_id.is_some() || snap.any_requires_grad());
+            && (x_id.is_some() || h0_id.is_some() || self.weights.any_requires_grad());
 
+        let out_shape = vec![batch, seq_len, self.hidden_size * dirs];
+        let hn_shape = vec![units, batch, self.hidden_size];
+
+        #[cfg(feature = "cuda-dynamic")]
+        if let Some(gpu_id) = cuda_gpu_id(&self.cfg.device) {
+            let wref = self.weights.as_ref();
+            if let Some(cuda_res) = cuda_gru_forward(
+                gpu_id,
+                &input.data,
+                h0.map(|h| h.data.as_slice()),
+                &wref.weight_ih,
+                &wref.weight_hh,
+                &wref.bias_ih,
+                &wref.bias_hh,
+                batch,
+                seq_len,
+                self.cfg.input_size,
+                self.cfg.hidden_size,
+                self.cfg.num_layers,
+                self.cfg.bidirectional,
+                self.cfg.dtype,
+                need_grad,
+            ) {
+                let (raw_out, raw_hn, cache_opt) = cuda_res?;
+                let out_data = quantize_vec(raw_out, self.dtype);
+                let hn_data = quantize_vec(raw_hn, self.dtype);
+
+                let (out_id, hn_id) = if need_grad {
+                    let out_len = out_data.len();
+                    let hn_len = hn_data.len();
+                    let ids = self.weights.grad_ids();
+                    let mut all_inputs = vec![x_id, h0_id];
+                    for u in 0..units {
+                        all_inputs.push(ids.w_ih_ids[u]);
+                        all_inputs.push(ids.w_hh_ids[u]);
+                        all_inputs.push(ids.b_ih_ids[u]);
+                        all_inputs.push(ids.b_hh_ids[u]);
+                    }
+                    let cuda_cache = cache_opt.ok_or_else(|| {
+                        OchreError::DeviceError(
+                            "Missing CUDA GRU cache for BPTT ( >_< )".to_string(),
+                        )
+                    })?;
+                    let bptt_fn = Arc::new(move |d_joint: &[f32]| {
+                        let d_output = &d_joint[..out_len];
+                        let d_hn = &d_joint[out_len..out_len + hn_len];
+                        let grad_out = cuda_gru_backward(gpu_id, &cuda_cache, d_output, d_hn)
+                            .ok_or_else(|| {
+                                OchreError::DeviceError(
+                                    "CUDA GRU backward session unavailable ( >_< )".to_string(),
+                                )
+                            })??;
+                        let mut res = Vec::new();
+                        if let Some(id) = x_id {
+                            res.push((id, grad_out.d_input));
+                        }
+                        if let Some(id) = h0_id {
+                            res.push((id, grad_out.d_h0));
+                        }
+                        for u in 0..units {
+                            if let Some(id) = ids.w_ih_ids[u] {
+                                res.push((id, grad_out.d_weight_ih[u].clone()));
+                            }
+                            if let Some(id) = ids.w_hh_ids[u] {
+                                res.push((id, grad_out.d_weight_hh[u].clone()));
+                            }
+                            if let (Some(id), Some(db)) = (ids.b_ih_ids[u], &grad_out.d_bias_ih[u])
+                            {
+                                res.push((id, db.clone()));
+                            }
+                            if let (Some(id), Some(db)) = (ids.b_hh_ids[u], &grad_out.d_bias_hh[u])
+                            {
+                                res.push((id, db.clone()));
+                            }
+                        }
+                        Ok(res)
+                    });
+                    let (oid, hid, _) =
+                        record_multi_output_bptt(all_inputs, out_len, hn_len, None, bptt_fn);
+                    (oid, hid)
+                } else {
+                    (None, None)
+                };
+
+                return Ok((
+                    Tensor {
+                        strides: compute_strides(&out_shape),
+                        shape: out_shape,
+                        data: out_data,
+                        dtype: self.dtype,
+                        device: self.device.clone(),
+                        requires_grad: need_grad,
+                        node_id: out_id,
+                    },
+                    Tensor {
+                        strides: compute_strides(&hn_shape),
+                        shape: hn_shape,
+                        data: hn_data,
+                        dtype: self.dtype,
+                        device: self.device.clone(),
+                        requires_grad: need_grad,
+                        node_id: hn_id,
+                    },
+                ));
+            }
+        }
+
+        let wref = self.weights.as_ref();
         let (raw_out, raw_hn, cache) = gru_forward_core(
             &self.cfg,
-            &snap,
+            &wref,
             &input.data,
             h0.map(|h| h.data.as_slice()),
             batch,
@@ -1121,8 +1585,6 @@ impl GRU {
             need_grad,
         )?;
 
-        let out_shape = vec![batch, seq_len, self.hidden_size * dirs];
-        let hn_shape = vec![units, batch, self.hidden_size];
         let out_data = quantize_vec(raw_out, self.dtype);
         let hn_data = quantize_vec(raw_hn, self.dtype);
 
@@ -1130,20 +1592,21 @@ impl GRU {
             let out_len = out_data.len();
             let hn_len = hn_data.len();
             let cfg = self.cfg.clone();
+            let snap_bwd = self.weights.snapshot();
 
             let mut all_inputs = vec![x_id, h0_id];
             for u in 0..units {
-                all_inputs.push(snap.w_ih_ids[u]);
-                all_inputs.push(snap.w_hh_ids[u]);
-                all_inputs.push(snap.b_ih_ids[u]);
-                all_inputs.push(snap.b_hh_ids[u]);
+                all_inputs.push(snap_bwd.w_ih_ids[u]);
+                all_inputs.push(snap_bwd.w_hh_ids[u]);
+                all_inputs.push(snap_bwd.b_ih_ids[u]);
+                all_inputs.push(snap_bwd.b_hh_ids[u]);
             }
 
-            let snap_bwd = snap.clone();
             let bptt_fn = Arc::new(move |d_joint: &[f32]| {
                 let d_output = &d_joint[..out_len];
                 let d_hn = &d_joint[out_len..out_len + hn_len];
-                let grad_out = gru_backward_core(&cfg, &snap_bwd, &cache, d_output, d_hn)?;
+                let wref_bwd = snap_bwd.as_ref();
+                let grad_out = gru_backward_core(&cfg, &wref_bwd, &cache, d_output, d_hn)?;
                 let mut res = Vec::new();
                 if let Some(id) = x_id {
                     res.push((id, grad_out.d_input));
@@ -1211,7 +1674,7 @@ struct GruCache {
 
 fn gru_forward_core(
     cfg: &SeqCoreConfig,
-    snap: &WeightsSnapshot,
+    weights: &WeightsRef<'_>,
     x: &[f32],
     h0: Option<&[f32]>,
     batch: usize,
@@ -1238,7 +1701,7 @@ fn gru_forward_core(
         ));
     }
 
-    let mut cur_input = x.to_vec();
+    let mut prev_layer_out: Option<Vec<f32>> = None;
     let mut hn = vec![0.0f32; units * bh];
     let mut layer_inputs = Vec::with_capacity(if save_cache { cfg.num_layers } else { 0 });
     let mut unit_h_prev = Vec::with_capacity(if save_cache { units } else { 0 });
@@ -1247,17 +1710,21 @@ fn gru_forward_core(
     let mut unit_n = Vec::with_capacity(if save_cache { units } else { 0 });
     let mut unit_gh_n = Vec::with_capacity(if save_cache { units } else { 0 });
 
+    let mut gi_all = vec![0.0f32; batch * seq_len * h3];
+    let mut gh = vec![0.0f32; bh3];
+
     for layer in 0..cfg.num_layers {
         let in_dim = if layer == 0 { cfg.input_size } else { h * dirs };
         let out_dim = h * dirs;
+        let cur_in: &[f32] = match prev_layer_out.as_deref() {
+            Some(buf) => buf,
+            None => x,
+        };
         let mut layer_out = vec![0.0f32; batch * seq_len * out_dim];
 
         if save_cache {
-            layer_inputs.push(cur_input.clone());
+            layer_inputs.push(cur_in.to_vec());
         }
-
-        let mut gi_all = vec![0.0f32; batch * seq_len * h3];
-        let mut gh = vec![0.0f32; bh3];
 
         for dir in 0..dirs {
             let u = layer * dirs + dir;
@@ -1265,8 +1732,8 @@ fn gru_forward_core(
                 batch * seq_len,
                 h3,
                 in_dim,
-                &cur_input,
-                &snap.weight_ih[u],
+                cur_in,
+                weights.weight_ih[u],
                 &mut gi_all,
                 false,
                 true,
@@ -1306,8 +1773,8 @@ fn gru_forward_core(
                 Vec::new()
             };
 
-            let b_ih = snap.bias_ih[u].as_deref();
-            let b_hh = snap.bias_hh[u].as_deref();
+            let b_ih = weights.bias_ih[u];
+            let b_hh = weights.bias_hh[u];
             let mut br_sum = vec![0.0f32; h];
             let mut bz_sum = vec![0.0f32; h];
             let mut bi_n = vec![0.0f32; h];
@@ -1334,12 +1801,12 @@ fn gru_forward_core(
                     all_prev[step * bh..(step + 1) * bh].copy_from_slice(&h_prev);
                 }
 
-                gemm_dispatch(
+                gemm_step_dispatch(
                     batch,
                     h3,
                     h,
                     &h_prev,
-                    &snap.weight_hh[u],
+                    weights.weight_hh[u],
                     &mut gh,
                     false,
                     true,
@@ -1350,6 +1817,10 @@ fn gru_forward_core(
                 for b in 0..batch {
                     let gi_row = &gi_all[(b * seq_len + t) * h3..(b * seq_len + t + 1) * h3];
                     let gh_row = &gh[b * h3..(b + 1) * h3];
+                    let (gi_r, gi_zn) = gi_row.split_at(h);
+                    let (gi_z, gi_n) = gi_zn.split_at(h);
+                    let (gh_r, gh_zn) = gh_row.split_at(h);
+                    let (gh_z, gh_n_slice) = gh_zn.split_at(h);
                     let hp_row = &h_prev[b * h..(b + 1) * h];
                     let hc_row = &mut h_cur[b * h..(b + 1) * h];
 
@@ -1360,10 +1831,10 @@ fn gru_forward_core(
                         let n_dst = &mut all_n[base..base + h];
                         let ghn_dst = &mut all_gh_n[base..base + h];
                         for j in 0..h {
-                            let r = sigmoid_f32(gi_row[j] + gh_row[j] + br_sum[j]);
-                            let z = sigmoid_f32(gi_row[h + j] + gh_row[h + j] + bz_sum[j]);
-                            let gh_n_val = gh_row[2 * h + j] + bh_n[j];
-                            let n = (gi_row[2 * h + j] + bi_n[j] + r * gh_n_val).tanh();
+                            let r = sigmoid_f32(gi_r[j] + gh_r[j] + br_sum[j]);
+                            let z = sigmoid_f32(gi_z[j] + gh_z[j] + bz_sum[j]);
+                            let gh_n_val = gh_n_slice[j] + bh_n[j];
+                            let n = (gi_n[j] + bi_n[j] + r * gh_n_val).tanh();
                             hc_row[j] = (1.0 - z) * n + z * hp_row[j];
                             r_dst[j] = r;
                             z_dst[j] = z;
@@ -1372,10 +1843,10 @@ fn gru_forward_core(
                         }
                     } else {
                         for j in 0..h {
-                            let r = sigmoid_f32(gi_row[j] + gh_row[j] + br_sum[j]);
-                            let z = sigmoid_f32(gi_row[h + j] + gh_row[h + j] + bz_sum[j]);
-                            let gh_n_val = gh_row[2 * h + j] + bh_n[j];
-                            let n = (gi_row[2 * h + j] + bi_n[j] + r * gh_n_val).tanh();
+                            let r = sigmoid_f32(gi_r[j] + gh_r[j] + br_sum[j]);
+                            let z = sigmoid_f32(gi_z[j] + gh_z[j] + bz_sum[j]);
+                            let gh_n_val = gh_n_slice[j] + bh_n[j];
+                            let n = (gi_n[j] + bi_n[j] + r * gh_n_val).tanh();
                             hc_row[j] = (1.0 - z) * n + z * hp_row[j];
                         }
                     }
@@ -1404,11 +1875,11 @@ fn gru_forward_core(
             }
         }
 
-        cur_input = layer_out;
+        prev_layer_out = Some(layer_out);
     }
 
     Ok((
-        cur_input,
+        prev_layer_out.unwrap_or_default(),
         hn,
         GruCache {
             batch,
@@ -1425,7 +1896,7 @@ fn gru_forward_core(
 
 fn gru_backward_core(
     cfg: &SeqCoreConfig,
-    snap: &WeightsSnapshot,
+    weights: &WeightsRef<'_>,
     cache: &GruCache,
     d_output: &[f32],
     d_hn: &[f32],
@@ -1439,25 +1910,25 @@ fn gru_backward_core(
     let bh = batch * h;
     let bh3 = batch * h3;
 
-    let mut d_weight_ih: Vec<Vec<f32>> = snap
+    let mut d_weight_ih: Vec<Vec<f32>> = weights
         .weight_ih
         .iter()
         .map(|w| vec![0.0f32; w.len()])
         .collect();
-    let mut d_weight_hh: Vec<Vec<f32>> = snap
+    let mut d_weight_hh: Vec<Vec<f32>> = weights
         .weight_hh
         .iter()
         .map(|w| vec![0.0f32; w.len()])
         .collect();
-    let mut d_bias_ih: Vec<Option<Vec<f32>>> = snap
+    let mut d_bias_ih: Vec<Option<Vec<f32>>> = weights
         .bias_ih
         .iter()
-        .map(|o| o.as_ref().map(|b| vec![0.0f32; b.len()]))
+        .map(|o| o.map(|b| vec![0.0f32; b.len()]))
         .collect();
-    let mut d_bias_hh: Vec<Option<Vec<f32>>> = snap
+    let mut d_bias_hh: Vec<Option<Vec<f32>>> = weights
         .bias_hh
         .iter()
-        .map(|o| o.as_ref().map(|b| vec![0.0f32; b.len()]))
+        .map(|o| o.map(|b| vec![0.0f32; b.len()]))
         .collect();
     let mut d_h0 = vec![0.0f32; units * bh];
     let mut d_cur_out = d_output.to_vec();
@@ -1473,7 +1944,6 @@ fn gru_backward_core(
             let mut dh_next = d_hn[u * bh..(u + 1) * bh].to_vec();
             let mut dgi_all = vec![0.0f32; batch * seq_len * h3];
             let mut dgh_steps = vec![0.0f32; seq_len * bh3];
-            let mut dh_from_gh = vec![0.0f32; bh];
 
             for step in (0..seq_len).rev() {
                 let t = if dir == 0 { step } else { seq_len - 1 - step };
@@ -1519,21 +1989,18 @@ fn gru_backward_core(
                     }
                 }
 
-                gemm_dispatch(
+                gemm_step_dispatch(
                     batch,
                     h,
                     h3,
                     dgh,
-                    &snap.weight_hh[u],
-                    &mut dh_from_gh,
+                    weights.weight_hh[u],
+                    &mut dh_next,
                     false,
                     false,
-                    0.0,
+                    1.0,
                     &cfg.device,
                 )?;
-                for (d, &s) in dh_next.iter_mut().zip(dh_from_gh.iter()) {
-                    *d += s;
-                }
             }
 
             d_h0[u * bh..(u + 1) * bh].copy_from_slice(&dh_next);
@@ -1582,7 +2049,7 @@ fn gru_backward_core(
                 in_dim,
                 h3,
                 &dgi_all,
-                &snap.weight_ih[u],
+                weights.weight_ih[u],
                 &mut d_layer_in,
                 false,
                 false,
@@ -1696,9 +2163,34 @@ impl LSTM {
         batch: usize,
         seq_len: usize,
     ) -> OchreResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-        let snap = self.weights.snapshot();
+        let wref = self.weights.as_ref();
+        #[cfg(feature = "cuda-dynamic")]
+        if let Some(gpu_id) = cuda_gpu_id(&self.cfg.device)
+            && let Some(res) = cuda_lstm_forward(
+                gpu_id,
+                x,
+                h0,
+                c0,
+                &wref.weight_ih,
+                &wref.weight_hh,
+                &wref.bias_ih,
+                &wref.bias_hh,
+                batch,
+                seq_len,
+                self.cfg.input_size,
+                self.cfg.hidden_size,
+                self.cfg.num_layers,
+                self.cfg.bidirectional,
+                self.cfg.dtype,
+                false,
+            )
+        {
+            let (out, hn, cn, _) = res?;
+            return Ok((out, hn, cn));
+        }
+
         let (out, hn, cn, _) =
-            lstm_forward_core(&self.cfg, &snap, x, h0, c0, batch, seq_len, false)?;
+            lstm_forward_core(&self.cfg, &wref, x, h0, c0, batch, seq_len, false)?;
         Ok((out, hn, cn))
     }
 
@@ -1715,10 +2207,39 @@ impl LSTM {
         batch: usize,
         seq_len: usize,
     ) -> OchreResult<SeqGradOutput> {
-        let snap = self.weights.snapshot();
+        let wref = self.weights.as_ref();
+        #[cfg(feature = "cuda-dynamic")]
+        if let Some(gpu_id) = cuda_gpu_id(&self.cfg.device)
+            && let Some(fwd_res) = cuda_lstm_forward(
+                gpu_id,
+                x,
+                h0,
+                c0,
+                &wref.weight_ih,
+                &wref.weight_hh,
+                &wref.bias_ih,
+                &wref.bias_hh,
+                batch,
+                seq_len,
+                self.cfg.input_size,
+                self.cfg.hidden_size,
+                self.cfg.num_layers,
+                self.cfg.bidirectional,
+                self.cfg.dtype,
+                true,
+            )
+        {
+            let (_, _, _, cache_opt) = fwd_res?;
+            if let Some(cache) = cache_opt
+                && let Some(bwd_res) = cuda_lstm_backward(gpu_id, &cache, d_output, d_hn, d_cn)
+            {
+                return Ok(from_cuda_grads(bwd_res?));
+            }
+        }
+
         let (_, _, _, cache) =
-            lstm_forward_core(&self.cfg, &snap, x, h0, c0, batch, seq_len, true)?;
-        lstm_backward_core(&self.cfg, &snap, &cache, d_output, d_hn, d_cn)
+            lstm_forward_core(&self.cfg, &wref, x, h0, c0, batch, seq_len, true)?;
+        lstm_backward_core(&self.cfg, &wref, &cache, d_output, d_hn, d_cn)
     }
 
     /// Autograd-compatible forward pass returning `(output, (h_n, c_n))`.
@@ -1735,7 +2256,6 @@ impl LSTM {
             validate_state_tensor(c, units, batch, self.hidden_size, "LSTM c0")?;
         }
 
-        let snap = self.weights.snapshot();
         let x_id = if input.requires_grad {
             input.node_id
         } else {
@@ -1744,11 +2264,140 @@ impl LSTM {
         let h0_id = hx.and_then(|(h, _)| if h.requires_grad { h.node_id } else { None });
         let c0_id = hx.and_then(|(_, c)| if c.requires_grad { c.node_id } else { None });
         let need_grad = AutogradTape::is_grad_enabled()
-            && (x_id.is_some() || h0_id.is_some() || c0_id.is_some() || snap.any_requires_grad());
+            && (x_id.is_some()
+                || h0_id.is_some()
+                || c0_id.is_some()
+                || self.weights.any_requires_grad());
 
+        let out_shape = vec![batch, seq_len, self.hidden_size * dirs];
+        let state_shape = vec![units, batch, self.hidden_size];
+
+        #[cfg(feature = "cuda-dynamic")]
+        if let Some(gpu_id) = cuda_gpu_id(&self.cfg.device) {
+            let wref = self.weights.as_ref();
+            if let Some(cuda_res) = cuda_lstm_forward(
+                gpu_id,
+                &input.data,
+                hx.map(|(h, _)| h.data.as_slice()),
+                hx.map(|(_, c)| c.data.as_slice()),
+                &wref.weight_ih,
+                &wref.weight_hh,
+                &wref.bias_ih,
+                &wref.bias_hh,
+                batch,
+                seq_len,
+                self.cfg.input_size,
+                self.cfg.hidden_size,
+                self.cfg.num_layers,
+                self.cfg.bidirectional,
+                self.cfg.dtype,
+                need_grad,
+            ) {
+                let (raw_out, raw_hn, raw_cn, cache_opt) = cuda_res?;
+                let out_data = quantize_vec(raw_out, self.dtype);
+                let hn_data = quantize_vec(raw_hn, self.dtype);
+                let cn_data = quantize_vec(raw_cn, self.dtype);
+
+                let (out_id, hn_id, cn_id) = if need_grad {
+                    let out_len = out_data.len();
+                    let hn_len = hn_data.len();
+                    let cn_len = cn_data.len();
+                    let ids = self.weights.grad_ids();
+                    let mut all_inputs = vec![x_id, h0_id, c0_id];
+                    for u in 0..units {
+                        all_inputs.push(ids.w_ih_ids[u]);
+                        all_inputs.push(ids.w_hh_ids[u]);
+                        all_inputs.push(ids.b_ih_ids[u]);
+                        all_inputs.push(ids.b_hh_ids[u]);
+                    }
+                    let cuda_cache = cache_opt.ok_or_else(|| {
+                        OchreError::DeviceError(
+                            "Missing CUDA LSTM cache for BPTT ( >_< )".to_string(),
+                        )
+                    })?;
+                    let bptt_fn = Arc::new(move |d_joint: &[f32]| {
+                        let d_output = &d_joint[..out_len];
+                        let d_hn = &d_joint[out_len..out_len + hn_len];
+                        let d_cn = &d_joint[out_len + hn_len..out_len + hn_len + cn_len];
+                        let grad_out =
+                            cuda_lstm_backward(gpu_id, &cuda_cache, d_output, d_hn, d_cn)
+                                .ok_or_else(|| {
+                                    OchreError::DeviceError(
+                                        "CUDA LSTM backward session unavailable ( >_< )"
+                                            .to_string(),
+                                    )
+                                })??;
+                        let mut res = Vec::new();
+                        if let Some(id) = x_id {
+                            res.push((id, grad_out.d_input));
+                        }
+                        if let Some(id) = h0_id {
+                            res.push((id, grad_out.d_h0));
+                        }
+                        if let (Some(id), Some(dc0)) = (c0_id, grad_out.d_c0) {
+                            res.push((id, dc0));
+                        }
+                        for u in 0..units {
+                            if let Some(id) = ids.w_ih_ids[u] {
+                                res.push((id, grad_out.d_weight_ih[u].clone()));
+                            }
+                            if let Some(id) = ids.w_hh_ids[u] {
+                                res.push((id, grad_out.d_weight_hh[u].clone()));
+                            }
+                            if let (Some(id), Some(db)) = (ids.b_ih_ids[u], &grad_out.d_bias_ih[u])
+                            {
+                                res.push((id, db.clone()));
+                            }
+                            if let (Some(id), Some(db)) = (ids.b_hh_ids[u], &grad_out.d_bias_hh[u])
+                            {
+                                res.push((id, db.clone()));
+                            }
+                        }
+                        Ok(res)
+                    });
+                    record_multi_output_bptt(all_inputs, out_len, hn_len, Some(cn_len), bptt_fn)
+                } else {
+                    (None, None, None)
+                };
+
+                return Ok((
+                    Tensor {
+                        strides: compute_strides(&out_shape),
+                        shape: out_shape,
+                        data: out_data,
+                        dtype: self.dtype,
+                        device: self.device.clone(),
+                        requires_grad: need_grad,
+                        node_id: out_id,
+                    },
+                    (
+                        Tensor {
+                            strides: compute_strides(&state_shape),
+                            shape: state_shape.clone(),
+                            data: hn_data,
+                            dtype: self.dtype,
+                            device: self.device.clone(),
+                            requires_grad: need_grad,
+                            node_id: hn_id,
+                        },
+                        Tensor {
+                            strides: compute_strides(&state_shape),
+                            shape: state_shape,
+                            data: cn_data,
+                            dtype: self.dtype,
+                            device: self.device.clone(),
+                            requires_grad: need_grad,
+                            node_id: cn_id,
+                        },
+                    ),
+                ));
+            }
+        }
+
+        let wref = self.weights.as_ref();
         let (raw_out, raw_hn, raw_cn, cache) = lstm_forward_core(
             &self.cfg,
-            &snap,
+            &wref,
             &input.data,
             hx.map(|(h, _)| h.data.as_slice()),
             hx.map(|(_, c)| c.data.as_slice()),
@@ -1757,8 +2406,6 @@ impl LSTM {
             need_grad,
         )?;
 
-        let out_shape = vec![batch, seq_len, self.hidden_size * dirs];
-        let state_shape = vec![units, batch, self.hidden_size];
         let out_data = quantize_vec(raw_out, self.dtype);
         let hn_data = quantize_vec(raw_hn, self.dtype);
         let cn_data = quantize_vec(raw_cn, self.dtype);
@@ -1768,21 +2415,22 @@ impl LSTM {
             let hn_len = hn_data.len();
             let cn_len = cn_data.len();
             let cfg = self.cfg.clone();
+            let snap_bwd = self.weights.snapshot();
 
             let mut all_inputs = vec![x_id, h0_id, c0_id];
             for u in 0..units {
-                all_inputs.push(snap.w_ih_ids[u]);
-                all_inputs.push(snap.w_hh_ids[u]);
-                all_inputs.push(snap.b_ih_ids[u]);
-                all_inputs.push(snap.b_hh_ids[u]);
+                all_inputs.push(snap_bwd.w_ih_ids[u]);
+                all_inputs.push(snap_bwd.w_hh_ids[u]);
+                all_inputs.push(snap_bwd.b_ih_ids[u]);
+                all_inputs.push(snap_bwd.b_hh_ids[u]);
             }
 
-            let snap_bwd = snap.clone();
             let bptt_fn = Arc::new(move |d_joint: &[f32]| {
                 let d_output = &d_joint[..out_len];
                 let d_hn = &d_joint[out_len..out_len + hn_len];
                 let d_cn = &d_joint[out_len + hn_len..out_len + hn_len + cn_len];
-                let grad_out = lstm_backward_core(&cfg, &snap_bwd, &cache, d_output, d_hn, d_cn)?;
+                let wref_bwd = snap_bwd.as_ref();
+                let grad_out = lstm_backward_core(&cfg, &wref_bwd, &cache, d_output, d_hn, d_cn)?;
                 let mut res = Vec::new();
                 if let Some(id) = x_id {
                     res.push((id, grad_out.d_input));
@@ -1867,7 +2515,7 @@ type LstmForwardOut = (Vec<f32>, Vec<f32>, Vec<f32>, LstmCache);
 #[allow(clippy::too_many_arguments)]
 fn lstm_forward_core(
     cfg: &SeqCoreConfig,
-    snap: &WeightsSnapshot,
+    weights: &WeightsRef<'_>,
     x: &[f32],
     h0: Option<&[f32]>,
     c0: Option<&[f32]>,
@@ -1902,7 +2550,7 @@ fn lstm_forward_core(
         ));
     }
 
-    let mut cur_input = x.to_vec();
+    let mut prev_layer_out: Option<Vec<f32>> = None;
     let mut hn = vec![0.0f32; units * bh];
     let mut cn = vec![0.0f32; units * bh];
 
@@ -1915,17 +2563,21 @@ fn lstm_forward_core(
     let mut unit_o = Vec::with_capacity(if save_cache { units } else { 0 });
     let mut unit_tc = Vec::with_capacity(if save_cache { units } else { 0 });
 
+    let mut gi_all = vec![0.0f32; batch * seq_len * h4];
+    let mut gh = vec![0.0f32; bh4];
+
     for layer in 0..cfg.num_layers {
         let in_dim = if layer == 0 { cfg.input_size } else { h * dirs };
         let out_dim = h * dirs;
+        let cur_in: &[f32] = match prev_layer_out.as_deref() {
+            Some(buf) => buf,
+            None => x,
+        };
         let mut layer_out = vec![0.0f32; batch * seq_len * out_dim];
 
         if save_cache {
-            layer_inputs.push(cur_input.clone());
+            layer_inputs.push(cur_in.to_vec());
         }
-
-        let mut gi_all = vec![0.0f32; batch * seq_len * h4];
-        let mut gh = vec![0.0f32; bh4];
 
         for dir in 0..dirs {
             let u = layer * dirs + dir;
@@ -1933,8 +2585,8 @@ fn lstm_forward_core(
                 batch * seq_len,
                 h4,
                 in_dim,
-                &cur_input,
-                &snap.weight_ih[u],
+                cur_in,
+                weights.weight_ih[u],
                 &mut gi_all,
                 false,
                 true,
@@ -1989,8 +2641,8 @@ fn lstm_forward_core(
                 Vec::new()
             };
 
-            let b_ih = snap.bias_ih[u].as_deref();
-            let b_hh = snap.bias_hh[u].as_deref();
+            let b_ih = weights.bias_ih[u];
+            let b_hh = weights.bias_hh[u];
             let mut b_total = vec![0.0f32; h4];
             if let Some(v) = b_ih {
                 for (d, &s) in b_total.iter_mut().zip(v.iter()) {
@@ -2002,6 +2654,9 @@ fn lstm_forward_core(
                     *d += s;
                 }
             }
+            let (bi, bfgo) = b_total.split_at(h);
+            let (bf, bgo) = bfgo.split_at(h);
+            let (bg, bo) = bgo.split_at(h);
 
             let mut h_cur = vec![0.0f32; bh];
             let mut c_cur = vec![0.0f32; bh];
@@ -2012,12 +2667,12 @@ fn lstm_forward_core(
                     all_cp[step * bh..(step + 1) * bh].copy_from_slice(&c_prev);
                 }
 
-                gemm_dispatch(
+                gemm_step_dispatch(
                     batch,
                     h4,
                     h,
                     &h_prev,
-                    &snap.weight_hh[u],
+                    weights.weight_hh[u],
                     &mut gh,
                     false,
                     true,
@@ -2028,6 +2683,12 @@ fn lstm_forward_core(
                 for b in 0..batch {
                     let gi_row = &gi_all[(b * seq_len + t) * h4..(b * seq_len + t + 1) * h4];
                     let gh_row = &gh[b * h4..(b + 1) * h4];
+                    let (gi_i, gi_fgo) = gi_row.split_at(h);
+                    let (gi_f, gi_go) = gi_fgo.split_at(h);
+                    let (gi_g, gi_o) = gi_go.split_at(h);
+                    let (gh_i, gh_fgo) = gh_row.split_at(h);
+                    let (gh_f, gh_go) = gh_fgo.split_at(h);
+                    let (gh_g, gh_o) = gh_go.split_at(h);
                     let cp_row = &c_prev[b * h..(b + 1) * h];
                     let hc_row = &mut h_cur[b * h..(b + 1) * h];
                     let cc_row = &mut c_cur[b * h..(b + 1) * h];
@@ -2040,13 +2701,10 @@ fn lstm_forward_core(
                         let o_dst = &mut all_o[base..base + h];
                         let tc_dst = &mut all_tc[base..base + h];
                         for j in 0..h {
-                            let iv = sigmoid_f32(gi_row[j] + gh_row[j] + b_total[j]);
-                            let fv = sigmoid_f32(gi_row[h + j] + gh_row[h + j] + b_total[h + j]);
-                            let gv =
-                                (gi_row[2 * h + j] + gh_row[2 * h + j] + b_total[2 * h + j]).tanh();
-                            let ov = sigmoid_f32(
-                                gi_row[3 * h + j] + gh_row[3 * h + j] + b_total[3 * h + j],
-                            );
+                            let iv = sigmoid_f32(gi_i[j] + gh_i[j] + bi[j]);
+                            let fv = sigmoid_f32(gi_f[j] + gh_f[j] + bf[j]);
+                            let gv = (gi_g[j] + gh_g[j] + bg[j]).tanh();
+                            let ov = sigmoid_f32(gi_o[j] + gh_o[j] + bo[j]);
 
                             let c_new = fv * cp_row[j] + iv * gv;
                             let tc = c_new.tanh();
@@ -2061,13 +2719,10 @@ fn lstm_forward_core(
                         }
                     } else {
                         for j in 0..h {
-                            let iv = sigmoid_f32(gi_row[j] + gh_row[j] + b_total[j]);
-                            let fv = sigmoid_f32(gi_row[h + j] + gh_row[h + j] + b_total[h + j]);
-                            let gv =
-                                (gi_row[2 * h + j] + gh_row[2 * h + j] + b_total[2 * h + j]).tanh();
-                            let ov = sigmoid_f32(
-                                gi_row[3 * h + j] + gh_row[3 * h + j] + b_total[3 * h + j],
-                            );
+                            let iv = sigmoid_f32(gi_i[j] + gh_i[j] + bi[j]);
+                            let fv = sigmoid_f32(gi_f[j] + gh_f[j] + bf[j]);
+                            let gv = (gi_g[j] + gh_g[j] + bg[j]).tanh();
+                            let ov = sigmoid_f32(gi_o[j] + gh_o[j] + bo[j]);
 
                             let c_new = fv * cp_row[j] + iv * gv;
                             let tc = c_new.tanh();
@@ -2104,11 +2759,11 @@ fn lstm_forward_core(
             }
         }
 
-        cur_input = layer_out;
+        prev_layer_out = Some(layer_out);
     }
 
     Ok((
-        cur_input,
+        prev_layer_out.unwrap_or_default(),
         hn,
         cn,
         LstmCache {
@@ -2128,7 +2783,7 @@ fn lstm_forward_core(
 
 fn lstm_backward_core(
     cfg: &SeqCoreConfig,
-    snap: &WeightsSnapshot,
+    weights: &WeightsRef<'_>,
     cache: &LstmCache,
     d_output: &[f32],
     d_hn: &[f32],
@@ -2143,25 +2798,25 @@ fn lstm_backward_core(
     let bh = batch * h;
     let bh4 = batch * h4;
 
-    let mut d_weight_ih: Vec<Vec<f32>> = snap
+    let mut d_weight_ih: Vec<Vec<f32>> = weights
         .weight_ih
         .iter()
         .map(|w| vec![0.0f32; w.len()])
         .collect();
-    let mut d_weight_hh: Vec<Vec<f32>> = snap
+    let mut d_weight_hh: Vec<Vec<f32>> = weights
         .weight_hh
         .iter()
         .map(|w| vec![0.0f32; w.len()])
         .collect();
-    let mut d_bias_ih: Vec<Option<Vec<f32>>> = snap
+    let mut d_bias_ih: Vec<Option<Vec<f32>>> = weights
         .bias_ih
         .iter()
-        .map(|o| o.as_ref().map(|b| vec![0.0f32; b.len()]))
+        .map(|o| o.map(|b| vec![0.0f32; b.len()]))
         .collect();
-    let mut d_bias_hh: Vec<Option<Vec<f32>>> = snap
+    let mut d_bias_hh: Vec<Option<Vec<f32>>> = weights
         .bias_hh
         .iter()
-        .map(|o| o.as_ref().map(|b| vec![0.0f32; b.len()]))
+        .map(|o| o.map(|b| vec![0.0f32; b.len()]))
         .collect();
     let mut d_h0 = vec![0.0f32; units * bh];
     let mut d_c0 = vec![0.0f32; units * bh];
@@ -2230,12 +2885,12 @@ fn lstm_backward_core(
                     }
                 }
 
-                gemm_dispatch(
+                gemm_step_dispatch(
                     batch,
                     h,
                     h4,
                     dgates_step,
-                    &snap.weight_hh[u],
+                    weights.weight_hh[u],
                     &mut dh_next,
                     false,
                     false,
@@ -2295,7 +2950,7 @@ fn lstm_backward_core(
                 in_dim,
                 h4,
                 &dgates_all,
-                &snap.weight_ih[u],
+                weights.weight_ih[u],
                 &mut d_layer_in,
                 false,
                 false,
