@@ -1208,17 +1208,26 @@ impl CausalLM {
         self.lm_head.forward(&h)
     }
 
-    /// Autoregressive token generation using pre-allocated `KVCache` buffers.
-    /// Returns `prompt_ids` followed by `max_new_tokens` newly generated token IDs.
-    pub fn generate(
+    fn has_linear_bias(&self) -> bool {
+        self.lm_head.bias.is_some()
+            || self.layers.iter().any(|b| {
+                b.attn.q_proj.bias.is_some()
+                    || b.attn.k_proj.bias.is_some()
+                    || b.attn.v_proj.bias.is_some()
+                    || b.attn.o_proj.bias.is_some()
+                    || b.ffn.w_gate.bias.is_some()
+                    || b.ffn.w_up.bias.is_some()
+                    || b.ffn.w_down.bias.is_some()
+            })
+    }
+
+    fn validate_generate_args(
         &self,
         prompt_ids: &[usize],
         max_new_tokens: usize,
         temperature: f32,
-        top_k: usize,
         top_p: f32,
-        seed: u64,
-    ) -> OchreResult<Vec<usize>> {
+    ) -> OchreResult<usize> {
         if prompt_ids.is_empty() {
             return Err(OchreError::EmptyData);
         }
@@ -1239,11 +1248,507 @@ impl CausalLM {
                 self.config.max_seq_len
             )));
         }
+        for &id in prompt_ids {
+            if id >= self.config.vocab_size {
+                return Err(OchreError::InvalidParameter(format!(
+                    "generate prompt token ID {id} >= vocab_size {} ( >_< )",
+                    self.config.vocab_size
+                )));
+            }
+        }
+        Ok(total_len)
+    }
+
+    /// 100% VRAM-resident autoregressive generation for `CausalLM` (single-GPU CUDA, bias-free).
+    /// Uploads weights, RoPE tables, and prompt tokens once, pre-allocates per-layer VRAM KV caches
+    /// (`[num_kv_heads * max_seq_len * head_dim]`) and step scratch once, runs prefill + all decode
+    /// steps in VRAM (downloading only `[vocab_size]` logits per token), samples on host with
+    /// `sample_next_token`, and uploads only the single next token `u64` per step.
+    /// Returns `None` if CUDA is unavailable (graceful CPU fallback).
+    #[cfg(feature = "cuda-dynamic")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_cuda_vram(
+        &self,
+        gpu_id: usize,
+        prompt_ids: &[usize],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        top_p: f32,
+        seed: u64,
+    ) -> Option<OchreResult<Vec<usize>>> {
+        let total_len =
+            match self.validate_generate_args(prompt_ids, max_new_tokens, temperature, top_p) {
+                Ok(tl) => tl,
+                Err(e) => return Some(Err(e)),
+            };
+        if self.has_linear_bias() {
+            return None;
+        }
+        let mut output = Vec::with_capacity(total_len);
+        output.extend_from_slice(prompt_ids);
+        if max_new_tokens == 0 {
+            return Some(Ok(output));
+        }
+
+        let p_len = prompt_ids.len();
+        let d_model = self.config.d_model;
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = d_model / num_heads;
+        let kv_dim = num_kv_heads * head_dim;
+        let hidden_dim = self.config.ffn_hidden_dim;
+        let vocab_size = self.config.vocab_size;
+        let max_seq_len = self.config.max_seq_len;
+        let num_layers = self.layers.len();
+        let dtype = self.config.dtype;
+
+        cuda_nn::with_vram_session(gpu_id, |sess| {
+            struct CudaGenLayer {
+                an_g: CudaDeviceBuf,
+                wq: CudaDeviceBuf,
+                wk: CudaDeviceBuf,
+                wv: CudaDeviceBuf,
+                wo: CudaDeviceBuf,
+                fn_g: CudaDeviceBuf,
+                wg: CudaDeviceBuf,
+                wu: CudaDeviceBuf,
+                wd: CudaDeviceBuf,
+                rope: Option<(CudaDeviceBuf, CudaDeviceBuf)>,
+                an_eps: f32,
+                fn_eps: f32,
+                k_cache: CudaDeviceBuf,
+                v_cache: CudaDeviceBuf,
+            }
+
+            let d_emb = sess.upload_f32(&self.tok_embeddings.weight.data)?;
+            let kv_cache_elems = num_kv_heads * max_seq_len * head_dim;
+            let mut gen_layers = Vec::with_capacity(num_layers);
+            for layer in &self.layers {
+                let rope = match &layer.attn.rope {
+                    Some(r) => Some((
+                        sess.upload_f32(&r.cos_table)?,
+                        sess.upload_f32(&r.sin_table)?,
+                    )),
+                    None => None,
+                };
+                gen_layers.push(CudaGenLayer {
+                    an_g: sess.upload_f32(&layer.attn_norm.gamma.data)?,
+                    wq: sess.upload_f32(&layer.attn.q_proj.weight.data)?,
+                    wk: sess.upload_f32(&layer.attn.k_proj.weight.data)?,
+                    wv: sess.upload_f32(&layer.attn.v_proj.weight.data)?,
+                    wo: sess.upload_f32(&layer.attn.o_proj.weight.data)?,
+                    fn_g: sess.upload_f32(&layer.ffn_norm.gamma.data)?,
+                    wg: sess.upload_f32(&layer.ffn.w_gate.weight.data)?,
+                    wu: sess.upload_f32(&layer.ffn.w_up.weight.data)?,
+                    wd: sess.upload_f32(&layer.ffn.w_down.weight.data)?,
+                    rope,
+                    an_eps: layer.attn_norm.eps,
+                    fn_eps: layer.ffn_norm.eps,
+                    k_cache: sess.alloc_f32(kv_cache_elems)?,
+                    v_cache: sess.alloc_f32(kv_cache_elems)?,
+                });
+            }
+            let d_final_g = sess.upload_f32(&self.final_norm.gamma.data)?;
+            let d_lm_head = sess.upload_f32(&self.lm_head.weight.data)?;
+
+            let prompt_u64: Vec<u64> = prompt_ids.iter().map(|&id| id as u64).collect();
+            let d_prompt_ids = sess.upload_u64(&prompt_u64)?;
+            let d_step_id = sess.alloc_u64(1)?;
+
+            let max_tok = p_len.max(1);
+            let d_h = sess.alloc_f32(max_tok * d_model)?;
+            let d_xn = sess.alloc_f32(max_tok * d_model)?;
+            let d_rstd = sess.alloc_f32(max_tok)?;
+            let d_q_bshd = sess.alloc_f32(max_tok * d_model)?;
+            let d_q_bhsd = sess.alloc_f32(max_tok * d_model)?;
+            let d_k_bshd = sess.alloc_f32(max_tok * kv_dim)?;
+            let d_v_bshd = sess.alloc_f32(max_tok * kv_dim)?;
+            let d_k_bhsd_new = sess.alloc_f32(max_tok * kv_dim)?;
+            let d_k_bhsd_full = if num_kv_heads > 1 {
+                Some(sess.alloc_f32(total_len * kv_dim)?)
+            } else {
+                None
+            };
+            let d_v_bhsd_full = if num_kv_heads > 1 {
+                Some(sess.alloc_f32(total_len * kv_dim)?)
+            } else {
+                None
+            };
+            let d_attn_bhsd = sess.alloc_f32(max_tok * d_model)?;
+            let d_attn_merged = sess.alloc_f32(max_tok * d_model)?;
+            let d_lse = sess.alloc_f32(num_heads * max_tok)?;
+            let d_sub = sess.alloc_f32(max_tok * d_model)?;
+            let d_gate = sess.alloc_f32(max_tok * hidden_dim)?;
+            let d_up = sess.alloc_f32(max_tok * hidden_dim)?;
+            let d_swiglu = sess.alloc_f32(max_tok * hidden_dim)?;
+            let d_final_h = sess.alloc_f32(d_model)?;
+            let d_final_rstd = sess.alloc_f32(1)?;
+            let d_logits = sess.alloc_f32(vocab_size)?;
+
+            let mut logits = vec![0.0f32; vocab_size];
+            let mut sample_buf: Vec<(usize, f32)> = if temperature > 1e-6 {
+                Vec::with_capacity(vocab_size)
+            } else {
+                Vec::new()
+            };
+            let mut rng = FastRng::new(seed);
+            let mut tok_u64 = [0u64; 1];
+
+            for step_idx in 0..max_new_tokens {
+                let (seq_len, cur_len, ids_ptr) = if step_idx == 0 {
+                    (p_len, 0usize, d_prompt_ids.ptr())
+                } else {
+                    (1usize, p_len + step_idx - 1, d_step_id.ptr())
+                };
+                let total_kv_len = cur_len + seq_len;
+
+                sess.embedding_gather_dev(d_emb.ptr(), ids_ptr, d_h.ptr(), seq_len, d_model)?;
+
+                for layer in &gen_layers {
+                    sess.rmsnorm_fwd_dev(
+                        d_h.ptr(),
+                        layer.an_g.ptr(),
+                        d_xn.ptr(),
+                        d_rstd.ptr(),
+                        seq_len,
+                        d_model,
+                        layer.an_eps,
+                    )?;
+                    sess.sgemm_dev(
+                        seq_len,
+                        d_model,
+                        d_model,
+                        d_xn.ptr(),
+                        layer.wq.ptr(),
+                        d_q_bshd.ptr(),
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        seq_len,
+                        kv_dim,
+                        d_model,
+                        d_xn.ptr(),
+                        layer.wk.ptr(),
+                        d_k_bshd.ptr(),
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        seq_len,
+                        kv_dim,
+                        d_model,
+                        d_xn.ptr(),
+                        layer.wv.ptr(),
+                        d_v_bshd.ptr(),
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+
+                    let q_ptr = if seq_len > 1 && num_heads > 1 {
+                        sess.bshd_to_bhsd_dev(
+                            d_q_bshd.ptr(),
+                            d_q_bhsd.ptr(),
+                            1,
+                            seq_len,
+                            num_heads,
+                            head_dim,
+                        )?;
+                        d_q_bhsd.ptr()
+                    } else {
+                        d_q_bshd.ptr()
+                    };
+                    if let Some((d_cos, d_sin)) = &layer.rope {
+                        sess.rope(
+                            q_ptr,
+                            d_cos.ptr(),
+                            d_sin.ptr(),
+                            1,
+                            num_heads,
+                            seq_len,
+                            head_dim,
+                            cur_len,
+                            false,
+                        )?;
+                    }
+
+                    // Append RoPE-rotated K and raw V to per-layer BSHD KV cache `[max_seq_len, kv_dim]`.
+                    if seq_len > 1 && num_kv_heads > 1 {
+                        sess.bshd_to_bhsd_dev(
+                            d_k_bshd.ptr(),
+                            d_k_bhsd_new.ptr(),
+                            1,
+                            seq_len,
+                            num_kv_heads,
+                            head_dim,
+                        )?;
+                        if let Some((d_cos, d_sin)) = &layer.rope {
+                            sess.rope(
+                                d_k_bhsd_new.ptr(),
+                                d_cos.ptr(),
+                                d_sin.ptr(),
+                                1,
+                                num_kv_heads,
+                                seq_len,
+                                head_dim,
+                                cur_len,
+                                false,
+                            )?;
+                        }
+                        sess.bhsd_to_bshd_dev(
+                            d_k_bhsd_new.ptr(),
+                            layer.k_cache.ptr_offset_f32(cur_len * kv_dim),
+                            1,
+                            num_kv_heads,
+                            seq_len,
+                            head_dim,
+                        )?;
+                    } else {
+                        if let Some((d_cos, d_sin)) = &layer.rope {
+                            sess.rope(
+                                d_k_bshd.ptr(),
+                                d_cos.ptr(),
+                                d_sin.ptr(),
+                                1,
+                                num_kv_heads,
+                                seq_len,
+                                head_dim,
+                                cur_len,
+                                false,
+                            )?;
+                        }
+                        sess.copy_f32(
+                            d_k_bshd.ptr(),
+                            layer.k_cache.ptr_offset_f32(cur_len * kv_dim),
+                            seq_len * kv_dim,
+                        )?;
+                    }
+                    sess.copy_f32(
+                        d_v_bshd.ptr(),
+                        layer.v_cache.ptr_offset_f32(cur_len * kv_dim),
+                        seq_len * kv_dim,
+                    )?;
+
+                    let (k_sdpa_ptr, v_sdpa_ptr) = match (&d_k_bhsd_full, &d_v_bhsd_full) {
+                        (Some(kf), Some(vf)) => {
+                            sess.bshd_to_bhsd_dev(
+                                layer.k_cache.ptr(),
+                                kf.ptr(),
+                                1,
+                                total_kv_len,
+                                num_kv_heads,
+                                head_dim,
+                            )?;
+                            sess.bshd_to_bhsd_dev(
+                                layer.v_cache.ptr(),
+                                vf.ptr(),
+                                1,
+                                total_kv_len,
+                                num_kv_heads,
+                                head_dim,
+                            )?;
+                            (kf.ptr(), vf.ptr())
+                        }
+                        _ => (layer.k_cache.ptr(), layer.v_cache.ptr()),
+                    };
+
+                    sess.flash_sdpa_fwd(
+                        q_ptr,
+                        k_sdpa_ptr,
+                        v_sdpa_ptr,
+                        d_attn_bhsd.ptr(),
+                        d_lse.ptr(),
+                        1,
+                        num_heads,
+                        num_kv_heads,
+                        seq_len,
+                        total_kv_len,
+                        head_dim,
+                        true,
+                        cur_len,
+                    )?;
+
+                    let attn_merged_ptr = if seq_len > 1 && num_heads > 1 {
+                        sess.bhsd_to_bshd_dev(
+                            d_attn_bhsd.ptr(),
+                            d_attn_merged.ptr(),
+                            1,
+                            num_heads,
+                            seq_len,
+                            head_dim,
+                        )?;
+                        d_attn_merged.ptr()
+                    } else {
+                        d_attn_bhsd.ptr()
+                    };
+
+                    sess.sgemm_dev(
+                        seq_len,
+                        d_model,
+                        d_model,
+                        attn_merged_ptr,
+                        layer.wo.ptr(),
+                        d_sub.ptr(),
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.add_inplace_dev_f32(d_h.ptr(), d_sub.ptr(), seq_len * d_model)?;
+
+                    sess.rmsnorm_fwd_dev(
+                        d_h.ptr(),
+                        layer.fn_g.ptr(),
+                        d_xn.ptr(),
+                        d_rstd.ptr(),
+                        seq_len,
+                        d_model,
+                        layer.fn_eps,
+                    )?;
+                    sess.sgemm_dev(
+                        seq_len,
+                        hidden_dim,
+                        d_model,
+                        d_xn.ptr(),
+                        layer.wg.ptr(),
+                        d_gate.ptr(),
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.sgemm_dev(
+                        seq_len,
+                        hidden_dim,
+                        d_model,
+                        d_xn.ptr(),
+                        layer.wu.ptr(),
+                        d_up.ptr(),
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.swiglu_fwd(
+                        d_gate.ptr(),
+                        d_up.ptr(),
+                        d_swiglu.ptr(),
+                        seq_len * hidden_dim,
+                    )?;
+                    sess.sgemm_dev(
+                        seq_len,
+                        d_model,
+                        hidden_dim,
+                        d_swiglu.ptr(),
+                        layer.wd.ptr(),
+                        d_sub.ptr(),
+                        false,
+                        true,
+                        1.0,
+                        0.0,
+                        dtype,
+                    )?;
+                    sess.add_inplace_dev_f32(d_h.ptr(), d_sub.ptr(), seq_len * d_model)?;
+                }
+
+                let last_h_ptr = d_h.ptr_offset_f32((seq_len - 1) * d_model);
+                sess.rmsnorm_fwd_dev(
+                    last_h_ptr,
+                    d_final_g.ptr(),
+                    d_final_h.ptr(),
+                    d_final_rstd.ptr(),
+                    1,
+                    d_model,
+                    self.final_norm.eps,
+                )?;
+                sess.sgemm_dev(
+                    1,
+                    vocab_size,
+                    d_model,
+                    d_final_h.ptr(),
+                    d_lm_head.ptr(),
+                    d_logits.ptr(),
+                    false,
+                    true,
+                    1.0,
+                    0.0,
+                    dtype,
+                )?;
+
+                sess.dtoh_f32(&mut logits, &d_logits)?;
+                let next_tok = sample_next_token(
+                    &logits,
+                    temperature,
+                    top_k,
+                    top_p,
+                    &mut rng,
+                    &mut sample_buf,
+                );
+                output.push(next_tok);
+
+                if step_idx + 1 < max_new_tokens {
+                    tok_u64[0] = next_tok as u64;
+                    sess.htod_u64(&d_step_id, &tok_u64)?;
+                }
+            }
+
+            Ok(output)
+        })
+    }
+
+    /// Autoregressive token generation using pre-allocated `KVCache` buffers.
+    /// Returns `prompt_ids` followed by `max_new_tokens` newly generated token IDs.
+    pub fn generate(
+        &self,
+        prompt_ids: &[usize],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        top_p: f32,
+        seed: u64,
+    ) -> OchreResult<Vec<usize>> {
+        let total_len =
+            self.validate_generate_args(prompt_ids, max_new_tokens, temperature, top_p)?;
 
         let mut output = Vec::with_capacity(total_len);
         output.extend_from_slice(prompt_ids);
         if max_new_tokens == 0 {
             return Ok(output);
+        }
+
+        #[cfg(feature = "cuda-dynamic")]
+        if matches!(self.device, DeviceType::Gpu(_) | DeviceType::MultiGpu(_))
+            && !self.has_linear_bias()
+        {
+            let gpu_id = match &self.device {
+                DeviceType::Gpu(id) => *id,
+                DeviceType::MultiGpu(ids) => ids.first().copied().unwrap_or(0),
+                _ => 0,
+            };
+            if let Some(res) = self.generate_cuda_vram(
+                gpu_id,
+                prompt_ids,
+                max_new_tokens,
+                temperature,
+                top_k,
+                top_p,
+                seed,
+            ) {
+                return res;
+            }
         }
 
         let d_model = self.config.d_model;
@@ -1427,17 +1932,7 @@ impl CausalLM {
                 )));
             }
         }
-        let has_unexpected_bias = self.lm_head.bias.is_some()
-            || self.layers.iter().any(|b| {
-                b.attn.q_proj.bias.is_some()
-                    || b.attn.k_proj.bias.is_some()
-                    || b.attn.v_proj.bias.is_some()
-                    || b.attn.o_proj.bias.is_some()
-                    || b.ffn.w_gate.bias.is_some()
-                    || b.ffn.w_up.bias.is_some()
-                    || b.ffn.w_down.bias.is_some()
-            });
-        if has_unexpected_bias {
+        if self.has_linear_bias() {
             return Err(OchreError::InvalidParameter(
                 "CausalLM::train_steps does not support biased Linear layers ( >_< )".to_string(),
             ));
@@ -3561,6 +4056,11 @@ mod tests {
 
         let loaded_greedy = loaded.generate(&[1, 5, 12], 5, 0.0, 0, 1.0, 7).unwrap();
         assert_eq!(gen_greedy, loaded_greedy);
+
+        // GPU dispatch (runs generate_cuda_vram on CUDA hosts or falls back cleanly to CPU)
+        let lm_gpu = CausalLM::from_dit_bytes(&bytes, DeviceType::Gpu(0)).unwrap();
+        let gpu_greedy = lm_gpu.generate(&[1, 5, 12], 5, 0.0, 0, 1.0, 7).unwrap();
+        assert_eq!(gpu_greedy, gen_greedy);
     }
 
     #[test]
