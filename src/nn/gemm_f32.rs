@@ -86,6 +86,20 @@ fn detect_gemm_isa() -> GemmIsa {
     GemmIsa::Scalar
 }
 
+/// Avoids AVX-512 12x32 padding waste and downclocking for small `M < 24 && M != 12`.
+#[inline]
+fn select_gemm_isa_for_m(isa: GemmIsa, m: usize) -> GemmIsa {
+    if isa == GemmIsa::Avx512F && m < 24 && m != 12 {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            return GemmIsa::Avx2Fma;
+        }
+        return GemmIsa::Scalar;
+    }
+    isa
+}
+
 #[inline]
 fn has_avx2_for_pack() -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -243,6 +257,577 @@ pub fn sgemm_serial(
 
     sgemm_core(m, n, k, a, b, c, trans_a, trans_b, alpha, beta, None, false);
     Ok(())
+}
+
+/// Pre-packed A matrix in BLIS micro-panel layout (`MR_K x kc` strips in `(k_block, m_block)` order)
+/// for repeated `SGEMM` calls with the same left-hand matrix (e.g. `Conv2d` weights across a batch).
+#[derive(Clone, Debug)]
+pub struct PackedA {
+    data: Vec<f32>,
+    m: usize,
+    k: usize,
+    m_padded: usize,
+    isa: GemmIsa,
+}
+
+impl PackedA {
+    /// Packs `op(A)` of shape `(m, k)` into contiguous micro-panels matching the active CPU ISA.
+    pub fn pack(a: &[f32], m: usize, k: usize, trans_a: bool) -> OchreResult<Self> {
+        let req_a = m.checked_mul(k).ok_or_else(|| {
+            OchreError::InvalidParameter("PackedA::pack A dimensions overflow ( >_< )".to_string())
+        })?;
+        if a.len() < req_a {
+            let (rows_a, cols_a) = if trans_a { (k, m) } else { (m, k) };
+            return Err(OchreError::InvalidParameter(format!(
+                "PackedA::pack A ({rows_a}x{cols_a}) slice too small: need {req_a}, got {} ( >_< )",
+                a.len()
+            )));
+        }
+
+        let isa = select_gemm_isa_for_m(detect_gemm_isa(), m);
+        let mr_blk = if isa == GemmIsa::Avx512F { MR_512 } else { MR };
+        let m_padded = m.div_ceil(mr_blk) * mr_blk;
+
+        if m == 0 || k == 0 {
+            return Ok(Self {
+                data: Vec::new(),
+                m,
+                k,
+                m_padded,
+                isa,
+            });
+        }
+
+        let mut data = vec![0.0f32; m_padded * k];
+        let mut pc = 0usize;
+        while pc < k {
+            let kc = (k - pc).min(KC);
+            let k_base = pc * m_padded;
+            let mut ic = 0usize;
+            while ic < m {
+                let mc = (m - ic).min(MC);
+                let panel_len = mc.div_ceil(mr_blk) * mr_blk * kc;
+                let dst = &mut data[k_base + ic * kc..k_base + ic * kc + panel_len];
+                if mr_blk == MR_512 {
+                    pack_panel_a::<MR_512>(a, m, k, ic, pc, mc, kc, trans_a, dst);
+                } else {
+                    pack_panel_a::<MR>(a, m, k, ic, pc, mc, kc, trans_a, dst);
+                }
+                ic += MC;
+            }
+            pc += KC;
+        }
+
+        Ok(Self {
+            data,
+            m,
+            k,
+            m_padded,
+            isa,
+        })
+    }
+}
+
+/// Pre-packed B matrix in BLIS micro-panel layout (`kc x NR_K` strips in `(k_block, n_strip)` order)
+/// for repeated `SGEMM` calls with the same right-hand matrix (e.g. recurrent `W_hh` weights).
+#[derive(Clone, Debug)]
+pub struct PackedB {
+    data: Vec<f32>,
+    n: usize,
+    k: usize,
+    nr_blk: usize,
+    n_padded: usize,
+    isa: GemmIsa,
+}
+
+impl PackedB {
+    /// Packs `op(B)` of shape `(k, n)` into contiguous micro-panels matching the active CPU ISA.
+    pub fn pack(b: &[f32], n: usize, k: usize, trans_b: bool) -> OchreResult<Self> {
+        let req_b = k.checked_mul(n).ok_or_else(|| {
+            OchreError::InvalidParameter("PackedB::pack B dimensions overflow ( >_< )".to_string())
+        })?;
+        if b.len() < req_b {
+            let (rows_b, cols_b) = if trans_b { (n, k) } else { (k, n) };
+            return Err(OchreError::InvalidParameter(format!(
+                "PackedB::pack B ({rows_b}x{cols_b}) slice too small: need {req_b}, got {} ( >_< )",
+                b.len()
+            )));
+        }
+
+        let isa = detect_gemm_isa();
+        let nr_blk = if isa == GemmIsa::Avx512F && n > NR {
+            NR_512
+        } else {
+            NR
+        };
+        let n_padded = n.div_ceil(nr_blk) * nr_blk;
+
+        if n == 0 || k == 0 {
+            return Ok(Self {
+                data: Vec::new(),
+                n,
+                k,
+                nr_blk,
+                n_padded,
+                isa,
+            });
+        }
+
+        let use_avx2_pack = has_avx2_for_pack();
+        let mut data = vec![0.0f32; k * n_padded];
+        let mut pc = 0usize;
+        while pc < k {
+            let kc = (k - pc).min(KC);
+            let k_base = pc * n_padded;
+            let dst = &mut data[k_base..k_base + n_padded * kc];
+            if nr_blk == NR_512 {
+                pack_panel_b::<NR_512>(b, n, k, pc, 0, kc, n, trans_b, use_avx2_pack, dst);
+            } else {
+                pack_panel_b::<NR>(b, n, k, pc, 0, kc, n, trans_b, use_avx2_pack, dst);
+            }
+            pc += KC;
+        }
+
+        Ok(Self {
+            data,
+            n,
+            k,
+            nr_blk,
+            n_padded,
+            isa,
+        })
+    }
+}
+
+/// Single-threaded `SGEMM` using a pre-packed `PackedA` left-hand matrix:
+/// `C = alpha * op(A) * op(B) + beta * C` in row-major order.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_prepacked_a_serial(
+    m: usize,
+    n: usize,
+    k: usize,
+    packed_a: &PackedA,
+    b: &[f32],
+    c: &mut [f32],
+    trans_b: bool,
+    alpha: f32,
+    beta: f32,
+) -> OchreResult<()> {
+    if packed_a.m != m || packed_a.k != k {
+        return Err(OchreError::InvalidParameter(format!(
+            "sgemm_prepacked_a_serial shape mismatch: packed_a is ({}, {}), call requested ({m}, {k}) ( >_< )",
+            packed_a.m, packed_a.k
+        )));
+    }
+    let req_b = k.checked_mul(n).ok_or_else(|| {
+        OchreError::InvalidParameter(
+            "sgemm_prepacked_a_serial B dimensions overflow ( >_< )".to_string(),
+        )
+    })?;
+    let req_c = m.checked_mul(n).ok_or_else(|| {
+        OchreError::InvalidParameter(
+            "sgemm_prepacked_a_serial C dimensions overflow ( >_< )".to_string(),
+        )
+    })?;
+    if b.len() < req_b {
+        return Err(OchreError::InvalidParameter(format!(
+            "sgemm_prepacked_a_serial B slice too small: need {req_b}, got {} ( >_< )",
+            b.len()
+        )));
+    }
+    if c.len() < req_c {
+        return Err(OchreError::InvalidParameter(format!(
+            "sgemm_prepacked_a_serial C slice too small: need {req_c}, got {} ( >_< )",
+            c.len()
+        )));
+    }
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    if k == 0 || alpha == 0.0 {
+        scale_c_only(c, req_c, beta);
+        return Ok(());
+    }
+
+    let use_avx2_pack = has_avx2_for_pack();
+    match packed_a.isa {
+        #[cfg(target_arch = "x86_64")]
+        GemmIsa::Avx512F => {
+            if n <= NR {
+                // SAFETY: `c` has at least `m * n` elements and AVX-512F is verified by `PackedA::pack`.
+                unsafe {
+                    sgemm_prepacked_a_specialized::<MR_512, NR>(
+                        m,
+                        n,
+                        k,
+                        packed_a,
+                        b,
+                        c.as_mut_ptr(),
+                        trans_b,
+                        alpha,
+                        beta,
+                        use_avx2_pack,
+                    );
+                }
+            } else {
+                // SAFETY: `c` has at least `m * n` elements and AVX-512F is verified by `PackedA::pack`.
+                unsafe {
+                    sgemm_prepacked_a_specialized::<MR_512, NR_512>(
+                        m,
+                        n,
+                        k,
+                        packed_a,
+                        b,
+                        c.as_mut_ptr(),
+                        trans_b,
+                        alpha,
+                        beta,
+                        use_avx2_pack,
+                    );
+                }
+            }
+        }
+        _ => {
+            // SAFETY: `c` has at least `m * n` elements.
+            unsafe {
+                sgemm_prepacked_a_specialized::<MR, NR>(
+                    m,
+                    n,
+                    k,
+                    packed_a,
+                    b,
+                    c.as_mut_ptr(),
+                    trans_b,
+                    alpha,
+                    beta,
+                    use_avx2_pack,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `SGEMM` using a pre-packed `PackedB` right-hand matrix:
+/// `C = alpha * op(A) * op(B) + beta * C` in row-major order.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_prepacked_b(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    packed_b: &PackedB,
+    c: &mut [f32],
+    trans_a: bool,
+    alpha: f32,
+    beta: f32,
+    use_parallel: bool,
+) -> OchreResult<()> {
+    if packed_b.n != n || packed_b.k != k {
+        return Err(OchreError::InvalidParameter(format!(
+            "sgemm_prepacked_b shape mismatch: packed_b is ({}, {}), call requested ({k}, {n}) ( >_< )",
+            packed_b.k, packed_b.n
+        )));
+    }
+    let req_a = m.checked_mul(k).ok_or_else(|| {
+        OchreError::InvalidParameter("sgemm_prepacked_b A dimensions overflow ( >_< )".to_string())
+    })?;
+    let req_c = m.checked_mul(n).ok_or_else(|| {
+        OchreError::InvalidParameter("sgemm_prepacked_b C dimensions overflow ( >_< )".to_string())
+    })?;
+    if a.len() < req_a {
+        return Err(OchreError::InvalidParameter(format!(
+            "sgemm_prepacked_b A slice too small: need {req_a}, got {} ( >_< )",
+            a.len()
+        )));
+    }
+    if c.len() < req_c {
+        return Err(OchreError::InvalidParameter(format!(
+            "sgemm_prepacked_b C slice too small: need {req_c}, got {} ( >_< )",
+            c.len()
+        )));
+    }
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    if k == 0 || alpha == 0.0 {
+        scale_c_only(c, req_c, beta);
+        return Ok(());
+    }
+
+    match (packed_b.isa, packed_b.nr_blk) {
+        #[cfg(target_arch = "x86_64")]
+        (GemmIsa::Avx512F, NR_512) => {
+            sgemm_prepacked_b_core::<MR_512, NR_512>(
+                m,
+                n,
+                k,
+                a,
+                packed_b,
+                c,
+                trans_a,
+                alpha,
+                beta,
+                GemmIsa::Avx512F,
+                use_parallel,
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        (GemmIsa::Avx512F, NR) => {
+            let isa = select_gemm_isa_for_m(GemmIsa::Avx512F, m);
+            if isa == GemmIsa::Avx512F {
+                sgemm_prepacked_b_core::<MR_512, NR>(
+                    m,
+                    n,
+                    k,
+                    a,
+                    packed_b,
+                    c,
+                    trans_a,
+                    alpha,
+                    beta,
+                    GemmIsa::Avx512F,
+                    use_parallel,
+                );
+            } else {
+                sgemm_prepacked_b_core::<MR, NR>(
+                    m,
+                    n,
+                    k,
+                    a,
+                    packed_b,
+                    c,
+                    trans_a,
+                    alpha,
+                    beta,
+                    isa,
+                    use_parallel,
+                );
+            }
+        }
+        _ => {
+            sgemm_prepacked_b_core::<MR, NR>(
+                m,
+                n,
+                k,
+                a,
+                packed_b,
+                c,
+                trans_a,
+                alpha,
+                beta,
+                packed_b.isa,
+                use_parallel,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// # Safety
+/// `c_base` must point to a valid writable buffer of at least `m * n` `f32` elements.
+#[allow(clippy::too_many_arguments)]
+unsafe fn sgemm_prepacked_a_specialized<const MR_K: usize, const NR_K: usize>(
+    m: usize,
+    n: usize,
+    k: usize,
+    packed_a: &PackedA,
+    b: &[f32],
+    c_base: *mut f32,
+    trans_b: bool,
+    alpha: f32,
+    beta: f32,
+    use_avx2_pack: bool,
+) {
+    let max_nc = n.min(NC);
+    let max_kc = k.min(KC);
+    let need_b = max_nc.div_ceil(NR_K) * NR_K * max_kc;
+
+    with_scratch(&PACK_B_SCRATCH, need_b, |packed_b| {
+        let mut jc = 0usize;
+        while jc < n {
+            let nc = (n - jc).min(NC);
+            let mut pc = 0usize;
+            while pc < k {
+                let kc = (k - pc).min(KC);
+                let eff_beta = if pc == 0 { beta } else { 1.0 };
+                pack_panel_b::<NR_K>(b, n, k, pc, jc, kc, nc, trans_b, use_avx2_pack, packed_b);
+
+                let k_base = pc * packed_a.m_padded;
+                let mut ic = 0usize;
+                while ic < m {
+                    let mc = (m - ic).min(MC);
+                    let panel_len = mc.div_ceil(MR_K) * MR_K * kc;
+                    let pa = &packed_a.data[k_base + ic * kc..k_base + ic * kc + panel_len];
+                    // SAFETY: `(ic..ic+mc, jc..jc+nc)` lies within `[0..m) x [0..n)`.
+                    unsafe {
+                        let c_tile = c_base.add(ic * n + jc);
+                        macro_kernel::<MR_K, NR_K>(
+                            mc,
+                            nc,
+                            kc,
+                            n,
+                            alpha,
+                            eff_beta,
+                            pa,
+                            packed_b,
+                            c_tile,
+                            None,
+                            packed_a.isa,
+                        );
+                    }
+                    ic += MC;
+                }
+                pc += KC;
+            }
+            jc += NC;
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sgemm_prepacked_b_core<const MR_K: usize, const NR_K: usize>(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    packed_b: &PackedB,
+    c: &mut [f32],
+    trans_a: bool,
+    alpha: f32,
+    beta: f32,
+    isa: GemmIsa,
+    use_parallel: bool,
+) {
+    if !use_parallel {
+        // SAFETY: `c` has at least `m * n` elements and the single tile owns `[0..m) x [0..n)`.
+        unsafe {
+            sgemm_prepacked_b_tile::<MR_K, NR_K>(
+                m,
+                n,
+                k,
+                0,
+                m,
+                0,
+                n,
+                a,
+                packed_b,
+                c.as_mut_ptr(),
+                trans_a,
+                alpha,
+                beta,
+                isa,
+            );
+        }
+        return;
+    }
+
+    let nthreads = rayon::current_num_threads();
+    let (nt_m, nt_n) = choose_2d_grid(m, n, MR_K, NR_K, nthreads);
+    let total_tiles = nt_m * nt_n;
+    if total_tiles <= 1 {
+        // SAFETY: `c` has at least `m * n` elements and the single tile owns `[0..m) x [0..n)`.
+        unsafe {
+            sgemm_prepacked_b_tile::<MR_K, NR_K>(
+                m,
+                n,
+                k,
+                0,
+                m,
+                0,
+                n,
+                a,
+                packed_b,
+                c.as_mut_ptr(),
+                trans_a,
+                alpha,
+                beta,
+                isa,
+            );
+        }
+        return;
+    }
+
+    let tile_m = m.div_ceil(nt_m).div_ceil(MR_K) * MR_K;
+    let tile_n = n.div_ceil(nt_n).div_ceil(NR_K) * NR_K;
+    let c_ptr = SendMutPtr(c.as_mut_ptr());
+
+    (0..total_tiles).into_par_iter().for_each(|tile_idx| {
+        let im = tile_idx / nt_n;
+        let jn = tile_idx % nt_n;
+        let ic0 = im * tile_m;
+        let jc0 = jn * tile_n;
+        if ic0 >= m || jc0 >= n {
+            return;
+        }
+        let tm = (m - ic0).min(tile_m);
+        let tn = (n - jc0).min(tile_n);
+        let ptr = c_ptr;
+        // SAFETY: `tile_idx` maps to a strictly disjoint `[ic0..ic0+tm) x [jc0..jc0+tn)` tile of `c`.
+        unsafe {
+            sgemm_prepacked_b_tile::<MR_K, NR_K>(
+                m, n, k, ic0, tm, jc0, tn, a, packed_b, ptr.0, trans_a, alpha, beta, isa,
+            );
+        }
+    });
+}
+
+/// # Safety
+/// `c_base` must point to a valid buffer of at least `m * n` `f32` elements, and no other thread
+/// may concurrently access `[ic0..ic0+tm) x [jc0..jc0+tn)`. `jc0` must be a multiple of `NR_K`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn sgemm_prepacked_b_tile<const MR_K: usize, const NR_K: usize>(
+    m: usize,
+    n: usize,
+    k: usize,
+    ic0: usize,
+    tm: usize,
+    jc0: usize,
+    tn: usize,
+    a: &[f32],
+    packed_b: &PackedB,
+    c_base: *mut f32,
+    trans_a: bool,
+    alpha: f32,
+    beta: f32,
+    isa: GemmIsa,
+) {
+    let max_mc = tm.min(MC);
+    let max_kc = k.min(KC);
+    let need_a = max_mc.div_ceil(MR_K) * MR_K * max_kc;
+
+    with_scratch(&PACK_A_SCRATCH, need_a, |packed_a| {
+        let mut dj = 0usize;
+        while dj < tn {
+            let nc = (tn - dj).min(NC);
+            let jc = jc0 + dj;
+            let pb_len = nc.div_ceil(NR_K) * NR_K;
+            let mut pc = 0usize;
+            while pc < k {
+                let kc = (k - pc).min(KC);
+                let eff_beta = if pc == 0 { beta } else { 1.0 };
+                let k_base = pc * packed_b.n_padded;
+                let pb = &packed_b.data[k_base + jc * kc..k_base + jc * kc + pb_len * kc];
+
+                let mut di = 0usize;
+                while di < tm {
+                    let mc = (tm - di).min(MC);
+                    let ic = ic0 + di;
+                    pack_panel_a::<MR_K>(a, m, k, ic, pc, mc, kc, trans_a, packed_a);
+                    // SAFETY: `(ic..ic+mc, jc..jc+nc)` lies within `[ic0..ic0+tm) x [jc0..jc0+tn)`.
+                    unsafe {
+                        let c_tile = c_base.add(ic * n + jc);
+                        macro_kernel::<MR_K, NR_K>(
+                            mc, nc, kc, n, alpha, eff_beta, packed_a, pb, c_tile, None, isa,
+                        );
+                    }
+                    di += MC;
+                }
+                pc += KC;
+            }
+            dj += NC;
+        }
+    });
 }
 
 /// Batched single-precision matrix multiplication:
@@ -458,7 +1043,7 @@ fn sgemm_core(
     epilogue: Option<TileEpilogue<'_>>,
     use_parallel: bool,
 ) {
-    let isa = detect_gemm_isa();
+    let isa = select_gemm_isa_for_m(detect_gemm_isa(), m);
     let use_avx2_pack = has_avx2_for_pack();
     let (mr_blk, nr_blk) = match isa {
         GemmIsa::Avx512F => {
@@ -595,6 +1180,7 @@ unsafe fn sgemm_tile_serial(
     isa: GemmIsa,
     use_avx2_pack: bool,
 ) {
+    let isa = select_gemm_isa_for_m(isa, m);
     #[cfg(target_arch = "x86_64")]
     if isa == GemmIsa::Avx512F {
         if n <= NR {
@@ -1930,6 +2516,90 @@ mod tests {
             );
             for idx in 0..m * n {
                 assert!((c[bi * m * n + idx] - c_ref[idx]).abs() < 1e-3);
+            }
+        }
+    }
+
+    #[test]
+    fn test_packed_a_and_packed_b_parity() {
+        let shapes = [
+            (1, 1, 1),
+            (7, 10, 19),
+            (12, 35, 33),
+            (16, 48, 64),
+            (23, 29, 270),
+            (80, 150, 275),
+        ];
+
+        for &(m, n, k) in &shapes {
+            for trans_a in [false, true] {
+                for trans_b in [false, true] {
+                    let a: Vec<f32> = (0..m * k)
+                        .map(|i| ((i * 13 % 29) as f32 - 14.0) * 0.05)
+                        .collect();
+                    let b: Vec<f32> = (0..k * n)
+                        .map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.05)
+                        .collect();
+
+                    let packed_a = PackedA::pack(&a, m, k, trans_a).unwrap();
+                    let packed_b = PackedB::pack(&b, n, k, trans_b).unwrap();
+
+                    let mut c_pa = vec![0.75f32; m * n];
+                    let mut c_pb_ser = vec![0.75f32; m * n];
+                    let mut c_pb_par = vec![0.75f32; m * n];
+                    let mut c_ref = vec![0.75f32; m * n];
+
+                    sgemm_prepacked_a_serial(m, n, k, &packed_a, &b, &mut c_pa, trans_b, 1.25, 0.5)
+                        .unwrap();
+                    sgemm_prepacked_b(
+                        m,
+                        n,
+                        k,
+                        &a,
+                        &packed_b,
+                        &mut c_pb_ser,
+                        trans_a,
+                        1.25,
+                        0.5,
+                        false,
+                    )
+                    .unwrap();
+                    sgemm_prepacked_b(
+                        m,
+                        n,
+                        k,
+                        &a,
+                        &packed_b,
+                        &mut c_pb_par,
+                        trans_a,
+                        1.25,
+                        0.5,
+                        true,
+                    )
+                    .unwrap();
+                    naive_sgemm(m, n, k, &a, &b, &mut c_ref, trans_a, trans_b, 1.25, 0.5);
+
+                    for idx in 0..m * n {
+                        assert!(
+                            (c_pa[idx] - c_ref[idx]).abs() < 2e-3,
+                            "PackedA mismatch at ({m},{n},{k}) ta={trans_a} tb={trans_b} idx={idx}: {} vs {}",
+                            c_pa[idx],
+                            c_ref[idx]
+                        );
+                        assert!(
+                            (c_pb_ser[idx] - c_ref[idx]).abs() < 2e-3,
+                            "PackedB(serial) mismatch at ({m},{n},{k}) ta={trans_a} tb={trans_b} idx={idx}: {} vs {}",
+                            c_pb_ser[idx],
+                            c_ref[idx]
+                        );
+                        assert!(
+                            (c_pb_par[idx] - c_ref[idx]).abs() < 2e-3,
+                            "PackedB(par) mismatch at ({m},{n},{k}) ta={trans_a} tb={trans_b} idx={idx}: {} vs {}",
+                            c_pb_par[idx],
+                            c_ref[idx]
+                        );
+                    }
+                }
             }
         }
     }

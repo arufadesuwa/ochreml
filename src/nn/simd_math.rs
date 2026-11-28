@@ -1007,6 +1007,104 @@ pub(crate) fn simd_exp_sub_max_sum(src: &[f32], dst: &mut [f32]) -> (f32, f32) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+#[allow(dead_code)]
+unsafe fn exp_sub_scalar_into_avx512(src: &[f32], shift: f32, dst: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let n = src.len().min(dst.len());
+    let sp = src.as_ptr();
+    let dp = dst.as_mut_ptr();
+    let vshift = _mm512_set1_ps(shift);
+    let mut i = 0;
+    // SAFETY: `i + 16 <= n <= src.len(), dst.len()`, and AVX-512F is active.
+    unsafe {
+        while i + 16 <= n {
+            let shifted = _mm512_sub_ps(_mm512_loadu_ps(sp.add(i)), vshift);
+            _mm512_storeu_ps(dp.add(i), avx512::exp_ps(shifted));
+            i += 16;
+        }
+    }
+    for idx in i..n {
+        dst[idx] = exp_f32_scalar(src[idx] - shift);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[allow(dead_code)]
+unsafe fn exp_sub_scalar_into_avx2(src: &[f32], shift: f32, dst: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let n = src.len().min(dst.len());
+    let sp = src.as_ptr();
+    let dp = dst.as_mut_ptr();
+    let vshift = _mm256_set1_ps(shift);
+    let mut i = 0;
+    // SAFETY: `i + 8 <= n <= src.len(), dst.len()`, and AVX2+FMA are active.
+    unsafe {
+        while i + 8 <= n {
+            let shifted = _mm256_sub_ps(_mm256_loadu_ps(sp.add(i)), vshift);
+            _mm256_storeu_ps(dp.add(i), avx2::exp_ps(shifted));
+            i += 8;
+        }
+    }
+    for idx in i..n {
+        dst[idx] = exp_f32_scalar(src[idx] - shift);
+    }
+}
+
+#[allow(dead_code)]
+fn exp_sub_scalar_into_chunk(src: &[f32], shift: f32, dst: &mut [f32], isa: SimdIsa) {
+    #[cfg(target_arch = "x86_64")]
+    match isa {
+        SimdIsa::Avx512F => {
+            // SAFETY: `detect_simd_isa()` verified runtime AVX-512F support.
+            unsafe { exp_sub_scalar_into_avx512(src, shift, dst) };
+            return;
+        }
+        SimdIsa::Avx2Fma => {
+            // SAFETY: `detect_simd_isa()` verified runtime AVX2+FMA support.
+            unsafe { exp_sub_scalar_into_avx2(src, shift, dst) };
+            return;
+        }
+        SimdIsa::Scalar => {}
+    }
+    let _ = isa;
+    let n = src.len().min(dst.len());
+    for idx in 0..n {
+        dst[idx] = exp_f32_scalar(src[idx] - shift);
+    }
+}
+
+/// Vectorized `dst[i] = exp(src[i] - shift)` (AVX-512F / AVX2+FMA / scalar fallback).
+///
+/// Handles `f32::NEG_INFINITY` entries cleanly (`exp(-inf - shift) -> 0.0`) and
+/// safely writes `0.0` when `!shift.is_finite()`.
+#[allow(dead_code)]
+pub(crate) fn simd_exp_sub_scalar_into(src: &[f32], shift: f32, dst: &mut [f32]) {
+    let n = src.len().min(dst.len());
+    if n == 0 {
+        return;
+    }
+    if !shift.is_finite() {
+        dst[..n].fill(0.0);
+        return;
+    }
+    let isa = detect_simd_isa();
+    if n >= SIMD_RAYON_THRESHOLD {
+        let chunk = (n / rayon::current_num_threads().max(1))
+            .max(16_384)
+            .div_ceil(16)
+            * 16;
+        src[..n]
+            .par_chunks(chunk)
+            .zip(dst[..n].par_chunks_mut(chunk))
+            .for_each(|(sc, dc)| exp_sub_scalar_into_chunk(sc, shift, dc, isa));
+    } else {
+        exp_sub_scalar_into_chunk(&src[..n], shift, &mut dst[..n], isa);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 unsafe fn softmax_row_avx512(row: &mut [f32]) {
     use std::arch::x86_64::*;
     let n = row.len();
@@ -1886,5 +1984,62 @@ mod tests {
         for &idx in &[0, 17, 65_537, n - 1] {
             assert!((out[idx] - ref_gelu_fwd_f64(x[idx])).abs() < 2e-5);
         }
+    }
+
+    #[test]
+    fn test_simd_exp_sub_scalar_into() {
+        // Non-multiple-of-16 length with finite values, extreme negatives, and NEG_INFINITY.
+        let mut src: Vec<f32> = (-25..=25).map(|i| (i as f32) * 0.3).collect();
+        src[0] = f32::NEG_INFINITY;
+        src[7] = f32::NEG_INFINITY;
+        src[16] = f32::NEG_INFINITY;
+        let last = src.len() - 1;
+        src[last] = f32::NEG_INFINITY;
+        src.push(-120.0);
+        src.push(2.5);
+        let n = src.len();
+        assert_ne!(n % 16, 0);
+
+        let shift = 1.75f32;
+        let mut dst = vec![f32::NAN; n];
+        let mut dst_scalar = vec![f32::NAN; n];
+        simd_exp_sub_scalar_into(&src, shift, &mut dst);
+        exp_sub_scalar_into_chunk(&src, shift, &mut dst_scalar, SimdIsa::Scalar);
+
+        for i in 0..n {
+            if src[i] == f32::NEG_INFINITY || src[i] - shift <= EXP_CLAMP_LO {
+                assert_eq!(dst[i], 0.0, "expected 0.0 at idx={i} for src={}", src[i]);
+                assert_eq!(dst_scalar[i], 0.0);
+            } else {
+                let expected = ((src[i] - shift) as f64).exp() as f32;
+                let rel_err = (dst[i] - expected).abs() / expected.max(1e-6);
+                assert!(
+                    rel_err < 2e-5,
+                    "exp_sub_scalar mismatch at idx={i}: got {} vs {expected}",
+                    dst[i]
+                );
+                assert!((dst[i] - dst_scalar[i]).abs() <= 1e-5 * expected.max(1.0));
+            }
+        }
+
+        // Non-finite shifts must safely produce 0.0 without NaNs.
+        for &bad_shift in &[f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
+            let mut out_bad = vec![1.0f32; n];
+            simd_exp_sub_scalar_into(&src, bad_shift, &mut out_bad);
+            assert!(out_bad.iter().all(|&v| v == 0.0));
+        }
+
+        // Exercise parallel path above SIMD_RAYON_THRESHOLD.
+        let big_n = SIMD_RAYON_THRESHOLD + 23;
+        let mut big_src: Vec<f32> = (0..big_n)
+            .map(|i| ((i % 41) as f32 - 20.0) * 0.25)
+            .collect();
+        big_src[13] = f32::NEG_INFINITY;
+        big_src[big_n - 1] = f32::NEG_INFINITY;
+        let mut big_dst = vec![0.0f32; big_n];
+        simd_exp_sub_scalar_into(&big_src, 0.5, &mut big_dst);
+        assert_eq!(big_dst[13], 0.0);
+        assert_eq!(big_dst[big_n - 1], 0.0);
+        assert!((big_dst[100] - ((big_src[100] - 0.5) as f64).exp() as f32).abs() < 2e-4);
     }
 }

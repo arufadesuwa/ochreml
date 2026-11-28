@@ -25,6 +25,7 @@ use crate::nn::simd_math::{
     simd_sigmoid_into, simd_silu_bwd_into, simd_silu_fwd_into, simd_tanh_into,
 };
 use crate::nn::tensor::{FastRng, Tensor};
+use rayon::prelude::*;
 
 /// Binary serialization tag for `Sequential` in `.dit` files.
 pub const TAG_NN_SEQUENTIAL: u8 = 100;
@@ -1152,9 +1153,13 @@ impl Sequential {
             }
         }
 
-        let max_bs = batch_size.min(n_samples);
-        let backend = get_backend(&self.device);
         let is_cpu = matches!(self.device, DeviceType::Cpu);
+        let max_bs = if is_cpu && matches!(in_state, DimState::Nchw { .. }) {
+            batch_size.min(n_samples).min(64)
+        } else {
+            batch_size.min(n_samples)
+        };
+        let backend = get_backend(&self.device);
 
         let mut buf_a = vec![0.0f32; max_bs * plan.max_dim.max(in_dim)];
         let mut buf_b = vec![0.0f32; max_bs * plan.max_dim.max(in_dim)];
@@ -1834,9 +1839,8 @@ fn forward_layer_raw(
                     .forward_raw(&scratch.c1_out, bs, out_h, out_w, &mut scratch.b1_out)?;
             scratch.b1_mean = m1;
             scratch.b1_inv = i1;
-            for (dst, &v) in scratch.r1_out.iter_mut().zip(scratch.b1_out.iter()) {
-                *dst = v.max(0.0);
-            }
+            scratch.r1_out.copy_from_slice(&scratch.b1_out);
+            simd_relu_inplace(&mut scratch.r1_out);
             rb.conv2
                 .forward_raw(&scratch.r1_out, bs, out_h, out_w, &mut scratch.c2_out)?;
             let (m2, i2) =
@@ -1862,9 +1866,8 @@ fn forward_layer_raw(
                 }
             }
 
-            for (o, &s) in out_slice.iter_mut().zip(scratch.sum_out.iter()) {
-                *o = s.max(0.0);
-            }
+            out_slice.copy_from_slice(&scratch.sum_out);
+            simd_relu_inplace(out_slice);
             Ok(())
         }
     }
@@ -2536,21 +2539,47 @@ fn linear_fused_act_cpu(
 fn bn2d_eval_into(bn: &BatchNorm2d, x: &[f32], batch: usize, h: usize, w: usize, out: &mut [f32]) {
     let c = bn.num_features;
     let plane = h * w;
+    if batch == 0 || c == 0 || plane == 0 {
+        return;
+    }
     let eps_d = bn.eps as f64;
     let gamma = bn.weight.as_ref().map(|t| t.data.as_slice());
     let beta = bn.bias.as_ref().map(|t| t.data.as_slice());
+
+    let mut scale_shift = vec![0.0f32; 2 * c];
+    let (scale, shift) = scale_shift.split_at_mut(c);
     for ch in 0..c {
         let mu = bn.running_mean[ch] as f64;
         let var = bn.running_var[ch] as f64;
         let istd = 1.0 / (var + eps_d).sqrt();
         let g = gamma.map_or(1.0f64, |gd| gd[ch] as f64);
         let bt = beta.map_or(0.0f64, |bd| bd[ch] as f64);
-        for b in 0..batch {
-            let base = (b * c + ch) * plane;
-            for idx in 0..plane {
-                let x_hat = ((x[base + idx] as f64) - mu) * istd;
-                out[base + idx] = (g * x_hat + bt) as f32;
+        scale[ch] = (g * istd) as f32;
+        shift[ch] = (bt - g * mu * istd) as f32;
+    }
+
+    let sample_stride = c * plane;
+    let total_elems = batch * sample_stride;
+    let apply_sample = |b: usize, dst_b: &mut [f32]| {
+        let src_b = &x[b * sample_stride..(b + 1) * sample_stride];
+        for ch in 0..c {
+            let sc = scale[ch];
+            let sh = shift[ch];
+            let dst_c = &mut dst_b[ch * plane..(ch + 1) * plane];
+            let src_c = &src_b[ch * plane..(ch + 1) * plane];
+            for (d, &s) in dst_c.iter_mut().zip(src_c.iter()) {
+                *d = s * sc + sh;
             }
+        }
+    };
+
+    if total_elems >= 16_384 && batch >= 2 {
+        out.par_chunks_mut(sample_stride)
+            .enumerate()
+            .for_each(|(b, dst_b)| apply_sample(b, dst_b));
+    } else {
+        for (b, dst_b) in out.chunks_mut(sample_stride).enumerate() {
+            apply_sample(b, dst_b);
         }
     }
 }
@@ -2684,10 +2713,8 @@ fn forward_layer_eval_ref(
             let (_, out_h, out_w) = out_st.require_nchw("ResidualBlock")?;
             let mid_len = bs * rb.out_channels * out_h * out_w;
             scratch.c1_out.resize(mid_len, 0.0);
-            scratch.b1_out.resize(mid_len, 0.0);
             scratch.r1_out.resize(mid_len, 0.0);
             scratch.c2_out.resize(mid_len, 0.0);
-            scratch.sum_out.resize(mid_len, 0.0);
 
             rb.conv1
                 .forward_raw(in_slice, bs, in_h, in_w, &mut scratch.c1_out)?;
@@ -2697,21 +2724,12 @@ fn forward_layer_eval_ref(
                 bs,
                 out_h,
                 out_w,
-                &mut scratch.b1_out,
+                &mut scratch.r1_out,
             );
-            for (dst, &v) in scratch.r1_out.iter_mut().zip(scratch.b1_out.iter()) {
-                *dst = v.max(0.0);
-            }
+            simd_relu_inplace(&mut scratch.r1_out);
             rb.conv2
                 .forward_raw(&scratch.r1_out, bs, out_h, out_w, &mut scratch.c2_out)?;
-            bn2d_eval_into(
-                &rb.bn2,
-                &scratch.c2_out,
-                bs,
-                out_h,
-                out_w,
-                &mut scratch.sum_out,
-            );
+            bn2d_eval_into(&rb.bn2, &scratch.c2_out, bs, out_h, out_w, out_slice);
 
             if let Some((ref ds_c, ref ds_bn)) = rb.downsample {
                 scratch.ds_c_out.resize(mid_len, 0.0);
@@ -2725,17 +2743,15 @@ fn forward_layer_eval_ref(
                     out_w,
                     &mut scratch.d_tmp1,
                 );
-                for (s, &idv) in scratch.sum_out.iter_mut().zip(scratch.d_tmp1.iter()) {
-                    *s += idv;
+                for (o, &idv) in out_slice.iter_mut().zip(scratch.d_tmp1.iter()) {
+                    *o += idv;
                 }
             } else {
-                for (s, &idv) in scratch.sum_out.iter_mut().zip(in_slice.iter()) {
-                    *s += idv;
+                for (o, &idv) in out_slice.iter_mut().zip(in_slice.iter()) {
+                    *o += idv;
                 }
             }
-            for (o, &s) in out_slice.iter_mut().zip(scratch.sum_out.iter()) {
-                *o = s.max(0.0);
-            }
+            simd_relu_inplace(out_slice);
             Ok(())
         }
     }
