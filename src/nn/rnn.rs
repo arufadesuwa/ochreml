@@ -6,19 +6,65 @@
 use crate::backend::get_backend;
 #[cfg(feature = "cuda-dynamic")]
 use crate::backends::cuda_nn::{
-    CudaSeqGradOutput, cuda_gru_backward, cuda_gru_forward, cuda_lstm_backward, cuda_lstm_forward,
-    cuda_rnn_backward, cuda_rnn_forward,
+    CudaSeqGradOutput, cuda_gru_backward, cuda_gru_forward, cuda_gru_train_steps,
+    cuda_lstm_backward, cuda_lstm_forward, cuda_lstm_train_steps, cuda_rnn_backward,
+    cuda_rnn_forward, cuda_rnn_train_steps,
 };
 use crate::device::DeviceType;
 use crate::error::{OchreError, OchreResult};
 use crate::nn::autograd::{AutogradTape, CustomBackward, CustomBackwardFn, GradStore, Op};
 use crate::nn::dtype::{DType, TensorStorage};
-use crate::nn::gemm_f32::{sgemm, sgemm_serial};
+use crate::nn::gemm_f32::{PackedB, sgemm, sgemm_prepacked_b, sgemm_serial};
+use crate::nn::losses::{MSELoss, Reduction};
 use crate::nn::optim::{clip_grad_norm_, clip_grad_store_norm_};
+use crate::nn::simd_math::{
+    simd_adamw_step_f32, simd_relu_inplace, simd_sigmoid_into, simd_tanh_into,
+};
 use crate::nn::tensor::{Tensor, compute_strides};
+use std::cell::RefCell;
 use std::sync::Arc;
 
-const STEP_SERIAL_GEMM_THRESHOLD: usize = 4_000_000;
+const STEP_SERIAL_GEMM_THRESHOLD: usize = 500_000;
+
+#[derive(Default)]
+struct SeqInferenceScratch {
+    gi_all: Vec<f32>,
+    gh: Vec<f32>,
+    h_prev: Vec<f32>,
+    h_cur: Vec<f32>,
+    c_prev: Vec<f32>,
+    c_cur: Vec<f32>,
+    b_total: Vec<f32>,
+    pre_a: Vec<f32>,
+    pre_b: Vec<f32>,
+    act_a: Vec<f32>,
+    act_b: Vec<f32>,
+    tc_buf: Vec<f32>,
+    layer_a: Vec<f32>,
+    layer_b: Vec<f32>,
+}
+
+thread_local! {
+    static SEQ_INF_SCRATCH: RefCell<SeqInferenceScratch> = RefCell::new(SeqInferenceScratch::default());
+}
+
+#[inline]
+fn ensure_len(buf: &mut Vec<f32>, len: usize) {
+    if buf.len() < len {
+        buf.resize(len, 0.0);
+    }
+}
+
+fn with_seq_inf_scratch<R>(f: impl FnOnce(&mut SeqInferenceScratch) -> R) -> R {
+    SEQ_INF_SCRATCH.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            f(&mut guard)
+        } else {
+            let mut fallback = SeqInferenceScratch::default();
+            f(&mut fallback)
+        }
+    })
+}
 
 #[inline]
 fn quantize_vec(data: Vec<f32>, dtype: DType) -> Vec<f32> {
@@ -26,12 +72,6 @@ fn quantize_vec(data: Vec<f32>, dtype: DType) -> Vec<f32> {
         DType::F32 => data,
         DType::BF16 | DType::F16 => TensorStorage::from_f32_slice(&data, dtype).to_f32_vec(),
     }
-}
-
-#[inline(always)]
-fn sigmoid_f32(x: f32) -> f32 {
-    let xc = x.clamp(-80.0, 80.0);
-    1.0 / (1.0 + (-xc).exp())
 }
 
 #[cfg(feature = "cuda-dynamic")]
@@ -111,6 +151,28 @@ fn gemm_step_dispatch(
         }
     } else {
         gemm_dispatch(m, n, k, a, b, c, trans_a, trans_b, beta, device)
+    }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn gemm_step_prepacked_b(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    packed_b: Option<&PackedB>,
+    b_raw: &[f32],
+    c: &mut [f32],
+    trans_b: bool,
+    beta: f32,
+    device: &DeviceType,
+) -> OchreResult<()> {
+    if let Some(pb) = packed_b {
+        let use_par = m.saturating_mul(n).saturating_mul(k) >= STEP_SERIAL_GEMM_THRESHOLD;
+        sgemm_prepacked_b(m, n, k, a, pb, c, false, 1.0, beta, use_par)
+    } else {
+        gemm_step_dispatch(m, n, k, a, b_raw, c, false, trans_b, beta, device)
     }
 }
 
@@ -618,6 +680,35 @@ impl RNN {
         clip_grad_store_norm_(grads, &ids, max_norm)
     }
 
+    /// Runs `steps` MSE + AdamW training iterations in-place without autograd tape overhead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_steps(
+        &mut self,
+        x: &[f32],
+        target: &[f32],
+        batch: usize,
+        seq_len: usize,
+        steps: usize,
+        lr: f32,
+        weight_decay: f32,
+        grad_clip: Option<f32>,
+    ) -> OchreResult<Vec<f32>> {
+        seq_train_steps_common(
+            &self.cfg,
+            &mut self.weights,
+            SeqTrainKind::Rnn(self.nonlinearity),
+            x,
+            target,
+            batch,
+            seq_len,
+            steps,
+            lr,
+            weight_decay,
+            grad_clip,
+            "RNN",
+        )
+    }
+
     /// Raw forward pass returning `(output [B, S, H*dirs], h_n [L*dirs, B, H])`.
     pub fn forward_raw(
         &self,
@@ -970,140 +1061,184 @@ fn rnn_forward_core(
         ));
     }
 
-    let mut prev_layer_out: Option<Vec<f32>> = None;
+    let out_dim = h * dirs;
+    let layer_out_len = batch * seq_len * out_dim;
+    let mut final_out = vec![0.0f32; layer_out_len];
     let mut hn = vec![0.0f32; units * bh];
     let mut layer_inputs = Vec::with_capacity(if save_cache { cfg.num_layers } else { 0 });
     let mut unit_h_prev = Vec::with_capacity(if save_cache { units } else { 0 });
     let mut unit_h_states = Vec::with_capacity(if save_cache { units } else { 0 });
 
-    let mut x_proj = vec![0.0f32; batch * seq_len * h];
-    let mut h_proj = vec![0.0f32; bh];
+    with_seq_inf_scratch(|scratch| -> OchreResult<()> {
+        let SeqInferenceScratch {
+            gi_all,
+            gh,
+            h_prev,
+            h_cur,
+            b_total,
+            pre_a,
+            layer_a,
+            layer_b,
+            ..
+        } = scratch;
 
-    for layer in 0..cfg.num_layers {
-        let in_dim = if layer == 0 { cfg.input_size } else { h * dirs };
-        let out_dim = h * dirs;
-        let cur_in: &[f32] = match prev_layer_out.as_deref() {
-            Some(buf) => buf,
-            None => x,
-        };
-        let mut layer_out = vec![0.0f32; batch * seq_len * out_dim];
-
-        if save_cache {
-            layer_inputs.push(cur_in.to_vec());
+        let xp_len = batch * seq_len * h;
+        ensure_len(gi_all, xp_len);
+        ensure_len(gh, bh);
+        ensure_len(h_prev, bh);
+        ensure_len(h_cur, bh);
+        ensure_len(b_total, h);
+        ensure_len(pre_a, bh);
+        if cfg.num_layers > 1 {
+            ensure_len(layer_a, layer_out_len);
+            ensure_len(layer_b, layer_out_len);
         }
 
-        for dir in 0..dirs {
-            let u = layer * dirs + dir;
-            gemm_dispatch(
-                batch * seq_len,
-                h,
-                in_dim,
-                cur_in,
-                weights.weight_ih[u],
-                &mut x_proj,
-                false,
-                true,
-                0.0,
-                &cfg.device,
-            )?;
-
-            let mut h_prev = if let Some(h_init) = h0 {
-                h_init[u * bh..(u + 1) * bh].to_vec()
+        for layer in 0..cfg.num_layers {
+            let in_dim = if layer == 0 { cfg.input_size } else { h * dirs };
+            let cur_in: &[f32] = if layer == 0 {
+                x
             } else {
-                vec![0.0f32; bh]
+                &layer_b[..batch * seq_len * in_dim]
+            };
+            let layer_out: &mut [f32] = if layer + 1 < cfg.num_layers {
+                &mut layer_a[..layer_out_len]
+            } else {
+                &mut final_out[..layer_out_len]
             };
 
-            let mut all_prev = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-            let mut all_states = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-
-            let b_ih = weights.bias_ih[u];
-            let b_hh = weights.bias_hh[u];
-            let mut b_total = vec![0.0f32; h];
-            if let Some(v) = b_ih {
-                for (d, &s) in b_total.iter_mut().zip(v.iter()) {
-                    *d += s;
-                }
-            }
-            if let Some(v) = b_hh {
-                for (d, &s) in b_total.iter_mut().zip(v.iter()) {
-                    *d += s;
-                }
+            if save_cache {
+                layer_inputs.push(cur_in.to_vec());
             }
 
-            let mut h_cur = vec![0.0f32; bh];
-            for step in 0..seq_len {
-                let t = if dir == 0 { step } else { seq_len - 1 - step };
-                if save_cache {
-                    all_prev[step * bh..(step + 1) * bh].copy_from_slice(&h_prev);
-                }
-
-                gemm_step_dispatch(
-                    batch,
+            for dir in 0..dirs {
+                let u = layer * dirs + dir;
+                gemm_dispatch(
+                    batch * seq_len,
                     h,
-                    h,
-                    &h_prev,
-                    weights.weight_hh[u],
-                    &mut h_proj,
+                    in_dim,
+                    cur_in,
+                    weights.weight_ih[u],
+                    &mut gi_all[..xp_len],
                     false,
                     true,
                     0.0,
                     &cfg.device,
                 )?;
 
-                for b in 0..batch {
-                    let xp_row = &x_proj[(b * seq_len + t) * h..(b * seq_len + t + 1) * h];
-                    let hp_row = &h_proj[b * h..(b + 1) * h];
-                    let hc_row = &mut h_cur[b * h..(b + 1) * h];
-                    match nonlin {
-                        RnnNonlinearity::Tanh => {
-                            for j in 0..h {
-                                hc_row[j] = (xp_row[j] + hp_row[j] + b_total[j]).tanh();
-                            }
-                        }
-                        RnnNonlinearity::Relu => {
-                            for j in 0..h {
-                                hc_row[j] = (xp_row[j] + hp_row[j] + b_total[j]).max(0.0);
-                            }
-                        }
+                if let Some(h_init) = h0 {
+                    h_prev[..bh].copy_from_slice(&h_init[u * bh..(u + 1) * bh]);
+                } else {
+                    h_prev[..bh].fill(0.0);
+                }
+
+                let mut all_prev = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+                let mut all_states = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+
+                b_total[..h].fill(0.0);
+                if let Some(v) = weights.bias_ih[u] {
+                    for (d, &s) in b_total[..h].iter_mut().zip(v.iter()) {
+                        *d += s;
+                    }
+                }
+                if let Some(v) = weights.bias_hh[u] {
+                    for (d, &s) in b_total[..h].iter_mut().zip(v.iter()) {
+                        *d += s;
                     }
                 }
 
-                write_step_to_batch_seq(
-                    &h_cur,
-                    batch,
-                    seq_len,
-                    out_dim,
-                    dir * h,
-                    h,
-                    t,
-                    &mut layer_out,
-                );
-                if save_cache {
-                    all_states[step * bh..(step + 1) * bh].copy_from_slice(&h_cur);
+                let packed_whh = if matches!(cfg.device, DeviceType::Cpu) {
+                    Some(PackedB::pack(weights.weight_hh[u], h, h, true)?)
+                } else {
+                    None
+                };
+
+                for step in 0..seq_len {
+                    let t = if dir == 0 { step } else { seq_len - 1 - step };
+                    if save_cache {
+                        all_prev[step * bh..(step + 1) * bh].copy_from_slice(&h_prev[..bh]);
+                    }
+
+                    gemm_step_prepacked_b(
+                        batch,
+                        h,
+                        h,
+                        &h_prev[..bh],
+                        packed_whh.as_ref(),
+                        weights.weight_hh[u],
+                        &mut gh[..bh],
+                        true,
+                        0.0,
+                        &cfg.device,
+                    )?;
+
+                    match nonlin {
+                        RnnNonlinearity::Tanh => {
+                            for b in 0..batch {
+                                let xp_row =
+                                    &gi_all[(b * seq_len + t) * h..(b * seq_len + t + 1) * h];
+                                let hp_row = &gh[b * h..(b + 1) * h];
+                                let pa_row = &mut pre_a[b * h..(b + 1) * h];
+                                for j in 0..h {
+                                    pa_row[j] = xp_row[j] + hp_row[j] + b_total[j];
+                                }
+                            }
+                            simd_tanh_into(&pre_a[..bh], &mut h_cur[..bh]);
+                        }
+                        RnnNonlinearity::Relu => {
+                            for b in 0..batch {
+                                let xp_row =
+                                    &gi_all[(b * seq_len + t) * h..(b * seq_len + t + 1) * h];
+                                let hp_row = &gh[b * h..(b + 1) * h];
+                                let hc_row = &mut h_cur[b * h..(b + 1) * h];
+                                for j in 0..h {
+                                    hc_row[j] = xp_row[j] + hp_row[j] + b_total[j];
+                                }
+                            }
+                            simd_relu_inplace(&mut h_cur[..bh]);
+                        }
+                    }
+
+                    write_step_to_batch_seq(
+                        &h_cur[..bh],
+                        batch,
+                        seq_len,
+                        out_dim,
+                        dir * h,
+                        h,
+                        t,
+                        layer_out,
+                    );
+                    if save_cache {
+                        all_states[step * bh..(step + 1) * bh].copy_from_slice(&h_cur[..bh]);
+                    }
+                    std::mem::swap(h_prev, h_cur);
                 }
-                std::mem::swap(&mut h_prev, &mut h_cur);
+
+                hn[u * bh..(u + 1) * bh].copy_from_slice(&h_prev[..bh]);
+                if save_cache {
+                    unit_h_prev.push(all_prev);
+                    unit_h_states.push(all_states);
+                }
             }
 
-            hn[u * bh..(u + 1) * bh].copy_from_slice(&h_prev);
-            if save_cache {
-                unit_h_prev.push(all_prev);
-                unit_h_states.push(all_states);
+            if layer + 1 < cfg.num_layers {
+                std::mem::swap(layer_a, layer_b);
             }
         }
-
-        prev_layer_out = Some(layer_out);
-    }
+        Ok(())
+    })?;
 
     Ok((
-        prev_layer_out.unwrap_or_default(),
+        final_out,
         hn,
         RnnCache {
             batch,
@@ -1165,6 +1300,12 @@ fn rnn_backward_core(
             let mut da_all = vec![0.0f32; batch * seq_len * h];
             let mut da_steps = vec![0.0f32; seq_len * bh];
 
+            let packed_whh = if matches!(cfg.device, DeviceType::Cpu) {
+                Some(PackedB::pack(weights.weight_hh[u], h, h, false)?)
+            } else {
+                None
+            };
+
             for step in (0..seq_len).rev() {
                 let t = if dir == 0 { step } else { seq_len - 1 - step };
                 let h_cur = &cache.unit_h_states[u][step * bh..(step + 1) * bh];
@@ -1200,14 +1341,14 @@ fn rnn_backward_core(
                     }
                 }
 
-                gemm_step_dispatch(
+                gemm_step_prepacked_b(
                     batch,
                     h,
                     h,
                     da_step,
+                    packed_whh.as_ref(),
                     weights.weight_hh[u],
                     &mut dh_next,
-                    false,
                     false,
                     0.0,
                     &cfg.device,
@@ -1367,6 +1508,35 @@ impl GRU {
     pub fn clip_grad_store_norm(&self, grads: &mut GradStore, max_norm: f32) -> f32 {
         let ids = self.weights.param_node_ids();
         clip_grad_store_norm_(grads, &ids, max_norm)
+    }
+
+    /// Runs `steps` MSE + AdamW training iterations in-place without autograd tape overhead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_steps(
+        &mut self,
+        x: &[f32],
+        target: &[f32],
+        batch: usize,
+        seq_len: usize,
+        steps: usize,
+        lr: f32,
+        weight_decay: f32,
+        grad_clip: Option<f32>,
+    ) -> OchreResult<Vec<f32>> {
+        seq_train_steps_common(
+            &self.cfg,
+            &mut self.weights,
+            SeqTrainKind::Gru,
+            x,
+            target,
+            batch,
+            seq_len,
+            steps,
+            lr,
+            weight_decay,
+            grad_clip,
+            "GRU",
+        )
     }
 
     /// Raw forward pass returning `(output [B, S, H*dirs], h_n [L*dirs, B, H])`.
@@ -1701,7 +1871,9 @@ fn gru_forward_core(
         ));
     }
 
-    let mut prev_layer_out: Option<Vec<f32>> = None;
+    let out_dim = h * dirs;
+    let layer_out_len = batch * seq_len * out_dim;
+    let mut final_out = vec![0.0f32; layer_out_len];
     let mut hn = vec![0.0f32; units * bh];
     let mut layer_inputs = Vec::with_capacity(if save_cache { cfg.num_layers } else { 0 });
     let mut unit_h_prev = Vec::with_capacity(if save_cache { units } else { 0 });
@@ -1710,176 +1882,233 @@ fn gru_forward_core(
     let mut unit_n = Vec::with_capacity(if save_cache { units } else { 0 });
     let mut unit_gh_n = Vec::with_capacity(if save_cache { units } else { 0 });
 
-    let mut gi_all = vec![0.0f32; batch * seq_len * h3];
-    let mut gh = vec![0.0f32; bh3];
+    with_seq_inf_scratch(|scratch| -> OchreResult<()> {
+        let SeqInferenceScratch {
+            gi_all,
+            gh,
+            h_prev,
+            h_cur,
+            b_total,
+            pre_a,
+            pre_b,
+            act_a,
+            act_b,
+            layer_a,
+            layer_b,
+            ..
+        } = scratch;
 
-    for layer in 0..cfg.num_layers {
-        let in_dim = if layer == 0 { cfg.input_size } else { h * dirs };
-        let out_dim = h * dirs;
-        let cur_in: &[f32] = match prev_layer_out.as_deref() {
-            Some(buf) => buf,
-            None => x,
-        };
-        let mut layer_out = vec![0.0f32; batch * seq_len * out_dim];
-
-        if save_cache {
-            layer_inputs.push(cur_in.to_vec());
+        let gi_len = batch * seq_len * h3;
+        ensure_len(gi_all, gi_len);
+        ensure_len(gh, bh3);
+        ensure_len(h_prev, bh);
+        ensure_len(h_cur, bh);
+        ensure_len(b_total, 4 * h);
+        ensure_len(pre_a, 2 * bh);
+        ensure_len(act_a, 2 * bh);
+        ensure_len(pre_b, bh);
+        ensure_len(act_b, bh);
+        if cfg.num_layers > 1 {
+            ensure_len(layer_a, layer_out_len);
+            ensure_len(layer_b, layer_out_len);
         }
 
-        for dir in 0..dirs {
-            let u = layer * dirs + dir;
-            gemm_dispatch(
-                batch * seq_len,
-                h3,
-                in_dim,
-                cur_in,
-                weights.weight_ih[u],
-                &mut gi_all,
-                false,
-                true,
-                0.0,
-                &cfg.device,
-            )?;
-
-            let mut h_prev = if let Some(h_init) = h0 {
-                h_init[u * bh..(u + 1) * bh].to_vec()
+        for layer in 0..cfg.num_layers {
+            let in_dim = if layer == 0 { cfg.input_size } else { h * dirs };
+            let cur_in: &[f32] = if layer == 0 {
+                x
             } else {
-                vec![0.0f32; bh]
+                &layer_b[..batch * seq_len * in_dim]
+            };
+            let layer_out: &mut [f32] = if layer + 1 < cfg.num_layers {
+                &mut layer_a[..layer_out_len]
+            } else {
+                &mut final_out[..layer_out_len]
             };
 
-            let mut all_prev = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-            let mut all_r = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-            let mut all_z = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-            let mut all_n = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-            let mut all_gh_n = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-
-            let b_ih = weights.bias_ih[u];
-            let b_hh = weights.bias_hh[u];
-            let mut br_sum = vec![0.0f32; h];
-            let mut bz_sum = vec![0.0f32; h];
-            let mut bi_n = vec![0.0f32; h];
-            let mut bh_n = vec![0.0f32; h];
-            if let Some(v) = b_ih {
-                for j in 0..h {
-                    br_sum[j] += v[j];
-                    bz_sum[j] += v[h + j];
-                    bi_n[j] = v[2 * h + j];
-                }
-            }
-            if let Some(v) = b_hh {
-                for j in 0..h {
-                    br_sum[j] += v[j];
-                    bz_sum[j] += v[h + j];
-                    bh_n[j] = v[2 * h + j];
-                }
+            if save_cache {
+                layer_inputs.push(cur_in.to_vec());
             }
 
-            let mut h_cur = vec![0.0f32; bh];
-            for step in 0..seq_len {
-                let t = if dir == 0 { step } else { seq_len - 1 - step };
-                if save_cache {
-                    all_prev[step * bh..(step + 1) * bh].copy_from_slice(&h_prev);
-                }
-
-                gemm_step_dispatch(
-                    batch,
+            for dir in 0..dirs {
+                let u = layer * dirs + dir;
+                gemm_dispatch(
+                    batch * seq_len,
                     h3,
-                    h,
-                    &h_prev,
-                    weights.weight_hh[u],
-                    &mut gh,
+                    in_dim,
+                    cur_in,
+                    weights.weight_ih[u],
+                    &mut gi_all[..gi_len],
                     false,
                     true,
                     0.0,
                     &cfg.device,
                 )?;
 
-                for b in 0..batch {
-                    let gi_row = &gi_all[(b * seq_len + t) * h3..(b * seq_len + t + 1) * h3];
-                    let gh_row = &gh[b * h3..(b + 1) * h3];
-                    let (gi_r, gi_zn) = gi_row.split_at(h);
-                    let (gi_z, gi_n) = gi_zn.split_at(h);
-                    let (gh_r, gh_zn) = gh_row.split_at(h);
-                    let (gh_z, gh_n_slice) = gh_zn.split_at(h);
-                    let hp_row = &h_prev[b * h..(b + 1) * h];
-                    let hc_row = &mut h_cur[b * h..(b + 1) * h];
+                if let Some(h_init) = h0 {
+                    h_prev[..bh].copy_from_slice(&h_init[u * bh..(u + 1) * bh]);
+                } else {
+                    h_prev[..bh].fill(0.0);
+                }
 
-                    if save_cache {
-                        let base = step * bh + b * h;
-                        let r_dst = &mut all_r[base..base + h];
-                        let z_dst = &mut all_z[base..base + h];
-                        let n_dst = &mut all_n[base..base + h];
-                        let ghn_dst = &mut all_gh_n[base..base + h];
+                let mut all_prev = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+                let mut all_r = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+                let mut all_z = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+                let mut all_n = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+                let mut all_gh_n = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+
+                b_total[..4 * h].fill(0.0);
+                {
+                    let (br_sum, rest) = b_total[..4 * h].split_at_mut(h);
+                    let (bz_sum, rest2) = rest.split_at_mut(h);
+                    let (bi_n, bh_n) = rest2.split_at_mut(h);
+                    if let Some(v) = weights.bias_ih[u] {
                         for j in 0..h {
-                            let r = sigmoid_f32(gi_r[j] + gh_r[j] + br_sum[j]);
-                            let z = sigmoid_f32(gi_z[j] + gh_z[j] + bz_sum[j]);
-                            let gh_n_val = gh_n_slice[j] + bh_n[j];
-                            let n = (gi_n[j] + bi_n[j] + r * gh_n_val).tanh();
-                            hc_row[j] = (1.0 - z) * n + z * hp_row[j];
-                            r_dst[j] = r;
-                            z_dst[j] = z;
-                            n_dst[j] = n;
-                            ghn_dst[j] = gh_n_val;
+                            br_sum[j] += v[j];
+                            bz_sum[j] += v[h + j];
+                            bi_n[j] = v[2 * h + j];
                         }
-                    } else {
+                    }
+                    if let Some(v) = weights.bias_hh[u] {
                         for j in 0..h {
-                            let r = sigmoid_f32(gi_r[j] + gh_r[j] + br_sum[j]);
-                            let z = sigmoid_f32(gi_z[j] + gh_z[j] + bz_sum[j]);
-                            let gh_n_val = gh_n_slice[j] + bh_n[j];
-                            let n = (gi_n[j] + bi_n[j] + r * gh_n_val).tanh();
-                            hc_row[j] = (1.0 - z) * n + z * hp_row[j];
+                            br_sum[j] += v[j];
+                            bz_sum[j] += v[h + j];
+                            bh_n[j] = v[2 * h + j];
                         }
                     }
                 }
+                let (br_sum, rest) = b_total[..4 * h].split_at(h);
+                let (bz_sum, rest2) = rest.split_at(h);
+                let (bi_n, bh_n) = rest2.split_at(h);
 
-                write_step_to_batch_seq(
-                    &h_cur,
-                    batch,
-                    seq_len,
-                    out_dim,
-                    dir * h,
-                    h,
-                    t,
-                    &mut layer_out,
-                );
-                std::mem::swap(&mut h_prev, &mut h_cur);
+                let packed_whh = if matches!(cfg.device, DeviceType::Cpu) {
+                    Some(PackedB::pack(weights.weight_hh[u], h3, h, true)?)
+                } else {
+                    None
+                };
+
+                for step in 0..seq_len {
+                    let t = if dir == 0 { step } else { seq_len - 1 - step };
+                    if save_cache {
+                        all_prev[step * bh..(step + 1) * bh].copy_from_slice(&h_prev[..bh]);
+                    }
+
+                    gemm_step_prepacked_b(
+                        batch,
+                        h3,
+                        h,
+                        &h_prev[..bh],
+                        packed_whh.as_ref(),
+                        weights.weight_hh[u],
+                        &mut gh[..bh3],
+                        true,
+                        0.0,
+                        &cfg.device,
+                    )?;
+
+                    {
+                        let (pre_r, pre_z) = pre_a[..2 * bh].split_at_mut(bh);
+                        for b in 0..batch {
+                            let gi_row =
+                                &gi_all[(b * seq_len + t) * h3..(b * seq_len + t + 1) * h3];
+                            let gh_row = &gh[b * h3..(b + 1) * h3];
+                            let dst_r = &mut pre_r[b * h..(b + 1) * h];
+                            let dst_z = &mut pre_z[b * h..(b + 1) * h];
+                            for j in 0..h {
+                                dst_r[j] = gi_row[j] + gh_row[j] + br_sum[j];
+                                dst_z[j] = gi_row[h + j] + gh_row[h + j] + bz_sum[j];
+                            }
+                        }
+                    }
+                    simd_sigmoid_into(&pre_a[..2 * bh], &mut act_a[..2 * bh]);
+
+                    let (r_act, z_act) = act_a[..2 * bh].split_at(bh);
+                    for b in 0..batch {
+                        let gi_n =
+                            &gi_all[(b * seq_len + t) * h3 + 2 * h..(b * seq_len + t + 1) * h3];
+                        let gh_n_slice = &gh[b * h3 + 2 * h..(b + 1) * h3];
+                        let r_row = &r_act[b * h..(b + 1) * h];
+                        let dst_n = &mut pre_b[b * h..(b + 1) * h];
+                        if save_cache {
+                            let ghn_dst = &mut all_gh_n[step * bh + b * h..step * bh + (b + 1) * h];
+                            for j in 0..h {
+                                let gh_n_val = gh_n_slice[j] + bh_n[j];
+                                ghn_dst[j] = gh_n_val;
+                                dst_n[j] = gi_n[j] + bi_n[j] + r_row[j] * gh_n_val;
+                            }
+                        } else {
+                            for j in 0..h {
+                                let gh_n_val = gh_n_slice[j] + bh_n[j];
+                                dst_n[j] = gi_n[j] + bi_n[j] + r_row[j] * gh_n_val;
+                            }
+                        }
+                    }
+                    simd_tanh_into(&pre_b[..bh], &mut act_b[..bh]);
+
+                    let n_act = &act_b[..bh];
+                    for j in 0..bh {
+                        let z = z_act[j];
+                        h_cur[j] = (1.0 - z) * n_act[j] + z * h_prev[j];
+                    }
+                    if save_cache {
+                        let base = step * bh;
+                        all_r[base..base + bh].copy_from_slice(r_act);
+                        all_z[base..base + bh].copy_from_slice(z_act);
+                        all_n[base..base + bh].copy_from_slice(n_act);
+                    }
+
+                    write_step_to_batch_seq(
+                        &h_cur[..bh],
+                        batch,
+                        seq_len,
+                        out_dim,
+                        dir * h,
+                        h,
+                        t,
+                        layer_out,
+                    );
+                    std::mem::swap(h_prev, h_cur);
+                }
+
+                hn[u * bh..(u + 1) * bh].copy_from_slice(&h_prev[..bh]);
+                if save_cache {
+                    unit_h_prev.push(all_prev);
+                    unit_r.push(all_r);
+                    unit_z.push(all_z);
+                    unit_n.push(all_n);
+                    unit_gh_n.push(all_gh_n);
+                }
             }
 
-            hn[u * bh..(u + 1) * bh].copy_from_slice(&h_prev);
-            if save_cache {
-                unit_h_prev.push(all_prev);
-                unit_r.push(all_r);
-                unit_z.push(all_z);
-                unit_n.push(all_n);
-                unit_gh_n.push(all_gh_n);
+            if layer + 1 < cfg.num_layers {
+                std::mem::swap(layer_a, layer_b);
             }
         }
-
-        prev_layer_out = Some(layer_out);
-    }
+        Ok(())
+    })?;
 
     Ok((
-        prev_layer_out.unwrap_or_default(),
+        final_out,
         hn,
         GruCache {
             batch,
@@ -1945,6 +2174,12 @@ fn gru_backward_core(
             let mut dgi_all = vec![0.0f32; batch * seq_len * h3];
             let mut dgh_steps = vec![0.0f32; seq_len * bh3];
 
+            let packed_whh = if matches!(cfg.device, DeviceType::Cpu) {
+                Some(PackedB::pack(weights.weight_hh[u], h, h3, false)?)
+            } else {
+                None
+            };
+
             for step in (0..seq_len).rev() {
                 let t = if dir == 0 { step } else { seq_len - 1 - step };
                 let off = step * bh;
@@ -1989,14 +2224,14 @@ fn gru_backward_core(
                     }
                 }
 
-                gemm_step_dispatch(
+                gemm_step_prepacked_b(
                     batch,
                     h,
                     h3,
                     dgh,
+                    packed_whh.as_ref(),
                     weights.weight_hh[u],
                     &mut dh_next,
-                    false,
                     false,
                     1.0,
                     &cfg.device,
@@ -2152,6 +2387,35 @@ impl LSTM {
     pub fn clip_grad_store_norm(&self, grads: &mut GradStore, max_norm: f32) -> f32 {
         let ids = self.weights.param_node_ids();
         clip_grad_store_norm_(grads, &ids, max_norm)
+    }
+
+    /// Runs `steps` MSE + AdamW training iterations in-place without autograd tape overhead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_steps(
+        &mut self,
+        x: &[f32],
+        target: &[f32],
+        batch: usize,
+        seq_len: usize,
+        steps: usize,
+        lr: f32,
+        weight_decay: f32,
+        grad_clip: Option<f32>,
+    ) -> OchreResult<Vec<f32>> {
+        seq_train_steps_common(
+            &self.cfg,
+            &mut self.weights,
+            SeqTrainKind::Lstm,
+            x,
+            target,
+            batch,
+            seq_len,
+            steps,
+            lr,
+            weight_decay,
+            grad_clip,
+            "LSTM",
+        )
     }
 
     /// Raw forward pass returning `(output [B, S, H*dirs], h_n [L*dirs, B, H], c_n [L*dirs, B, H])`.
@@ -2550,7 +2814,9 @@ fn lstm_forward_core(
         ));
     }
 
-    let mut prev_layer_out: Option<Vec<f32>> = None;
+    let out_dim = h * dirs;
+    let layer_out_len = batch * seq_len * out_dim;
+    let mut final_out = vec![0.0f32; layer_out_len];
     let mut hn = vec![0.0f32; units * bh];
     let mut cn = vec![0.0f32; units * bh];
 
@@ -2563,207 +2829,239 @@ fn lstm_forward_core(
     let mut unit_o = Vec::with_capacity(if save_cache { units } else { 0 });
     let mut unit_tc = Vec::with_capacity(if save_cache { units } else { 0 });
 
-    let mut gi_all = vec![0.0f32; batch * seq_len * h4];
-    let mut gh = vec![0.0f32; bh4];
+    with_seq_inf_scratch(|scratch| -> OchreResult<()> {
+        let SeqInferenceScratch {
+            gi_all,
+            gh,
+            h_prev,
+            h_cur,
+            c_prev,
+            c_cur,
+            b_total,
+            pre_a,
+            pre_b,
+            act_a,
+            act_b,
+            tc_buf,
+            layer_a,
+            layer_b,
+        } = scratch;
 
-    for layer in 0..cfg.num_layers {
-        let in_dim = if layer == 0 { cfg.input_size } else { h * dirs };
-        let out_dim = h * dirs;
-        let cur_in: &[f32] = match prev_layer_out.as_deref() {
-            Some(buf) => buf,
-            None => x,
-        };
-        let mut layer_out = vec![0.0f32; batch * seq_len * out_dim];
-
-        if save_cache {
-            layer_inputs.push(cur_in.to_vec());
+        let gi_len = batch * seq_len * h4;
+        ensure_len(gi_all, gi_len);
+        ensure_len(gh, bh4);
+        ensure_len(h_prev, bh);
+        ensure_len(h_cur, bh);
+        ensure_len(c_prev, bh);
+        ensure_len(c_cur, bh);
+        ensure_len(b_total, h4);
+        ensure_len(pre_a, 3 * bh);
+        ensure_len(act_a, 3 * bh);
+        ensure_len(pre_b, bh);
+        ensure_len(act_b, bh);
+        ensure_len(tc_buf, bh);
+        if cfg.num_layers > 1 {
+            ensure_len(layer_a, layer_out_len);
+            ensure_len(layer_b, layer_out_len);
         }
 
-        for dir in 0..dirs {
-            let u = layer * dirs + dir;
-            gemm_dispatch(
-                batch * seq_len,
-                h4,
-                in_dim,
-                cur_in,
-                weights.weight_ih[u],
-                &mut gi_all,
-                false,
-                true,
-                0.0,
-                &cfg.device,
-            )?;
-
-            let mut h_prev = if let Some(h_init) = h0 {
-                h_init[u * bh..(u + 1) * bh].to_vec()
+        for layer in 0..cfg.num_layers {
+            let in_dim = if layer == 0 { cfg.input_size } else { h * dirs };
+            let cur_in: &[f32] = if layer == 0 {
+                x
             } else {
-                vec![0.0f32; bh]
+                &layer_b[..batch * seq_len * in_dim]
             };
-            let mut c_prev = if let Some(c_init) = c0 {
-                c_init[u * bh..(u + 1) * bh].to_vec()
+            let layer_out: &mut [f32] = if layer + 1 < cfg.num_layers {
+                &mut layer_a[..layer_out_len]
             } else {
-                vec![0.0f32; bh]
+                &mut final_out[..layer_out_len]
             };
 
-            let mut all_hp = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-            let mut all_cp = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-            let mut all_i = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-            let mut all_f = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-            let mut all_g = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-            let mut all_o = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-            let mut all_tc = if save_cache {
-                vec![0.0f32; seq_len * bh]
-            } else {
-                Vec::new()
-            };
-
-            let b_ih = weights.bias_ih[u];
-            let b_hh = weights.bias_hh[u];
-            let mut b_total = vec![0.0f32; h4];
-            if let Some(v) = b_ih {
-                for (d, &s) in b_total.iter_mut().zip(v.iter()) {
-                    *d += s;
-                }
+            if save_cache {
+                layer_inputs.push(cur_in.to_vec());
             }
-            if let Some(v) = b_hh {
-                for (d, &s) in b_total.iter_mut().zip(v.iter()) {
-                    *d += s;
-                }
-            }
-            let (bi, bfgo) = b_total.split_at(h);
-            let (bf, bgo) = bfgo.split_at(h);
-            let (bg, bo) = bgo.split_at(h);
 
-            let mut h_cur = vec![0.0f32; bh];
-            let mut c_cur = vec![0.0f32; bh];
-            for step in 0..seq_len {
-                let t = if dir == 0 { step } else { seq_len - 1 - step };
-                if save_cache {
-                    all_hp[step * bh..(step + 1) * bh].copy_from_slice(&h_prev);
-                    all_cp[step * bh..(step + 1) * bh].copy_from_slice(&c_prev);
-                }
-
-                gemm_step_dispatch(
-                    batch,
+            for dir in 0..dirs {
+                let u = layer * dirs + dir;
+                gemm_dispatch(
+                    batch * seq_len,
                     h4,
-                    h,
-                    &h_prev,
-                    weights.weight_hh[u],
-                    &mut gh,
+                    in_dim,
+                    cur_in,
+                    weights.weight_ih[u],
+                    &mut gi_all[..gi_len],
                     false,
                     true,
                     0.0,
                     &cfg.device,
                 )?;
 
-                for b in 0..batch {
-                    let gi_row = &gi_all[(b * seq_len + t) * h4..(b * seq_len + t + 1) * h4];
-                    let gh_row = &gh[b * h4..(b + 1) * h4];
-                    let (gi_i, gi_fgo) = gi_row.split_at(h);
-                    let (gi_f, gi_go) = gi_fgo.split_at(h);
-                    let (gi_g, gi_o) = gi_go.split_at(h);
-                    let (gh_i, gh_fgo) = gh_row.split_at(h);
-                    let (gh_f, gh_go) = gh_fgo.split_at(h);
-                    let (gh_g, gh_o) = gh_go.split_at(h);
-                    let cp_row = &c_prev[b * h..(b + 1) * h];
-                    let hc_row = &mut h_cur[b * h..(b + 1) * h];
-                    let cc_row = &mut c_cur[b * h..(b + 1) * h];
-
-                    if save_cache {
-                        let base = step * bh + b * h;
-                        let i_dst = &mut all_i[base..base + h];
-                        let f_dst = &mut all_f[base..base + h];
-                        let g_dst = &mut all_g[base..base + h];
-                        let o_dst = &mut all_o[base..base + h];
-                        let tc_dst = &mut all_tc[base..base + h];
-                        for j in 0..h {
-                            let iv = sigmoid_f32(gi_i[j] + gh_i[j] + bi[j]);
-                            let fv = sigmoid_f32(gi_f[j] + gh_f[j] + bf[j]);
-                            let gv = (gi_g[j] + gh_g[j] + bg[j]).tanh();
-                            let ov = sigmoid_f32(gi_o[j] + gh_o[j] + bo[j]);
-
-                            let c_new = fv * cp_row[j] + iv * gv;
-                            let tc = c_new.tanh();
-                            cc_row[j] = c_new;
-                            hc_row[j] = ov * tc;
-
-                            i_dst[j] = iv;
-                            f_dst[j] = fv;
-                            g_dst[j] = gv;
-                            o_dst[j] = ov;
-                            tc_dst[j] = tc;
-                        }
-                    } else {
-                        for j in 0..h {
-                            let iv = sigmoid_f32(gi_i[j] + gh_i[j] + bi[j]);
-                            let fv = sigmoid_f32(gi_f[j] + gh_f[j] + bf[j]);
-                            let gv = (gi_g[j] + gh_g[j] + bg[j]).tanh();
-                            let ov = sigmoid_f32(gi_o[j] + gh_o[j] + bo[j]);
-
-                            let c_new = fv * cp_row[j] + iv * gv;
-                            let tc = c_new.tanh();
-                            cc_row[j] = c_new;
-                            hc_row[j] = ov * tc;
-                        }
-                    }
+                if let Some(h_init) = h0 {
+                    h_prev[..bh].copy_from_slice(&h_init[u * bh..(u + 1) * bh]);
+                } else {
+                    h_prev[..bh].fill(0.0);
+                }
+                if let Some(c_init) = c0 {
+                    c_prev[..bh].copy_from_slice(&c_init[u * bh..(u + 1) * bh]);
+                } else {
+                    c_prev[..bh].fill(0.0);
                 }
 
-                write_step_to_batch_seq(
-                    &h_cur,
-                    batch,
-                    seq_len,
-                    out_dim,
-                    dir * h,
-                    h,
-                    t,
-                    &mut layer_out,
-                );
-                std::mem::swap(&mut h_prev, &mut h_cur);
-                std::mem::swap(&mut c_prev, &mut c_cur);
+                let mut all_hp = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+                let mut all_cp = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+                let mut all_i = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+                let mut all_f = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+                let mut all_g = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+                let mut all_o = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+                let mut all_tc = if save_cache {
+                    vec![0.0f32; seq_len * bh]
+                } else {
+                    Vec::new()
+                };
+
+                b_total[..h4].fill(0.0);
+                if let Some(v) = weights.bias_ih[u] {
+                    for (d, &s) in b_total[..h4].iter_mut().zip(v.iter()) {
+                        *d += s;
+                    }
+                }
+                if let Some(v) = weights.bias_hh[u] {
+                    for (d, &s) in b_total[..h4].iter_mut().zip(v.iter()) {
+                        *d += s;
+                    }
+                }
+                let (bi, bfgo) = b_total[..h4].split_at(h);
+                let (bf, bgo) = bfgo.split_at(h);
+                let (bg, bo) = bgo.split_at(h);
+
+                let packed_whh = if matches!(cfg.device, DeviceType::Cpu) {
+                    Some(PackedB::pack(weights.weight_hh[u], h4, h, true)?)
+                } else {
+                    None
+                };
+
+                for step in 0..seq_len {
+                    let t = if dir == 0 { step } else { seq_len - 1 - step };
+                    if save_cache {
+                        all_hp[step * bh..(step + 1) * bh].copy_from_slice(&h_prev[..bh]);
+                        all_cp[step * bh..(step + 1) * bh].copy_from_slice(&c_prev[..bh]);
+                    }
+
+                    gemm_step_prepacked_b(
+                        batch,
+                        h4,
+                        h,
+                        &h_prev[..bh],
+                        packed_whh.as_ref(),
+                        weights.weight_hh[u],
+                        &mut gh[..bh4],
+                        true,
+                        0.0,
+                        &cfg.device,
+                    )?;
+
+                    {
+                        let (pre_i, pre_fo) = pre_a[..3 * bh].split_at_mut(bh);
+                        let (pre_f, pre_o) = pre_fo.split_at_mut(bh);
+                        for b in 0..batch {
+                            let gi_row =
+                                &gi_all[(b * seq_len + t) * h4..(b * seq_len + t + 1) * h4];
+                            let gh_row = &gh[b * h4..(b + 1) * h4];
+                            let dst_i = &mut pre_i[b * h..(b + 1) * h];
+                            let dst_f = &mut pre_f[b * h..(b + 1) * h];
+                            let dst_o = &mut pre_o[b * h..(b + 1) * h];
+                            let dst_g = &mut pre_b[b * h..(b + 1) * h];
+                            for j in 0..h {
+                                dst_i[j] = gi_row[j] + gh_row[j] + bi[j];
+                                dst_f[j] = gi_row[h + j] + gh_row[h + j] + bf[j];
+                                dst_g[j] = gi_row[2 * h + j] + gh_row[2 * h + j] + bg[j];
+                                dst_o[j] = gi_row[3 * h + j] + gh_row[3 * h + j] + bo[j];
+                            }
+                        }
+                    }
+                    simd_sigmoid_into(&pre_a[..3 * bh], &mut act_a[..3 * bh]);
+                    simd_tanh_into(&pre_b[..bh], &mut act_b[..bh]);
+
+                    let (i_act, fo_act) = act_a[..3 * bh].split_at(bh);
+                    let (f_act, o_act) = fo_act.split_at(bh);
+                    let g_act = &act_b[..bh];
+                    for j in 0..bh {
+                        c_cur[j] = f_act[j] * c_prev[j] + i_act[j] * g_act[j];
+                    }
+                    simd_tanh_into(&c_cur[..bh], &mut tc_buf[..bh]);
+                    for j in 0..bh {
+                        h_cur[j] = o_act[j] * tc_buf[j];
+                    }
+                    if save_cache {
+                        let base = step * bh;
+                        all_i[base..base + bh].copy_from_slice(i_act);
+                        all_f[base..base + bh].copy_from_slice(f_act);
+                        all_g[base..base + bh].copy_from_slice(g_act);
+                        all_o[base..base + bh].copy_from_slice(o_act);
+                        all_tc[base..base + bh].copy_from_slice(&tc_buf[..bh]);
+                    }
+
+                    write_step_to_batch_seq(
+                        &h_cur[..bh],
+                        batch,
+                        seq_len,
+                        out_dim,
+                        dir * h,
+                        h,
+                        t,
+                        layer_out,
+                    );
+                    std::mem::swap(h_prev, h_cur);
+                    std::mem::swap(c_prev, c_cur);
+                }
+
+                hn[u * bh..(u + 1) * bh].copy_from_slice(&h_prev[..bh]);
+                cn[u * bh..(u + 1) * bh].copy_from_slice(&c_prev[..bh]);
+                if save_cache {
+                    unit_h_prev.push(all_hp);
+                    unit_c_prev.push(all_cp);
+                    unit_i.push(all_i);
+                    unit_f.push(all_f);
+                    unit_g.push(all_g);
+                    unit_o.push(all_o);
+                    unit_tc.push(all_tc);
+                }
             }
 
-            hn[u * bh..(u + 1) * bh].copy_from_slice(&h_prev);
-            cn[u * bh..(u + 1) * bh].copy_from_slice(&c_prev);
-            if save_cache {
-                unit_h_prev.push(all_hp);
-                unit_c_prev.push(all_cp);
-                unit_i.push(all_i);
-                unit_f.push(all_f);
-                unit_g.push(all_g);
-                unit_o.push(all_o);
-                unit_tc.push(all_tc);
+            if layer + 1 < cfg.num_layers {
+                std::mem::swap(layer_a, layer_b);
             }
         }
-
-        prev_layer_out = Some(layer_out);
-    }
+        Ok(())
+    })?;
 
     Ok((
-        prev_layer_out.unwrap_or_default(),
+        final_out,
         hn,
         cn,
         LstmCache {
@@ -2835,6 +3133,12 @@ fn lstm_backward_core(
             let mut dgates_all = vec![0.0f32; batch * seq_len * h4];
             let mut dgates_steps = vec![0.0f32; seq_len * bh4];
 
+            let packed_whh = if matches!(cfg.device, DeviceType::Cpu) {
+                Some(PackedB::pack(weights.weight_hh[u], h, h4, false)?)
+            } else {
+                None
+            };
+
             for step in (0..seq_len).rev() {
                 let t = if dir == 0 { step } else { seq_len - 1 - step };
                 let off = step * bh;
@@ -2885,14 +3189,14 @@ fn lstm_backward_core(
                     }
                 }
 
-                gemm_step_dispatch(
+                gemm_step_prepacked_b(
                     batch,
                     h,
                     h4,
                     dgates_step,
+                    packed_whh.as_ref(),
                     weights.weight_hh[u],
                     &mut dh_next,
-                    false,
                     false,
                     0.0,
                     &cfg.device,
@@ -2971,6 +3275,292 @@ fn lstm_backward_core(
         d_bias_ih,
         d_bias_hh,
     })
+}
+
+#[derive(Clone, Copy)]
+enum SeqTrainKind {
+    Rnn(RnnNonlinearity),
+    Gru,
+    Lstm,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seq_train_steps_common(
+    cfg: &SeqCoreConfig,
+    weights: &mut SeqWeights,
+    kind: SeqTrainKind,
+    x: &[f32],
+    target: &[f32],
+    batch: usize,
+    seq_len: usize,
+    steps: usize,
+    lr: f32,
+    weight_decay: f32,
+    grad_clip: Option<f32>,
+    name: &str,
+) -> OchreResult<Vec<f32>> {
+    if batch == 0 || seq_len == 0 {
+        return Err(OchreError::EmptyData);
+    }
+    if steps == 0 {
+        return Err(OchreError::InvalidParameter(format!(
+            "{name}::train_steps steps must be > 0 ( >_< )"
+        )));
+    }
+    if !lr.is_finite() || lr < 0.0 {
+        return Err(OchreError::InvalidParameter(format!(
+            "{name}::train_steps lr={lr} must be finite and >= 0 ( >_< )"
+        )));
+    }
+    if !weight_decay.is_finite() || weight_decay < 0.0 {
+        return Err(OchreError::InvalidParameter(format!(
+            "{name}::train_steps weight_decay={weight_decay} must be finite and >= 0 ( >_< )"
+        )));
+    }
+    if let Some(gc) = grad_clip
+        && (!gc.is_finite() || gc < 0.0)
+    {
+        return Err(OchreError::InvalidParameter(format!(
+            "{name}::train_steps grad_clip={gc} must be finite and >= 0 ( >_< )"
+        )));
+    }
+    let dirs = if cfg.bidirectional { 2 } else { 1 };
+    let out_features = cfg.hidden_size * dirs;
+    let expected_x = batch
+        .checked_mul(seq_len)
+        .and_then(|v| v.checked_mul(cfg.input_size))
+        .ok_or_else(|| {
+            OchreError::InvalidParameter(format!("{name}::train_steps x size overflow ( >_< )"))
+        })?;
+    let expected_t = batch
+        .checked_mul(seq_len)
+        .and_then(|v| v.checked_mul(out_features))
+        .ok_or_else(|| {
+            OchreError::InvalidParameter(format!(
+                "{name}::train_steps target size overflow ( >_< )"
+            ))
+        })?;
+    if x.len() != expected_x {
+        return Err(OchreError::InvalidParameter(format!(
+            "{name}::train_steps expected x len {expected_x} ({batch}x{seq_len}x{}), got {} ( >_< )",
+            cfg.input_size,
+            x.len()
+        )));
+    }
+    if target.len() != expected_t {
+        return Err(OchreError::InvalidParameter(format!(
+            "{name}::train_steps expected target len {expected_t} ({batch}x{seq_len}x{out_features}), got {} ( >_< )",
+            target.len()
+        )));
+    }
+
+    #[cfg(feature = "cuda-dynamic")]
+    if let Some(gpu_id) = cuda_gpu_id(&cfg.device) {
+        let mut w_ih: Vec<&mut [f32]> = weights
+            .weight_ih
+            .iter_mut()
+            .map(|t| t.data.as_mut_slice())
+            .collect();
+        let mut w_hh: Vec<&mut [f32]> = weights
+            .weight_hh
+            .iter_mut()
+            .map(|t| t.data.as_mut_slice())
+            .collect();
+        let mut b_ih: Vec<Option<&mut [f32]>> = weights
+            .bias_ih
+            .iter_mut()
+            .map(|o| o.as_mut().map(|t| t.data.as_mut_slice()))
+            .collect();
+        let mut b_hh: Vec<Option<&mut [f32]>> = weights
+            .bias_hh
+            .iter_mut()
+            .map(|o| o.as_mut().map(|t| t.data.as_mut_slice()))
+            .collect();
+        let cuda_res = match kind {
+            SeqTrainKind::Rnn(nonlin) => cuda_rnn_train_steps(
+                gpu_id,
+                x,
+                target,
+                None,
+                &mut w_ih,
+                &mut w_hh,
+                &mut b_ih,
+                &mut b_hh,
+                batch,
+                seq_len,
+                cfg.input_size,
+                cfg.hidden_size,
+                cfg.num_layers,
+                cfg.bidirectional,
+                nonlin == RnnNonlinearity::Relu,
+                cfg.dtype,
+                steps,
+                lr,
+                weight_decay,
+                grad_clip,
+            ),
+            SeqTrainKind::Gru => cuda_gru_train_steps(
+                gpu_id,
+                x,
+                target,
+                None,
+                &mut w_ih,
+                &mut w_hh,
+                &mut b_ih,
+                &mut b_hh,
+                batch,
+                seq_len,
+                cfg.input_size,
+                cfg.hidden_size,
+                cfg.num_layers,
+                cfg.bidirectional,
+                cfg.dtype,
+                steps,
+                lr,
+                weight_decay,
+                grad_clip,
+            ),
+            SeqTrainKind::Lstm => cuda_lstm_train_steps(
+                gpu_id,
+                x,
+                target,
+                None,
+                None,
+                &mut w_ih,
+                &mut w_hh,
+                &mut b_ih,
+                &mut b_hh,
+                batch,
+                seq_len,
+                cfg.input_size,
+                cfg.hidden_size,
+                cfg.num_layers,
+                cfg.bidirectional,
+                cfg.dtype,
+                steps,
+                lr,
+                weight_decay,
+                grad_clip,
+            ),
+        };
+        if let Some(res) = cuda_res {
+            return res;
+        }
+    }
+
+    let units = cfg.num_layers * dirs;
+    let state_len = units * batch * cfg.hidden_size;
+    let mut d_out = vec![0.0f32; expected_t];
+    let d_hn = vec![0.0f32; state_len];
+    let d_cn = if matches!(kind, SeqTrainKind::Lstm) {
+        vec![0.0f32; state_len]
+    } else {
+        Vec::new()
+    };
+    let mse = MSELoss::new(Reduction::Mean);
+
+    let param_count = weights.parameters().len();
+    let mut opt_m: Vec<Vec<f32>> = Vec::with_capacity(param_count);
+    let mut opt_v: Vec<Vec<f32>> = Vec::with_capacity(param_count);
+    let mut master_weights: Vec<Option<Vec<f32>>> = Vec::with_capacity(param_count);
+    for p in weights.parameters() {
+        let len = p.data.len();
+        opt_m.push(vec![0.0f32; len]);
+        opt_v.push(vec![0.0f32; len]);
+        master_weights.push(if cfg.dtype != DType::F32 {
+            Some(p.data.clone())
+        } else {
+            None
+        });
+    }
+
+    let mut loss_history = Vec::with_capacity(steps);
+    for step in 0..steps {
+        let (loss, mut grad_out) = {
+            let wref = weights.as_ref();
+            match kind {
+                SeqTrainKind::Rnn(nonlin) => {
+                    let (out, _, cache) =
+                        rnn_forward_core(cfg, nonlin, &wref, x, None, batch, seq_len, true)?;
+                    let loss = mse.forward_into(&out, target, &mut d_out)?;
+                    let g = rnn_backward_core(cfg, nonlin, &wref, &cache, &d_out, &d_hn)?;
+                    (loss, g)
+                }
+                SeqTrainKind::Gru => {
+                    let (out, _, cache) =
+                        gru_forward_core(cfg, &wref, x, None, batch, seq_len, true)?;
+                    let loss = mse.forward_into(&out, target, &mut d_out)?;
+                    let g = gru_backward_core(cfg, &wref, &cache, &d_out, &d_hn)?;
+                    (loss, g)
+                }
+                SeqTrainKind::Lstm => {
+                    let (out, _, _, cache) =
+                        lstm_forward_core(cfg, &wref, x, None, None, batch, seq_len, true)?;
+                    let loss = mse.forward_into(&out, target, &mut d_out)?;
+                    let g = lstm_backward_core(cfg, &wref, &cache, &d_out, &d_hn, &d_cn)?;
+                    (loss, g)
+                }
+            }
+        };
+        loss_history.push(loss);
+
+        let mut grad_slices: Vec<&mut [f32]> = Vec::with_capacity(param_count);
+        for (dw_ih, (dw_hh, (db_ih, db_hh))) in grad_out.d_weight_ih.iter_mut().zip(
+            grad_out.d_weight_hh.iter_mut().zip(
+                grad_out
+                    .d_bias_ih
+                    .iter_mut()
+                    .zip(grad_out.d_bias_hh.iter_mut()),
+            ),
+        ) {
+            grad_slices.push(dw_ih.as_mut_slice());
+            grad_slices.push(dw_hh.as_mut_slice());
+            if let Some(db) = db_ih.as_mut() {
+                grad_slices.push(db.as_mut_slice());
+            }
+            if let Some(db) = db_hh.as_mut() {
+                grad_slices.push(db.as_mut_slice());
+            }
+        }
+        if let Some(max_norm) = grad_clip {
+            clip_rnn_grad_norm_(&mut grad_slices, max_norm);
+        }
+
+        let mut params_mut = weights.parameters_mut();
+        for (i, (p, g)) in params_mut.iter_mut().zip(grad_slices.iter()).enumerate() {
+            if let Some(ref mut mw) = master_weights[i] {
+                simd_adamw_step_f32(
+                    mw,
+                    g,
+                    &mut opt_m[i],
+                    &mut opt_v[i],
+                    lr,
+                    0.9,
+                    0.999,
+                    1e-8,
+                    weight_decay,
+                    step + 1,
+                );
+                let q = TensorStorage::from_f32_slice(mw, cfg.dtype).to_f32_vec();
+                p.data.copy_from_slice(&q);
+            } else {
+                simd_adamw_step_f32(
+                    &mut p.data,
+                    g,
+                    &mut opt_m[i],
+                    &mut opt_v[i],
+                    lr,
+                    0.9,
+                    0.999,
+                    1e-8,
+                    weight_decay,
+                    step + 1,
+                );
+            }
+        }
+    }
+
+    Ok(loss_history)
 }
 
 #[cfg(test)]
@@ -3638,6 +4228,87 @@ mod tests {
         assert!(
             last_loss < first_loss * 0.5,
             "LSTM training loss should decrease: first={first_loss}, last={last_loss}"
+        );
+    }
+
+    #[test]
+    fn test_seq_train_steps_cpu_and_validation() {
+        let batch = 2usize;
+        let seq_len = 5usize;
+        let in_dim = 4usize;
+        let hid_dim = 6usize;
+        let x: Vec<f32> = (0..batch * seq_len * in_dim)
+            .map(|i| ((i as f32) * 0.17).sin() * 0.5)
+            .collect();
+        let target_uni = vec![0.4f32; batch * seq_len * hid_dim];
+        let target_bi = vec![0.4f32; batch * seq_len * hid_dim * 2];
+
+        let mut rnn = RNN::new(
+            in_dim,
+            hid_dim,
+            1,
+            RnnNonlinearity::Tanh,
+            true,
+            false,
+            DType::F32,
+            DeviceType::Cpu,
+            11,
+        )
+        .unwrap();
+        let r_losses = rnn
+            .train_steps(&x, &target_uni, batch, seq_len, 8, 0.05, 1e-4, Some(1.0))
+            .unwrap();
+        assert_eq!(r_losses.len(), 8);
+        assert!(r_losses.iter().all(|v| v.is_finite()));
+        assert!(r_losses[7] < r_losses[0]);
+
+        let mut gru = GRU::new(
+            in_dim,
+            hid_dim,
+            2,
+            true,
+            true,
+            DType::F32,
+            DeviceType::Cpu,
+            22,
+        )
+        .unwrap();
+        let g_losses = gru
+            .train_steps(&x, &target_bi, batch, seq_len, 8, 0.05, 0.0, Some(2.0))
+            .unwrap();
+        assert_eq!(g_losses.len(), 8);
+        assert!(g_losses.iter().all(|v| v.is_finite()));
+        assert!(g_losses[7] < g_losses[0]);
+
+        let mut lstm = LSTM::new(
+            in_dim,
+            hid_dim,
+            1,
+            true,
+            false,
+            DType::F32,
+            DeviceType::Cpu,
+            33,
+        )
+        .unwrap();
+        let l_losses = lstm
+            .train_steps(&x, &target_uni, batch, seq_len, 8, 0.05, 0.0, None)
+            .unwrap();
+        assert_eq!(l_losses.len(), 8);
+        assert!(l_losses.iter().all(|v| v.is_finite()));
+        assert!(l_losses[7] < l_losses[0]);
+
+        assert!(
+            rnn.train_steps(&x, &target_uni, batch, seq_len, 0, 0.01, 0.0, None)
+                .is_err()
+        );
+        assert!(
+            gru.train_steps(&x, &target_bi, batch, seq_len, 2, -0.01, 0.0, None)
+                .is_err()
+        );
+        assert!(
+            lstm.train_steps(&x[..4], &target_uni, batch, seq_len, 2, 0.01, 0.0, None)
+                .is_err()
         );
     }
 }

@@ -1418,6 +1418,76 @@ impl PyResidualBlock {
     }
 }
 
+fn ingest_f32_3d(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    name: &str,
+) -> PyResult<(Vec<f32>, usize, usize, usize)> {
+    let (data, shape) = if let Ok(pt) = obj.extract::<PyRef<'_, PyTensor>>() {
+        let g = pt.read_guard()?;
+        (g.data.clone(), g.shape.clone())
+    } else {
+        ingest_f32_data(py, obj, None)?
+    };
+    if shape.len() != 3 {
+        return Err(PyValueError::new_err(format!(
+            "{name} expects a 3D [batch, seq_len, features] tensor or array, got shape {:?} ( >_< )",
+            shape
+        )));
+    }
+    Ok((data, shape[0], shape[1], shape[2]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_seq_train_steps<T: Send + Sync>(
+    py: Python<'_>,
+    inner: &Arc<RwLock<T>>,
+    x: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
+    steps: usize,
+    lr: f32,
+    weight_decay: f32,
+    grad_clip: Option<f32>,
+    name: &str,
+    train_fn: impl FnOnce(
+        &mut T,
+        &[f32],
+        &[f32],
+        usize,
+        usize,
+        usize,
+        f32,
+        f32,
+        Option<f32>,
+    ) -> OchreResult<Vec<f32>>
+    + Send,
+) -> PyResult<Vec<f32>> {
+    let (x_data, b, s, _) = ingest_f32_3d(py, x, &format!("{name}.train_steps x"))?;
+    let (t_data, tb, ts, _) = ingest_f32_3d(py, target, &format!("{name}.train_steps target"))?;
+    if tb != b || ts != s {
+        return Err(PyValueError::new_err(format!(
+            "{name}.train_steps batch/seq_len mismatch: x=({b}, {s}) vs target=({tb}, {ts}) ( >_< )"
+        )));
+    }
+    let losses = py.detach(|| -> OchreResult<Vec<f32>> {
+        let mut guard = inner
+            .write()
+            .map_err(|_| OchreError::General(format!("{name} lock poisoned ( >_< )")))?;
+        train_fn(
+            &mut guard,
+            &x_data,
+            &t_data,
+            b,
+            s,
+            steps,
+            lr,
+            weight_decay,
+            grad_clip,
+        )
+    })?;
+    Ok(losses)
+}
+
 #[pyclass(name = "RNN", module = "ochreml._ochreml.nn", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyRNN {
@@ -1470,6 +1540,32 @@ impl PyRNN {
             let (out, hn) = guard.forward(inp, h0_ref)?;
             Ok((PyTensor::from_tensor(out), PyTensor::from_tensor(hn)))
         })
+    }
+
+    #[pyo3(signature = (x, target, steps = 1, lr = 1e-3, weight_decay = 0.0, grad_clip = None))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_steps(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        target: &Bound<'_, PyAny>,
+        steps: usize,
+        lr: f32,
+        weight_decay: f32,
+        grad_clip: Option<f32>,
+    ) -> PyResult<Vec<f32>> {
+        run_seq_train_steps(
+            py,
+            &self.inner,
+            x,
+            target,
+            steps,
+            lr,
+            weight_decay,
+            grad_clip,
+            "RNN",
+            |m, xd, td, b, s, st, l, wd, gc| m.train_steps(xd, td, b, s, st, l, wd, gc),
+        )
     }
 
     pub fn parameters(&self) -> PyResult<Vec<PyTensor>> {
@@ -1532,6 +1628,32 @@ impl PyGRU {
             let (out, hn) = guard.forward(inp, h0_ref)?;
             Ok((PyTensor::from_tensor(out), PyTensor::from_tensor(hn)))
         })
+    }
+
+    #[pyo3(signature = (x, target, steps = 1, lr = 1e-3, weight_decay = 0.0, grad_clip = None))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_steps(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        target: &Bound<'_, PyAny>,
+        steps: usize,
+        lr: f32,
+        weight_decay: f32,
+        grad_clip: Option<f32>,
+    ) -> PyResult<Vec<f32>> {
+        run_seq_train_steps(
+            py,
+            &self.inner,
+            x,
+            target,
+            steps,
+            lr,
+            weight_decay,
+            grad_clip,
+            "GRU",
+            |m, xd, td, b, s, st, l, wd, gc| m.train_steps(xd, td, b, s, st, l, wd, gc),
+        )
     }
 
     pub fn parameters(&self) -> PyResult<Vec<PyTensor>> {
@@ -1611,6 +1733,32 @@ impl PyLSTM {
                 "LSTM forward requires both h0 and c0 when state is provided ( >_< )",
             )),
         }
+    }
+
+    #[pyo3(signature = (x, target, steps = 1, lr = 1e-3, weight_decay = 0.0, grad_clip = None))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_steps(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        target: &Bound<'_, PyAny>,
+        steps: usize,
+        lr: f32,
+        weight_decay: f32,
+        grad_clip: Option<f32>,
+    ) -> PyResult<Vec<f32>> {
+        run_seq_train_steps(
+            py,
+            &self.inner,
+            x,
+            target,
+            steps,
+            lr,
+            weight_decay,
+            grad_clip,
+            "LSTM",
+            |m, xd, td, b, s, st, l, wd, gc| m.train_steps(xd, td, b, s, st, l, wd, gc),
+        )
     }
 
     pub fn parameters(&self) -> PyResult<Vec<PyTensor>> {

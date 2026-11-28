@@ -1073,6 +1073,31 @@ class ResidualBlock(Module):
 # =========================================================================
 
 
+def _run_seq_train_steps(
+    module: Module,
+    x: Any,
+    target: Any,
+    steps: int,
+    lr: float,
+    weight_decay: float,
+    grad_clip: Optional[float],
+) -> List[float]:
+    x_arg = _unwrap_tensor(x) if isinstance(x, Tensor) else x
+    t_arg = _unwrap_tensor(target) if isinstance(target, Tensor) else target
+    losses = list(
+        module._rust.train_steps(
+            x_arg,
+            t_arg,
+            steps=int(steps),
+            lr=float(lr),
+            weight_decay=float(weight_decay),
+            grad_clip=float(grad_clip) if grad_clip is not None else None,
+        )
+    )
+    module._cached_params = [Parameter._from_rust(p) for p in module._rust.parameters()]
+    return losses
+
+
 class RNN(Module):
     """Multi-layer Elman RNN with BPTT in Rust (o´∀｀o)."""
 
@@ -1123,6 +1148,39 @@ class RNN(Module):
         )
         return Tensor._from_rust(out), Tensor._from_rust(hn)
 
+    def train_steps(
+        self,
+        x: Any,
+        target: Any,
+        steps: int = 1,
+        lr: float = 1e-3,
+        weight_decay: float = 0.0,
+        grad_clip: Optional[float] = None,
+    ) -> List[float]:
+        """Run zero-GIL multi-step AdamW + MSE training in Rust and return per-step losses (*≧ω≦*).
+
+        Parameters
+        ----------
+        x : array-like or Tensor
+            Input sequence of shape ``(batch, seq_len, input_size)``.
+        target : array-like or Tensor
+            Target sequence of shape ``(batch, seq_len, out_features)``.
+        steps : int, default=1
+            Number of optimization steps to execute.
+        lr : float, default=1e-3
+            AdamW learning rate.
+        weight_decay : float, default=0.0
+            AdamW decoupled weight decay coefficient.
+        grad_clip : float or None, default=None
+            Optional global L2 gradient norm clipping threshold.
+
+        Returns
+        -------
+        list of float
+            Mean squared error loss at each training step.
+        """
+        return _run_seq_train_steps(self, x, target, steps, lr, weight_decay, grad_clip)
+
 
 class GRU(Module):
     """Multi-layer Gated Recurrent Unit (GRU) with BPTT in Rust (*≧ω≦*)."""
@@ -1171,6 +1229,39 @@ class GRU(Module):
         )
         return Tensor._from_rust(out), Tensor._from_rust(hn)
 
+    def train_steps(
+        self,
+        x: Any,
+        target: Any,
+        steps: int = 1,
+        lr: float = 1e-3,
+        weight_decay: float = 0.0,
+        grad_clip: Optional[float] = None,
+    ) -> List[float]:
+        """Run zero-GIL multi-step AdamW + MSE training in Rust and return per-step losses (*≧ω≦*).
+
+        Parameters
+        ----------
+        x : array-like or Tensor
+            Input sequence of shape ``(batch, seq_len, input_size)``.
+        target : array-like or Tensor
+            Target sequence of shape ``(batch, seq_len, out_features)``.
+        steps : int, default=1
+            Number of optimization steps to execute.
+        lr : float, default=1e-3
+            AdamW learning rate.
+        weight_decay : float, default=0.0
+            AdamW decoupled weight decay coefficient.
+        grad_clip : float or None, default=None
+            Optional global L2 gradient norm clipping threshold.
+
+        Returns
+        -------
+        list of float
+            Mean squared error loss at each training step.
+        """
+        return _run_seq_train_steps(self, x, target, steps, lr, weight_decay, grad_clip)
+
 
 class LSTM(Module):
     """Multi-layer Long Short-Term Memory (LSTM) with BPTT in Rust (＾▽＾)."""
@@ -1217,6 +1308,39 @@ class LSTM(Module):
         h0, c0 = (None, None) if hx is None else (_unwrap_tensor(hx[0]), _unwrap_tensor(hx[1]))
         out, (hn, cn) = self._rust.forward(_unwrap_tensor(input), h0, c0)
         return Tensor._from_rust(out), (Tensor._from_rust(hn), Tensor._from_rust(cn))
+
+    def train_steps(
+        self,
+        x: Any,
+        target: Any,
+        steps: int = 1,
+        lr: float = 1e-3,
+        weight_decay: float = 0.0,
+        grad_clip: Optional[float] = None,
+    ) -> List[float]:
+        """Run zero-GIL multi-step AdamW + MSE training in Rust and return per-step losses (＾▽＾).
+
+        Parameters
+        ----------
+        x : array-like or Tensor
+            Input sequence of shape ``(batch, seq_len, input_size)``.
+        target : array-like or Tensor
+            Target sequence of shape ``(batch, seq_len, out_features)``.
+        steps : int, default=1
+            Number of optimization steps to execute.
+        lr : float, default=1e-3
+            AdamW learning rate.
+        weight_decay : float, default=0.0
+            AdamW decoupled weight decay coefficient.
+        grad_clip : float or None, default=None
+            Optional global L2 gradient norm clipping threshold.
+
+        Returns
+        -------
+        list of float
+            Mean squared error loss at each training step.
+        """
+        return _run_seq_train_steps(self, x, target, steps, lr, weight_decay, grad_clip)
 
 
 # =========================================================================

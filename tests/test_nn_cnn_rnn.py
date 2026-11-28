@@ -367,3 +367,82 @@ def test_rnn_gru_lstm_forward_and_bptt_update(cls_name, num_layers, bidirectiona
         opt.step()
 
     assert losses[-1] < losses[0]
+
+
+@pytest.mark.parametrize("cls_name", ["RNN", "GRU", "LSTM"])
+@pytest.mark.parametrize("num_layers,bidirectional", [(1, False), (2, True)])
+def test_rnn_gru_lstm_train_steps(cls_name, num_layers, bidirectional):
+    rng = np.random.default_rng(202)
+    batch, seq_len, in_dim, hid_dim = 3, 5, 4, 6
+    dirs = 2 if bidirectional else 1
+
+    x_np = rng.normal(0.0, 0.5, size=(batch, seq_len, in_dim)).astype(np.float32)
+    target_np = np.full((batch, seq_len, hid_dim * dirs), 0.4, dtype=np.float32)
+
+    if cls_name == "RNN":
+        layer = nn.RNN(
+            in_dim,
+            hid_dim,
+            num_layers=num_layers,
+            nonlinearity="tanh",
+            bidirectional=bidirectional,
+            device="cpu",
+            seed=17,
+        )
+    elif cls_name == "GRU":
+        layer = nn.GRU(
+            in_dim,
+            hid_dim,
+            num_layers=num_layers,
+            bidirectional=bidirectional,
+            device="cpu",
+            seed=17,
+        )
+    else:
+        layer = nn.LSTM(
+            in_dim,
+            hid_dim,
+            num_layers=num_layers,
+            bidirectional=bidirectional,
+            device="cpu",
+            seed=17,
+        )
+
+    before_params = [p.numpy().copy() for p in layer.parameters()]
+    before_out = layer(nn.Tensor(x_np, device="cpu"))[0].numpy()
+    before_mse = float(np.mean((before_out - target_np) ** 2))
+
+    steps = 10
+    losses = layer.train_steps(
+        x_np,
+        target_np,
+        steps=steps,
+        lr=0.05,
+        weight_decay=1e-4,
+        grad_clip=1.0,
+    )
+    assert len(losses) == steps
+    assert all(np.isfinite(v) for v in losses)
+    assert np.isclose(losses[0], before_mse, atol=1e-5)
+    assert losses[-1] < losses[0]
+
+    after_params = [p.numpy().copy() for p in layer.parameters()]
+    assert any(not np.allclose(b, a) for b, a in zip(before_params, after_params))
+
+    after_out = layer(nn.Tensor(x_np, device="cpu"))[0].numpy()
+    after_mse = float(np.mean((after_out - target_np) ** 2))
+    assert not np.allclose(after_out, before_out)
+    assert after_mse < before_mse
+
+    # Verify Tensor input support and validation errors
+    losses_t = layer.train_steps(
+        nn.Tensor(x_np, device="cpu"),
+        nn.Tensor(target_np, device="cpu"),
+        steps=2,
+        lr=0.01,
+    )
+    assert len(losses_t) == 2
+    assert all(np.isfinite(v) for v in losses_t)
+
+    with pytest.raises(ValueError):
+        layer.train_steps(x_np, target_np, steps=0)

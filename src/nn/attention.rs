@@ -6,8 +6,9 @@ use crate::device::DeviceType;
 use crate::error::{OchreError, OchreResult};
 use crate::nn::autograd::{AutogradTape, CustomBackward, Op};
 use crate::nn::dtype::{DType, TensorStorage};
-use crate::nn::gemm_f32::sgemm;
+use crate::nn::gemm_f32::{sgemm, sgemm_serial};
 use crate::nn::layers::Linear;
+use crate::nn::simd_math::simd_exp_sub_scalar_into;
 use crate::nn::tensor::{Tensor, compute_strides};
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -83,6 +84,19 @@ fn axpy_f32(y: &mut [f32], x: &[f32], alpha: f32) {
     for (yv, &xv) in y[..n].iter_mut().zip(x[..n].iter()) {
         *yv += alpha * xv;
     }
+}
+
+#[cfg(feature = "cuda-dynamic")]
+const CUDA_FLASH_DISPATCH_THRESHOLD: usize = 16_384;
+
+#[cfg(feature = "cuda-dynamic")]
+#[inline]
+fn should_dispatch_cuda_flash(batch: usize, num_heads: usize, q_len: usize, kv_len: usize) -> bool {
+    batch
+        .saturating_mul(num_heads)
+        .saturating_mul(q_len)
+        .saturating_mul(kv_len)
+        >= CUDA_FLASH_DISPATCH_THRESHOLD
 }
 
 #[cfg(feature = "cuda-dynamic")]
@@ -632,6 +646,12 @@ pub(crate) fn flash_attention_forward_strided_into(
         return Ok(());
     }
 
+    let tile_gemm = if total_heads >= 2 {
+        sgemm_serial
+    } else {
+        sgemm
+    };
+
     let run_head =
         |bh: usize, out_head: &mut [f32], mut lse_head: Option<&mut [f32]>| -> OchreResult<()> {
             let b = bh / num_heads;
@@ -689,12 +709,8 @@ pub(crate) fn flash_attention_forward_strided_into(
                             *ov *= alpha;
                         }
                     }
-                    let mut row_sum = 0.0f32;
-                    for c in 0..bc {
-                        let p = (scores[c] - m_new).exp();
-                        probs[c] = p;
-                        row_sum += p;
-                    }
+                    simd_exp_sub_scalar_into(&scores[..bc], m_new, &mut probs[..bc]);
+                    let row_sum: f32 = probs[..bc].iter().copied().sum();
                     for (c, &p) in probs[..bc].iter().enumerate() {
                         if p != 0.0 {
                             let kj = j_start + c;
@@ -766,7 +782,7 @@ pub(crate) fn flash_attention_forward_strided_into(
                         let v_tile = &v_head[j_start * head_dim..(j_start + bc) * head_dim];
 
                         // S_tile[br x bc] = scale * Q_tile[br x D] @ K_tile[bc x D]^T
-                        sgemm(
+                        tile_gemm(
                             br,
                             bc,
                             head_dim,
@@ -814,16 +830,8 @@ pub(crate) fn flash_attention_forward_strided_into(
                                 0.0
                             };
 
-                            let mut row_sum = 0.0f32;
-                            for (p_slot, &s) in prob_row.iter_mut().zip(score_row.iter()) {
-                                let p = if s == f32::NEG_INFINITY {
-                                    0.0
-                                } else {
-                                    (s - m_new).exp()
-                                };
-                                *p_slot = p;
-                                row_sum += p;
-                            }
+                            simd_exp_sub_scalar_into(score_row, m_new, prob_row);
+                            let row_sum: f32 = prob_row.iter().copied().sum();
 
                             let o_row = &mut o_tile[r * head_dim..(r + 1) * head_dim];
                             if alpha == 0.0 {
@@ -839,7 +847,7 @@ pub(crate) fn flash_attention_forward_strided_into(
                         }
 
                         // O_tile[br x D] += P_tile[br x bc] @ V_tile[bc x D]
-                        sgemm(
+                        tile_gemm(
                             br,
                             head_dim,
                             bc,
@@ -933,7 +941,8 @@ pub fn flash_attention_forward_on_device(
     )?;
 
     #[cfg(feature = "cuda-dynamic")]
-    if let Some(gpu_id) = cuda_gpu_id(device)
+    if should_dispatch_cuda_flash(batch, num_heads, q_len, kv_len)
+        && let Some(gpu_id) = cuda_gpu_id(device)
         && let Some(Ok(res)) = crate::backends::cuda_nn::cuda_flash_attention_fwd(
             gpu_id,
             q,
@@ -988,7 +997,8 @@ pub fn flash_attention_backward_on_device(
     device: &DeviceType,
 ) -> OchreResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
     #[cfg(feature = "cuda-dynamic")]
-    if let Some(gpu_id) = cuda_gpu_id(device)
+    if should_dispatch_cuda_flash(batch, num_heads, q_len, kv_len)
+        && let Some(gpu_id) = cuda_gpu_id(device)
         && d_out.len() == q.len()
         && out.len() == q.len()
         && lse.len() == batch * num_heads * q_len
@@ -1140,6 +1150,8 @@ pub(crate) fn flash_attention_backward_into(
     let q_head_stride = q_len * head_dim;
     let kv_head_stride = kv_len * head_dim;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let use_serial = (group_size == 1 && batch * num_heads >= 2) || (batch * num_kv_heads >= 2);
+    let tile_gemm = if use_serial { sgemm_serial } else { sgemm };
 
     let backward_one_head = |bh: usize,
                              dq_head: &mut [f32],
@@ -1203,7 +1215,7 @@ pub(crate) fn flash_attention_backward_into(
                     let dq_tile = &mut dq_head[i_start * head_dim..(i_start + br) * head_dim];
 
                     // S_tile[br x bc] = scale * Q_tile[br x D] @ K_tile[bc x D]^T
-                    sgemm(
+                    tile_gemm(
                         br,
                         bc,
                         head_dim,
@@ -1217,7 +1229,7 @@ pub(crate) fn flash_attention_backward_into(
                     )?;
 
                     // dP_tile[br x bc] = dO_tile[br x D] @ V_tile[bc x D]^T
-                    sgemm(
+                    tile_gemm(
                         br,
                         bc,
                         head_dim,
@@ -1251,10 +1263,9 @@ pub(crate) fn flash_attention_backward_into(
                         };
                         let s_row = &scores[row_off..row_off + valid_c];
                         let dp_row = &dp_tile[row_off..row_off + valid_c];
+                        simd_exp_sub_scalar_into(s_row, lse_i, &mut p_row[..valid_c]);
                         for c in 0..valid_c {
-                            let p = (s_row[c] - lse_i).exp();
-                            p_row[c] = p;
-                            ds_row[c] = p * (dp_row[c] - di) * scale;
+                            ds_row[c] = p_row[c] * (dp_row[c] - di) * scale;
                         }
                         if valid_c < bc {
                             p_row[valid_c..].fill(0.0);
@@ -1263,7 +1274,7 @@ pub(crate) fn flash_attention_backward_into(
                     }
 
                     // dV_tile[bc x D] += P_tile[br x bc]^T @ dO_tile[br x D]
-                    sgemm(
+                    tile_gemm(
                         bc,
                         head_dim,
                         br,
@@ -1277,7 +1288,7 @@ pub(crate) fn flash_attention_backward_into(
                     )?;
 
                     // dK_tile[bc x D] += dS_scaled[br x bc]^T @ Q_tile[br x D]
-                    sgemm(
+                    tile_gemm(
                         bc,
                         head_dim,
                         br,
@@ -1291,7 +1302,7 @@ pub(crate) fn flash_attention_backward_into(
                     )?;
 
                     // dQ_tile[br x D] += dS_scaled[br x bc] @ K_tile[bc x D]
-                    sgemm(
+                    tile_gemm(
                         br,
                         head_dim,
                         bc,
@@ -1389,6 +1400,71 @@ impl ScaledDotProductAttention {
             )));
         }
 
+        let out_shape = vec![batch, num_heads, q_len, head_dim];
+        let q_id = if q.requires_grad { q.node_id } else { None };
+        let k_id = if k.requires_grad { k.node_id } else { None };
+        let v_id = if v.requires_grad { v.node_id } else { None };
+        let grad_active =
+            AutogradTape::is_grad_enabled() && (q_id.is_some() || k_id.is_some() || v_id.is_some());
+
+        #[cfg(feature = "cuda-dynamic")]
+        if grad_active
+            && should_dispatch_cuda_flash(batch, num_heads, q_len, kv_len)
+            && let Some(gpu_id) = cuda_gpu_id(&q.device)
+            && let Some(cuda_res) = crate::backends::cuda_nn::cuda_flash_attention_fwd_cached(
+                gpu_id,
+                &q.data,
+                &k.data,
+                &v.data,
+                batch,
+                num_heads,
+                num_kv_heads,
+                q_len,
+                kv_len,
+                head_dim,
+                causal,
+                kv_offset,
+            )
+        {
+            let (raw_out, cache) = cuda_res?;
+            let out_data = maybe_quantize(raw_out, q.dtype);
+            let bwd = CustomBackward(Arc::new(move |d_out: &[f32]| {
+                let (dq, dk, dv) = crate::backends::cuda_nn::cuda_flash_attention_bwd_cached(
+                    gpu_id, &cache, d_out,
+                )
+                .ok_or_else(|| {
+                    OchreError::DeviceError(
+                        "CUDA FlashAttention cached backward session unavailable ( >_< )"
+                            .to_string(),
+                    )
+                })??;
+                let mut pairs = Vec::with_capacity(3);
+                if let Some(id) = q_id {
+                    pairs.push((id, dq));
+                }
+                if let Some(id) = k_id {
+                    pairs.push((id, dk));
+                }
+                if let Some(id) = v_id {
+                    pairs.push((id, dv));
+                }
+                Ok(pairs)
+            }));
+            let id = AutogradTape::record(Op::Custom {
+                inputs: vec![q_id, k_id, v_id],
+                backward: bwd,
+            });
+            return Ok(Tensor {
+                strides: compute_strides(&out_shape),
+                shape: out_shape,
+                data: out_data,
+                dtype: q.dtype,
+                device: q.device.clone(),
+                requires_grad: true,
+                node_id: Some(id),
+            });
+        }
+
         let (raw_out, lse) = flash_attention_forward_on_device(
             &q.data,
             &k.data,
@@ -1403,13 +1479,6 @@ impl ScaledDotProductAttention {
             kv_offset,
             &q.device,
         )?;
-        let out_shape = vec![batch, num_heads, q_len, head_dim];
-
-        let q_id = if q.requires_grad { q.node_id } else { None };
-        let k_id = if k.requires_grad { k.node_id } else { None };
-        let v_id = if v.requires_grad { v.node_id } else { None };
-        let grad_active =
-            AutogradTape::is_grad_enabled() && (q_id.is_some() || k_id.is_some() || v_id.is_some());
 
         let (out_data, node_id) = if grad_active {
             let out_data = maybe_quantize(raw_out.clone(), q.dtype);
@@ -2626,5 +2695,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_sdpa_large_gpu_cached_fallback_parity() {
+        // batch*num_heads*q_len*kv_len = 1*4*64*64 = 16_384 exercises the cached GPU dispatch branch
+        // and verifies clean CPU fallback when CUDA runtime is unavailable.
+        AutogradTape::clear();
+        let (batch, num_heads, num_kv_heads, seq_len, head_dim) = (1, 4, 2, 64, 8);
+        let q_data: Vec<f32> = (0..batch * num_heads * seq_len * head_dim)
+            .map(|i| ((i as f32) * 0.05).sin() * 0.4)
+            .collect();
+        let k_data: Vec<f32> = (0..batch * num_kv_heads * seq_len * head_dim)
+            .map(|i| ((i as f32) * 0.09).cos() * 0.4)
+            .collect();
+        let v_data: Vec<f32> = (0..batch * num_kv_heads * seq_len * head_dim)
+            .map(|i| ((i as f32) * 0.03).sin() * 0.4)
+            .collect();
+
+        let q_cpu = Tensor::parameter(
+            q_data.clone(),
+            vec![batch, num_heads, seq_len, head_dim],
+            DType::F32,
+            DeviceType::Cpu,
+        )
+        .unwrap();
+        let k_cpu = Tensor::parameter(
+            k_data.clone(),
+            vec![batch, num_kv_heads, seq_len, head_dim],
+            DType::F32,
+            DeviceType::Cpu,
+        )
+        .unwrap();
+        let v_cpu = Tensor::parameter(
+            v_data.clone(),
+            vec![batch, num_kv_heads, seq_len, head_dim],
+            DType::F32,
+            DeviceType::Cpu,
+        )
+        .unwrap();
+        let out_cpu = ScaledDotProductAttention::new()
+            .forward(&q_cpu, &k_cpu, &v_cpu, true, 0)
+            .unwrap();
+        let g_cpu = out_cpu.sum(None).unwrap().backward().unwrap();
+
+        AutogradTape::clear();
+        let q_gpu = Tensor::parameter(
+            q_data,
+            vec![batch, num_heads, seq_len, head_dim],
+            DType::F32,
+            DeviceType::Gpu(0),
+        )
+        .unwrap();
+        let k_gpu = Tensor::parameter(
+            k_data,
+            vec![batch, num_kv_heads, seq_len, head_dim],
+            DType::F32,
+            DeviceType::Gpu(0),
+        )
+        .unwrap();
+        let v_gpu = Tensor::parameter(
+            v_data,
+            vec![batch, num_kv_heads, seq_len, head_dim],
+            DType::F32,
+            DeviceType::Gpu(0),
+        )
+        .unwrap();
+        let out_gpu = ScaledDotProductAttention::new()
+            .forward(&q_gpu, &k_gpu, &v_gpu, true, 0)
+            .unwrap();
+        let g_gpu = out_gpu.sum(None).unwrap().backward().unwrap();
+
+        for (&a, &b) in out_cpu.data.iter().zip(out_gpu.data.iter()) {
+            assert!((a - b).abs() < 1e-5);
+        }
+        assert_eq!(
+            g_cpu.get(q_cpu.node_id.unwrap()).unwrap().len(),
+            g_gpu.get(q_gpu.node_id.unwrap()).unwrap().len()
+        );
     }
 }
