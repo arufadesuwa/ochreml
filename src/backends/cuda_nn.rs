@@ -6,11 +6,11 @@ use crate::backends::cuda::{
     CUDA_SUCCESS, CuContext, CuDevicePtr, CuResult, CudaDriver, get_driver,
 };
 use crate::error::{OchreError, OchreResult};
-use crate::nn::dtype::DType;
+use crate::nn::dtype::{DType, TensorStorage};
 use libloading::Library;
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 type CublasStatus = i32;
 type CublasHandle = *mut c_void;
@@ -184,6 +184,101 @@ impl CudaNnWorkspace {
     }
 }
 
+const VRAM_POOL_MIN_BYTES: usize = 256;
+const VRAM_POOL_POW2_MAX_BYTES: usize = 16 * 1024 * 1024;
+const VRAM_POOL_LARGE_ALIGN_BYTES: usize = 1024 * 1024;
+const VRAM_POOL_MAX_CACHED_BYTES: usize = 512 * 1024 * 1024;
+const VRAM_POOL_MAX_BUFS_PER_BUCKET: usize = 32;
+
+/// Rounds a VRAM allocation size up to its slab pool bucket size:
+/// clamped to at least 256 B, next power of two up to 16 MiB, and 1 MiB-aligned above 16 MiB.
+#[inline]
+pub(crate) fn pool_bucket_size(byte_len: usize) -> usize {
+    let clamped = byte_len.max(VRAM_POOL_MIN_BYTES);
+    if clamped <= VRAM_POOL_POW2_MAX_BYTES {
+        clamped.next_power_of_two()
+    } else {
+        let align = VRAM_POOL_LARGE_ALIGN_BYTES;
+        clamped.saturating_add(align - 1) & !(align - 1)
+    }
+}
+
+struct VramPool {
+    ctx: CuContext,
+    cu_ctx_set_current: unsafe extern "C" fn(CuContext) -> CuResult,
+    cu_mem_free: unsafe extern "C" fn(CuDevicePtr) -> CuResult,
+    buckets: HashMap<usize, Vec<CuDevicePtr>>,
+    cached_bytes: usize,
+    max_cached_bytes: usize,
+}
+
+// SAFETY: Serialized via Arc<Mutex<VramPool>> and binds `self.ctx` before releasing device pointers.
+unsafe impl Send for VramPool {}
+// SAFETY: Guarded by Mutex.
+unsafe impl Sync for VramPool {}
+
+impl VramPool {
+    fn new(driver: &CudaDriver, ctx: CuContext) -> Self {
+        Self {
+            ctx,
+            cu_ctx_set_current: driver.cu_ctx_set_current,
+            cu_mem_free: driver.cu_mem_free,
+            buckets: HashMap::new(),
+            cached_bytes: 0,
+            max_cached_bytes: VRAM_POOL_MAX_CACHED_BYTES,
+        }
+    }
+
+    fn pop(&mut self, bucket_len: usize) -> Option<CuDevicePtr> {
+        let ptr = self.buckets.get_mut(&bucket_len)?.pop()?;
+        self.cached_bytes = self.cached_bytes.saturating_sub(bucket_len);
+        Some(ptr)
+    }
+
+    fn recycle(&mut self, bucket_len: usize, ptr: CuDevicePtr) {
+        if ptr == 0 {
+            return;
+        }
+        let under_bucket_cap =
+            self.buckets.get(&bucket_len).map_or(0, Vec::len) < VRAM_POOL_MAX_BUFS_PER_BUCKET;
+        if under_bucket_cap && self.cached_bytes.saturating_add(bucket_len) <= self.max_cached_bytes
+        {
+            self.buckets.entry(bucket_len).or_default().push(ptr);
+            self.cached_bytes += bucket_len;
+        } else {
+            // SAFETY: Bind owning CUDA context before freeing evicted device buffer.
+            unsafe {
+                let _ = (self.cu_ctx_set_current)(self.ctx);
+                let _ = (self.cu_mem_free)(ptr);
+            }
+        }
+    }
+
+    fn drain_all(&mut self) {
+        if self.buckets.is_empty() {
+            return;
+        }
+        // SAFETY: Bind owning CUDA context once before releasing all remaining pooled buffers.
+        unsafe {
+            let _ = (self.cu_ctx_set_current)(self.ctx);
+            for (_, ptrs) in self.buckets.drain() {
+                for ptr in ptrs {
+                    if ptr != 0 {
+                        let _ = (self.cu_mem_free)(ptr);
+                    }
+                }
+            }
+        }
+        self.cached_bytes = 0;
+    }
+}
+
+impl Drop for VramPool {
+    fn drop(&mut self) {
+        self.drain_all();
+    }
+}
+
 struct NnPtxFuncs {
     _module: CuModule,
     gelu: CuFunction,
@@ -244,6 +339,8 @@ struct NnPtxFuncs {
     flash_sdpa_fwd_f32: CuFunction,
     flash_sdpa_bwd_dq_f32: CuFunction,
     flash_sdpa_bwd_dkv_f32: CuFunction,
+    sdpa_causal_softmax_f32: CuFunction,
+    sdpa_bwd_ds_f32: CuFunction,
     embedding_scatter_add_f32: CuFunction,
     bshd_to_bhsd_f32: CuFunction,
     bhsd_to_bshd_f32: CuFunction,
@@ -253,6 +350,7 @@ struct CudaNnCtxState {
     handle: CublasHandle,
     cublas_destroy: FnCublasDestroy,
     workspace: CudaNnWorkspace,
+    vram_pool: Arc<Mutex<VramPool>>,
     ptx: Option<NnPtxFuncs>,
 }
 
@@ -5400,6 +5498,368 @@ BSHD_DONE:
 BHSD_DONE:
     ret;
 }
+
+.visible .entry ochre_sdpa_causal_softmax_f32(
+    .param .u64 p_s,
+    .param .u64 p_lse,
+    .param .u64 p_total_rows,
+    .param .u64 p_q_len,
+    .param .u64 p_kv_len,
+    .param .u32 p_causal,
+    .param .u64 p_kv_offset
+)
+{
+    .shared .f32 smem_scs[128];
+    .reg .pred %p<5>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<10>;
+
+    mov.u32 %r4, %ctaid.x;         // row_idx
+    mov.u32 %r1, %tid.x;           // tid in 0..127
+    cvt.u64.u32 %rd1, %r4;
+    ld.param.u64 %rd2, [p_total_rows];
+    setp.ge.u64 %p1, %rd1, %rd2;
+    @%p1 bra SCS_DONE;
+
+    ld.param.u64 %rd3, [p_q_len];
+    ld.param.u64 %rd4, [p_kv_len];
+    rem.u64 %rd5, %rd1, %rd3;      // qi = row_idx % q_len
+
+    // valid_kv = causal ? min(kv_offset + qi + 1, kv_len) : kv_len
+    mov.u64 %rd6, %rd4;
+    ld.param.u32 %r5, [p_causal];
+    setp.eq.u32 %p2, %r5, 0;
+    @%p2 bra SCS_VKV_OK;
+    ld.param.u64 %rd7, [p_kv_offset];
+    add.u64 %rd7, %rd7, %rd5;
+    add.u64 %rd7, %rd7, 1;
+    min.u64 %rd6, %rd6, %rd7;
+SCS_VKV_OK:
+
+    mul.lo.u64 %rd8, %rd1, %rd4;
+    shl.b64 %rd8, %rd8, 2;
+    ld.param.u64 %rd9, [p_s];
+    add.u64 %rd9, %rd9, %rd8;      // s_row
+
+    cvt.u64.u32 %rd10, %r1;        // tid u64
+    shl.b64 %rd11, %rd10, 2;       // tid * 4
+    mov.u64 %rd12, smem_scs;
+    add.u64 %rd12, %rd12, %rd11;   // &smem_scs[tid]
+
+    // Handle valid_kv == 0
+    setp.ne.u64 %p2, %rd6, 0;
+    @%p2 bra SCS_MAX_INIT;
+    mov.f32 %f1, 0f00000000;
+    mov.u64 %rd13, %rd10;
+SCS_ZERO_ALL:
+    setp.ge.u64 %p3, %rd13, %rd4;
+    @%p3 bra SCS_ZERO_LSE;
+    shl.b64 %rd14, %rd13, 2;
+    add.u64 %rd15, %rd9, %rd14;
+    st.global.f32 [%rd15], %f1;
+    add.u64 %rd13, %rd13, 128;
+    bra SCS_ZERO_ALL;
+SCS_ZERO_LSE:
+    setp.ne.u32 %p3, %r1, 0;
+    @%p3 bra SCS_DONE;
+    ld.param.u64 %rd14, [p_lse];
+    shl.b64 %rd15, %rd1, 2;
+    add.u64 %rd14, %rd14, %rd15;
+    mov.f32 %f2, 0fFF800000;       // -inf
+    st.global.f32 [%rd14], %f2;
+    bra SCS_DONE;
+
+SCS_MAX_INIT:
+    mov.f32 %f1, 0fFF800000;       // local_max = -inf
+    mov.u64 %rd13, %rd10;
+SCS_MAX_LOOP:
+    setp.ge.u64 %p3, %rd13, %rd6;
+    @%p3 bra SCS_MAX_RED;
+    shl.b64 %rd14, %rd13, 2;
+    add.u64 %rd15, %rd9, %rd14;
+    ld.global.f32 %f2, [%rd15];
+    max.f32 %f1, %f1, %f2;
+    add.u64 %rd13, %rd13, 128;
+    bra SCS_MAX_LOOP;
+
+SCS_MAX_RED:
+    st.shared.f32 [%rd12], %f1;
+    bar.sync 0;
+    mov.u32 %r2, 64;
+SCS_MAX_TREE:
+    setp.eq.u32 %p4, %r2, 0;
+    @%p4 bra SCS_MAX_DONE;
+    setp.ge.u32 %p3, %r1, %r2;
+    @%p3 bra SCS_MAX_SYNC;
+    add.u32 %r3, %r1, %r2;
+    cvt.u64.u32 %rd14, %r3;
+    shl.b64 %rd14, %rd14, 2;
+    mov.u64 %rd15, smem_scs;
+    add.u64 %rd15, %rd15, %rd14;
+    ld.shared.f32 %f2, [%rd15];
+    max.f32 %f1, %f1, %f2;
+    st.shared.f32 [%rd12], %f1;
+SCS_MAX_SYNC:
+    bar.sync 0;
+    shr.u32 %r2, %r2, 1;
+    bra SCS_MAX_TREE;
+
+SCS_MAX_DONE:
+    mov.u64 %rd15, smem_scs;
+    ld.shared.f32 %f3, [%rd15];    // row_max
+    bar.sync 0;
+
+    // Pass 2: exp(s - row_max) for c < valid_kv, zero for c >= valid_kv
+    mov.f32 %f4, 0f00000000;       // local_sum
+    mov.f32 %f5, 0fC2A00000;       // -80.0
+    mov.f32 %f6, 0f3FB8AA3B;       // log2(e)
+    mov.u64 %rd13, %rd10;
+SCS_EXP_LOOP:
+    setp.ge.u64 %p3, %rd13, %rd4;
+    @%p3 bra SCS_SUM_RED;
+    shl.b64 %rd14, %rd13, 2;
+    add.u64 %rd15, %rd9, %rd14;
+    setp.ge.u64 %p4, %rd13, %rd6;
+    @%p4 bra SCS_EXP_MASK;
+    ld.global.f32 %f2, [%rd15];
+    sub.f32 %f7, %f2, %f3;
+    max.f32 %f7, %f7, %f5;
+    mul.f32 %f7, %f7, %f6;
+    ex2.approx.f32 %f8, %f7;
+    add.f32 %f4, %f4, %f8;
+    st.global.f32 [%rd15], %f8;
+    bra SCS_EXP_NEXT;
+SCS_EXP_MASK:
+    mov.f32 %f8, 0f00000000;
+    st.global.f32 [%rd15], %f8;
+SCS_EXP_NEXT:
+    add.u64 %rd13, %rd13, 128;
+    bra SCS_EXP_LOOP;
+
+SCS_SUM_RED:
+    st.shared.f32 [%rd12], %f4;
+    bar.sync 0;
+    mov.u32 %r2, 64;
+SCS_SUM_TREE:
+    setp.eq.u32 %p4, %r2, 0;
+    @%p4 bra SCS_SUM_DONE;
+    setp.ge.u32 %p3, %r1, %r2;
+    @%p3 bra SCS_SUM_SYNC;
+    add.u32 %r3, %r1, %r2;
+    cvt.u64.u32 %rd14, %r3;
+    shl.b64 %rd14, %rd14, 2;
+    mov.u64 %rd15, smem_scs;
+    add.u64 %rd15, %rd15, %rd14;
+    ld.shared.f32 %f2, [%rd15];
+    add.f32 %f4, %f4, %f2;
+    st.shared.f32 [%rd12], %f4;
+SCS_SUM_SYNC:
+    bar.sync 0;
+    shr.u32 %r2, %r2, 1;
+    bra SCS_SUM_TREE;
+
+SCS_SUM_DONE:
+    mov.u64 %rd15, smem_scs;
+    ld.shared.f32 %f9, [%rd15];    // row_sum
+    mov.f32 %f5, 0f3F800000;       // 1.0
+    div.rn.f32 %f6, %f5, %f9;      // inv_sum = 1.0 / row_sum
+
+    mov.u64 %rd13, %rd10;
+SCS_NORM_LOOP:
+    setp.ge.u64 %p3, %rd13, %rd6;
+    @%p3 bra SCS_WRITE_LSE;
+    shl.b64 %rd14, %rd13, 2;
+    add.u64 %rd15, %rd9, %rd14;
+    ld.global.f32 %f7, [%rd15];
+    mul.f32 %f7, %f7, %f6;
+    st.global.f32 [%rd15], %f7;
+    add.u64 %rd13, %rd13, 128;
+    bra SCS_NORM_LOOP;
+
+SCS_WRITE_LSE:
+    setp.ne.u32 %p3, %r1, 0;
+    @%p3 bra SCS_DONE;
+    lg2.approx.f32 %f7, %f9;
+    mov.f32 %f8, 0f3F317218;       // ln(2)
+    fma.rn.f32 %f7, %f7, %f8, %f3; // row_max + ln(row_sum)
+    ld.param.u64 %rd14, [p_lse];
+    shl.b64 %rd15, %rd1, 2;
+    add.u64 %rd14, %rd14, %rd15;
+    st.global.f32 [%rd14], %f7;
+SCS_DONE:
+    ret;
+}
+
+.visible .entry ochre_sdpa_bwd_ds_f32(
+    .param .u64 p_do,
+    .param .u64 p_o,
+    .param .u64 p_s,
+    .param .u64 p_dp,
+    .param .u64 p_lse,
+    .param .u64 p_total_rows,
+    .param .u64 p_q_len,
+    .param .u64 p_kv_len,
+    .param .u64 p_head_dim,
+    .param .u32 p_causal,
+    .param .u64 p_kv_offset,
+    .param .f32 p_scale
+)
+{
+    .shared .f32 smem_sbd[128];
+    .reg .pred %p<5>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<13>;
+
+    mov.u32 %r4, %ctaid.x;         // row_idx
+    mov.u32 %r1, %tid.x;           // tid in 0..127
+    cvt.u64.u32 %rd1, %r4;
+    ld.param.u64 %rd2, [p_total_rows];
+    setp.ge.u64 %p1, %rd1, %rd2;
+    @%p1 bra SBD_DONE;
+
+    ld.param.u64 %rd3, [p_q_len];
+    ld.param.u64 %rd4, [p_kv_len];
+    ld.param.u64 %rd5, [p_head_dim];
+    rem.u64 %rd6, %rd1, %rd3;      // qi = row_idx % q_len
+
+    // valid_kv = causal ? min(kv_offset + qi + 1, kv_len) : kv_len
+    mov.u64 %rd7, %rd4;
+    ld.param.u32 %r5, [p_causal];
+    setp.eq.u32 %p2, %r5, 0;
+    @%p2 bra SBD_VKV_OK;
+    ld.param.u64 %rd8, [p_kv_offset];
+    add.u64 %rd8, %rd8, %rd6;
+    add.u64 %rd8, %rd8, 1;
+    min.u64 %rd7, %rd7, %rd8;
+SBD_VKV_OK:
+
+    mul.lo.u64 %rd9, %rd1, %rd4;
+    shl.b64 %rd9, %rd9, 2;
+    ld.param.u64 %rd10, [p_s];
+    add.u64 %rd10, %rd10, %rd9;    // s_row
+    ld.param.u64 %rd11, [p_dp];
+    add.u64 %rd11, %rd11, %rd9;    // dp_row
+
+    cvt.u64.u32 %rd12, %r1;        // tid u64
+    shl.b64 %rd13, %rd12, 2;       // tid * 4
+
+    ld.param.u64 %rd14, [p_lse];
+    shl.b64 %rd15, %rd1, 2;
+    add.u64 %rd14, %rd14, %rd15;
+    ld.global.f32 %f1, [%rd14];    // lse_i
+    setp.eq.u64 %p2, %rd7, 0;
+    @%p2 bra SBD_ZERO_ROW;
+    mov.f32 %f2, 0fFC000000;
+    setp.le.f32 %p2, %f1, %f2;
+    @%p2 bra SBD_ZERO_ROW;
+    bra SBD_COMPUTE_DI;
+
+SBD_ZERO_ROW:
+    mov.f32 %f3, 0f00000000;
+    mov.u64 %rd16, %rd12;
+SBD_ZERO_LOOP:
+    setp.ge.u64 %p3, %rd16, %rd4;
+    @%p3 bra SBD_DONE;
+    shl.b64 %rd17, %rd16, 2;
+    add.u64 %rd18, %rd10, %rd17;
+    st.global.f32 [%rd18], %f3;
+    add.u64 %rd18, %rd11, %rd17;
+    st.global.f32 [%rd18], %f3;
+    add.u64 %rd16, %rd16, 128;
+    bra SBD_ZERO_LOOP;
+
+SBD_COMPUTE_DI:
+    mul.lo.u64 %rd14, %rd1, %rd5;
+    shl.b64 %rd14, %rd14, 2;
+    ld.param.u64 %rd15, [p_do];
+    add.u64 %rd15, %rd15, %rd14;   // do_row
+    ld.param.u64 %rd16, [p_o];
+    add.u64 %rd16, %rd16, %rd14;   // o_row
+
+    mov.f32 %f2, 0f00000000;       // local D_i
+    mov.u64 %rd17, %rd12;
+SBD_DI_LOOP:
+    setp.ge.u64 %p3, %rd17, %rd5;
+    @%p3 bra SBD_DI_RED;
+    shl.b64 %rd18, %rd17, 2;
+    add.u64 %rd19, %rd15, %rd18;
+    ld.global.f32 %f3, [%rd19];
+    add.u64 %rd19, %rd16, %rd18;
+    ld.global.f32 %f4, [%rd19];
+    fma.rn.f32 %f2, %f3, %f4, %f2;
+    add.u64 %rd17, %rd17, 128;
+    bra SBD_DI_LOOP;
+
+SBD_DI_RED:
+    mov.u64 %rd17, smem_sbd;
+    add.u64 %rd17, %rd17, %rd13;
+    st.shared.f32 [%rd17], %f2;
+    bar.sync 0;
+
+    mov.u32 %r2, 64;
+SBD_DI_TREE:
+    setp.eq.u32 %p4, %r2, 0;
+    @%p4 bra SBD_DI_DONE;
+    setp.ge.u32 %p3, %r1, %r2;
+    @%p3 bra SBD_DI_SYNC;
+    add.u32 %r3, %r1, %r2;
+    cvt.u64.u32 %rd18, %r3;
+    shl.b64 %rd18, %rd18, 2;
+    mov.u64 %rd19, smem_sbd;
+    add.u64 %rd19, %rd19, %rd18;
+    ld.shared.f32 %f3, [%rd19];
+    add.f32 %f2, %f2, %f3;
+    st.shared.f32 [%rd17], %f2;
+SBD_DI_SYNC:
+    bar.sync 0;
+    shr.u32 %r2, %r2, 1;
+    bra SBD_DI_TREE;
+
+SBD_DI_DONE:
+    mov.u64 %rd19, smem_sbd;
+    ld.shared.f32 %f2, [%rd19];    // D_i
+    ld.param.f32 %f3, [p_scale];
+    mov.f32 %f4, 0fC2A00000;       // -80.0
+    mov.f32 %f5, 0f42A00000;       // +80.0
+    mov.f32 %f6, 0f3FB8AA3B;       // log2(e)
+
+    mov.u64 %rd16, %rd12;
+SBD_OUT_LOOP:
+    setp.ge.u64 %p3, %rd16, %rd4;
+    @%p3 bra SBD_DONE;
+    shl.b64 %rd17, %rd16, 2;
+    add.u64 %rd18, %rd10, %rd17;   // &s_row[c]
+    add.u64 %rd19, %rd11, %rd17;   // &dp_row[c]
+    setp.ge.u64 %p4, %rd16, %rd7;
+    @%p4 bra SBD_OUT_MASK;
+
+    ld.global.f32 %f7, [%rd18];    // s_val
+    ld.global.f32 %f8, [%rd19];    // dp_val
+    sub.f32 %f9, %f7, %f1;         // s_val - lse_i
+    max.f32 %f9, %f9, %f4;
+    min.f32 %f9, %f9, %f5;
+    mul.f32 %f9, %f9, %f6;
+    ex2.approx.f32 %f10, %f9;      // p_val
+    sub.f32 %f11, %f8, %f2;        // dp_val - D_i
+    mul.f32 %f12, %f10, %f11;
+    mul.f32 %f12, %f12, %f3;       // dS = p * (dp - D_i) * scale
+    st.global.f32 [%rd18], %f10;   // overwrite s with P
+    st.global.f32 [%rd19], %f12;   // overwrite dp with dS
+    bra SBD_OUT_NEXT;
+
+SBD_OUT_MASK:
+    mov.f32 %f10, 0f00000000;
+    st.global.f32 [%rd18], %f10;
+    st.global.f32 [%rd19], %f10;
+SBD_OUT_NEXT:
+    add.u64 %rd16, %rd16, 128;
+    bra SBD_OUT_LOOP;
+
+SBD_DONE:
+    ret;
+}
 "#;
 
 fn load_cublas_library() -> Option<Library> {
@@ -5555,10 +6015,52 @@ fn load_ptx_funcs(rt: &CudaNnRuntime) -> Option<NnPtxFuncs> {
         flash_sdpa_fwd_f32: get_fn("ochre_flash_sdpa_fwd_f32")?,
         flash_sdpa_bwd_dq_f32: get_fn("ochre_flash_sdpa_bwd_dq_f32")?,
         flash_sdpa_bwd_dkv_f32: get_fn("ochre_flash_sdpa_bwd_dkv_f32")?,
+        sdpa_causal_softmax_f32: get_fn("ochre_sdpa_causal_softmax_f32")?,
+        sdpa_bwd_ds_f32: get_fn("ochre_sdpa_bwd_ds_f32")?,
         embedding_scatter_add_f32: get_fn("ochre_embedding_scatter_add_f32")?,
         bshd_to_bhsd_f32: get_fn("ochre_bshd_to_bhsd_f32")?,
         bhsd_to_bshd_f32: get_fn("ochre_bhsd_to_bshd_f32")?,
     })
+}
+
+fn get_nn_ctx_mutex(
+    driver: &CudaDriver,
+    rt: &CudaNnRuntime,
+    gpu_id: usize,
+) -> Option<&'static Mutex<CudaNnCtxState>> {
+    let ctx_arc = driver.get_device_ctx(gpu_id).ok()?;
+    let cu_ctx = {
+        let guard = ctx_arc.lock().ok()?;
+        guard.ctx
+    };
+
+    let mut map = rt.contexts.lock().ok()?;
+    let key = cu_ctx as usize;
+    if let std::collections::hash_map::Entry::Vacant(e) = map.entry(key) {
+        // SAFETY: Bind `cu_ctx` before creating cuBLAS handle and loading PTX module.
+        let set_rc = unsafe { (driver.cu_ctx_set_current)(cu_ctx) };
+        if set_rc != CUDA_SUCCESS {
+            return None;
+        }
+        let mut handle: CublasHandle = std::ptr::null_mut();
+        // SAFETY: Initializes cuBLAS handle on bound context.
+        let blas_rc = unsafe { (rt.cublas_create)(&mut handle) };
+        if blas_rc != CUBLAS_STATUS_SUCCESS || handle.is_null() {
+            return None;
+        }
+        let ptx = load_ptx_funcs(rt);
+        let state = CudaNnCtxState {
+            handle,
+            cublas_destroy: rt.cublas_destroy,
+            workspace: CudaNnWorkspace::new(driver, cu_ctx),
+            vram_pool: Arc::new(Mutex::new(VramPool::new(driver, cu_ctx))),
+            ptx,
+        };
+        e.insert(Box::new(Mutex::new(state)));
+    }
+    let boxed = map.get(&key)?;
+    // SAFETY: Entries in `rt.contexts` live for `'static` and are never removed.
+    Some(unsafe { &*(boxed.as_ref() as *const Mutex<CudaNnCtxState>) })
 }
 
 fn with_nn_ctx<R>(
@@ -5567,40 +6069,7 @@ fn with_nn_ctx<R>(
 ) -> Option<OchreResult<R>> {
     let driver = get_driver()?;
     let rt = get_nn_runtime()?;
-    let ctx_arc = driver.get_device_ctx(gpu_id).ok()?;
-    let cu_ctx = {
-        let guard = ctx_arc.lock().ok()?;
-        guard.ctx
-    };
-
-    let ctx_mutex: &'static Mutex<CudaNnCtxState> = {
-        let mut map = rt.contexts.lock().ok()?;
-        let key = cu_ctx as usize;
-        if let std::collections::hash_map::Entry::Vacant(e) = map.entry(key) {
-            // SAFETY: Bind `cu_ctx` before creating cuBLAS handle and loading PTX module.
-            let set_rc = unsafe { (driver.cu_ctx_set_current)(cu_ctx) };
-            if set_rc != CUDA_SUCCESS {
-                return None;
-            }
-            let mut handle: CublasHandle = std::ptr::null_mut();
-            // SAFETY: Initializes cuBLAS handle on bound context.
-            let blas_rc = unsafe { (rt.cublas_create)(&mut handle) };
-            if blas_rc != CUBLAS_STATUS_SUCCESS || handle.is_null() {
-                return None;
-            }
-            let ptx = load_ptx_funcs(rt);
-            let state = CudaNnCtxState {
-                handle,
-                cublas_destroy: rt.cublas_destroy,
-                workspace: CudaNnWorkspace::new(driver, cu_ctx),
-                ptx,
-            };
-            e.insert(Box::new(Mutex::new(state)));
-        }
-        let boxed = map.get(&key)?;
-        // SAFETY: Entries in `rt.contexts` live for `'static` and are never removed.
-        unsafe { &*(boxed.as_ref() as *const Mutex<CudaNnCtxState>) }
-    };
+    let ctx_mutex = get_nn_ctx_mutex(driver, rt, gpu_id)?;
 
     let mut state = ctx_mutex.lock().ok()?;
     // SAFETY: Bind CUDA context for this calling thread.
@@ -6710,17 +7179,16 @@ pub fn cuda_avg_pool2d_f32(
 // VRAM-Resident CUDA Device Buffers & Session (Zero Per-Op Host Copies / Sync)
 // ============================================================================
 
-/// Safe RAII wrapper around a CUDA device memory allocation (`CuDevicePtr`).
-/// Automatically binds its owning CUDA context and calls `cuMemFree` on drop.
+/// Safe RAII wrapper around a pooled CUDA device memory allocation (`CuDevicePtr`).
+/// Automatically recycles into its owning `VramPool` on drop (zero `cuMemFree` on hot drops).
 pub struct CudaDeviceBuf {
     ptr: CuDevicePtr,
     byte_len: usize,
-    ctx: CuContext,
-    cu_ctx_set_current: unsafe extern "C" fn(CuContext) -> CuResult,
-    cu_mem_free: unsafe extern "C" fn(CuDevicePtr) -> CuResult,
+    bucket_len: usize,
+    pool: Arc<Mutex<VramPool>>,
 }
 
-// SAFETY: `CudaDeviceBuf` owns a unique device pointer and binds its CUDA context on drop.
+// SAFETY: `CudaDeviceBuf` owns a unique device pointer and recycles into a Mutex-guarded `VramPool`.
 unsafe impl Send for CudaDeviceBuf {}
 // SAFETY: `&CudaDeviceBuf` exposes only immutable pointer/size metadata; actual CUDA device operations
 // are serialized through the per-context Mutex inside `with_vram_session`.
@@ -6729,13 +7197,14 @@ unsafe impl Sync for CudaDeviceBuf {}
 impl Drop for CudaDeviceBuf {
     fn drop(&mut self) {
         if self.ptr != 0 {
-            // SAFETY: Bind owning CUDA context before freeing the owned device pointer.
-            unsafe {
-                let _ = (self.cu_ctx_set_current)(self.ctx);
-                let _ = (self.cu_mem_free)(self.ptr);
-            }
+            let ptr = self.ptr;
+            let bucket_len = self.bucket_len;
             self.ptr = 0;
             self.byte_len = 0;
+            match self.pool.lock() {
+                Ok(mut pool) => pool.recycle(bucket_len, ptr),
+                Err(poisoned) => poisoned.into_inner().recycle(bucket_len, ptr),
+            }
         }
     }
 }
@@ -6844,40 +7313,7 @@ pub fn with_vram_session<R>(
 ) -> Option<OchreResult<R>> {
     let driver = get_driver()?;
     let rt = get_nn_runtime()?;
-    let ctx_arc = driver.get_device_ctx(gpu_id).ok()?;
-    let cu_ctx = {
-        let guard = ctx_arc.lock().ok()?;
-        guard.ctx
-    };
-
-    let ctx_mutex: &'static Mutex<CudaNnCtxState> = {
-        let mut map = rt.contexts.lock().ok()?;
-        let key = cu_ctx as usize;
-        if let std::collections::hash_map::Entry::Vacant(e) = map.entry(key) {
-            // SAFETY: Bind `cu_ctx` before creating cuBLAS handle and loading PTX module.
-            let set_rc = unsafe { (driver.cu_ctx_set_current)(cu_ctx) };
-            if set_rc != CUDA_SUCCESS {
-                return None;
-            }
-            let mut handle: CublasHandle = std::ptr::null_mut();
-            // SAFETY: Initializes cuBLAS handle on bound context.
-            let blas_rc = unsafe { (rt.cublas_create)(&mut handle) };
-            if blas_rc != CUBLAS_STATUS_SUCCESS || handle.is_null() {
-                return None;
-            }
-            let ptx = load_ptx_funcs(rt);
-            let state = CudaNnCtxState {
-                handle,
-                cublas_destroy: rt.cublas_destroy,
-                workspace: CudaNnWorkspace::new(driver, cu_ctx),
-                ptx,
-            };
-            e.insert(Box::new(Mutex::new(state)));
-        }
-        let boxed = map.get(&key)?;
-        // SAFETY: Entries in `rt.contexts` live for `'static` and are never removed.
-        unsafe { &*(boxed.as_ref() as *const Mutex<CudaNnCtxState>) }
-    };
+    let ctx_mutex = get_nn_ctx_mutex(driver, rt, gpu_id)?;
 
     let mut state = ctx_mutex.lock().ok()?;
     state.ptx.as_ref()?;
@@ -6907,23 +7343,41 @@ impl<'a> CudaVramSession<'a> {
             .ok_or_else(|| OchreError::DeviceError("CUDA NN PTX not loaded ( >_< )".to_string()))
     }
 
-    /// Allocates `byte_len` bytes in VRAM (minimum 4 bytes so pointer is always non-null).
+    /// Allocates at least `byte_len` bytes in VRAM from the persistent slab pool (or `cuMemAlloc` on miss).
     pub fn alloc_bytes(&self, byte_len: usize) -> OchreResult<CudaDeviceBuf> {
-        let alloc_sz = byte_len.max(4);
+        let logical_sz = byte_len.max(4);
+        let bucket_len = pool_bucket_size(logical_sz);
+        if let Ok(mut pool) = self.state.vram_pool.lock()
+            && let Some(ptr) = pool.pop(bucket_len)
+        {
+            return Ok(CudaDeviceBuf {
+                ptr,
+                byte_len: logical_sz,
+                bucket_len,
+                pool: Arc::clone(&self.state.vram_pool),
+            });
+        }
         let mut ptr: CuDevicePtr = 0;
         // SAFETY: Context is bound by `CudaVramSession`; `ptr` receives a valid device allocation.
-        let rc = unsafe { (self.driver.cu_mem_alloc)(&mut ptr, alloc_sz) };
+        let mut rc = unsafe { (self.driver.cu_mem_alloc)(&mut ptr, bucket_len) };
+        if (rc != CUDA_SUCCESS || ptr == 0)
+            && let Ok(mut pool) = self.state.vram_pool.lock()
+        {
+            pool.drain_all();
+            ptr = 0;
+            // SAFETY: Retry allocation after releasing cached slab buffers.
+            rc = unsafe { (self.driver.cu_mem_alloc)(&mut ptr, bucket_len) };
+        }
         if rc != CUDA_SUCCESS || ptr == 0 {
             return Err(OchreError::DeviceError(format!(
-                "CUDA VRAM cuMemAlloc({alloc_sz}) failed with code {rc} (´；ω；`)"
+                "CUDA VRAM cuMemAlloc({bucket_len}) failed with code {rc} (´；ω；`)"
             )));
         }
         Ok(CudaDeviceBuf {
             ptr,
-            byte_len: alloc_sz,
-            ctx: self.state.workspace.ctx,
-            cu_ctx_set_current: self.driver.cu_ctx_set_current,
-            cu_mem_free: self.driver.cu_mem_free,
+            byte_len: logical_sz,
+            bucket_len,
+            pool: Arc::clone(&self.state.vram_pool),
         })
     }
 
@@ -7086,6 +7540,77 @@ impl<'a> CudaVramSession<'a> {
             )
         };
         check_cublas(status, "cublasSgemm_v2(dev)")
+    }
+
+    /// Device-resident strided batched cuBLAS SGEMM (`C[b] = alpha * op(A[b]) * op(B[b]) + beta * C[b]`),
+    /// falling back to a loop over `sgemm_dev` when `cublasSgemmStridedBatched` is unavailable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sgemm_strided_batched_dev(
+        &mut self,
+        m: usize,
+        n: usize,
+        k: usize,
+        d_a: CuDevicePtr,
+        stride_a: usize,
+        d_b: CuDevicePtr,
+        stride_b: usize,
+        d_c: CuDevicePtr,
+        stride_c: usize,
+        batch_count: usize,
+        trans_a: bool,
+        trans_b: bool,
+        alpha: f32,
+        beta: f32,
+    ) -> OchreResult<()> {
+        if batch_count == 0 || m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+        if let Some(strided_fn) = self.rt.cublas_sgemm_strided_batched {
+            let op_a = if trans_a { CUBLAS_OP_T } else { CUBLAS_OP_N };
+            let op_b = if trans_b { CUBLAS_OP_T } else { CUBLAS_OP_N };
+            let lda = if trans_a { m as i32 } else { k as i32 };
+            let ldb = if trans_b { k as i32 } else { n as i32 };
+            // SAFETY: All strided device slices lie within valid allocations on the bound CUDA context.
+            let status = unsafe {
+                strided_fn(
+                    self.state.handle,
+                    op_b,
+                    op_a,
+                    n as i32,
+                    m as i32,
+                    k as i32,
+                    &alpha,
+                    d_b,
+                    ldb,
+                    stride_b as i64,
+                    d_a,
+                    lda,
+                    stride_a as i64,
+                    &beta,
+                    d_c,
+                    n as i32,
+                    stride_c as i64,
+                    batch_count as i32,
+                )
+            };
+            return check_cublas(status, "cublasSgemmStridedBatched(dev)");
+        }
+        for b in 0..batch_count {
+            self.sgemm_dev(
+                m,
+                n,
+                k,
+                d_a + ((b * stride_a * 4) as u64),
+                d_b + ((b * stride_b * 4) as u64),
+                d_c + ((b * stride_c * 4) as u64),
+                trans_a,
+                trans_b,
+                alpha,
+                beta,
+                DType::F32,
+            )?;
+        }
+        Ok(())
     }
 
     /// Converts `n` f32 elements at `d_src` to bf16 at `d_dst` on GPU.
@@ -8402,11 +8927,13 @@ impl<'a> CudaVramSession<'a> {
         launch_1d_async(self.rt, func, n, 256, &mut params)
     }
 
-    /// VRAM-resident tiled online-softmax FlashSDPA forward supporting GQA/MQA, causal masking, and `kv_offset`.
+    /// VRAM-resident GQA-native FlashSDPA forward supporting causal masking and `kv_offset`.
+    /// Uses batched cuBLAS + `ochre_sdpa_causal_softmax_f32` (0 K/V duplication) when `q_len * kv_len <= 512 * 512`,
+    /// and tiled online-softmax PTX `ochre_flash_sdpa_fwd_f32` for larger sequences.
     /// `d_q`/`d_out`: `[B, H, q_len, D]`, `d_k`/`d_v`: `[B, H_kv, kv_len, D]`, `d_lse`: `[B, H, q_len]`.
     #[allow(clippy::too_many_arguments)]
     pub fn flash_sdpa_fwd(
-        &self,
+        &mut self,
         mut d_q: CuDevicePtr,
         mut d_k: CuDevicePtr,
         mut d_v: CuDevicePtr,
@@ -8430,6 +8957,80 @@ impl<'a> CudaVramSession<'a> {
             )));
         }
         let total_q_rows = batch * num_heads * q_len;
+        if kv_len == 0 {
+            self.fill_f32(d_out, 0.0, total_q_rows * head_dim)?;
+            self.fill_f32(d_lse, f32::NEG_INFINITY, total_q_rows)?;
+            return Ok(());
+        }
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        if q_len.saturating_mul(kv_len) <= 512 * 512 {
+            let b_kv = batch * num_kv_heads;
+            let g = num_heads / num_kv_heads;
+            let m_q = g * q_len;
+            let stride_q = m_q * head_dim;
+            let stride_kv = kv_len * head_dim;
+            let stride_s = m_q * kv_len;
+            let d_s = self.alloc_f32(b_kv * stride_s)?;
+
+            self.sgemm_strided_batched_dev(
+                m_q,
+                kv_len,
+                head_dim,
+                d_q,
+                stride_q,
+                d_k,
+                stride_kv,
+                d_s.ptr(),
+                stride_s,
+                b_kv,
+                false,
+                true,
+                scale,
+                0.0,
+            )?;
+
+            let softmax_fn = self.ptx()?.sdpa_causal_softmax_f32;
+            let mut d_s_ptr = d_s.ptr();
+            let mut tr_u64 = total_q_rows as u64;
+            let mut ql_u64 = q_len as u64;
+            let mut kvl_u64 = kv_len as u64;
+            let mut causal_u32 = u32::from(causal);
+            let mut kvo_u64 = kv_offset as u64;
+            let mut sm_params: [*mut c_void; 7] = [
+                (&mut d_s_ptr as *mut CuDevicePtr).cast(),
+                (&mut d_lse as *mut CuDevicePtr).cast(),
+                (&mut tr_u64 as *mut u64).cast(),
+                (&mut ql_u64 as *mut u64).cast(),
+                (&mut kvl_u64 as *mut u64).cast(),
+                (&mut causal_u32 as *mut u32).cast(),
+                (&mut kvo_u64 as *mut u64).cast(),
+            ];
+            launch_grid_async(
+                self.rt,
+                softmax_fn,
+                total_q_rows as u32,
+                128,
+                &mut sm_params,
+            )?;
+
+            return self.sgemm_strided_batched_dev(
+                m_q,
+                head_dim,
+                kv_len,
+                d_s.ptr(),
+                stride_s,
+                d_v,
+                stride_kv,
+                d_out,
+                stride_q,
+                b_kv,
+                false,
+                false,
+                1.0,
+                0.0,
+            );
+        }
+
         let func = self.ptx()?.flash_sdpa_fwd_f32;
         let mut tqr_u64 = total_q_rows as u64;
         let mut nh_u64 = num_heads as u64;
@@ -8439,7 +9040,7 @@ impl<'a> CudaVramSession<'a> {
         let mut hd_u64 = head_dim as u64;
         let mut causal_u32 = u32::from(causal);
         let mut kvo_u64 = kv_offset as u64;
-        let mut scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut scale_arg = scale;
         let mut params: [*mut c_void; 14] = [
             (&mut d_q as *mut CuDevicePtr).cast(),
             (&mut d_k as *mut CuDevicePtr).cast(),
@@ -8454,16 +9055,18 @@ impl<'a> CudaVramSession<'a> {
             (&mut hd_u64 as *mut u64).cast(),
             (&mut causal_u32 as *mut u32).cast(),
             (&mut kvo_u64 as *mut u64).cast(),
-            (&mut scale as *mut f32).cast(),
+            (&mut scale_arg as *mut f32).cast(),
         ];
         launch_grid_async(self.rt, func, total_q_rows as u32, 64, &mut params)
     }
 
-    /// VRAM-resident tiled FlashSDPA backward supporting GQA/MQA, causal masking, and `kv_offset`.
-    /// `d_row_scratch` must have capacity for `batch * num_heads * q_len` `f32` elements.
+    /// VRAM-resident GQA-native FlashSDPA backward supporting causal masking and `kv_offset`.
+    /// Uses batched cuBLAS + `ochre_sdpa_bwd_ds_f32` (0 K/V duplication) when `q_len * kv_len <= 512 * 512`,
+    /// and tiled PTX `ochre_flash_sdpa_bwd_{dq,dkv}_f32` for larger sequences.
+    /// `d_row_scratch` must have capacity for `batch * num_heads * q_len` `f32` elements on the tiled path.
     #[allow(clippy::too_many_arguments)]
     pub fn flash_sdpa_bwd(
-        &self,
+        &mut self,
         mut d_do: CuDevicePtr,
         mut d_q: CuDevicePtr,
         mut d_k: CuDevicePtr,
@@ -8497,8 +9100,127 @@ impl<'a> CudaVramSession<'a> {
             self.fill_f32(d_dv, 0.0, batch * num_kv_heads * kv_len * head_dim)?;
             return Ok(());
         }
-        let ptx = self.ptx()?;
         let total_q_rows = batch * num_heads * q_len;
+        let mut scale = 1.0f32 / (head_dim as f32).sqrt();
+        if q_len.saturating_mul(kv_len) <= 512 * 512 {
+            let b_kv = batch * num_kv_heads;
+            let g = num_heads / num_kv_heads;
+            let m_q = g * q_len;
+            let stride_q = m_q * head_dim;
+            let stride_kv = kv_len * head_dim;
+            let stride_s = m_q * kv_len;
+            let d_s = self.alloc_f32(b_kv * stride_s)?;
+            let d_dp = self.alloc_f32(b_kv * stride_s)?;
+
+            self.sgemm_strided_batched_dev(
+                m_q,
+                kv_len,
+                head_dim,
+                d_q,
+                stride_q,
+                d_k,
+                stride_kv,
+                d_s.ptr(),
+                stride_s,
+                b_kv,
+                false,
+                true,
+                scale,
+                0.0,
+            )?;
+            self.sgemm_strided_batched_dev(
+                m_q,
+                kv_len,
+                head_dim,
+                d_do,
+                stride_q,
+                d_v,
+                stride_kv,
+                d_dp.ptr(),
+                stride_s,
+                b_kv,
+                false,
+                true,
+                1.0,
+                0.0,
+            )?;
+
+            let ds_fn = self.ptx()?.sdpa_bwd_ds_f32;
+            let mut d_s_ptr = d_s.ptr();
+            let mut d_dp_ptr = d_dp.ptr();
+            let mut tr_u64 = total_q_rows as u64;
+            let mut ql_u64 = q_len as u64;
+            let mut kvl_u64 = kv_len as u64;
+            let mut hd_u64 = head_dim as u64;
+            let mut causal_u32 = u32::from(causal);
+            let mut kvo_u64 = kv_offset as u64;
+            let mut ds_params: [*mut c_void; 12] = [
+                (&mut d_do as *mut CuDevicePtr).cast(),
+                (&mut d_out as *mut CuDevicePtr).cast(),
+                (&mut d_s_ptr as *mut CuDevicePtr).cast(),
+                (&mut d_dp_ptr as *mut CuDevicePtr).cast(),
+                (&mut d_lse as *mut CuDevicePtr).cast(),
+                (&mut tr_u64 as *mut u64).cast(),
+                (&mut ql_u64 as *mut u64).cast(),
+                (&mut kvl_u64 as *mut u64).cast(),
+                (&mut hd_u64 as *mut u64).cast(),
+                (&mut causal_u32 as *mut u32).cast(),
+                (&mut kvo_u64 as *mut u64).cast(),
+                (&mut scale as *mut f32).cast(),
+            ];
+            launch_grid_async(self.rt, ds_fn, total_q_rows as u32, 128, &mut ds_params)?;
+
+            self.sgemm_strided_batched_dev(
+                kv_len,
+                head_dim,
+                m_q,
+                d_s.ptr(),
+                stride_s,
+                d_do,
+                stride_q,
+                d_dv,
+                stride_kv,
+                b_kv,
+                true,
+                false,
+                1.0,
+                0.0,
+            )?;
+            self.sgemm_strided_batched_dev(
+                m_q,
+                head_dim,
+                kv_len,
+                d_dp.ptr(),
+                stride_s,
+                d_k,
+                stride_kv,
+                d_dq,
+                stride_q,
+                b_kv,
+                false,
+                false,
+                1.0,
+                0.0,
+            )?;
+            return self.sgemm_strided_batched_dev(
+                kv_len,
+                head_dim,
+                m_q,
+                d_dp.ptr(),
+                stride_s,
+                d_q,
+                stride_q,
+                d_dk,
+                stride_kv,
+                b_kv,
+                true,
+                false,
+                1.0,
+                0.0,
+            );
+        }
+
+        let ptx = self.ptx()?;
         let total_kv_rows = batch * num_kv_heads * kv_len;
         let mut tqr_u64 = total_q_rows as u64;
         let mut tkvr_u64 = total_kv_rows as u64;
@@ -8509,7 +9231,6 @@ impl<'a> CudaVramSession<'a> {
         let mut hd_u64 = head_dim as u64;
         let mut causal_u32 = u32::from(causal);
         let mut kvo_u64 = kv_offset as u64;
-        let mut scale = 1.0f32 / (head_dim as f32).sqrt();
 
         let mut dq_params: [*mut c_void; 17] = [
             (&mut d_do as *mut CuDevicePtr).cast(),
@@ -8972,6 +9693,148 @@ pub fn cuda_flash_attention_bwd(
         let mut dq = vec![0.0f32; q.len()];
         let mut dk = vec![0.0f32; k.len()];
         let mut dv = vec![0.0f32; v.len()];
+        sess.dtoh_f32(&mut dq, &d_dq)?;
+        sess.dtoh_f32(&mut dk, &d_dk)?;
+        sess.dtoh_f32(&mut dv, &d_dv)?;
+        Ok((dq, dk, dv))
+    })
+}
+
+/// Device-resident FlashAttention activation cache kept in VRAM between
+/// `cuda_flash_attention_fwd_cached` and `cuda_flash_attention_bwd_cached`.
+pub struct CudaFlashCache {
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    causal: bool,
+    kv_offset: usize,
+    d_q: CudaDeviceBuf,
+    d_k: CudaDeviceBuf,
+    d_v: CudaDeviceBuf,
+    d_out: CudaDeviceBuf,
+    d_lse: CudaDeviceBuf,
+}
+
+/// Host wrapper for VRAM-resident CUDA FlashAttention forward that keeps `Q, K, V, O, LSE`
+/// resident in VRAM inside `CudaFlashCache` for zero-reupload autograd backward.
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_flash_attention_fwd_cached(
+    gpu_id: usize,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    causal: bool,
+    kv_offset: usize,
+) -> Option<OchreResult<(Vec<f32>, CudaFlashCache)>> {
+    if batch == 0 || num_heads == 0 || num_kv_heads == 0 || head_dim == 0 || q_len == 0 {
+        return None;
+    }
+    with_vram_session(gpu_id, |sess| {
+        let d_q = sess.upload_f32(q)?;
+        let d_k = sess.upload_f32(k)?;
+        let d_v = sess.upload_f32(v)?;
+        let out_len = batch * num_heads * q_len * head_dim;
+        let lse_len = batch * num_heads * q_len;
+        let d_out = sess.alloc_f32(out_len)?;
+        let d_lse = sess.alloc_f32(lse_len)?;
+        sess.flash_sdpa_fwd(
+            d_q.ptr(),
+            d_k.ptr(),
+            d_v.ptr(),
+            d_out.ptr(),
+            d_lse.ptr(),
+            batch,
+            num_heads,
+            num_kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            causal,
+            kv_offset,
+        )?;
+        let mut out = vec![0.0f32; out_len];
+        sess.dtoh_f32(&mut out, &d_out)?;
+        Ok((
+            out,
+            CudaFlashCache {
+                batch,
+                num_heads,
+                num_kv_heads,
+                q_len,
+                kv_len,
+                head_dim,
+                causal,
+                kv_offset,
+                d_q,
+                d_k,
+                d_v,
+                d_out,
+                d_lse,
+            },
+        ))
+    })
+}
+
+/// Host wrapper for VRAM-resident CUDA FlashAttention backward consuming `CudaFlashCache`
+/// without re-uploading `Q, K, V, O, LSE`.
+#[allow(clippy::type_complexity)]
+pub fn cuda_flash_attention_bwd_cached(
+    gpu_id: usize,
+    cache: &CudaFlashCache,
+    d_out: &[f32],
+) -> Option<OchreResult<(Vec<f32>, Vec<f32>, Vec<f32>)>> {
+    if cache.batch == 0 || cache.num_heads == 0 || cache.num_kv_heads == 0 || cache.head_dim == 0 {
+        return None;
+    }
+    with_vram_session(gpu_id, |sess| {
+        if d_out.len() != cache.d_out.len_f32() {
+            return Err(OchreError::InvalidParameter(format!(
+                "CUDA flash attention cached backward d_out len {} != expected {} ( >_< )",
+                d_out.len(),
+                cache.d_out.len_f32()
+            )));
+        }
+        let d_do = sess.upload_f32(d_out)?;
+        let d_row_ptr = if cache.q_len.saturating_mul(cache.kv_len) > 512 * 512 {
+            Some(sess.alloc_f32(cache.batch * cache.num_heads * cache.q_len)?)
+        } else {
+            None
+        };
+        let d_dq = sess.alloc_f32(cache.d_q.len_f32())?;
+        let d_dk = sess.alloc_f32(cache.d_k.len_f32())?;
+        let d_dv = sess.alloc_f32(cache.d_v.len_f32())?;
+        sess.flash_sdpa_bwd(
+            d_do.ptr(),
+            cache.d_q.ptr(),
+            cache.d_k.ptr(),
+            cache.d_v.ptr(),
+            cache.d_out.ptr(),
+            cache.d_lse.ptr(),
+            d_row_ptr.as_ref().map_or(0, CudaDeviceBuf::ptr),
+            d_dq.ptr(),
+            d_dk.ptr(),
+            d_dv.ptr(),
+            cache.batch,
+            cache.num_heads,
+            cache.num_kv_heads,
+            cache.q_len,
+            cache.kv_len,
+            cache.head_dim,
+            cache.causal,
+            cache.kv_offset,
+        )?;
+        let mut dq = vec![0.0f32; cache.d_q.len_f32()];
+        let mut dk = vec![0.0f32; cache.d_k.len_f32()];
+        let mut dv = vec![0.0f32; cache.d_v.len_f32()];
         sess.dtoh_f32(&mut dq, &d_dq)?;
         sess.dtoh_f32(&mut dk, &d_dk)?;
         sess.dtoh_f32(&mut dv, &d_dv)?;
@@ -10446,6 +11309,1010 @@ pub fn cuda_lstm_backward(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeqCellKind {
+    Rnn { is_relu: bool },
+    Gru,
+    Lstm,
+}
+
+impl SeqCellKind {
+    #[inline]
+    fn gate_mult(self) -> usize {
+        match self {
+            Self::Rnn { .. } => 1,
+            Self::Gru => 3,
+            Self::Lstm => 4,
+        }
+    }
+
+    #[inline]
+    fn packed_bias_elems(self, h: usize) -> usize {
+        match self {
+            Self::Rnn { .. } => h,
+            Self::Gru => 4 * h,
+            Self::Lstm => 4 * h,
+        }
+    }
+
+    #[inline]
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rnn { .. } => "RNN",
+            Self::Gru => "GRU",
+            Self::Lstm => "LSTM",
+        }
+    }
+}
+
+struct SeqTrainUnitState {
+    w_ih_idx: usize,
+    w_hh_idx: usize,
+    b_ih_idx: Option<usize>,
+    b_hh_idx: Option<usize>,
+    has_bias_any: bool,
+    d_b_packed: CudaDeviceBuf,
+    d_all_h: CudaDeviceBuf,
+    d_all_c: Option<CudaDeviceBuf>,
+    gate_bufs: Vec<CudaDeviceBuf>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_seq_train_args(
+    kind: SeqCellKind,
+    x: &[f32],
+    target: &[f32],
+    h0: Option<&[f32]>,
+    c0: Option<&[f32]>,
+    weight_ih: &[&mut [f32]],
+    weight_hh: &[&mut [f32]],
+    bias_ih: &[Option<&mut [f32]>],
+    bias_hh: &[Option<&mut [f32]>],
+    batch: usize,
+    seq_len: usize,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    steps: usize,
+    lr: f32,
+    weight_decay: f32,
+    grad_clip: Option<f32>,
+) -> OchreResult<()> {
+    let label = kind.label();
+    if batch == 0 || seq_len == 0 || input_size == 0 || hidden_size == 0 || num_layers == 0 {
+        return Err(OchreError::InvalidParameter(format!(
+            "CUDA {label} train_steps dimensions must all be > 0 ( >_< )"
+        )));
+    }
+    if steps == 0 {
+        return Err(OchreError::InvalidParameter(format!(
+            "CUDA {label} train_steps steps must be > 0 ( >_< )"
+        )));
+    }
+    if !lr.is_finite() || lr < 0.0 {
+        return Err(OchreError::InvalidParameter(format!(
+            "CUDA {label} train_steps lr={lr} must be finite and >= 0 ( >_< )"
+        )));
+    }
+    if !weight_decay.is_finite() || weight_decay < 0.0 {
+        return Err(OchreError::InvalidParameter(format!(
+            "CUDA {label} train_steps weight_decay={weight_decay} must be finite and >= 0 ( >_< )"
+        )));
+    }
+    if let Some(gc) = grad_clip
+        && (!gc.is_finite() || gc < 0.0)
+    {
+        return Err(OchreError::InvalidParameter(format!(
+            "CUDA {label} train_steps grad_clip={gc} must be finite and >= 0 ( >_< )"
+        )));
+    }
+    let dirs = if bidirectional { 2 } else { 1 };
+    let units = num_layers * dirs;
+    let gates = kind.gate_mult() * hidden_size;
+    let bh = batch * hidden_size;
+    if x.len() != batch * seq_len * input_size {
+        return Err(OchreError::InvalidParameter(format!(
+            "CUDA {label} input length {} != expected {} ( >_< )",
+            x.len(),
+            batch * seq_len * input_size
+        )));
+    }
+    if target.len() != batch * seq_len * hidden_size * dirs {
+        return Err(OchreError::InvalidParameter(format!(
+            "CUDA {label} target length {} != expected {} ( >_< )",
+            target.len(),
+            batch * seq_len * hidden_size * dirs
+        )));
+    }
+    if let Some(h_init) = h0
+        && h_init.len() != units * bh
+    {
+        return Err(OchreError::InvalidParameter(format!(
+            "CUDA {label} h0 length mismatch ( >_< )"
+        )));
+    }
+    if let Some(c_init) = c0
+        && c_init.len() != units * bh
+    {
+        return Err(OchreError::InvalidParameter(format!(
+            "CUDA {label} c0 length mismatch ( >_< )"
+        )));
+    }
+    if weight_ih.len() != units
+        || weight_hh.len() != units
+        || bias_ih.len() != units
+        || bias_hh.len() != units
+    {
+        return Err(OchreError::InvalidParameter(format!(
+            "CUDA {label} weight/bias unit count mismatch ( >_< )"
+        )));
+    }
+    for u in 0..units {
+        let layer = u / dirs;
+        let in_dim = if layer == 0 {
+            input_size
+        } else {
+            hidden_size * dirs
+        };
+        if weight_ih[u].len() != gates * in_dim || weight_hh[u].len() != gates * hidden_size {
+            return Err(OchreError::InvalidParameter(format!(
+                "CUDA {label} unit {u} weight size mismatch ( >_< )"
+            )));
+        }
+        if let Some(b) = bias_ih[u].as_deref()
+            && b.len() != gates
+        {
+            return Err(OchreError::InvalidParameter(format!(
+                "CUDA {label} unit {u} bias_ih size mismatch ( >_< )"
+            )));
+        }
+        if let Some(b) = bias_hh[u].as_deref()
+            && b.len() != gates
+        {
+            return Err(OchreError::InvalidParameter(format!(
+                "CUDA {label} unit {u} bias_hh size mismatch ( >_< )"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn pack_seq_unit_bias_dev(
+    sess: &CudaVramSession<'_>,
+    kind: SeqCellKind,
+    h: usize,
+    b_ih_ptr: Option<CuDevicePtr>,
+    b_hh_ptr: Option<CuDevicePtr>,
+    d_b_packed: CuDevicePtr,
+) -> OchreResult<()> {
+    match kind {
+        SeqCellKind::Rnn { .. } | SeqCellKind::Lstm => {
+            let gates = kind.gate_mult() * h;
+            match (b_ih_ptr, b_hh_ptr) {
+                (Some(bih), Some(bhh)) => {
+                    sess.copy_f32(bih, d_b_packed, gates)?;
+                    sess.add_inplace_dev_f32(d_b_packed, bhh, gates)?;
+                }
+                (Some(bih), None) => sess.copy_f32(bih, d_b_packed, gates)?,
+                (None, Some(bhh)) => sess.copy_f32(bhh, d_b_packed, gates)?,
+                (None, None) => {}
+            }
+        }
+        SeqCellKind::Gru => {
+            sess.fill_f32(d_b_packed, 0.0, 4 * h)?;
+            if let Some(bih) = b_ih_ptr {
+                sess.copy_f32(bih, d_b_packed, 2 * h)?;
+                sess.copy_f32(
+                    bih + ((2 * h * 4) as u64),
+                    d_b_packed + ((2 * h * 4) as u64),
+                    h,
+                )?;
+            }
+            if let Some(bhh) = b_hh_ptr {
+                sess.add_inplace_dev_f32(d_b_packed, bhh, 2 * h)?;
+                sess.copy_f32(
+                    bhh + ((2 * h * 4) as u64),
+                    d_b_packed + ((3 * h * 4) as u64),
+                    h,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seq_train_unit_fwd_dev(
+    sess: &mut CudaVramSession<'_>,
+    kind: SeqCellKind,
+    unit: &SeqTrainUnitState,
+    d_params: &[CudaDeviceBuf],
+    d_x_layer: CuDevicePtr,
+    d_layer_out: CuDevicePtr,
+    d_h0: Option<&CudaDeviceBuf>,
+    d_c0: Option<&CudaDeviceBuf>,
+    d_gi_all: CuDevicePtr,
+    d_gh: CuDevicePtr,
+    batch: usize,
+    seq_len: usize,
+    in_dim: usize,
+    h: usize,
+    out_dim: usize,
+    u: usize,
+    dir: usize,
+    dtype: DType,
+) -> OchreResult<()> {
+    let gates = kind.gate_mult() * h;
+    let bh = batch * h;
+    let d_w_ih = d_params[unit.w_ih_idx].ptr();
+    let d_w_hh = d_params[unit.w_hh_idx].ptr();
+
+    sess.sgemm_dev(
+        batch * seq_len,
+        gates,
+        in_dim,
+        d_x_layer,
+        d_w_ih,
+        d_gi_all,
+        false,
+        true,
+        1.0,
+        0.0,
+        dtype,
+    )?;
+
+    if let Some(h0_buf) = d_h0 {
+        sess.copy_f32(h0_buf.ptr_offset_f32(u * bh), unit.d_all_h.ptr(), bh)?;
+    } else {
+        sess.fill_f32(unit.d_all_h.ptr(), 0.0, bh)?;
+    }
+    if let Some(ref all_c) = unit.d_all_c {
+        if let Some(c0_buf) = d_c0 {
+            sess.copy_f32(c0_buf.ptr_offset_f32(u * bh), all_c.ptr(), bh)?;
+        } else {
+            sess.fill_f32(all_c.ptr(), 0.0, bh)?;
+        }
+    }
+
+    for step in 0..seq_len {
+        let t = if dir == 0 { step } else { seq_len - 1 - step };
+        let p_hp = unit.d_all_h.ptr_offset_f32(step * bh);
+        let p_hc = unit.d_all_h.ptr_offset_f32((step + 1) * bh);
+        sess.sgemm_dev(
+            batch, gates, h, p_hp, d_w_hh, d_gh, false, true, 1.0, 0.0, dtype,
+        )?;
+        match kind {
+            SeqCellKind::Rnn { is_relu } => sess.rnn_step_fwd_dev(
+                d_gi_all,
+                d_gh,
+                unit.d_b_packed.ptr(),
+                p_hc,
+                d_layer_out,
+                batch,
+                seq_len,
+                h,
+                out_dim,
+                t,
+                dir * h,
+                is_relu,
+                unit.has_bias_any,
+            )?,
+            SeqCellKind::Gru => sess.gru_step_fwd_dev(
+                d_gi_all,
+                d_gh,
+                unit.d_b_packed.ptr(),
+                p_hp,
+                p_hc,
+                d_layer_out,
+                unit.gate_bufs[0].ptr_offset_f32(step * bh),
+                unit.gate_bufs[1].ptr_offset_f32(step * bh),
+                unit.gate_bufs[2].ptr_offset_f32(step * bh),
+                unit.gate_bufs[3].ptr_offset_f32(step * bh),
+                batch,
+                seq_len,
+                h,
+                out_dim,
+                t,
+                dir * h,
+                true,
+            )?,
+            SeqCellKind::Lstm => {
+                let all_c = unit.d_all_c.as_ref().ok_or_else(|| {
+                    OchreError::DeviceError("Missing LSTM cell state buffer ( >_< )".to_string())
+                })?;
+                sess.lstm_step_fwd_dev(
+                    d_gi_all,
+                    d_gh,
+                    unit.d_b_packed.ptr(),
+                    all_c.ptr_offset_f32(step * bh),
+                    p_hc,
+                    all_c.ptr_offset_f32((step + 1) * bh),
+                    d_layer_out,
+                    unit.gate_bufs[0].ptr_offset_f32(step * bh),
+                    unit.gate_bufs[1].ptr_offset_f32(step * bh),
+                    unit.gate_bufs[2].ptr_offset_f32(step * bh),
+                    unit.gate_bufs[3].ptr_offset_f32(step * bh),
+                    unit.gate_bufs[4].ptr_offset_f32(step * bh),
+                    batch,
+                    seq_len,
+                    h,
+                    out_dim,
+                    t,
+                    dir * h,
+                    true,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seq_train_unit_bwd_dev(
+    sess: &mut CudaVramSession<'_>,
+    kind: SeqCellKind,
+    unit: &SeqTrainUnitState,
+    d_params: &[CudaDeviceBuf],
+    d_grads: &[CudaDeviceBuf],
+    d_cur_out: CuDevicePtr,
+    d_x_layer: CuDevicePtr,
+    d_layer_in: Option<CuDevicePtr>,
+    d_dh_next: CuDevicePtr,
+    d_dc_next: Option<CuDevicePtr>,
+    d_dgi_all: CuDevicePtr,
+    d_dgh_steps: CuDevicePtr,
+    batch: usize,
+    seq_len: usize,
+    in_dim: usize,
+    h: usize,
+    out_dim: usize,
+    dir: usize,
+    dtype: DType,
+) -> OchreResult<()> {
+    let gates = kind.gate_mult() * h;
+    let bh = batch * h;
+    let b_gates = batch * gates;
+    let d_w_ih = d_params[unit.w_ih_idx].ptr();
+    let d_w_hh = d_params[unit.w_hh_idx].ptr();
+
+    sess.fill_f32(d_dh_next, 0.0, bh)?;
+    if let Some(dc_next) = d_dc_next {
+        sess.fill_f32(dc_next, 0.0, bh)?;
+    }
+
+    for step in (0..seq_len).rev() {
+        let t = if dir == 0 { step } else { seq_len - 1 - step };
+        let p_dgh = d_dgh_steps + ((step * b_gates * 4) as u64);
+        match kind {
+            SeqCellKind::Rnn { is_relu } => {
+                sess.rnn_step_bwd_dev(
+                    d_cur_out,
+                    d_dh_next,
+                    unit.d_all_h.ptr_offset_f32((step + 1) * bh),
+                    p_dgh,
+                    d_dgi_all,
+                    batch,
+                    seq_len,
+                    h,
+                    out_dim,
+                    t,
+                    dir * h,
+                    is_relu,
+                )?;
+                sess.sgemm_dev(
+                    batch, h, h, p_dgh, d_w_hh, d_dh_next, false, false, 1.0, 0.0, dtype,
+                )?;
+            }
+            SeqCellKind::Gru => {
+                let off = step * bh;
+                sess.gru_step_bwd_dev(
+                    d_cur_out,
+                    d_dh_next,
+                    unit.d_all_h.ptr_offset_f32(off),
+                    unit.gate_bufs[0].ptr_offset_f32(off),
+                    unit.gate_bufs[1].ptr_offset_f32(off),
+                    unit.gate_bufs[2].ptr_offset_f32(off),
+                    unit.gate_bufs[3].ptr_offset_f32(off),
+                    d_dgi_all,
+                    p_dgh,
+                    batch,
+                    seq_len,
+                    h,
+                    out_dim,
+                    t,
+                    dir * h,
+                )?;
+                sess.sgemm_dev(
+                    batch, h, gates, p_dgh, d_w_hh, d_dh_next, false, false, 1.0, 1.0, dtype,
+                )?;
+            }
+            SeqCellKind::Lstm => {
+                let off = step * bh;
+                let all_c = unit.d_all_c.as_ref().ok_or_else(|| {
+                    OchreError::DeviceError("Missing LSTM cell state buffer ( >_< )".to_string())
+                })?;
+                let dc_next = d_dc_next.ok_or_else(|| {
+                    OchreError::DeviceError("Missing LSTM dc_next buffer ( >_< )".to_string())
+                })?;
+                sess.lstm_step_bwd_dev(
+                    d_cur_out,
+                    d_dh_next,
+                    dc_next,
+                    all_c.ptr_offset_f32(off),
+                    unit.gate_bufs[0].ptr_offset_f32(off),
+                    unit.gate_bufs[1].ptr_offset_f32(off),
+                    unit.gate_bufs[2].ptr_offset_f32(off),
+                    unit.gate_bufs[3].ptr_offset_f32(off),
+                    unit.gate_bufs[4].ptr_offset_f32(off),
+                    d_dgi_all,
+                    p_dgh,
+                    batch,
+                    seq_len,
+                    h,
+                    out_dim,
+                    t,
+                    dir * h,
+                )?;
+                sess.sgemm_dev(
+                    batch, h, gates, p_dgh, d_w_hh, d_dh_next, false, false, 1.0, 0.0, dtype,
+                )?;
+            }
+        }
+    }
+
+    match kind {
+        SeqCellKind::Gru => {
+            if let Some(idx) = unit.b_ih_idx {
+                sess.sum_rows_f32(d_dgi_all, d_grads[idx].ptr(), batch * seq_len, gates)?;
+            }
+            if let Some(idx) = unit.b_hh_idx {
+                sess.sum_rows_f32(d_dgh_steps, d_grads[idx].ptr(), seq_len * batch, gates)?;
+            }
+        }
+        SeqCellKind::Rnn { .. } | SeqCellKind::Lstm => {
+            if let Some(ih_idx) = unit.b_ih_idx {
+                sess.sum_rows_f32(d_dgh_steps, d_grads[ih_idx].ptr(), seq_len * batch, gates)?;
+                if let Some(hh_idx) = unit.b_hh_idx {
+                    sess.copy_f32(d_grads[ih_idx].ptr(), d_grads[hh_idx].ptr(), gates)?;
+                }
+            } else if let Some(hh_idx) = unit.b_hh_idx {
+                sess.sum_rows_f32(d_dgh_steps, d_grads[hh_idx].ptr(), seq_len * batch, gates)?;
+            }
+        }
+    }
+
+    sess.sgemm_dev(
+        gates,
+        h,
+        seq_len * batch,
+        d_dgh_steps,
+        unit.d_all_h.ptr(),
+        d_grads[unit.w_hh_idx].ptr(),
+        true,
+        false,
+        1.0,
+        0.0,
+        dtype,
+    )?;
+    sess.sgemm_dev(
+        gates,
+        in_dim,
+        batch * seq_len,
+        d_dgi_all,
+        d_x_layer,
+        d_grads[unit.w_ih_idx].ptr(),
+        true,
+        false,
+        1.0,
+        0.0,
+        dtype,
+    )?;
+    if let Some(layer_in) = d_layer_in {
+        sess.sgemm_dev(
+            batch * seq_len,
+            in_dim,
+            gates,
+            d_dgi_all,
+            d_w_ih,
+            layer_in,
+            false,
+            false,
+            1.0,
+            if dir == 0 { 0.0 } else { 1.0 },
+            dtype,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cuda_seq_train_steps_inner(
+    gpu_id: usize,
+    kind: SeqCellKind,
+    x: &[f32],
+    target: &[f32],
+    h0: Option<&[f32]>,
+    c0: Option<&[f32]>,
+    weight_ih: &mut [&mut [f32]],
+    weight_hh: &mut [&mut [f32]],
+    bias_ih: &mut [Option<&mut [f32]>],
+    bias_hh: &mut [Option<&mut [f32]>],
+    batch: usize,
+    seq_len: usize,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    dtype: DType,
+    steps: usize,
+    lr: f32,
+    weight_decay: f32,
+    grad_clip: Option<f32>,
+) -> Option<OchreResult<Vec<f32>>> {
+    if let Err(e) = validate_seq_train_args(
+        kind,
+        x,
+        target,
+        h0,
+        c0,
+        weight_ih,
+        weight_hh,
+        bias_ih,
+        bias_hh,
+        batch,
+        seq_len,
+        input_size,
+        hidden_size,
+        num_layers,
+        bidirectional,
+        steps,
+        lr,
+        weight_decay,
+        grad_clip,
+    ) {
+        return Some(Err(e));
+    }
+
+    let dirs = if bidirectional { 2 } else { 1 };
+    let units = num_layers * dirs;
+    let h = hidden_size;
+    let gates = kind.gate_mult() * h;
+    let bh = batch * h;
+    let out_dim = h * dirs;
+    let rows = batch * seq_len;
+
+    with_vram_session(gpu_id, |sess| {
+        // 1. Upload inputs, targets, initial states, and weights ONCE.
+        let d_x = sess.upload_f32(x)?;
+        let d_target = sess.upload_f32(target)?;
+        let d_h0 = match h0 {
+            Some(hi) => Some(sess.upload_f32(hi)?),
+            None => None,
+        };
+        let d_c0 = match c0 {
+            Some(ci) => Some(sess.upload_f32(ci)?),
+            None => None,
+        };
+
+        let mut d_params = Vec::with_capacity(units * 4);
+        let mut d_grads = Vec::with_capacity(units * 4);
+        let mut d_opt_m = Vec::with_capacity(units * 4);
+        let mut d_opt_v = Vec::with_capacity(units * 4);
+        let mut param_lens = Vec::with_capacity(units * 4);
+
+        let mut push_param = |slice: &[f32]| -> OchreResult<usize> {
+            let idx = d_params.len();
+            let len = slice.len();
+            param_lens.push(len);
+            d_params.push(sess.upload_f32(slice)?);
+            d_grads.push(sess.alloc_zeros_f32(len)?);
+            d_opt_m.push(sess.alloc_zeros_f32(len)?);
+            d_opt_v.push(sess.alloc_zeros_f32(len)?);
+            Ok(idx)
+        };
+
+        let mut unit_states = Vec::with_capacity(units);
+        for u in 0..units {
+            let w_ih_idx = push_param(weight_ih[u])?;
+            let w_hh_idx = push_param(weight_hh[u])?;
+            let b_ih_idx = match bias_ih[u].as_deref() {
+                Some(b) => Some(push_param(b)?),
+                None => None,
+            };
+            let b_hh_idx = match bias_hh[u].as_deref() {
+                Some(b) => Some(push_param(b)?),
+                None => None,
+            };
+            let has_bias_any = b_ih_idx.is_some() || b_hh_idx.is_some();
+            let d_b_packed = sess.alloc_zeros_f32(kind.packed_bias_elems(h))?;
+            let d_all_h = sess.alloc_f32((seq_len + 1) * bh)?;
+            let d_all_c = if kind == SeqCellKind::Lstm {
+                Some(sess.alloc_f32((seq_len + 1) * bh)?)
+            } else {
+                None
+            };
+            let n_gate_bufs = match kind {
+                SeqCellKind::Rnn { .. } => 0,
+                SeqCellKind::Gru => 4,
+                SeqCellKind::Lstm => 5,
+            };
+            let mut gate_bufs = Vec::with_capacity(n_gate_bufs);
+            for _ in 0..n_gate_bufs {
+                gate_bufs.push(sess.alloc_f32(seq_len * bh)?);
+            }
+            unit_states.push(SeqTrainUnitState {
+                w_ih_idx,
+                w_hh_idx,
+                b_ih_idx,
+                b_hh_idx,
+                has_bias_any,
+                d_b_packed,
+                d_all_h,
+                d_all_c,
+                gate_bufs,
+            });
+        }
+
+        // 2. Pre-allocate pooled layer activations, loss, and scratch buffers ONCE.
+        let mut d_layer_acts = Vec::with_capacity(num_layers.saturating_sub(1));
+        for _ in 1..num_layers {
+            d_layer_acts.push(sess.alloc_f32(rows * out_dim)?);
+        }
+        let d_output = sess.alloc_f32(rows * out_dim)?;
+        let d_doutput = sess.alloc_f32(rows * out_dim)?;
+        let d_sq = sess.alloc_f32(rows * out_dim)?;
+        let d_step_loss = sess.alloc_zeros_f32(1)?;
+        let d_norm_sq = sess.alloc_zeros_f32(1)?;
+
+        let d_gi_all = sess.alloc_f32(rows * gates)?;
+        let d_gh = sess.alloc_f32(batch * gates)?;
+        let d_dgi_all = sess.alloc_f32(rows * gates)?;
+        let d_dgh_steps = sess.alloc_f32(seq_len * batch * gates)?;
+        let d_dh_next = sess.alloc_f32(bh)?;
+        let d_dc_next = if kind == SeqCellKind::Lstm {
+            Some(sess.alloc_f32(bh)?)
+        } else {
+            None
+        };
+        let d_layer_grad_a = if num_layers > 1 {
+            Some(sess.alloc_f32(rows * out_dim)?)
+        } else {
+            None
+        };
+        let d_layer_grad_b = if num_layers > 1 {
+            Some(sess.alloc_f32(rows * out_dim)?)
+        } else {
+            None
+        };
+
+        let mut loss_history = Vec::with_capacity(steps);
+        let mut host_step_loss = [0.0f32; 1];
+
+        // 3. Run all training steps 100% resident in VRAM (downloading 1 scalar loss per step).
+        for step in 0..steps {
+            for unit in &unit_states {
+                pack_seq_unit_bias_dev(
+                    sess,
+                    kind,
+                    h,
+                    unit.b_ih_idx.map(|i| d_params[i].ptr()),
+                    unit.b_hh_idx.map(|i| d_params[i].ptr()),
+                    unit.d_b_packed.ptr(),
+                )?;
+            }
+
+            for layer in 0..num_layers {
+                let in_dim = if layer == 0 { input_size } else { out_dim };
+                let x_ptr = if layer == 0 {
+                    d_x.ptr()
+                } else {
+                    d_layer_acts[layer - 1].ptr()
+                };
+                let out_ptr = if layer + 1 < num_layers {
+                    d_layer_acts[layer].ptr()
+                } else {
+                    d_output.ptr()
+                };
+                for dir in 0..dirs {
+                    let u = layer * dirs + dir;
+                    seq_train_unit_fwd_dev(
+                        sess,
+                        kind,
+                        &unit_states[u],
+                        &d_params,
+                        x_ptr,
+                        out_ptr,
+                        d_h0.as_ref(),
+                        d_c0.as_ref(),
+                        d_gi_all.ptr(),
+                        d_gh.ptr(),
+                        batch,
+                        seq_len,
+                        in_dim,
+                        h,
+                        out_dim,
+                        u,
+                        dir,
+                        dtype,
+                    )?;
+                }
+            }
+
+            sess.fill_f32(d_step_loss.ptr(), 0.0, 1)?;
+            sess.mse_grad_dev_f32(
+                d_output.ptr(),
+                d_target.ptr(),
+                d_doutput.ptr(),
+                d_sq.ptr(),
+                d_step_loss.ptr(),
+                rows,
+                out_dim,
+            )?;
+
+            let mut cur_out_ptr = d_doutput.ptr();
+            for layer in (0..num_layers).rev() {
+                let in_dim = if layer == 0 { input_size } else { out_dim };
+                let x_ptr = if layer == 0 {
+                    d_x.ptr()
+                } else {
+                    d_layer_acts[layer - 1].ptr()
+                };
+                let layer_in_ptr = if layer > 0 {
+                    match (&d_layer_grad_a, &d_layer_grad_b) {
+                        (Some(ga), Some(gb)) => {
+                            if cur_out_ptr == ga.ptr() {
+                                Some(gb.ptr())
+                            } else {
+                                Some(ga.ptr())
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                for dir in 0..dirs {
+                    let u = layer * dirs + dir;
+                    seq_train_unit_bwd_dev(
+                        sess,
+                        kind,
+                        &unit_states[u],
+                        &d_params,
+                        &d_grads,
+                        cur_out_ptr,
+                        x_ptr,
+                        layer_in_ptr,
+                        d_dh_next.ptr(),
+                        d_dc_next.as_ref().map(CudaDeviceBuf::ptr),
+                        d_dgi_all.ptr(),
+                        d_dgh_steps.ptr(),
+                        batch,
+                        seq_len,
+                        in_dim,
+                        h,
+                        out_dim,
+                        dir,
+                        dtype,
+                    )?;
+                }
+                if let Some(next_in) = layer_in_ptr {
+                    cur_out_ptr = next_in;
+                }
+            }
+
+            if let Some(max_norm) = grad_clip
+                && max_norm > 0.0
+            {
+                sess.fill_f32(d_norm_sq.ptr(), 0.0, 1)?;
+                for (dg, &len) in d_grads.iter().zip(param_lens.iter()) {
+                    sess.reduce_sum_sq_add_f32(dg.ptr(), d_norm_sq.ptr(), len)?;
+                }
+                for (dg, &len) in d_grads.iter().zip(param_lens.iter()) {
+                    sess.clip_scale_dev_f32(dg.ptr(), d_norm_sq.ptr(), max_norm, len)?;
+                }
+            }
+
+            for i in 0..d_params.len() {
+                sess.adamw_step_dev_f32(
+                    d_params[i].ptr(),
+                    d_grads[i].ptr(),
+                    d_opt_m[i].ptr(),
+                    d_opt_v[i].ptr(),
+                    param_lens[i],
+                    lr,
+                    0.9,
+                    0.999,
+                    1e-8,
+                    weight_decay,
+                    step + 1,
+                )?;
+            }
+
+            sess.dtoh_f32(&mut host_step_loss, &d_step_loss)?;
+            loss_history.push(host_step_loss[0] / (rows as f32));
+        }
+
+        // 4. Download updated weights/biases back to host slices ONCE at the end.
+        let download_param = |idx: usize, dst: &mut [f32]| -> OchreResult<()> {
+            sess.dtoh_f32(dst, &d_params[idx])?;
+            if dtype != DType::F32 {
+                let q = TensorStorage::from_f32_slice(dst, dtype).to_f32_vec();
+                dst.copy_from_slice(&q);
+            }
+            Ok(())
+        };
+
+        for (u, unit) in unit_states.iter().enumerate() {
+            download_param(unit.w_ih_idx, weight_ih[u])?;
+            download_param(unit.w_hh_idx, weight_hh[u])?;
+            if let (Some(idx), Some(dst)) = (unit.b_ih_idx, bias_ih[u].as_deref_mut()) {
+                download_param(idx, dst)?;
+            }
+            if let (Some(idx), Some(dst)) = (unit.b_hh_idx, bias_hh[u].as_deref_mut()) {
+                download_param(idx, dst)?;
+            }
+        }
+
+        Ok(loss_history)
+    })
+}
+
+/// 100% VRAM-resident multi-step AdamW + MSE training loop for Elman `RNN`.
+/// Uploads inputs and weights once, runs all `steps` in VRAM (downloading only 1 scalar MSE loss
+/// per step), and downloads updated weights back to host slices once at the end.
+/// Returns `None` if CUDA is unavailable (graceful CPU fallback).
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_rnn_train_steps(
+    gpu_id: usize,
+    x: &[f32],
+    target: &[f32],
+    h0: Option<&[f32]>,
+    weight_ih: &mut [&mut [f32]],
+    weight_hh: &mut [&mut [f32]],
+    bias_ih: &mut [Option<&mut [f32]>],
+    bias_hh: &mut [Option<&mut [f32]>],
+    batch: usize,
+    seq_len: usize,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    is_relu: bool,
+    dtype: DType,
+    steps: usize,
+    lr: f32,
+    weight_decay: f32,
+    grad_clip: Option<f32>,
+) -> Option<OchreResult<Vec<f32>>> {
+    cuda_seq_train_steps_inner(
+        gpu_id,
+        SeqCellKind::Rnn { is_relu },
+        x,
+        target,
+        h0,
+        None,
+        weight_ih,
+        weight_hh,
+        bias_ih,
+        bias_hh,
+        batch,
+        seq_len,
+        input_size,
+        hidden_size,
+        num_layers,
+        bidirectional,
+        dtype,
+        steps,
+        lr,
+        weight_decay,
+        grad_clip,
+    )
+}
+
+/// 100% VRAM-resident multi-step AdamW + MSE training loop for `GRU`.
+/// Uploads inputs and weights once, runs all `steps` in VRAM (downloading only 1 scalar MSE loss
+/// per step), and downloads updated weights back to host slices once at the end.
+/// Returns `None` if CUDA is unavailable (graceful CPU fallback).
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_gru_train_steps(
+    gpu_id: usize,
+    x: &[f32],
+    target: &[f32],
+    h0: Option<&[f32]>,
+    weight_ih: &mut [&mut [f32]],
+    weight_hh: &mut [&mut [f32]],
+    bias_ih: &mut [Option<&mut [f32]>],
+    bias_hh: &mut [Option<&mut [f32]>],
+    batch: usize,
+    seq_len: usize,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    dtype: DType,
+    steps: usize,
+    lr: f32,
+    weight_decay: f32,
+    grad_clip: Option<f32>,
+) -> Option<OchreResult<Vec<f32>>> {
+    cuda_seq_train_steps_inner(
+        gpu_id,
+        SeqCellKind::Gru,
+        x,
+        target,
+        h0,
+        None,
+        weight_ih,
+        weight_hh,
+        bias_ih,
+        bias_hh,
+        batch,
+        seq_len,
+        input_size,
+        hidden_size,
+        num_layers,
+        bidirectional,
+        dtype,
+        steps,
+        lr,
+        weight_decay,
+        grad_clip,
+    )
+}
+
+/// 100% VRAM-resident multi-step AdamW + MSE training loop for `LSTM`.
+/// Uploads inputs and weights once, runs all `steps` in VRAM (downloading only 1 scalar MSE loss
+/// per step), and downloads updated weights back to host slices once at the end.
+/// Returns `None` if CUDA is unavailable (graceful CPU fallback).
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_lstm_train_steps(
+    gpu_id: usize,
+    x: &[f32],
+    target: &[f32],
+    h0: Option<&[f32]>,
+    c0: Option<&[f32]>,
+    weight_ih: &mut [&mut [f32]],
+    weight_hh: &mut [&mut [f32]],
+    bias_ih: &mut [Option<&mut [f32]>],
+    bias_hh: &mut [Option<&mut [f32]>],
+    batch: usize,
+    seq_len: usize,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    dtype: DType,
+    steps: usize,
+    lr: f32,
+    weight_decay: f32,
+    grad_clip: Option<f32>,
+) -> Option<OchreResult<Vec<f32>>> {
+    cuda_seq_train_steps_inner(
+        gpu_id,
+        SeqCellKind::Lstm,
+        x,
+        target,
+        h0,
+        c0,
+        weight_ih,
+        weight_hh,
+        bias_ih,
+        bias_hh,
+        batch,
+        seq_len,
+        input_size,
+        hidden_size,
+        num_layers,
+        bidirectional,
+        dtype,
+        steps,
+        lr,
+        weight_decay,
+        grad_clip,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10510,6 +12377,8 @@ mod tests {
             "ochre_flash_sdpa_fwd_f32",
             "ochre_flash_sdpa_bwd_dq_f32",
             "ochre_flash_sdpa_bwd_dkv_f32",
+            "ochre_sdpa_causal_softmax_f32",
+            "ochre_sdpa_bwd_ds_f32",
             "ochre_embedding_scatter_add_f32",
             "ochre_bshd_to_bhsd_f32",
             "ochre_bhsd_to_bshd_f32",
@@ -10540,6 +12409,85 @@ mod tests {
             Ok(out)
         }) {
             assert_eq!(res.unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        }
+    }
+
+    #[test]
+    fn test_vram_pool_bucket_rounding() {
+        assert_eq!(pool_bucket_size(0), 256);
+        assert_eq!(pool_bucket_size(4), 256);
+        assert_eq!(pool_bucket_size(255), 256);
+        assert_eq!(pool_bucket_size(256), 256);
+        assert_eq!(pool_bucket_size(257), 512);
+        assert_eq!(pool_bucket_size(1024), 1024);
+        assert_eq!(pool_bucket_size(1025), 2048);
+        let mib16 = 16 * 1024 * 1024;
+        assert_eq!(pool_bucket_size(mib16 - 1), mib16);
+        assert_eq!(pool_bucket_size(mib16), mib16);
+        assert_eq!(pool_bucket_size(mib16 + 1), 17 * 1024 * 1024);
+        assert_eq!(pool_bucket_size(20 * 1024 * 1024 + 123), 21 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_cuda_seq_train_steps_validation_and_fallback() {
+        let mut w_ih = vec![0.1f32; 8];
+        let mut w_hh = vec![0.1f32; 4];
+        let mut b_ih = vec![0.0f32; 2];
+        let mut b_hh = vec![0.0f32; 2];
+        let x = vec![0.5f32; 12];
+        let target = vec![0.25f32; 6];
+
+        // Invalid steps = 0 returns Some(Err(...)) even on CPU-only hosts
+        let err_res = cuda_rnn_train_steps(
+            0,
+            &x,
+            &target,
+            None,
+            &mut [w_ih.as_mut_slice()],
+            &mut [w_hh.as_mut_slice()],
+            &mut [Some(b_ih.as_mut_slice())],
+            &mut [Some(b_hh.as_mut_slice())],
+            1,
+            3,
+            4,
+            2,
+            1,
+            false,
+            false,
+            DType::F32,
+            0,
+            0.01,
+            0.0,
+            None,
+        );
+        assert!(matches!(err_res, Some(Err(_))));
+
+        // Valid args: either None on CPU-only hosts or Ok(losses) on CUDA hosts
+        if let Some(res) = cuda_rnn_train_steps(
+            0,
+            &x,
+            &target,
+            None,
+            &mut [w_ih.as_mut_slice()],
+            &mut [w_hh.as_mut_slice()],
+            &mut [Some(b_ih.as_mut_slice())],
+            &mut [Some(b_hh.as_mut_slice())],
+            1,
+            3,
+            4,
+            2,
+            1,
+            false,
+            false,
+            DType::F32,
+            3,
+            0.01,
+            0.0,
+            Some(1.0),
+        ) {
+            let losses = res.unwrap();
+            assert_eq!(losses.len(), 3);
+            assert!(losses.iter().all(|v| v.is_finite()));
         }
     }
 }
